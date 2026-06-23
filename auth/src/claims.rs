@@ -43,24 +43,20 @@ impl TokenType {
 pub struct Claims {
 	/// Subject — the principal id (user UUID or service name).
 	pub sub: String,
-	/// Email of the principal (access tokens only).
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub email: Option<String>,
-	/// Account status snapshot (e.g. active/suspended) at issuance time.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub status: Option<String>,
-	/// Per-principal token version for coarse "revoke all" semantics.
-	#[serde(default)]
-	pub token_version: u64,
-	/// Token kind — the access/service discriminator.
-	pub typ: TokenType,
+	/// Issuer — the concierge auth service. Enforced by [`verify_token`](crate::jwks::verify_token).
+	pub iss: String,
+	/// Audience — the service/group the token is scoped to.
+	pub aud: String,
 	/// Expiry (unix seconds). TTL is short (5–15 min for access tokens).
 	pub exp: u64,
 	/// Issued-at (unix seconds).
 	#[serde(default)]
 	pub iat: u64,
-	/// Audience — the service/group the token is scoped to.
-	pub aud: String,
+	/// Token kind — the access/service discriminator.
+	pub typ: TokenType,
+	/// Per-principal token version for coarse "revoke all" semantics.
+	#[serde(default)]
+	pub token_version: u64,
 }
 
 impl Claims {

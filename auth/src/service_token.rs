@@ -21,12 +21,6 @@ impl ServiceTokenSource {
 		Self { token: Arc::from(token.into()) }
 	}
 
-	/// Build an unconfigured source holding an empty token; onward calls go out
-	/// unauthenticated until a real `SERVICE_TOKEN` is wired.
-	pub fn unconfigured() -> Self {
-		Self::new(String::new())
-	}
-
 	/// Build from `SERVICE_TOKEN`, if set.
 	pub fn from_env() -> Option<Self> {
 		env::var("SERVICE_TOKEN").ok().filter(|s| !s.is_empty()).map(Self::new)
