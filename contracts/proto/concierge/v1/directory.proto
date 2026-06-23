@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+// UserDirectory — the authoritative user/identity control plane.
+//
+// Owns investor accounts and their profile metadata. This is the identity plane:
+// money lives in the separate banking plane and is NEVER mirrored here. Every RPC
+// is authorized from the verified access-token Claims injected by the inbound auth
+// layer; self-service RPCs act on the caller's own `sub`, admin RPCs are gated by
+// the admin allowlist (config).
+service UserDirectory {
+  // The calling user's own identity (resolved from the access-token `sub`).
+  rpc GetMe(GetMeRequest) returns (UserProfile);
+
+  // Update the caller's own editable profile fields (full-replace of the set in
+  // UpdateProfileRequest). Identity/auth fields (email, status) are not editable here.
+  rpc UpdateProfile(UpdateProfileRequest) returns (UserProfile);
+
+  // Admin (allowlist): bump a user's token_version so all their outstanding access
+  // tokens are rejected. The token-revocation control surface.
+  rpc RevokeTokens(RevokeTokensRequest) returns (RevokeTokensResponse);
+
+  // Admin (allowlist): disable a user, freezing future sign-in/refresh without
+  // deleting the record.
+  rpc DisableUser(DisableUserRequest) returns (DisableUserResponse);
+}
+
+message GetMeRequest {}
+
+message UserProfile {
+  string user_id = 1;
+  string email = 2;
+  bool email_verified = 3;
+  string status = 4;
+  uint64 token_version = 5;
+  // Editable profile fields (control plane; empty until the user sets them). email and
+  // status above stay read-only — email is the IdP's, status is admin-managed.
+  string legal_name = 6;
+  string preferred_name = 7;
+  string phone = 8;
+  string date_of_birth = 9;
+  string nationality = 10;
+  string tax_residence = 11;
+  string residential_address = 12;
+  string language = 13;
+  string base_currency = 14;
+  string timezone = 15;
+}
+
+// The caller's editable profile, full-replace. Same 10 fields as the editable part of
+// UserProfile; an empty string clears the field.
+message UpdateProfileRequest {
+  string legal_name = 1;
+  string preferred_name = 2;
+  string phone = 3;
+  string date_of_birth = 4;
+  string nationality = 5;
+  string tax_residence = 6;
+  string residential_address = 7;
+  string language = 8;
+  string base_currency = 9;
+  string timezone = 10;
+}
+
+message RevokeTokensRequest {
+  string user_id = 1;
+}
+
+message RevokeTokensResponse {
+  uint64 token_version = 1;
+}
+
+message DisableUserRequest {
+  string user_id = 1;
+}
+
+message DisableUserResponse {}

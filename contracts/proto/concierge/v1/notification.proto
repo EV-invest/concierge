@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+// NotificationService — DEFERRED placeholder seam.
+//
+// Declared now to lock the namespace and let the runner mount a stub module; the
+// real delivery pipeline (channels, templating, fan-out) is future work. The stub
+// returns UNIMPLEMENTED.
+service NotificationService {
+  // Enqueue a notification to a user over some channel. Stubbed for now.
+  rpc Send(SendNotificationRequest) returns (SendNotificationResponse);
+}
+
+message SendNotificationRequest {
+  // The concierge canonical user id (a UUID) to notify.
+  string user_id = 1;
+  // Delivery channel hint, free-form for now (e.g. "email", "push", "sms").
+  string channel = 2;
+  // The notification body.
+  string body = 3;
+}
+
+message SendNotificationResponse {
+  // True once the notification has been accepted for delivery.
+  bool accepted = 1;
+}
