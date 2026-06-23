@@ -32,6 +32,28 @@ consumes. The message is declared here; transport is not yet wired.
 | `evconcierge_auth` — stateless token-verification flow + the `AuthService` issuance skeleton; imported by downstream service repos by git | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
+| **Design** — operator (admin) surface over this plane | [§ Design](#design) |
+
+---
+
+## Design
+
+The operator-facing design surface over this plane is **admin** — the operator
+console over the hub + microservices, covering the identity/platform slice:
+users (KYC · roles · `token_version` revoke), sessions & devices, feature flags.
+Its frontend lives in the `banking` clients repo, not here; the design is part of
+the shared EV Figma file (`e0V2P1cQpEFRuXTeNtEMh6`) — a dark-navy **Inter** system
+with every value bound to `ev/*` variables, shipped to clients as the published
+`@evinvest/uikit`.
+
+| Surface | What | Figma |
+| ------- | ---- | ----- |
+| **admin** | Operator console — users · KYC · roles · `token_version` revoke · sessions · feature flags (the identity/platform slice) | [node 346-27](https://www.figma.com/design/e0V2P1cQpEFRuXTeNtEMh6/Main?node-id=346-27) |
+
+**Observability** (surfaced in admin): **Sentry** (errors + tracing across the
+plane) · **PostHog** (product analytics, feature flags). Wired only through the
+`ev` crate features (`error_monitoring`, `analytics`) — a no-op until `SENTRY_DSN`
+/ `POSTHOG_KEY` are set, so unconfigured local/CI runs are unaffected.
 
 ---
 
