@@ -16,7 +16,6 @@ serde_json.workspace = true
 
 [dependencies]
 ev.workspace = true
-jiff.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

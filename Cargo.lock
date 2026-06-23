@@ -1293,7 +1293,6 @@ version = "0.1.0"
 dependencies = [
  "ev_lib",
  "getrandom 0.3.4",
- "jiff",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1461,15 +1460,11 @@ dependencies = [
  "evconcierge_contracts",
  "http 1.4.2",
  "jsonwebtoken",
- "reqwest 0.12.28",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
  "tower",
- "tracing",
- "uuid",
 ]
 
 [[package]]
