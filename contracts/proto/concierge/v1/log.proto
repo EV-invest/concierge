@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+// LogService — DEFERRED placeholder seam.
+//
+// Declared now to lock the namespace and let the runner mount a stub module; the
+// real audit/log sink is future work. The stub returns UNIMPLEMENTED.
+service LogService {
+  // Append a log entry. Stubbed for now.
+  rpc Append(AppendLogRequest) returns (AppendLogResponse);
+}
+
+message AppendLogRequest {
+  // Severity hint, free-form for now (e.g. "info", "warn", "error").
+  string level = 1;
+  // The log message.
+  string message = 2;
+}
+
+message AppendLogResponse {
+  // True once the entry has been accepted by the sink.
+  bool accepted = 1;
+}

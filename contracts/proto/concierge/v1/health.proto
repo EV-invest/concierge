@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+// Liveness probe for the concierge gRPC surface. Used by the `cabinet` BFF smoke
+// path (browser -> BFF -> gRPC) and by service health checks.
+service HealthService {
+  rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+message CheckRequest {}
+
+message CheckResponse {
+  string status = 1;
+}

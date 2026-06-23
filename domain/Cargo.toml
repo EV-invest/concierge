@@ -1,0 +1,22 @@
+[package]
+name = "domain"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom.workspace = true
+ev = { workspace = true, features = ["wasm"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[dependencies]
+ev.workspace = true
+jiff.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

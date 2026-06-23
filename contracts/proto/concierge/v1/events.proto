@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+// Cross-plane bridge messages — declared here, no transport wired yet.
+//
+// `UserLifecycleEvent` is emitted by concierge's outbox when an identity changes
+// state, and consumed by the banking money plane to gate or freeze money ops
+// (e.g. a SUSPENDED user or a SESSIONS_REVOKED bump must stop downstream
+// authorization). Messages only: no service is defined on this seam — the
+// transport (outbox relay / stream) is future work.
+message UserLifecycleEvent {
+  // The concierge canonical user id (a UUID) the event is about.
+  string user_id = 1;
+
+  // What changed about the user's lifecycle.
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    CREATED = 1;
+    SUSPENDED = 2;
+    REINSTATED = 3;
+    KYC_CHANGED = 4;
+    SESSIONS_REVOKED = 5;
+  }
+  Kind kind = 2;
+
+  // The user's KYC level after the change (relevant chiefly for KYC_CHANGED).
+  uint32 kyc_level = 3;
+
+  // When the change happened, unix SECONDS.
+  int64 occurred_at = 4;
+}
