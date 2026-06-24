@@ -29,4 +29,31 @@ message UserLifecycleEvent {
 
   // When the change happened, unix SECONDS.
   int64 occurred_at = 4;
+
+  // The outbox row key (a UUID), minted by the concierge outbox when the row is
+  // written. The unit of at-least-once delivery: the banking consumer upserts /
+  // dedupes by this id, so a redelivery or two same-second events are distinct.
+  string event_id = 5;
+
+  // Per-user strictly-increasing version, stamped from the user's row version at
+  // emit time. event_id gives dedupe; this gives ORDER — the consumer applies an
+  // event only if its sequence exceeds the last one stored for the user, so a
+  // stale REINSTATED cannot un-freeze a user a later SUSPENDED already froze.
+  uint64 sequence = 6;
+
+  // The shared correlation key both planes provision against: the provider
+  // (Google) `sub`. user_id above is concierge's OWN canonical id and means
+  // nothing to banking, which keys its users on this subject — so this is what
+  // the banking provisioner matches a CREATED event to a local UserId on.
+  string auth_subject = 7;
+
+  // Identity payload banking needs to materialize a user from CREATED without a
+  // synchronous callback (which would defeat the one-way bridge).
+  string email = 8;
+  bool email_verified = 9;
+
+  // The user's token_version after the change. SESSIONS_REVOKED carries the new
+  // floor so a banking consumer gating on token_version learns the value to
+  // store, not merely that "something was revoked".
+  uint64 token_version = 10;
 }
