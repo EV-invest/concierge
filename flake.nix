@@ -122,6 +122,7 @@
               protobuf
               clang-tools
               rust
+              sccache
               mold
               postgresql
               treefmt
@@ -132,6 +133,9 @@
             env.RUST_LIB_BACKTRACE = 0;
             env.PROTOC = "${pkgs.protobuf}/bin/protoc";
             env.DYLD_FALLBACK_LIBRARY_PATH = "${rust}/lib";
+            # shared compile cache across builds; incremental off (incompatible with sccache)
+            env.RUSTC_WRAPPER = "sccache";
+            env.CARGO_INCREMENTAL = "0";
           };
       }
     );
