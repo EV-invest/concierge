@@ -8,6 +8,7 @@
 
 use anyhow::Context;
 use ev::error_monitoring::{self, Config as SentryConfig};
+use evconcierge_auth::{Verifier, grpc_auth_layer};
 use evconcierge_contracts::concierge::v1::{
 	CheckRequest, CheckResponse,
 	auth_service_server::AuthServiceServer,
@@ -18,7 +19,7 @@ use evconcierge_contracts::concierge::v1::{
 };
 use tonic::{Request, Response, Status, transport::Server};
 use tonic_web::GrpcWebLayer;
-use tower::ServiceBuilder;
+use tower::{Layer, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
@@ -61,14 +62,23 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// `tonic-web` (`GrpcWebLayer` + `accept_http1`) lets browser/WASM clients reach
 	// the services over gRPC-Web with no separate proxy. `TraceLayer` emits a span
 	// per request through the same `tracing` subscriber (and Sentry integration).
+	//
+	// The auth choke point: every non-public service is wrapped in `auth.layer(...)`,
+	// which authenticates the inbound bearer token before any handler gets a body and
+	// injects the verified `Claims`. The scaffold `Verifier::unconfigured()` fails
+	// closed (`NotConfigured` → UNAVAILABLE), so the structural choke point exists now
+	// and implementers can't ship a directory/admin mutation that runs unauthenticated.
+	// `HealthService` (BFF liveness) and `AuthService` (the token-issuance surface:
+	// `Exchange`/`Refresh`/`Jwks`) are deliberately left UNWRAPPED — they are public.
+	let auth = grpc_auth_layer(Verifier::unconfigured());
 	Server::builder()
 		.accept_http1(true)
 		.layer(ServiceBuilder::new().layer(TraceLayer::new_for_grpc()).layer(GrpcWebLayer::new()).into_inner())
 		.add_service(HealthServiceServer::new(Health))
 		.add_service(AuthServiceServer::new(evconcierge_auth::AuthService::unconfigured()))
-		.add_service(UserDirectoryServer::new(directory::Directory::new()))
-		.add_service(NotificationServiceServer::new(notification::Notifications::new()))
-		.add_service(LogServiceServer::new(log::Logs::new()))
+		.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new())))
+		.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
+		.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 		.serve(config.bind_addr)
 		.await
 		.context("concierge gRPC server error")
