@@ -21,3 +21,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync"] }
 tonic.workspace = true
 tower.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

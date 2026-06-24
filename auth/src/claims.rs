@@ -54,6 +54,11 @@ pub struct Claims {
 	pub iat: u64,
 	/// Token kind — the access/service discriminator.
 	pub typ: TokenType,
+	/// Unique token id, for optional `jti` revocation and tracing. Kept byte-compatible
+	/// with the banking plane's `Claims` so a future jti-based revocation (or any token
+	/// the planes exchange) cannot drift apart; a parity test pins this wire shape.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub jti: Option<String>,
 	/// Per-principal token version for coarse "revoke all" semantics.
 	#[serde(default)]
 	pub token_version: u64,
@@ -64,5 +69,73 @@ impl Claims {
 	/// `Uuid` is left to the caller.
 	pub fn is_access(&self) -> bool {
 		matches!(self.typ, TokenType::Access)
+	}
+}
+
+// CROSS-PLANE PARITY CONTRACT — keep this block byte-identical in
+// evbanking_auth and evconcierge_auth.
+//
+// The two planes are intentionally independent (separate repos, no shared crate),
+// so the wire shape of `Claims`, `TokenType`, and `VerifyPolicy` is kept in lockstep
+// by this assertion rather than by a shared type. A synthetic divergence — dropping,
+// renaming, or adding a serialized field (the historic `jti` drift), or changing the
+// `typ` discriminant strings — fails this test in whichever plane drifts, before two
+// planes ever exchange a token.
+#[cfg(test)]
+mod parity {
+	use super::*;
+
+	fn full_claims() -> Claims {
+		Claims {
+			sub: "user-123".into(),
+			iss: "https://auth.test".into(),
+			aud: "plane".into(),
+			exp: 1,
+			iat: 1,
+			typ: TokenType::Access,
+			jti: Some("00000000-0000-0000-0000-000000000000".into()),
+			token_version: 0,
+		}
+	}
+
+	fn keys(value: &serde_json::Value) -> Vec<String> {
+		let mut k: Vec<String> = value.as_object().expect("claims serialize to a JSON object").keys().cloned().collect();
+		k.sort();
+		k
+	}
+
+	#[test]
+	fn claims_wire_field_set_is_canonical() {
+		let value = serde_json::to_value(full_claims()).unwrap();
+		assert_eq!(keys(&value), ["aud", "exp", "iat", "iss", "jti", "sub", "token_version", "typ"]);
+	}
+
+	#[test]
+	fn jti_is_omitted_when_absent() {
+		let mut claims = full_claims();
+		claims.jti = None;
+		let value = serde_json::to_value(&claims).unwrap();
+		assert!(value.get("jti").is_none(), "jti must be skipped when None to stay byte-compatible");
+		assert_eq!(keys(&value), ["aud", "exp", "iat", "iss", "sub", "token_version", "typ"]);
+	}
+
+	#[test]
+	fn token_type_discriminants_are_stable() {
+		assert_eq!(serde_json::to_value(TokenType::Access).unwrap(), serde_json::json!("access"));
+		assert_eq!(serde_json::to_value(TokenType::Service).unwrap(), serde_json::json!("service"));
+		assert_eq!(TokenType::Access.as_str(), "access");
+		assert_eq!(TokenType::Service.as_str(), "service");
+	}
+
+	#[test]
+	fn verify_policy_carries_issuer_audiences_and_allowed_types() {
+		let policy = crate::jwks::VerifyPolicy {
+			issuer: "https://auth.test".into(),
+			audiences: vec!["plane".into()],
+			allowed_types: vec![TokenType::Access, TokenType::Service],
+		};
+		assert_eq!(policy.issuer, "https://auth.test");
+		assert_eq!(policy.audiences, ["plane"]);
+		assert_eq!(policy.allowed_types, [TokenType::Access, TokenType::Service]);
 	}
 }

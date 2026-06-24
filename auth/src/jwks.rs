@@ -122,6 +122,7 @@ mod tests {
 			exp: get_current_timestamp() + 900,
 			iat: get_current_timestamp(),
 			typ,
+			jti: None,
 			token_version: 0,
 		}
 	}
