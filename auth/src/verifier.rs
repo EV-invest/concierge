@@ -7,6 +7,14 @@
 //! [`grpc_auth_layer`](crate::interceptor::grpc_auth_layer) to authorize inbound
 //! gRPC, or call [`Verifier::verify`] directly.
 //!
+//! **Refresh is hardened against abuse.** The unknown-`kid` branch is reachable by
+//! anyone with a syntactically valid header (no signature is checked first), so a
+//! naive "refresh on every miss" would let forged tokens with random `kid`s amplify
+//! into unbounded RPCs against the single concierge hub. The wiring must therefore
+//! mirror the banking twin (`piggybank/auth/src/verifier.rs`): a long-lived (lazy)
+//! channel rather than a dial per refresh; a minimum interval between refreshes; and
+//! a single-flight lock so concurrent misses collapse into one network call.
+//!
 //! Scaffold: an [`Verifier::unconfigured`] holds an empty cache and every verify
 //! answers [`AuthError::NotConfigured`] — the JWKS refresh pipeline is not wired.
 

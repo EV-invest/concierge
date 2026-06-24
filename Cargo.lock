@@ -1460,6 +1460,7 @@ dependencies = [
  "evconcierge_contracts",
  "http 1.4.2",
  "jsonwebtoken",
+ "reqwest 0.12.28",
  "serde",
  "thiserror 2.0.18",
  "tokio",

@@ -27,6 +27,7 @@
 
 pub mod claims;
 pub mod config;
+pub mod google;
 pub mod interceptor;
 pub mod jwks;
 pub mod service;
@@ -35,6 +36,7 @@ pub mod verifier;
 
 pub use claims::{Claims, TokenType};
 pub use config::{AuthConfig, GoogleConfig, SigningConfig, VerifierConfig};
+pub use google::{GoogleIdentity, GoogleOauth};
 pub use interceptor::{AuthLayer, Authenticate, claims_of, grpc_auth_layer};
 pub use jwks::{JwksCache, VerifyPolicy, verify_token};
 pub use service::AuthService;

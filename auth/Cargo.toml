@@ -15,6 +15,7 @@ ev = { workspace = true, features = ["error_monitoring"] }
 evconcierge_contracts.workspace = true
 http.workspace = true
 jsonwebtoken.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync"] }
