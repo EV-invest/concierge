@@ -3,8 +3,10 @@
 //! `concierge` is the identity/platform plane (a sibling to the banking money
 //! plane). One runner binary mounts its internal modules — `auth` (token issuance,
 //! served by [`evconcierge_auth::AuthService`]), `directory` (user profile/admin),
-//! `notification`, and `log` — on a single tonic server. Notifications and logs are
-//! DEFERRED stubs. There is no DB and no money plane here.
+//! `notification`, and `log` — on a single tonic server. It opens the Postgres
+//! control plane and applies its migrations on boot (the identity records + the
+//! cross-plane bridge outbox). Notifications and logs are DEFERRED stubs. There is
+//! no money plane here.
 
 use anyhow::Context;
 use ev::error_monitoring::{self, Config as SentryConfig};
@@ -26,6 +28,7 @@ use crate::config::Config;
 
 mod config;
 mod directory;
+mod infrastructure;
 mod log;
 mod notification;
 
@@ -53,6 +56,14 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
+	// The plane applies pending control-plane migrations on boot (idempotent). New
+	// migration FILES are authored with the sqlx CLI (`sqlx migrate add …`), never
+	// hand-written.
+	let pool = infrastructure::db::connect_sized(&config.database_url, config.db_max_connections)
+		.await
+		.context("failed to connect to the database")?;
+	infrastructure::db::migrate(&pool).await.context("failed to apply database migrations")?;
+
 	// Product-analytics capture (native PostHog). A `None` key makes capture a
 	// silent no-op, so this is safe to construct unconfigured.
 	let _analytics = ev::analytics::Analytics::new(config.posthog_key.clone(), config.posthog_host.clone());

@@ -26,7 +26,7 @@ consumes. The message is declared here; transport is not yet wired.
 
 | Topic | Source |
 | ----- | ------ |
-| Bring-up · `nix run` apps (`concierge`, optional `db`) · dev shell | [`flake.nix`](./flake.nix) |
+| Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
 | `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **notification**, **log**. `directory` is the live module; `notification` + `log` are DEFERRED stubs | [`runner/`](./runner) |
 | `evconcierge_auth` — stateless token-verification flow + the `AuthService` issuance skeleton; imported by downstream service repos by git | [`auth/`](./auth) |
@@ -84,14 +84,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
 
 ## Hard rules
 
-- This is a **scaffold**: pure infrastructure wiring. No business logic, demo
-  features, or DB migrations unless explicitly asked. Service handlers are stubs
-  (`tonic::Status::unimplemented`; health returns `"ok"`); application/domain
-  layers are placeholders to grow into.
-- The repo MUST `cargo check` cleanly with **no database and no services
-  running**: no `sqlx::query!` macros, no runtime connections — stubs only.
-  Prefer returning `Err(AuthError::NotConfigured)` / `Status::unimplemented`
-  over panicking macros.
+- The **auth** and **directory** modules are being de-scaffolded into the real
+  identity plane (Postgres control plane, migrations on boot). `notification` and
+  `log` stay DEFERRED stubs (`tonic::Status::unimplemented`); their application
+  layers are placeholders to grow into. Health returns `"ok"`.
+- Keep `cargo check` independent of a live database at BUILD time: use runtime
+  queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
+  hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
 - No extra deps, abstraction layers, or unasked-for features.
 - No comments explaining _what_; only _why_ if non-obvious.
 - No `.env*`, secrets, or large binaries committed.

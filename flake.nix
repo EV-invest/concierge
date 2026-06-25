@@ -42,8 +42,8 @@
 
         # ── concierge (the modular-monolith runner: all gRPC modules in-process) ──
         # Runs the `concierge` binary, which mounts the auth/directory/notification/
-        # log modules as in-process gRPC services. No external prerequisites for the
-        # scaffold (handlers are stubs); defaults below fill anything left unset.
+        # log modules as in-process gRPC services and applies its DB migrations on
+        # boot. Needs Postgres (`.#db`); defaults below fill anything left unset.
         runConcierge = pkgs.writeShellApplication {
           name = "run-concierge";
           runtimeInputs = with pkgs; [ rust pkg-config protobuf git ];
@@ -60,6 +60,7 @@
             fi
             set +a
 
+            export DATABASE_URL="''${DATABASE_URL:-postgres://postgres@localhost:5432/ev_concierge}"
             export CONCIERGE_BIND="''${CONCIERGE_BIND:-0.0.0.0:50061}"
             export RUST_LOG="''${RUST_LOG:-info,concierge=debug,evconcierge_auth=debug}"
             exec cargo run -p concierge
@@ -104,7 +105,7 @@
         };
       in
       {
-        # `nix run .#concierge` → the runner binary (auth/directory/notification/log modules in-process)
+        # `nix run .#concierge` → the runner binary (auth/directory/notification/log modules in-process; applies DB migrations on boot, needs `.#db`)
         # `nix run .#db`        → local Postgres only (creates ev_concierge)
         apps = {
           concierge = { type = "app"; program = "${runConcierge}/bin/run-concierge"; };

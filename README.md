@@ -17,7 +17,7 @@ contracts/auth crates.
 
 | Path | What | Stack |
 | ---- | ---- | ----- |
-| [`runner/`](runner) | the modular-monolith binary — composition root mounting modules `auth` · `directory` · `notification` · `log` | Rust · tonic |
+| [`runner/`](runner) | the modular-monolith binary — composition root mounting modules `auth` · `directory` · `notification` · `log`; opens the Postgres control plane and applies `runner/migrations` on boot | Rust · tonic · sqlx |
 | [`auth/`](auth) | `evconcierge_auth` — stateless token-verification flow + `AuthService` issuance skeleton (imported by downstream repos) | Rust · tonic · JWKS |
 | [`contracts/`](contracts) | `evconcierge_contracts` — gRPC wire contracts (`proto/concierge/v1/` → tonic stubs) | Rust · tonic-build · proto3 |
 | [`domain/`](domain) | shared identity types (pure, wasm-safe) over `ev::architecture` | Rust |
@@ -31,8 +31,8 @@ there's no need to enter the dev shell first.
 
 | Command | Brings up |
 | ------- | --------- |
-| `nix run .#concierge` | the runner binary (all gRPC modules in-process) |
-| `nix run .#db` | local Postgres (cluster under `.pg/`, trust auth) |
+| `nix run .#db` | local Postgres (cluster under `.pg/`, trust auth; creates `ev_concierge`) |
+| `nix run .#concierge` | the runner binary (all gRPC modules in-process; applies DB migrations on boot — needs `.#db`) |
 
 Equivalently, from the dev shell: `cargo run -p concierge`.
 
