@@ -9,7 +9,7 @@
 //! no money plane here.
 
 use anyhow::Context;
-use concierge::{config::Config, directory, infrastructure, log, notification};
+use concierge::{bridge, config::Config, directory, infrastructure, log, notification};
 use ev::error_monitoring::{self, Config as SentryConfig};
 use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
@@ -19,6 +19,7 @@ use evconcierge_contracts::concierge::v1::{
 	log_service_server::LogServiceServer,
 	notification_service_server::NotificationServiceServer,
 	user_directory_server::UserDirectoryServer,
+	user_events_server::UserEventsServer,
 };
 use tonic::{Request, Response, Status, transport::Server};
 use tonic_web::GrpcWebLayer;
@@ -101,11 +102,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// (the token-issuance surface: `Exchange`/`Refresh`/`Jwks`) are deliberately left
 	// UNWRAPPED — they are public.
 	let auth = grpc_auth_layer(verifier);
+
+	// The cross-plane bridge producer: the one-way identity→money seam the banking
+	// plane PULLS from. Mounted OUTSIDE the user `auth` layer — it is a
+	// service-to-service seam authenticated by its own shared bridge service token, not
+	// a user access token. Unconfigured (`BRIDGE_SERVICE_TOKEN` unset) it fails closed.
+	let bridge = bridge::Bridge::new(pool.clone(), config.bridge_service_token);
+
 	Server::builder()
 		.accept_http1(true)
 		.layer(ServiceBuilder::new().layer(TraceLayer::new_for_grpc()).layer(GrpcWebLayer::new()).into_inner())
 		.add_service(HealthServiceServer::new(Health))
 		.add_service(AuthServiceServer::new(auth_service))
+		.add_service(UserEventsServer::new(bridge))
 		.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users, config.admin_subjects.into()))))
 		.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
 		.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))

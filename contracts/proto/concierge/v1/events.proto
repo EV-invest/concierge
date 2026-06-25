@@ -2,13 +2,40 @@ syntax = "proto3";
 
 package concierge.v1;
 
-// Cross-plane bridge messages — declared here, no transport wired yet.
+// Cross-plane bridge — the ONE-WAY identity→money seam.
 //
 // `UserLifecycleEvent` is emitted by concierge's outbox when an identity changes
 // state, and consumed by the banking money plane to gate or freeze money ops
 // (e.g. a SUSPENDED user or a SESSIONS_REVOKED bump must stop downstream
-// authorization). Messages only: no service is defined on this seam — the
-// transport (outbox relay / stream) is future work.
+// authorization). Banking PULLS — concierge never calls banking.
+//
+// `UserEvents.PullUserLifecycle` serves `user_outbox` rows with
+// `position > after_position`, oldest-first, capped by `limit`; the puller stores
+// `next_position` as its cursor and advances. Read-only: concierge never deletes
+// rows — banking dedupes by `event_id` and orders per-user by `sequence`.
+//
+// The seam is authenticated with a shared bridge service token (env
+// BRIDGE_SERVICE_TOKEN on both ends). Graduate to mTLS/SPIFFE at platform scale.
+service UserEvents {
+  rpc PullUserLifecycle(PullUserLifecycleRequest) returns (PullUserLifecycleResponse);
+}
+
+message PullUserLifecycleRequest {
+  // Exclusive lower bound: serve rows with `position > after_position`. The puller's
+  // stored cursor; 0 to read from the beginning of the outbox.
+  int64 after_position = 1;
+  // Max rows to return. The server caps this at its own ceiling.
+  uint32 limit = 2;
+}
+
+message PullUserLifecycleResponse {
+  // The matched events, oldest-first by `position`.
+  repeated UserLifecycleEvent events = 1;
+  // The cursor to pass as the next `after_position`: the max `position` returned, or
+  // the request's `after_position` unchanged when no rows matched.
+  int64 next_position = 2;
+}
+
 message UserLifecycleEvent {
   // The concierge canonical user id (a UUID) the event is about.
   string user_id = 1;

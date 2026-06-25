@@ -6,9 +6,11 @@
 //!
 //! Hexagonal layout over the shared `domain`:
 //!   directory       — the user/profile gRPC service + the auth→directory provisioner loop
+//!   bridge          — the cross-plane (identity→money) producer over the user_outbox
 //!   infrastructure  — driven adapters (Postgres control plane + the user directory repo)
 //!   notification/log — DEFERRED stubs (no platform messaging/audit yet)
 
+pub mod bridge;
 pub mod config;
 pub mod directory;
 pub mod infrastructure;

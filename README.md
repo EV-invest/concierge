@@ -5,7 +5,10 @@ platform. It owns user-session auth, the user directory/profile, notifications,
 and logs. Its sibling repo `banking` is the **money** plane (TigerBeetle ledger,
 money-operation authorization); the two run independent auth flows and share no
 database. The only coupling is a one-way bridge: `concierge` emits
-user-lifecycle events that `banking` consumes.
+user-lifecycle events to its `user_outbox`, and `banking` **pulls** them over the
+`UserEvents.PullUserLifecycle` RPC to gate/freeze money ops. `concierge` never
+calls `banking`. The seam is authenticated by a shared bridge service token
+(`BRIDGE_SERVICE_TOKEN`); graduate to mTLS/SPIFFE at platform scale.
 
 `concierge` is a **modular monolith** — one runner binary whose internal modules
 are `auth`, `directory`, `notification`, and `log`. Downstream service repos

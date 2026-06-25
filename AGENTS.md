@@ -17,8 +17,11 @@ money-operation authorization). The two run **independent auth flows** and share
 no database.
 
 The only coupling is a one-way **cross-plane bridge**: `concierge` emits
-user-lifecycle events (`events.proto` — `UserLifecycleEvent`) that `banking`
-consumes. The message is declared here; transport is not yet wired.
+user-lifecycle events (`events.proto` — `UserLifecycleEvent`) to its
+`user_outbox`, and `banking` **pulls** them over the `UserEvents.PullUserLifecycle`
+RPC (`bridge` module) to gate/freeze money ops. `concierge` never calls `banking`.
+The seam is authenticated by a shared bridge service token (`BRIDGE_SERVICE_TOKEN`),
+mounted OUTSIDE the user auth layer; graduate to mTLS/SPIFFE at platform scale.
 
 ---
 
@@ -28,7 +31,7 @@ consumes. The message is declared here; transport is not yet wired.
 | ----- | ------ |
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
-| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **notification**, **log**. `directory` is the live module; `notification` + `log` are DEFERRED stubs | [`runner/`](./runner) |
+| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **notification**, **log**. `directory` + `bridge` are live; `notification` + `log` are DEFERRED stubs | [`runner/`](./runner) |
 | `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation with reuse detection · `Exchange`/`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`) provisioning users to the directory over an in-process `Provisioner` channel, **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
@@ -87,7 +90,9 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
 - The **auth** and **directory** modules are the real identity plane (Postgres
   control plane, migrations on boot): auth issues/verifies tokens, the directory is
   a Postgres-backed user repository (provision/profile/admin) that emits cross-plane
-  lifecycle events to `user_outbox` in the write tx. `notification` and `log` stay
+  lifecycle events to `user_outbox` in the write tx. The **bridge** module serves
+  those rows to banking over `UserEvents.PullUserLifecycle` (read-only; shared bridge
+  token; mounted outside the user auth layer). `notification` and `log` stay
   DEFERRED stubs (`tonic::Status::unimplemented`); their application layers are
   placeholders to grow into. Health returns `"ok"`.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime

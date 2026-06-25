@@ -17,6 +17,11 @@ pub struct Config {
 	/// Canonical user ids permitted to call the admin directory RPCs (`RevokeTokens`,
 	/// `DisableUser`). `ADMIN_SUBJECTS` is a comma-separated list (empty ⇒ no admins).
 	pub admin_subjects: Vec<String>,
+	/// Shared bearer token the banking money plane presents on the cross-plane bridge
+	/// (`UserEvents.PullUserLifecycle`). `BRIDGE_SERVICE_TOKEN`; `None` ⇒ the bridge is
+	/// not served (every pull is rejected), so an unconfigured plane never leaks the
+	/// outbox. Graduate to mTLS/SPIFFE at platform scale.
+	pub bridge_service_token: Option<String>,
 	pub sentry_dsn: Option<String>,
 	/// PostHog project key for native product-analytics capture. `None` disables
 	/// capture (a silent no-op), so the same code runs unconfigured (local, CI).
@@ -45,6 +50,7 @@ impl Config {
 			.filter(|s| !s.is_empty())
 			.map(str::to_owned)
 			.collect();
+		let bridge_service_token = env::var("BRIDGE_SERVICE_TOKEN").ok().filter(|s| !s.is_empty());
 		let sentry_dsn = env::var("SENTRY_DSN").ok().filter(|s| !s.is_empty());
 		let posthog_key = env::var("POSTHOG_KEY").ok().filter(|s| !s.is_empty());
 		let posthog_host = env::var("POSTHOG_HOST").ok().filter(|s| !s.is_empty());
@@ -54,6 +60,7 @@ impl Config {
 			bind_addr,
 			db_max_connections,
 			admin_subjects,
+			bridge_service_token,
 			sentry_dsn,
 			posthog_key,
 			posthog_host,
