@@ -1,4 +1,5 @@
-//! Downstream token verifier — what *other* service repos use.
+//! Downstream token verifier — what *other* service repos use, and what the
+//! concierge runner mounts for its own inbound gRPC.
 //!
 //! Holds the concierge plane's JWKS in a cache and verifies access/service tokens
 //! entirely locally (no per-request round trip, no per-service token storage). The
@@ -10,39 +11,153 @@
 //! **Refresh is hardened against abuse.** The unknown-`kid` branch is reachable by
 //! anyone with a syntactically valid header (no signature is checked first), so a
 //! naive "refresh on every miss" would let forged tokens with random `kid`s amplify
-//! into unbounded RPCs against the single concierge hub. The wiring must therefore
-//! mirror the banking twin (`piggybank/auth/src/verifier.rs`): a long-lived (lazy)
-//! channel rather than a dial per refresh; a minimum interval between refreshes; and
-//! a single-flight lock so concurrent misses collapse into one network call.
-//!
-//! Scaffold: an [`Verifier::unconfigured`] holds an empty cache and every verify
-//! answers [`AuthError::NotConfigured`] — the JWKS refresh pipeline is not wired.
+//! into unbounded RPCs against the single concierge hub. Three guards prevent that:
+//! a long-lived (lazy) channel rather than a dial per refresh; a minimum interval
+//! between refreshes; and a single-flight lock so concurrent misses collapse into
+//! one network call.
 
-use std::sync::Arc;
+use std::{
+	collections::HashMap,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
-use crate::{AuthError, Claims, interceptor::Authenticate};
+use evconcierge_contracts::concierge::v1::{JwksRequest, auth_service_client::AuthServiceClient};
+use jsonwebtoken::DecodingKey;
+use tokio::sync::{Mutex, RwLock};
+use tonic::transport::Channel;
+
+use crate::{
+	AuthError, Claims,
+	config::VerifierConfig,
+	interceptor::Authenticate,
+	jwks::{JwksCache, VerifyPolicy, verify_token},
+};
+
+/// Don't hit the plane's `Jwks` RPC more than once per this window, so a flood of
+/// forged unknown-`kid` tokens can't amplify into a DoS against the central hub.
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A cheaply-cloneable handle for local token verification.
 #[derive(Clone)]
 pub struct Verifier {
-	#[allow(dead_code)]
 	inner: Arc<Inner>,
 }
-
 impl Verifier {
-	/// Build a verifier with an empty cache and no upstream wiring. In this scaffold
-	/// every verify answers [`AuthError::NotConfigured`].
+	/// A fail-closed verifier with no upstream wiring: every verify answers
+	/// [`AuthError::NotConfigured`] (→ UNAVAILABLE). Used to assert the inbound choke
+	/// point exists before signing is configured, never to serve real traffic.
 	pub fn unconfigured() -> Self {
-		Self { inner: Arc::new(Inner {}) }
+		Self {
+			inner: Arc::new(Inner::Unconfigured),
+		}
 	}
 
-	/// Verify a bearer token. Scaffold stub — returns [`AuthError::NotConfigured`].
-	pub async fn verify(&self, _token: &str) -> Result<Claims, AuthError> {
-		Err(AuthError::NotConfigured)
+	/// Build a verifier with an empty cache; the first verify (or any unknown-`kid`)
+	/// fetches the JWKS. Fails only if the endpoint is not a valid URI.
+	pub fn try_new(config: VerifierConfig) -> Result<Self, AuthError> {
+		let channel = Channel::from_shared(config.jwks_grpc_endpoint.clone())
+			.map_err(|e| AuthError::JwksFetch(format!("invalid jwks endpoint {}: {e}", config.jwks_grpc_endpoint)))?
+			.connect_lazy();
+		Ok(Self {
+			inner: Arc::new(Inner::Wired(Box::new(Wired {
+				cache: RwLock::new(JwksCache::new()),
+				policy: VerifyPolicy {
+					issuer: config.issuer,
+					audiences: config.audiences,
+					allowed_types: config.allowed_types,
+				},
+				client: AuthServiceClient::new(channel),
+				last_refresh: Mutex::new(None),
+			}))),
+		})
+	}
+
+	/// Build a verifier and warm its cache with an initial JWKS fetch, so the first
+	/// real request does not pay the refresh latency.
+	pub async fn connect(config: VerifierConfig) -> Result<Self, AuthError> {
+		let verifier = Self::try_new(config)?;
+		verifier.refresh().await?;
+		Ok(verifier)
+	}
+
+	/// Verify a bearer token, refreshing the JWKS once if the `kid` is unknown
+	/// (a key rotation) before giving up. The refresh is throttled + single-flighted,
+	/// so a forged-`kid` flood costs at most one RPC per `MIN_REFRESH_INTERVAL`.
+	pub async fn verify(&self, token: &str) -> Result<Claims, AuthError> {
+		let wired = match &*self.inner {
+			Inner::Unconfigured => return Err(AuthError::NotConfigured),
+			Inner::Wired(wired) => wired,
+		};
+		let first = {
+			let cache = wired.cache.read().await;
+			verify_token(token, &cache, &wired.policy)
+		};
+		match first {
+			Err(AuthError::UnknownKid(_)) => {
+				self.refresh().await?;
+				let cache = wired.cache.read().await;
+				verify_token(token, &cache, &wired.policy)
+			}
+			other => other,
+		}
+	}
+
+	async fn refresh(&self) -> Result<(), AuthError> {
+		let wired = match &*self.inner {
+			Inner::Unconfigured => return Err(AuthError::NotConfigured),
+			Inner::Wired(wired) => wired,
+		};
+		// Single-flight: only one task refreshes at a time. Whoever waited then sees a
+		// recent `last_refresh` and skips the redundant network call.
+		let mut last_refresh = wired.last_refresh.lock().await;
+		if let Some(at) = *last_refresh
+			&& at.elapsed() < MIN_REFRESH_INTERVAL
+		{
+			return Ok(());
+		}
+
+		let mut client = wired.client.clone();
+		let response = client
+			.jwks(JwksRequest {})
+			.await
+			.map_err(|e| AuthError::JwksFetch(format!("concierge Jwks RPC failed: {e}")))?
+			.into_inner();
+
+		let mut keys = HashMap::new();
+		for jwk in response.keys {
+			if jwk.kty != "OKP" || jwk.crv != "Ed25519" {
+				continue;
+			}
+			let key = DecodingKey::from_ed_components(&jwk.x).map_err(|e| AuthError::JwksFetch(format!("bad Ed25519 key {}: {e}", jwk.kid)))?;
+			keys.insert(jwk.kid, key);
+		}
+		if keys.is_empty() {
+			return Err(AuthError::JwksFetch("concierge published no Ed25519 keys".into()));
+		}
+		wired.cache.write().await.replace(keys);
+		*last_refresh = Some(Instant::now());
+		Ok(())
 	}
 }
 
-struct Inner {}
+/// A fail-closed seam or a fully-wired verifier. The unconfigured arm exists so the
+/// inbound choke point can be asserted before signing is configured.
+enum Inner {
+	Unconfigured,
+	Wired(Box<Wired>),
+}
+
+struct Wired {
+	cache: RwLock<JwksCache>,
+	policy: VerifyPolicy,
+	/// A long-lived lazy channel to the plane's auth service; reconnects under the hood.
+	client: AuthServiceClient<Channel>,
+	/// Single-flight + throttle guard: holds the last successful refresh instant
+	/// (`None` until the first). Held across the refresh so concurrent misses await
+	/// one network call instead of each issuing their own.
+	last_refresh: Mutex<Option<Instant>>,
+}
 
 impl Authenticate for Verifier {
 	async fn authenticate(&self, token: String) -> Result<Claims, AuthError> {

@@ -6,8 +6,10 @@
 //!
 //! - [`AuthService`] is the user/session issuance surface (`Exchange`/`Refresh`/
 //!   `Logout`/`ListSessions`/`RevokeSession`/`Jwks`). The runner mounts it as a
-//!   tonic server; in this scaffold it is constructed [`AuthService::unconfigured`]
-//!   and every route answers `unimplemented`.
+//!   tonic server. It owns the signing keys / JWKS / Google client / refresh store
+//!   and provisions users in process over the [`Provisioner`] channel (auth →
+//!   directory). Built [`AuthService::try_new`] with a signing key configured it
+//!   mints real tokens; with none it runs inert ([`AuthError::NotConfigured`]).
 //!
 //! # For a downstream service (a separate repo)
 //!
@@ -27,18 +29,25 @@
 
 pub mod claims;
 pub mod config;
-pub mod google;
 pub mod interceptor;
 pub mod jwks;
+pub mod provisioner;
 pub mod service;
 pub mod service_token;
+pub mod telemetry;
 pub mod verifier;
+
+// Issuance internals — host-only (used by `service` via `crate::`), not part of the
+// verify-side surface downstream service repos import, so kept private.
+mod google;
+mod management;
+mod signer;
 
 pub use claims::{Claims, TokenType};
 pub use config::{AuthConfig, GoogleConfig, SigningConfig, VerifierConfig};
-pub use google::{GoogleIdentity, GoogleOauth};
 pub use interceptor::{AuthLayer, Authenticate, claims_of, grpc_auth_layer};
 pub use jwks::{JwksCache, VerifyPolicy, verify_token};
+pub use provisioner::{ProvisionCommand, ProvisionRequest, ProvisionedUser, Provisioner, provisioner_channel};
 pub use service::AuthService;
 pub use service_token::ServiceTokenSource;
 use thiserror::Error;
@@ -50,7 +59,8 @@ pub enum AuthError {
 	/// The flow has not been wired yet (no signing key configured — dev/CI).
 	#[error("auth flow is not configured")]
 	NotConfigured,
-	/// An in-process auth task could not be reached — its channel is closed.
+	/// An in-process auth task (the directory provisioner) could not be reached — its
+	/// channel is closed. The flow may be wired; the task is just gone.
 	#[error("auth service unavailable")]
 	Unavailable,
 	/// No bearer token was presented.

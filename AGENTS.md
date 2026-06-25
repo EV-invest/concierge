@@ -29,7 +29,7 @@ consumes. The message is declared here; transport is not yet wired.
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
 | `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **notification**, **log**. `directory` is the live module; `notification` + `log` are DEFERRED stubs | [`runner/`](./runner) |
-| `evconcierge_auth` — stateless token-verification flow + the `AuthService` issuance skeleton; imported by downstream service repos by git | [`auth/`](./auth) |
+| `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation with reuse detection · `Exchange`/`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`) provisioning users to the directory over an in-process `Provisioner` channel, **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
 | **Design** — operator (admin) surface over this plane | [§ Design](#design) |

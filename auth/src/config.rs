@@ -41,8 +41,13 @@ pub struct AuthConfig {
 	pub service_audience: String,
 	/// Access-token TTL (seconds). Short by design (5–15 min).
 	pub access_ttl_secs: u64,
-	/// Refresh-token TTL (seconds).
+	/// Refresh-token sliding-window TTL (seconds), reset on each rotation.
 	pub refresh_ttl_secs: u64,
+	/// Immutable absolute cap on a refresh family's lifetime (seconds), enforced
+	/// regardless of how often the sliding window is reset.
+	pub max_session_secs: u64,
+	/// Idle timeout (seconds) since the last rotation; `0` disables it.
+	pub idle_timeout_secs: u64,
 	/// Service-token TTL (seconds).
 	pub service_ttl_secs: u64,
 	/// Signing/verification key material. `None` ⇒ auth disabled (dev/CI).
@@ -74,6 +79,8 @@ impl AuthConfig {
 			service_audience: env::var("AUTH_SERVICE_AUDIENCE").unwrap_or_else(|_| "concierge-services".to_string()),
 			access_ttl_secs: parse_secs("AUTH_ACCESS_TTL_SECS", 900)?,
 			refresh_ttl_secs: parse_secs("AUTH_REFRESH_TTL_SECS", 2_592_000)?,
+			max_session_secs: parse_secs("AUTH_MAX_SESSION_SECS", 7_776_000)?,
+			idle_timeout_secs: parse_secs("AUTH_IDLE_TIMEOUT_SECS", 0)?,
 			service_ttl_secs: parse_secs("AUTH_SERVICE_TTL_SECS", 300)?,
 			signing,
 			google,
@@ -175,6 +182,8 @@ mod tests {
 			service_audience: service_audience.into(),
 			access_ttl_secs: 900,
 			refresh_ttl_secs: 2_592_000,
+			max_session_secs: 7_776_000,
+			idle_timeout_secs: 0,
 			service_ttl_secs: 300,
 			signing: None,
 			google: None,

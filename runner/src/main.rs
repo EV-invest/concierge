@@ -10,7 +10,7 @@
 
 use anyhow::Context;
 use ev::error_monitoring::{self, Config as SentryConfig};
-use evconcierge_auth::{Verifier, grpc_auth_layer};
+use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
 	CheckRequest, CheckResponse,
 	auth_service_server::AuthServiceServer,
@@ -70,29 +70,70 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
 	tracing::info!(bind = %config.bind_addr, "concierge listening");
 
+	// Auth issuance. `AuthConfig` is host-only (signing key, Google client, refresh
+	// TTLs); with no `AUTH_SIGNING_KEY_PEM` configured the service runs inert. The
+	// provisioner channel is the auth → directory seam: auth holds the `Provisioner`
+	// (called from `Exchange`/`Refresh`), and the directory module (A1c) keeps the
+	// receiver and drains it against Postgres. Until A1c lands the receiver is dropped
+	// here, so an `Exchange` attempt fails cleanly (`Unavailable`) rather than hanging.
+	let auth_config = AuthConfig::from_env().context("failed to load auth configuration")?;
+	let (provisioner, provision_rx) = provisioner_channel();
+	drop(provision_rx); // TODO(A1c): hand to `directory::Directory` to drain against the users repo.
+	let auth_service = AuthService::try_new(auth_config, provisioner).await.context("failed to build the auth service")?;
+
+	// Inbound verification choke point: a `Verifier` over this plane's own `Jwks` RPC.
+	// Built lazily so boot does not block on a self-dial; the first verify warms the
+	// cache. With no signing key, the served JWKS is empty and every inbound verify
+	// fails closed (`UnknownKid`/`JwksFetch` → UNAUTHENTICATED/UNAVAILABLE), so no
+	// directory/admin mutation can run unauthenticated.
+	let verifier_config = VerifierConfig {
+		issuer: auth_config_issuer(),
+		audiences: client_audiences(),
+		allowed_types: vec![evconcierge_auth::TokenType::Access],
+		jwks_grpc_endpoint: jwks_grpc_endpoint(&config.bind_addr),
+	};
+	verifier_config.assert_plane().context("verifier config carries a cross-plane identity")?;
+	let verifier = Verifier::try_new(verifier_config).context("failed to build the inbound token verifier")?;
+
 	// `tonic-web` (`GrpcWebLayer` + `accept_http1`) lets browser/WASM clients reach
 	// the services over gRPC-Web with no separate proxy. `TraceLayer` emits a span
 	// per request through the same `tracing` subscriber (and Sentry integration).
 	//
 	// The auth choke point: every non-public service is wrapped in `auth.layer(...)`,
 	// which authenticates the inbound bearer token before any handler gets a body and
-	// injects the verified `Claims`. The scaffold `Verifier::unconfigured()` fails
-	// closed (`NotConfigured` → UNAVAILABLE), so the structural choke point exists now
-	// and implementers can't ship a directory/admin mutation that runs unauthenticated.
-	// `HealthService` (BFF liveness) and `AuthService` (the token-issuance surface:
-	// `Exchange`/`Refresh`/`Jwks`) are deliberately left UNWRAPPED — they are public.
-	let auth = grpc_auth_layer(Verifier::unconfigured());
+	// injects the verified `Claims`. `HealthService` (BFF liveness) and `AuthService`
+	// (the token-issuance surface: `Exchange`/`Refresh`/`Jwks`) are deliberately left
+	// UNWRAPPED — they are public.
+	let auth = grpc_auth_layer(verifier);
 	Server::builder()
 		.accept_http1(true)
 		.layer(ServiceBuilder::new().layer(TraceLayer::new_for_grpc()).layer(GrpcWebLayer::new()).into_inner())
 		.add_service(HealthServiceServer::new(Health))
-		.add_service(AuthServiceServer::new(evconcierge_auth::AuthService::unconfigured()))
+		.add_service(AuthServiceServer::new(auth_service))
 		.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new())))
 		.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
 		.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 		.serve(config.bind_addr)
 		.await
 		.context("concierge gRPC server error")
+}
+
+/// The plane's issuer, read with the same default `evconcierge_auth` uses, so the
+/// inbound verifier expects exactly what issuance stamps.
+fn auth_config_issuer() -> String {
+	std::env::var("AUTH_ISSUER").unwrap_or_else(|_| "https://auth.concierge.ev".to_string())
+}
+
+/// The client audience(s) the inbound choke point accepts — user access tokens only.
+fn client_audiences() -> Vec<String> {
+	let raw = std::env::var("AUTH_CLIENT_AUDIENCE").unwrap_or_else(|_| "concierge".to_string());
+	raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
+}
+
+/// Where the inbound verifier dials the `Jwks` RPC: an override env, else this plane's
+/// own bind address (it serves its own JWKS in the same process).
+fn jwks_grpc_endpoint(bind_addr: &std::net::SocketAddr) -> String {
+	std::env::var("AUTH_JWKS_GRPC_ENDPOINT").unwrap_or_else(|_| format!("http://{bind_addr}"))
 }
 
 /// Liveness probe for the gRPC surface.

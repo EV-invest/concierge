@@ -15,12 +15,16 @@ ev = { workspace = true, features = ["error_monitoring"] }
 evconcierge_contracts.workspace = true
 http.workspace = true
 jsonwebtoken.workspace = true
+redis.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync"] }
 tonic.workspace = true
 tower.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

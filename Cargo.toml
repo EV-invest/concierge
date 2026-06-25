@@ -26,11 +26,16 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 # rustls only (no native-tls), matching how `ev` pulls reqwest.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 prost = "0.13"
+# rustls-only Redis for the issuing-side refresh-token state, matching the rustls
+# stance (no native-tls). No-op until `REDIS_URL` is set (in-process fallback).
+redis = { version = "0.32", default-features = false, features = ["tokio-rustls-comp", "connection-manager", "script"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 # Postgres control plane. Runtime queries (`sqlx::query*`, not the compile-time
 # macros) keep `cargo build` independent of a live database, mirroring banking.
 sqlx = "0.9.0"
+# Constant-time secret comparison for refresh-token rotation.
+subtle = "2.6"
 thiserror = "2.0.18"
 tokio = "1.52.3"
 tonic = "0.13"
