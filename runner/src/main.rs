@@ -9,6 +9,7 @@
 //! no money plane here.
 
 use anyhow::Context;
+use concierge::{config::Config, directory, infrastructure, log, notification};
 use ev::error_monitoring::{self, Config as SentryConfig};
 use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
@@ -23,14 +24,6 @@ use tonic::{Request, Response, Status, transport::Server};
 use tonic_web::GrpcWebLayer;
 use tower::{Layer, ServiceBuilder};
 use tower_http::trace::TraceLayer;
-
-use crate::config::Config;
-
-mod config;
-mod directory;
-mod infrastructure;
-mod log;
-mod notification;
 
 // Sentry must be initialised before the async runtime starts — no #[tokio::main].
 fn main() -> anyhow::Result<()> {
@@ -70,15 +63,18 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
 	tracing::info!(bind = %config.bind_addr, "concierge listening");
 
+	// The user directory repository: the only writer of the identity control plane and
+	// the cross-plane outbox. Shared by the directory service and the provisioner loop.
+	let users = std::sync::Arc::new(infrastructure::users::PgUsers::new(pool.clone()));
+
 	// Auth issuance. `AuthConfig` is host-only (signing key, Google client, refresh
 	// TTLs); with no `AUTH_SIGNING_KEY_PEM` configured the service runs inert. The
 	// provisioner channel is the auth → directory seam: auth holds the `Provisioner`
-	// (called from `Exchange`/`Refresh`), and the directory module (A1c) keeps the
-	// receiver and drains it against Postgres. Until A1c lands the receiver is dropped
-	// here, so an `Exchange` attempt fails cleanly (`Unavailable`) rather than hanging.
+	// (called from `Exchange`/`Refresh`), and the directory keeps the receiver and
+	// drains it against Postgres — provisioning/looking-up/revoking the matching user.
 	let auth_config = AuthConfig::from_env().context("failed to load auth configuration")?;
 	let (provisioner, provision_rx) = provisioner_channel();
-	drop(provision_rx); // TODO(A1c): hand to `directory::Directory` to drain against the users repo.
+	tokio::spawn(directory::run_provisioner(provision_rx, users.clone()));
 	let auth_service = AuthService::try_new(auth_config, provisioner).await.context("failed to build the auth service")?;
 
 	// Inbound verification choke point: a `Verifier` over this plane's own `Jwks` RPC.
@@ -110,7 +106,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 		.layer(ServiceBuilder::new().layer(TraceLayer::new_for_grpc()).layer(GrpcWebLayer::new()).into_inner())
 		.add_service(HealthServiceServer::new(Health))
 		.add_service(AuthServiceServer::new(auth_service))
-		.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new())))
+		.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users, config.admin_subjects.into()))))
 		.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
 		.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 		.serve(config.bind_addr)

@@ -3,7 +3,12 @@
 //! The [`User`] aggregate is `concierge`'s record of a person: provisioned on
 //! first sign-in and kept in sync with the session-auth identity. It is
 //! **identity-only** — it holds no money, balances, or subscriptions (those are
-//! the banking money plane's concern, reached over the cross-plane bridge).
+//! the banking money plane's concern, reached one-way over the cross-plane bridge).
+//!
+//! Mutating transitions accumulate [`UserEvent`]s; the persistence adapter drains
+//! them into the cross-plane `user_outbox` in the same transaction as the state
+//! change (the one ACID point), stamping each with the new `row_version` as the
+//! bridge `sequence`.
 //!
 //! Pure and wasm-safe: no crypto, no I/O, no clock reads. Identities are supplied
 //! by the (host-only) application layer, so this stays compilable to wasm and
@@ -15,10 +20,74 @@ use serde::{Deserialize, Serialize};
 use crate::error::DomainError;
 
 /// The platform's canonical user id (a UUID). **This** value is the `sub` of the
-/// first-party session JWT — never the IdP's `sub`.
+/// first-party session JWT — never the IdP's `sub` (see [`AuthSubject`]).
 pub type UserId = Id<UserTag>;
 /// Phantom tag making [`UserId`] a distinct, incompatible identity type.
 pub struct UserTag;
+
+/// The immutable external identity asserted by the identity provider (Google's
+/// `sub` claim). It is the stable natural key both planes provision a [`User`]
+/// against: never reused, never changing for a person, and distinct from the plane's
+/// own canonical [`UserId`] (which is what the first-party JWT carries as its `sub`).
+///
+/// Serializes transparently as the bare string so the wire/storage shape is just the
+/// subject value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AuthSubject(String);
+
+impl AuthSubject {
+	/// Parse a provider subject, rejecting an empty value. Trimmed but otherwise
+	/// opaque — the IdP owns its format.
+	pub fn parse(raw: &str) -> Result<Self, DomainError> {
+		let trimmed = raw.trim();
+		if trimmed.is_empty() {
+			return Err(DomainError::Validation("auth subject must not be empty".into()));
+		}
+		Ok(Self(trimmed.to_owned()))
+	}
+
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+}
+
+impl core::fmt::Display for AuthSubject {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.write_str(&self.0)
+	}
+}
+
+/// A user email. Parse-don't-validate: lowercased and trimmed on construction, so
+/// equality and the storage form are normalized. Deliberately **not** a unique key —
+/// a person may change the email behind a stable [`AuthSubject`]. Serializes
+/// transparently as the bare string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Email(String);
+
+impl Email {
+	/// Normalize and minimally check an email. Full validation is the IdP's job
+	/// (Google has already verified deliverability); this only guards against an
+	/// obviously malformed value reaching the aggregate.
+	pub fn parse(raw: &str) -> Result<Self, DomainError> {
+		let normalized = raw.trim().to_lowercase();
+		if normalized.len() < 3 || !normalized.contains('@') {
+			return Err(DomainError::Validation("email must contain '@'".into()));
+		}
+		Ok(Self(normalized))
+	}
+
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+}
+
+impl core::fmt::Display for Email {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.write_str(&self.0)
+	}
+}
 
 /// The minimal user lifecycle. `Disabled` freezes sign-in/refresh without deleting
 /// the record (the audit trail must outlive a deactivation).
@@ -46,29 +115,181 @@ impl UserStatus {
 	}
 }
 
-/// The platform's canonical user identity. Construct it with [`User::rehydrate`]
-/// (load from the store). Identity-only: email, lifecycle status, and the
-/// `token_version` that backs stateless "revoke all".
+/// The caller's editable profile fields (the full-replace set). All optional —
+/// `None`/an empty value clears the field. Identity/auth fields (email, status) are
+/// deliberately absent: they are not user-editable here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileFields {
+	pub legal_name: Option<String>,
+	pub preferred_name: Option<String>,
+	pub phone: Option<String>,
+	pub date_of_birth: Option<String>,
+	pub nationality: Option<String>,
+	pub tax_residence: Option<String>,
+	pub residential_address: Option<String>,
+	pub language: Option<String>,
+	pub base_currency: Option<String>,
+	pub timezone: Option<String>,
+}
+
+/// The platform's canonical user identity. Construct it with [`User::provision`]
+/// (first sign-in, raises [`UserEvent::Provisioned`]) or [`User::rehydrate`] (load
+/// from the store, no events). Mutating transitions accumulate [`UserEvent`]s drained
+/// by the adapter into the cross-plane outbox in the same unit of work.
 #[derive(Debug, Clone)]
 pub struct User {
 	id: UserId,
-	email: String,
+	auth_subject: AuthSubject,
+	email: Email,
+	email_verified: bool,
 	status: UserStatus,
 	token_version: u64,
+	kyc_level: u32,
+	profile: ProfileFields,
+	/// Per-user mutation counter; the bridge `sequence`. Bumped on every mutation,
+	/// and stamped onto each emitted event by the adapter.
+	row_version: u64,
+	pending: Vec<UserEvent>,
 }
 
 impl User {
-	/// Reconstitute an existing user from the store.
-	pub fn rehydrate(id: UserId, email: String, status: UserStatus, token_version: u64) -> Self {
-		Self { id, email, status, token_version }
+	/// Provision a brand-new user at first sign-in. The application layer mints the
+	/// [`UserId`] (host-only), keeping this pure.
+	pub fn provision(id: UserId, auth_subject: AuthSubject, email: Email, email_verified: bool) -> Self {
+		let mut user = Self {
+			id,
+			auth_subject,
+			email,
+			email_verified,
+			status: UserStatus::Active,
+			token_version: 0,
+			kyc_level: 0,
+			profile: ProfileFields::default(),
+			row_version: 0,
+			pending: Vec::new(),
+		};
+		user.bump_and_emit(UserEvent::Created);
+		user
+	}
+
+	/// Reconstitute an existing user from the store, including the editable profile
+	/// and the current `row_version`. Raises no events.
+	#[allow(clippy::too_many_arguments)]
+	pub fn rehydrate(
+		id: UserId,
+		auth_subject: AuthSubject,
+		email: Email,
+		email_verified: bool,
+		status: UserStatus,
+		token_version: u64,
+		kyc_level: u32,
+		profile: ProfileFields,
+		row_version: u64,
+	) -> Self {
+		Self {
+			id,
+			auth_subject,
+			email,
+			email_verified,
+			status,
+			token_version,
+			kyc_level,
+			profile,
+			row_version,
+			pending: Vec::new(),
+		}
+	}
+
+	/// Update the email (and its verified flag) to the IdP's current value. No-op
+	/// (and no event) when unchanged, so a routine sign-in does not churn outbox rows.
+	///
+	/// An already-verified stored email is never overwritten by an unverified one: a
+	/// principal whose IdP `sub` later carries an unverified (or attacker-influenced)
+	/// email must not be able to downgrade the account's verified address.
+	pub fn change_email(&mut self, email: Email, email_verified: bool) {
+		if self.email_verified && !email_verified {
+			return;
+		}
+		if self.email == email && self.email_verified == email_verified {
+			return;
+		}
+		self.email = email;
+		self.email_verified = email_verified;
+		// An email change carries no distinct bridge Kind; banking re-reads the email
+		// snapshot on the next lifecycle event, so this mutation bumps row_version
+		// without emitting an outbox row.
+		self.row_version += 1;
+	}
+
+	/// Full-replace the editable profile fields. Raises no cross-plane event — profile
+	/// metadata is the identity plane's own concern and the money plane does not gate on
+	/// it — but still bumps `row_version` so the per-user sequence stays monotonic.
+	pub fn update_profile(&mut self, fields: ProfileFields) {
+		self.profile = fields;
+		self.row_version += 1;
+	}
+
+	/// Bump `token_version`, invalidating every outstanding token for this user
+	/// ("revoke all"). Returns the new version and emits [`UserEvent::SessionsRevoked`].
+	pub fn revoke_tokens(&mut self) -> u64 {
+		self.token_version += 1;
+		self.bump_and_emit(UserEvent::SessionsRevoked);
+		self.token_version
+	}
+
+	/// Disable the user, freezing future sign-in/refresh, and emit
+	/// [`UserEvent::Suspended`]. No-op when already disabled.
+	pub fn disable(&mut self) {
+		if self.status == UserStatus::Disabled {
+			return;
+		}
+		self.status = UserStatus::Disabled;
+		self.bump_and_emit(UserEvent::Suspended);
+	}
+
+	/// Re-enable a disabled user and emit [`UserEvent::Reinstated`]. No-op when already
+	/// active.
+	pub fn enable(&mut self) {
+		if self.status == UserStatus::Active {
+			return;
+		}
+		self.status = UserStatus::Active;
+		self.bump_and_emit(UserEvent::Reinstated);
+	}
+
+	/// Set the KYC level and emit [`UserEvent::KycChanged`]. No-op when unchanged.
+	pub fn set_kyc_level(&mut self, level: u32) {
+		if self.kyc_level == level {
+			return;
+		}
+		self.kyc_level = level;
+		self.bump_and_emit(UserEvent::KycChanged);
+	}
+
+	fn bump_and_emit(&mut self, event: UserEvent) {
+		self.row_version += 1;
+		self.pending.push(event);
+	}
+
+	/// Drain the accumulated cross-plane events (the adapter writes them to the outbox).
+	pub fn drain_events(&mut self) -> Vec<UserEvent> {
+		core::mem::take(&mut self.pending)
 	}
 
 	pub fn id(&self) -> UserId {
 		self.id
 	}
 
-	pub fn email(&self) -> &str {
+	pub fn auth_subject(&self) -> &AuthSubject {
+		&self.auth_subject
+	}
+
+	pub fn email(&self) -> &Email {
 		&self.email
+	}
+
+	pub fn email_verified(&self) -> bool {
+		self.email_verified
 	}
 
 	pub fn status(&self) -> UserStatus {
@@ -81,6 +302,54 @@ impl User {
 
 	pub fn token_version(&self) -> u64 {
 		self.token_version
+	}
+
+	pub fn kyc_level(&self) -> u32 {
+		self.kyc_level
+	}
+
+	pub fn row_version(&self) -> u64 {
+		self.row_version
+	}
+
+	pub fn legal_name(&self) -> Option<&str> {
+		self.profile.legal_name.as_deref()
+	}
+
+	pub fn preferred_name(&self) -> Option<&str> {
+		self.profile.preferred_name.as_deref()
+	}
+
+	pub fn phone(&self) -> Option<&str> {
+		self.profile.phone.as_deref()
+	}
+
+	pub fn date_of_birth(&self) -> Option<&str> {
+		self.profile.date_of_birth.as_deref()
+	}
+
+	pub fn nationality(&self) -> Option<&str> {
+		self.profile.nationality.as_deref()
+	}
+
+	pub fn tax_residence(&self) -> Option<&str> {
+		self.profile.tax_residence.as_deref()
+	}
+
+	pub fn residential_address(&self) -> Option<&str> {
+		self.profile.residential_address.as_deref()
+	}
+
+	pub fn language(&self) -> Option<&str> {
+		self.profile.language.as_deref()
+	}
+
+	pub fn base_currency(&self) -> Option<&str> {
+		self.profile.base_currency.as_deref()
+	}
+
+	pub fn timezone(&self) -> Option<&str> {
+		self.profile.timezone.as_deref()
 	}
 }
 
@@ -96,9 +365,40 @@ impl AggregateRoot for User {
 	const NAME: &'static str = "user";
 }
 
+/// The cross-plane lifecycle facts the [`User`] aggregate raises. Each maps to a
+/// `user_outbox` row (one bridge `Kind`) the banking money plane consumes to
+/// gate/freeze money ops. Identity-internal mutations (email, profile) carry no
+/// `Kind` and are not represented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserEvent {
+	Created,
+	SessionsRevoked,
+	Suspended,
+	Reinstated,
+	KycChanged,
+}
+
+impl UserEvent {
+	/// The stored `user_outbox.kind` discriminant — the bridge `Kind`. Kept in lockstep
+	/// with `concierge.v1.UserLifecycleEvent.Kind` so the puller maps it straight through.
+	pub fn kind(self) -> &'static str {
+		match self {
+			Self::Created => "CREATED",
+			Self::SessionsRevoked => "SESSIONS_REVOKED",
+			Self::Suspended => "SUSPENDED",
+			Self::Reinstated => "REINSTATED",
+			Self::KycChanged => "KYC_CHANGED",
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn fixture() -> User {
+		User::provision(UserId::new(), AuthSubject::parse("g-123").unwrap(), Email::parse("Ada@Example.com").unwrap(), true)
+	}
 
 	#[test]
 	fn status_round_trips_through_str() {
@@ -108,10 +408,78 @@ mod tests {
 	}
 
 	#[test]
-	fn rehydrate_exposes_identity_fields() {
-		let user = User::rehydrate(UserId::new(), "ada@example.com".to_string(), UserStatus::Active, 0);
-		assert_eq!(user.email(), "ada@example.com");
-		assert!(user.is_active());
+	fn email_is_normalized() {
+		assert_eq!(Email::parse("  Ada@Example.COM ").unwrap().as_str(), "ada@example.com");
+		assert!(Email::parse("nope").is_err());
+	}
+
+	#[test]
+	fn provision_emits_created_and_bumps_row_version() {
+		let mut user = fixture();
 		assert_eq!(user.token_version(), 0);
+		assert!(user.is_active());
+		assert_eq!(user.row_version(), 1);
+		let events = user.drain_events();
+		assert_eq!(events, [UserEvent::Created]);
+		assert!(user.drain_events().is_empty());
+	}
+
+	#[test]
+	fn verified_email_is_not_overwritten_by_unverified() {
+		let mut user = fixture();
+		user.drain_events();
+		let before = user.row_version();
+		user.change_email(Email::parse("attacker@example.com").unwrap(), false);
+		assert_eq!(user.email().as_str(), "ada@example.com");
+		assert!(user.email_verified());
+		assert_eq!(user.row_version(), before);
+	}
+
+	#[test]
+	fn revoke_increments_version_and_emits() {
+		let mut user = fixture();
+		user.drain_events();
+		assert_eq!(user.revoke_tokens(), 1);
+		assert_eq!(user.drain_events(), [UserEvent::SessionsRevoked]);
+	}
+
+	#[test]
+	fn disable_then_enable_emits_each_once() {
+		let mut user = fixture();
+		user.drain_events();
+		user.disable();
+		user.disable();
+		assert_eq!(user.drain_events(), [UserEvent::Suspended]);
+		assert!(!user.is_active());
+		user.enable();
+		user.enable();
+		assert_eq!(user.drain_events(), [UserEvent::Reinstated]);
+		assert!(user.is_active());
+	}
+
+	#[test]
+	fn kyc_change_is_idempotent() {
+		let mut user = fixture();
+		user.drain_events();
+		user.set_kyc_level(2);
+		user.set_kyc_level(2);
+		assert_eq!(user.kyc_level(), 2);
+		assert_eq!(user.drain_events(), [UserEvent::KycChanged]);
+	}
+
+	#[test]
+	fn update_profile_bumps_row_version_without_event() {
+		let mut user = fixture();
+		user.drain_events();
+		let before = user.row_version();
+		user.update_profile(ProfileFields {
+			legal_name: Some("Ada Lovelace".into()),
+			preferred_name: Some("Ada".into()),
+			..ProfileFields::default()
+		});
+		assert_eq!(user.legal_name(), Some("Ada Lovelace"));
+		assert_eq!(user.preferred_name(), Some("Ada"));
+		assert_eq!(user.row_version(), before + 1);
+		assert!(user.drain_events().is_empty());
 	}
 }

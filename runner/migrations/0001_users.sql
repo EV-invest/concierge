@@ -16,6 +16,8 @@ CREATE TABLE users (
     email_verified      BOOLEAN NOT NULL DEFAULT FALSE,
     status              TEXT NOT NULL DEFAULT 'active',
     token_version       BIGINT NOT NULL DEFAULT 0,
+    -- KYC level surfaced to the banking money plane on the bridge (KYC_CHANGED).
+    kyc_level           INTEGER NOT NULL DEFAULT 0,
     -- Editable profile fields (control plane; NULL = unset), full-replaced by
     -- UpdateProfile. email and status above stay read-only at the service boundary.
     legal_name          TEXT,

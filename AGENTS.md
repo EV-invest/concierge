@@ -84,10 +84,12 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
 
 ## Hard rules
 
-- The **auth** and **directory** modules are being de-scaffolded into the real
-  identity plane (Postgres control plane, migrations on boot). `notification` and
-  `log` stay DEFERRED stubs (`tonic::Status::unimplemented`); their application
-  layers are placeholders to grow into. Health returns `"ok"`.
+- The **auth** and **directory** modules are the real identity plane (Postgres
+  control plane, migrations on boot): auth issues/verifies tokens, the directory is
+  a Postgres-backed user repository (provision/profile/admin) that emits cross-plane
+  lifecycle events to `user_outbox` in the write tx. `notification` and `log` stay
+  DEFERRED stubs (`tonic::Status::unimplemented`); their application layers are
+  placeholders to grow into. Health returns `"ok"`.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.

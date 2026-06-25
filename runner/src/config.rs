@@ -14,6 +14,9 @@ pub struct Config {
 	/// and the bridge outbox reads). `DB_MAX_CONNECTIONS`; defaults to the sqlx
 	/// default (10) — raise it for production.
 	pub db_max_connections: u32,
+	/// Canonical user ids permitted to call the admin directory RPCs (`RevokeTokens`,
+	/// `DisableUser`). `ADMIN_SUBJECTS` is a comma-separated list (empty ⇒ no admins).
+	pub admin_subjects: Vec<String>,
 	pub sentry_dsn: Option<String>,
 	/// PostHog project key for native product-analytics capture. `None` disables
 	/// capture (a silent no-op), so the same code runs unconfigured (local, CI).
@@ -35,6 +38,13 @@ impl Config {
 			.map(|v| v.parse().context("DB_MAX_CONNECTIONS must be a positive integer"))
 			.transpose()?
 			.unwrap_or(10);
+		let admin_subjects = env::var("ADMIN_SUBJECTS")
+			.unwrap_or_default()
+			.split(',')
+			.map(str::trim)
+			.filter(|s| !s.is_empty())
+			.map(str::to_owned)
+			.collect();
 		let sentry_dsn = env::var("SENTRY_DSN").ok().filter(|s| !s.is_empty());
 		let posthog_key = env::var("POSTHOG_KEY").ok().filter(|s| !s.is_empty());
 		let posthog_host = env::var("POSTHOG_HOST").ok().filter(|s| !s.is_empty());
@@ -43,6 +53,7 @@ impl Config {
 			database_url,
 			bind_addr,
 			db_max_connections,
+			admin_subjects,
 			sentry_dsn,
 			posthog_key,
 			posthog_host,
