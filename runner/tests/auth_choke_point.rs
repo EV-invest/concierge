@@ -15,7 +15,8 @@ use std::{net::TcpListener, time::Duration};
 
 use evconcierge_auth::{Verifier, grpc_auth_layer};
 use evconcierge_contracts::concierge::v1::{
-	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, RevokeTokensRequest, RevokeTokensResponse, UpdateProfileRequest, UserProfile,
+	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, ReinstateUserRequest, ReinstateUserResponse, RevokeTokensRequest, RevokeTokensResponse,
+	SetKycLevelRequest, SetKycLevelResponse, UpdateProfileRequest, UserProfile,
 	health_service_client::HealthServiceClient,
 	health_service_server::{HealthService, HealthServiceServer},
 	user_directory_client::UserDirectoryClient,
@@ -56,6 +57,14 @@ impl UserDirectory for Directory {
 
 	async fn disable_user(&self, _request: Request<DisableUserRequest>) -> Result<Response<DisableUserResponse>, Status> {
 		Err(Status::unimplemented("UserDirectory.DisableUser is not implemented"))
+	}
+
+	async fn reinstate_user(&self, _request: Request<ReinstateUserRequest>) -> Result<Response<ReinstateUserResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.ReinstateUser is not implemented"))
+	}
+
+	async fn set_kyc_level(&self, _request: Request<SetKycLevelRequest>) -> Result<Response<SetKycLevelResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.SetKycLevel is not implemented"))
 	}
 }
 

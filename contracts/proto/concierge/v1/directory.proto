@@ -22,8 +22,17 @@ service UserDirectory {
   rpc RevokeTokens(RevokeTokensRequest) returns (RevokeTokensResponse);
 
   // Admin (allowlist): disable a user, freezing future sign-in/refresh without
-  // deleting the record.
+  // deleting the record. Emits SUSPENDED across the cross-plane bridge.
   rpc DisableUser(DisableUserRequest) returns (DisableUserResponse);
+
+  // Admin (allowlist): re-enable a disabled user, lifting the sign-in/refresh
+  // freeze. Emits REINSTATED across the cross-plane bridge.
+  rpc ReinstateUser(ReinstateUserRequest) returns (ReinstateUserResponse);
+
+  // Admin (allowlist): set a user's KYC level. Emits KYC_CHANGED across the
+  // cross-plane bridge (so the money plane learns the new level). Echoes the
+  // level now in effect.
+  rpc SetKycLevel(SetKycLevelRequest) returns (SetKycLevelResponse);
 }
 
 message GetMeRequest {}
@@ -76,3 +85,19 @@ message DisableUserRequest {
 }
 
 message DisableUserResponse {}
+
+message ReinstateUserRequest {
+  string user_id = 1;
+}
+
+message ReinstateUserResponse {}
+
+message SetKycLevelRequest {
+  string user_id = 1;
+  uint32 kyc_level = 2;
+}
+
+message SetKycLevelResponse {
+  // The user's KYC level now in effect (echoes the applied level).
+  uint32 kyc_level = 1;
+}

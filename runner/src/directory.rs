@@ -3,8 +3,10 @@
 //! Two faces over one Postgres-backed [`PgUsers`] repository:
 //!
 //! - The [`UserDirectory`] gRPC service: `GetMe`/`UpdateProfile` (self-service on the
-//!   caller's own `sub`) and `RevokeTokens`/`DisableUser` (admin allowlist). Every RPC
-//!   is authorized from the verified [`Claims`] the inbound auth layer injected.
+//!   caller's own `sub`) and `RevokeTokens`/`DisableUser`/`ReinstateUser`/`SetKycLevel`
+//!   (admin allowlist). Every RPC is authorized from the verified [`Claims`] the inbound
+//!   auth layer injected. The admin mutations emit the matching cross-plane lifecycle
+//!   event (SESSIONS_REVOKED/SUSPENDED/REINSTATED/KYC_CHANGED) the money plane pulls.
 //! - [`run_provisioner`]: the receiving end of the auth → directory [`Provisioner`]
 //!   channel. The auth task verifies a Google identity, then asks the directory (over
 //!   the in-process channel, never the wire) to upsert/look up/revoke the matching user.
@@ -23,7 +25,8 @@ use domain::{
 };
 use evconcierge_auth::{AuthError, Claims, ProvisionCommand, ProvisionRequest, ProvisionedUser, claims_of};
 use evconcierge_contracts::concierge::v1::{
-	DisableUserRequest, DisableUserResponse, GetMeRequest, RevokeTokensRequest, RevokeTokensResponse, UpdateProfileRequest, UserProfile, user_directory_server::UserDirectory,
+	DisableUserRequest, DisableUserResponse, GetMeRequest, ReinstateUserRequest, ReinstateUserResponse, RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse,
+	UpdateProfileRequest, UserProfile, user_directory_server::UserDirectory,
 };
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
@@ -138,6 +141,21 @@ impl UserDirectory for Directory {
 		let target = parse_user_id(&request.get_ref().user_id)?;
 		self.users.disable_user(target).await.map_err(map_err)?;
 		Ok(Response::new(DisableUserResponse {}))
+	}
+
+	async fn reinstate_user(&self, request: Request<ReinstateUserRequest>) -> Result<Response<ReinstateUserResponse>, Status> {
+		require_admin(self, &request)?;
+		let target = parse_user_id(&request.get_ref().user_id)?;
+		self.users.enable_user(target).await.map_err(map_err)?;
+		Ok(Response::new(ReinstateUserResponse {}))
+	}
+
+	async fn set_kyc_level(&self, request: Request<SetKycLevelRequest>) -> Result<Response<SetKycLevelResponse>, Status> {
+		require_admin(self, &request)?;
+		let req = request.into_inner();
+		let target = parse_user_id(&req.user_id)?;
+		let user = self.users.set_kyc_level(target, req.kyc_level).await.map_err(map_err)?;
+		Ok(Response::new(SetKycLevelResponse { kyc_level: user.kyc_level() }))
 	}
 }
 
