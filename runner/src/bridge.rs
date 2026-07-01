@@ -128,6 +128,7 @@ fn kind_to_proto(kind: &str) -> Kind {
 		"REINSTATED" => Kind::Reinstated,
 		"KYC_CHANGED" => Kind::KycChanged,
 		"SESSIONS_REVOKED" => Kind::SessionsRevoked,
+		"ROLE_CHANGED" => Kind::RoleChanged,
 		_ => Kind::Unspecified,
 	}
 }
@@ -144,4 +145,29 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 		return false;
 	}
 	a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+	use domain::users::UserEvent;
+
+	use super::{Kind, kind_to_proto};
+
+	#[test]
+	fn every_user_event_kind_maps_to_a_concrete_proto_kind() {
+		// Guards the bridge producer: a `UserEvent` whose `kind()` string isn't mapped
+		// here degrades to `Unspecified` and is a silent no-op on the money plane — the
+		// exact bug that let ROLE_CHANGED never reach banking. Keep this list exhaustive.
+		for event in [
+			UserEvent::Created,
+			UserEvent::SessionsRevoked,
+			UserEvent::Suspended,
+			UserEvent::Reinstated,
+			UserEvent::KycChanged,
+			UserEvent::RoleChanged,
+		] {
+			assert_ne!(kind_to_proto(event.kind()), Kind::Unspecified, "unmapped bridge kind: {}", event.kind());
+		}
+		assert_eq!(kind_to_proto("ROLE_CHANGED"), Kind::RoleChanged);
+	}
 }

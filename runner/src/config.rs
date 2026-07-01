@@ -14,8 +14,12 @@ pub struct Config {
 	/// and the bridge outbox reads). `DB_MAX_CONNECTIONS`; defaults to the sqlx
 	/// default (10) — raise it for production.
 	pub db_max_connections: u32,
-	/// Canonical user ids permitted to call the admin directory RPCs (`RevokeTokens`,
-	/// `DisableUser`). `ADMIN_SUBJECTS` is a comma-separated list (empty ⇒ no admins).
+	/// Break-glass superadmin allowlist for the RBAC gate: a listed subject is treated as
+	/// [`Role::Owner`](domain::authz::Role) so the first operator can grant roles before any
+	/// role is persisted. `ADMIN_SUBJECTS` is a comma-separated list (empty ⇒ no bootstrap
+	/// admins). NOTE: these are CONCIERGE canonical user ids — the banking plane's identical
+	/// env is keyed on its OWN (disjoint) user id space, so the same human is a different
+	/// UUID on each plane; a wrong id fails closed to Investor.
 	pub admin_subjects: Vec<String>,
 	/// Shared bearer token the banking money plane presents on the cross-plane bridge
 	/// (`UserEvents.PullUserLifecycle`). `BRIDGE_SERVICE_TOKEN`; `None` ⇒ the bridge is
