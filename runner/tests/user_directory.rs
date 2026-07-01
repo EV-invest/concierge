@@ -11,7 +11,10 @@
 //! — and assert both the user row and the `user_outbox` rows it emits in the same tx.
 
 use concierge::infrastructure::{db, users::PgUsers};
-use domain::users::{AuthSubject, Email, UserStatus};
+use domain::{
+	authz::Role,
+	users::{AuthSubject, Email, UserStatus},
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -35,10 +38,11 @@ struct OutboxRow {
 	email: Option<String>,
 	email_verified: bool,
 	kyc_level: i32,
+	role: Option<String>,
 }
 
 async fn outbox_for(pool: &PgPool, user_id: Uuid) -> Vec<OutboxRow> {
-	sqlx::query_as::<_, OutboxRow>("SELECT kind, sequence, token_version, auth_subject, email, email_verified, kyc_level FROM user_outbox WHERE user_id = $1 ORDER BY position")
+	sqlx::query_as::<_, OutboxRow>("SELECT kind, sequence, token_version, auth_subject, email, email_verified, kyc_level, role FROM user_outbox WHERE user_id = $1 ORDER BY position")
 		.bind(user_id)
 		.fetch_all(pool)
 		.await
@@ -137,4 +141,25 @@ async fn kyc_change_emits_kyc_changed_with_level() {
 	let row = outbox_for(&pool, user.id().raw()).await.pop().expect("a row");
 	assert_eq!(row.kind, "KYC_CHANGED");
 	assert_eq!(row.kyc_level, 2);
+}
+
+#[tokio::test]
+async fn role_change_emits_role_changed_carrying_the_new_role() {
+	let Some((repo, pool)) = setup().await else {
+		return;
+	};
+	let user = repo.provision(unique_subject(), Email::parse("role@example.com").unwrap(), true).await.unwrap();
+
+	// A default-role user is Investor; the CREATED snapshot carries it.
+	let created = &outbox_for(&pool, user.id().raw()).await[0];
+	assert_eq!(created.role.as_deref(), Some("investor"), "CREATED snapshots the default role");
+
+	let promoted = repo.set_role(user.id(), Role::Admin).await.unwrap();
+	assert_eq!(promoted.role(), Role::Admin, "role persisted on the aggregate");
+	assert_eq!(repo.role_of(user.id()).await.unwrap(), Some(Role::Admin), "role_of reads it back for the gate");
+
+	let row = outbox_for(&pool, user.id().raw()).await.pop().expect("a row");
+	assert_eq!(row.kind, "ROLE_CHANGED");
+	assert_eq!(row.role.as_deref(), Some("admin"), "the outbox row carries the new role for banking to mirror");
+	assert_eq!(row.sequence, 2, "the per-user sequence advanced past CREATED");
 }

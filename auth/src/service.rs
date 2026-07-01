@@ -109,6 +109,7 @@ fn token_response(access_token: String, access_exp: u64, refresh: IssuedRefresh,
 			email: summary.email.clone(),
 			status: summary.status.clone(),
 			token_version: summary.token_version,
+			role: summary.role.clone(),
 		}),
 	}
 }

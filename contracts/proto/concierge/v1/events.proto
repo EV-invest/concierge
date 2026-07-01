@@ -48,6 +48,9 @@ message UserLifecycleEvent {
     REINSTATED = 3;
     KYC_CHANGED = 4;
     SESSIONS_REVOKED = 5;
+    // The user's platform access role changed. Carries the new role in `role` so the
+    // money plane can mirror it and gate operator RPCs.
+    ROLE_CHANGED = 6;
   }
   Kind kind = 2;
 
@@ -83,4 +86,9 @@ message UserLifecycleEvent {
   // floor so a banking consumer gating on token_version learns the value to
   // store, not merely that "something was revoked".
   uint64 token_version = 10;
+
+  // The user's platform access role after the change (snake_case: investor /
+  // operator / admin / owner). Carried on every row (a snapshot, like kyc_level) and
+  // authoritative for ROLE_CHANGED — the money plane mirrors it to gate operator RPCs.
+  string role = 11;
 }

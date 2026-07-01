@@ -72,6 +72,7 @@ struct OutboxRow {
 	email: Option<String>,
 	email_verified: bool,
 	token_version: i64,
+	role: Option<String>,
 }
 
 impl OutboxRow {
@@ -87,6 +88,8 @@ impl OutboxRow {
 			email: self.email.unwrap_or_default(),
 			email_verified: self.email_verified,
 			token_version: self.token_version as u64,
+			// Absent (pre-role rows) → empty; the banking puller reads empty as 'investor'.
+			role: self.role.unwrap_or_default(),
 		}
 	}
 }
@@ -99,7 +102,7 @@ impl UserEvents for Bridge {
 		let limit = (req.limit as i64).clamp(1, MAX_LIMIT);
 
 		let rows = sqlx::query_as::<_, OutboxRow>(
-			"SELECT position, user_id, kind, kyc_level, occurred_at, sequence, event_id, auth_subject, email, email_verified, token_version \
+			"SELECT position, user_id, kind, kyc_level, occurred_at, sequence, event_id, auth_subject, email, email_verified, token_version, role \
 			FROM user_outbox WHERE position > $1 ORDER BY position ASC LIMIT $2",
 		)
 		.bind(req.after_position)

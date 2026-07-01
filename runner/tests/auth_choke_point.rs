@@ -15,8 +15,8 @@ use std::{net::TcpListener, time::Duration};
 
 use evconcierge_auth::{Verifier, grpc_auth_layer};
 use evconcierge_contracts::concierge::v1::{
-	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, ReinstateUserRequest, ReinstateUserResponse, RevokeTokensRequest, RevokeTokensResponse,
-	SetKycLevelRequest, SetKycLevelResponse, UpdateProfileRequest, UserProfile,
+	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse,
+	RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
 	health_service_client::HealthServiceClient,
 	health_service_server::{HealthService, HealthServiceServer},
 	user_directory_client::UserDirectoryClient,
@@ -65,6 +65,18 @@ impl UserDirectory for Directory {
 
 	async fn set_kyc_level(&self, _request: Request<SetKycLevelRequest>) -> Result<Response<SetKycLevelResponse>, Status> {
 		Err(Status::unimplemented("UserDirectory.SetKycLevel is not implemented"))
+	}
+
+	async fn list_users(&self, _request: Request<ListUsersRequest>) -> Result<Response<ListUsersResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.ListUsers is not implemented"))
+	}
+
+	async fn get_user(&self, _request: Request<GetUserRequest>) -> Result<Response<UserProfile>, Status> {
+		Err(Status::unimplemented("UserDirectory.GetUser is not implemented"))
+	}
+
+	async fn set_role(&self, _request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.SetRole is not implemented"))
 	}
 }
 

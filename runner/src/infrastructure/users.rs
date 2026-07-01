@@ -11,6 +11,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use domain::{
+	authz::Role,
 	error::DomainError,
 	users::{AuthSubject, Email, ProfileFields, User, UserId, UserStatus},
 };
@@ -36,6 +37,7 @@ struct UserRow {
 	status: String,
 	token_version: i64,
 	kyc_level: i32,
+	role: String,
 	legal_name: Option<String>,
 	preferred_name: Option<String>,
 	phone: Option<String>,
@@ -60,6 +62,7 @@ impl UserRow {
 			UserStatus::parse(&self.status)?,
 			self.token_version as u64,
 			self.kyc_level as u32,
+			Role::parse(&self.role)?,
 			ProfileFields {
 				legal_name: self.legal_name,
 				preferred_name: self.preferred_name,
@@ -82,10 +85,24 @@ impl UserRow {
 /// than a runtime `format!` — keep this list in sync with [`UserRow`].
 macro_rules! user_columns {
 	() => {
-		"id, auth_subject, email, email_verified, status, token_version, kyc_level, \
+		"id, auth_subject, email, email_verified, status, token_version, kyc_level, role, \
 		legal_name, preferred_name, phone, date_of_birth, nationality, tax_residence, \
 		residential_address, language, base_currency, timezone, row_version"
 	};
+}
+
+/// A lightweight, read-only projection for the operator console's user list — mapped
+/// straight from SQL (not rehydrated through the aggregate) so it can carry the
+/// DB-managed `created_at` the identity aggregate deliberately omits.
+#[derive(sqlx::FromRow)]
+pub struct AdminUserRow {
+	pub id: Uuid,
+	pub email: Option<String>,
+	pub status: String,
+	pub kyc_level: i32,
+	pub role: String,
+	pub token_version: i64,
+	pub created_at: i64,
 }
 
 fn repo_err(err: sqlx::Error) -> DomainError {
@@ -124,8 +141,8 @@ impl PgUsers {
 			None => {
 				let candidate = User::provision(UserId::new(), subject.clone(), email.clone(), email_verified);
 				let inserted = sqlx::query_scalar::<_, Uuid>(
-					"INSERT INTO users (id, auth_subject, email, email_verified, status, token_version, kyc_level, row_version) \
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (auth_subject) DO NOTHING RETURNING id",
+					"INSERT INTO users (id, auth_subject, email, email_verified, status, token_version, kyc_level, role, row_version) \
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (auth_subject) DO NOTHING RETURNING id",
 				)
 				.bind(candidate.id().raw())
 				.bind(candidate.auth_subject().as_str())
@@ -134,6 +151,7 @@ impl PgUsers {
 				.bind(candidate.status().as_str())
 				.bind(candidate.token_version() as i64)
 				.bind(candidate.kyc_level() as i32)
+				.bind(candidate.role().as_str())
 				.bind(candidate.row_version() as i64)
 				.fetch_optional(&mut *tx)
 				.await
@@ -203,6 +221,62 @@ impl PgUsers {
 		.await
 	}
 
+	/// Set a user's platform access role; emits ROLE_CHANGED across the bridge.
+	pub async fn set_role(&self, id: UserId, role: Role) -> Result<User, DomainError> {
+		self.mutate(id, |user| {
+			user.set_role(role);
+		})
+		.await
+	}
+
+	/// The persisted role for a user id, if the user exists. Used by the authz gate.
+	pub async fn role_of(&self, id: UserId) -> Result<Option<Role>, DomainError> {
+		let raw: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+			.bind(id.raw())
+			.fetch_optional(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		raw.map(|r| Role::parse(&r)).transpose()
+	}
+
+	/// The operator console's user list: filtered + paginated summaries plus the total
+	/// matching the filters. Empty-string filters are treated as "no filter" so the
+	/// query stays a single static statement (sqlx 0.9 needs a `&'static str`).
+	pub async fn list(&self, query: &str, role: &str, status: &str, limit: i64, offset: i64) -> Result<(Vec<AdminUserRow>, i64), DomainError> {
+		let rows = sqlx::query_as::<_, AdminUserRow>(
+			"SELECT id, email, status, kyc_level, role, token_version, \
+			 EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at \
+			 FROM users \
+			 WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR id::text ILIKE '%' || $1 || '%') \
+			   AND ($2 = '' OR role = $2) \
+			   AND ($3 = '' OR status = $3) \
+			 ORDER BY created_at DESC LIMIT $4 OFFSET $5",
+		)
+		.bind(query)
+		.bind(role)
+		.bind(status)
+		.bind(limit)
+		.bind(offset)
+		.fetch_all(&self.pool)
+		.await
+		.map_err(repo_err)?;
+
+		let total: i64 = sqlx::query_scalar(
+			"SELECT COUNT(*) FROM users \
+			 WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR id::text ILIKE '%' || $1 || '%') \
+			   AND ($2 = '' OR role = $2) \
+			   AND ($3 = '' OR status = $3)",
+		)
+		.bind(query)
+		.bind(role)
+		.bind(status)
+		.fetch_one(&self.pool)
+		.await
+		.map_err(repo_err)?;
+
+		Ok((rows, total))
+	}
+
 	/// Load-mutate-persist in one transaction: read the row `FOR UPDATE`, run the
 	/// aggregate command, write the row back, and drain its events to the outbox.
 	async fn mutate(&self, id: UserId, command: impl FnOnce(&mut User)) -> Result<User, DomainError> {
@@ -228,7 +302,7 @@ async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(), DomainEr
 		"UPDATE users SET email = $2, email_verified = $3, status = $4, token_version = $5, kyc_level = $6, \
 		legal_name = $7, preferred_name = $8, phone = $9, date_of_birth = $10, nationality = $11, \
 		tax_residence = $12, residential_address = $13, language = $14, base_currency = $15, \
-		timezone = $16, row_version = $17, updated_at = now() WHERE id = $1",
+		timezone = $16, role = $17, row_version = $18, updated_at = now() WHERE id = $1",
 	)
 	.bind(user.id().raw())
 	.bind(user.email().as_str())
@@ -246,6 +320,7 @@ async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(), DomainEr
 	.bind(user.language())
 	.bind(user.base_currency())
 	.bind(user.timezone())
+	.bind(user.role().as_str())
 	.bind(user.row_version() as i64)
 	.execute(&mut *conn)
 	.await
@@ -261,8 +336,8 @@ async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Result<(), Do
 	let occurred_at = unix_now();
 	for event in user.drain_events() {
 		sqlx::query(
-			"INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject, email, email_verified, token_version) \
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+			"INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject, email, email_verified, token_version, role) \
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
 		)
 		.bind(user.id().raw())
 		.bind(event.kind())
@@ -273,6 +348,7 @@ async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Result<(), Do
 		.bind(user.email().as_str())
 		.bind(user.email_verified())
 		.bind(user.token_version() as i64)
+		.bind(user.role().as_str())
 		.execute(&mut *conn)
 		.await
 		.map_err(repo_err)?;

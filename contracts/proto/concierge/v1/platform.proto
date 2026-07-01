@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+// PlatformService — the platform/cabinet control surface (the admin console's
+// "Cabinet" screen). Owns non-money platform config: maintenance mode (the cabinet
+// holding page), the live announcement banner, and feature flags. All RPCs run
+// behind the user auth choke point; reads require PlatformRead (operator+), writes
+// require PlatformManage (admin+).
+//
+// NOTE the money-plane "read-only mode" (pause deposits & withdrawals) is NOT here:
+// that kill-switch is enforced by the banking plane and owned there. The cabinet
+// screen surfaces both; the BFF routes each toggle to its owning plane.
+service PlatformService {
+  // Read the whole platform config (maintenance, announcement, flags). PlatformRead.
+  rpc GetPlatformConfig(GetPlatformConfigRequest) returns (PlatformConfig);
+
+  // Toggle maintenance mode (cabinet holding page). PlatformManage.
+  rpc SetMaintenanceMode(SetMaintenanceModeRequest) returns (PlatformConfig);
+
+  // Set (or clear) the live announcement banner. PlatformManage.
+  rpc SetAnnouncement(SetAnnouncementRequest) returns (PlatformConfig);
+
+  // Upsert a feature flag (enable/disable + rollout). PlatformManage.
+  rpc SetFeatureFlag(SetFeatureFlagRequest) returns (PlatformConfig);
+}
+
+message GetPlatformConfigRequest {}
+
+message PlatformConfig {
+  bool maintenance_mode = 1;
+  string announcement_title = 2;
+  string announcement_body = 3;
+  bool announcement_active = 4;
+  repeated FeatureFlag flags = 5;
+}
+
+message FeatureFlag {
+  string key = 1;
+  string description = 2;
+  bool enabled = 3;
+  // Rollout percent 0..100 — informational here; PostHog owns real gradual rollout
+  // and experiment assignment at scale.
+  uint32 rollout = 4;
+}
+
+message SetMaintenanceModeRequest {
+  bool enabled = 1;
+}
+
+message SetAnnouncementRequest {
+  string title = 1;
+  string body = 2;
+  bool active = 3;
+}
+
+message SetFeatureFlagRequest {
+  string key = 1;
+  string description = 2;
+  bool enabled = 3;
+  uint32 rollout = 4;
+}

@@ -6,4 +6,5 @@
 //!   each emitting cross-plane lifecycle events to `user_outbox` in the write tx.
 
 pub mod db;
+pub mod platform;
 pub mod users;

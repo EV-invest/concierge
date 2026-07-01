@@ -17,7 +17,7 @@
 use ev::architecture::{AggregateRoot, Entity, Id};
 use serde::{Deserialize, Serialize};
 
-use crate::error::DomainError;
+use crate::{authz::Role, error::DomainError};
 
 /// The platform's canonical user id (a UUID). **This** value is the `sub` of the
 /// first-party session JWT — never the IdP's `sub` (see [`AuthSubject`]).
@@ -145,6 +145,9 @@ pub struct User {
 	status: UserStatus,
 	token_version: u64,
 	kyc_level: u32,
+	/// The platform-wide access role. This plane OWNS it; a change is mirrored to the
+	/// banking money plane over the bridge ([`UserEvent::RoleChanged`]).
+	role: Role,
 	profile: ProfileFields,
 	/// Per-user mutation counter; the bridge `sequence`. Bumped on every mutation,
 	/// and stamped onto each emitted event by the adapter.
@@ -164,6 +167,7 @@ impl User {
 			status: UserStatus::Active,
 			token_version: 0,
 			kyc_level: 0,
+			role: Role::default(),
 			profile: ProfileFields::default(),
 			row_version: 0,
 			pending: Vec::new(),
@@ -183,6 +187,7 @@ impl User {
 		status: UserStatus,
 		token_version: u64,
 		kyc_level: u32,
+		role: Role,
 		profile: ProfileFields,
 		row_version: u64,
 	) -> Self {
@@ -194,6 +199,7 @@ impl User {
 			status,
 			token_version,
 			kyc_level,
+			role,
 			profile,
 			row_version,
 			pending: Vec::new(),
@@ -266,6 +272,17 @@ impl User {
 		self.bump_and_emit(UserEvent::KycChanged);
 	}
 
+	/// Set the platform access role and emit [`UserEvent::RoleChanged`] (the money plane
+	/// mirrors it over the bridge). No-op when unchanged, so re-granting the same role
+	/// does not churn outbox rows.
+	pub fn set_role(&mut self, role: Role) {
+		if self.role == role {
+			return;
+		}
+		self.role = role;
+		self.bump_and_emit(UserEvent::RoleChanged);
+	}
+
 	fn bump_and_emit(&mut self, event: UserEvent) {
 		self.row_version += 1;
 		self.pending.push(event);
@@ -306,6 +323,10 @@ impl User {
 
 	pub fn kyc_level(&self) -> u32 {
 		self.kyc_level
+	}
+
+	pub fn role(&self) -> Role {
+		self.role
 	}
 
 	pub fn row_version(&self) -> u64 {
@@ -376,6 +397,7 @@ pub enum UserEvent {
 	Suspended,
 	Reinstated,
 	KycChanged,
+	RoleChanged,
 }
 
 impl UserEvent {
@@ -388,6 +410,7 @@ impl UserEvent {
 			Self::Suspended => "SUSPENDED",
 			Self::Reinstated => "REINSTATED",
 			Self::KycChanged => "KYC_CHANGED",
+			Self::RoleChanged => "ROLE_CHANGED",
 		}
 	}
 }
@@ -465,6 +488,17 @@ mod tests {
 		user.set_kyc_level(2);
 		assert_eq!(user.kyc_level(), 2);
 		assert_eq!(user.drain_events(), [UserEvent::KycChanged]);
+	}
+
+	#[test]
+	fn role_defaults_to_investor_and_change_is_idempotent() {
+		let mut user = fixture();
+		user.drain_events();
+		assert_eq!(user.role(), Role::Investor);
+		user.set_role(Role::Admin);
+		user.set_role(Role::Admin);
+		assert_eq!(user.role(), Role::Admin);
+		assert_eq!(user.drain_events(), [UserEvent::RoleChanged]);
 	}
 
 	#[test]

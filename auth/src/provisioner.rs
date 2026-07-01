@@ -44,6 +44,10 @@ pub struct ProvisionedUser {
 	pub email: String,
 	pub status: String,
 	pub token_version: u64,
+	/// The user's platform access role (snake_case), so a freshly issued token pair
+	/// carries a complete principal snapshot and the BFF can gate the admin console
+	/// without a second round trip.
+	pub role: String,
 }
 
 impl ProvisionedUser {

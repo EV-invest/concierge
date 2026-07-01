@@ -23,6 +23,7 @@ fn lifecycle_event_round_trips_with_full_envelope() {
 		email: "user@example.com".to_string(),
 		email_verified: true,
 		token_version: 3,
+		role: "admin".to_string(),
 	};
 
 	let decoded = UserLifecycleEvent::decode(event.encode_to_vec().as_slice()).expect("round trips");
@@ -34,4 +35,19 @@ fn lifecycle_event_round_trips_with_full_envelope() {
 	assert_eq!(decoded.email, "user@example.com");
 	assert!(decoded.email_verified);
 	assert_eq!(decoded.token_version, 3);
+	assert_eq!(decoded.role, "admin");
+}
+
+#[test]
+fn role_changed_kind_is_distinct() {
+	// The new ROLE_CHANGED variant must round-trip as its own discriminant, and the
+	// role string rides alongside it.
+	let event = UserLifecycleEvent {
+		kind: Kind::RoleChanged as i32,
+		role: "operator".to_string(),
+		..Default::default()
+	};
+	let decoded = UserLifecycleEvent::decode(event.encode_to_vec().as_slice()).expect("round trips");
+	assert_eq!(decoded.kind(), Kind::RoleChanged);
+	assert_eq!(decoded.role, "operator");
 }

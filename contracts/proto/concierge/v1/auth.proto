@@ -125,6 +125,9 @@ message UserSummary {
   string email = 2;
   string status = 3;
   uint64 token_version = 4;
+  // The user's platform access role (snake_case: investor/operator/admin/owner), so the
+  // BFF can gate the admin console at sign-in without a second round trip. Read-only.
+  string role = 5;
 }
 
 message JwksRequest {}

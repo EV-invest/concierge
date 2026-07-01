@@ -33,6 +33,19 @@ service UserDirectory {
   // cross-plane bridge (so the money plane learns the new level). Echoes the
   // level now in effect.
   rpc SetKycLevel(SetKycLevelRequest) returns (SetKycLevelResponse);
+
+  // Admin (UserRead): list/search users for the operator console — paginated, with
+  // optional role/KYC/status filters. Returns lightweight summaries, not full profiles.
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+
+  // Admin (UserRead): the full profile of ANY user by id (the admin sibling of the
+  // self-only GetMe), for the user-detail drawer.
+  rpc GetUser(GetUserRequest) returns (UserProfile);
+
+  // Admin (RoleGrant, Owner only): set a user's platform access role. Emits
+  // ROLE_CHANGED across the cross-plane bridge so the money plane mirrors it. Echoes
+  // the role now in effect.
+  rpc SetRole(SetRoleRequest) returns (SetRoleResponse);
 }
 
 message GetMeRequest {}
@@ -55,6 +68,11 @@ message UserProfile {
   string language = 13;
   string base_currency = 14;
   string timezone = 15;
+  // The user's KYC level (admin-managed; mirrored to the money plane).
+  uint32 kyc_level = 16;
+  // The user's platform access role (snake_case: investor/operator/admin/owner).
+  // Admin-managed via SetRole; read-only here.
+  string role = 17;
 }
 
 // The caller's editable profile, full-replace. Same 10 fields as the editable part of
@@ -100,4 +118,49 @@ message SetKycLevelRequest {
 message SetKycLevelResponse {
   // The user's KYC level now in effect (echoes the applied level).
   uint32 kyc_level = 1;
+}
+
+// A lightweight user row for the operator console's user list (not the full profile).
+// Named distinctly from auth.proto's login `UserSummary` (same package).
+message AdminUserSummary {
+  string user_id = 1;
+  string email = 2;
+  string status = 3;
+  uint32 kyc_level = 4;
+  string role = 5;
+  uint64 token_version = 6;
+  // Unix SECONDS the user was provisioned (joined).
+  int64 created_at = 7;
+}
+
+message ListUsersRequest {
+  // Free-text match over email/user_id (empty = no text filter).
+  string query = 1;
+  // Optional exact filters (empty string = unfiltered).
+  string role = 2;
+  string status = 3;
+  // Page window. `limit` is clamped server-side; `offset` is a simple row offset.
+  uint32 limit = 4;
+  uint32 offset = 5;
+}
+
+message ListUsersResponse {
+  repeated AdminUserSummary users = 1;
+  // Total matching the filters (before the page window), for the list header count.
+  uint64 total = 2;
+}
+
+message GetUserRequest {
+  string user_id = 1;
+}
+
+message SetRoleRequest {
+  string user_id = 1;
+  // The role to grant (snake_case: investor/operator/admin/owner).
+  string role = 2;
+}
+
+message SetRoleResponse {
+  // The role now in effect (echoes the applied role).
+  string role = 1;
 }

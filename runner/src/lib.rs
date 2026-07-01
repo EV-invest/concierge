@@ -10,9 +10,11 @@
 //!   infrastructure  — driven adapters (Postgres control plane + the user directory repo)
 //!   notification/log — DEFERRED stubs (no platform messaging/audit yet)
 
+pub mod authz;
 pub mod bridge;
 pub mod config;
 pub mod directory;
 pub mod infrastructure;
 pub mod log;
 pub mod notification;
+pub mod platform;

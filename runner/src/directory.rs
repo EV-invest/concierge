@@ -20,19 +20,21 @@
 use std::sync::Arc;
 
 use domain::{
+	authz::{Permission, Role},
 	error::DomainError,
 	users::{AuthSubject, Email, ProfileFields, User, UserId},
 };
-use evconcierge_auth::{AuthError, Claims, ProvisionCommand, ProvisionRequest, ProvisionedUser, claims_of};
+use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser, claims_of};
 use evconcierge_contracts::concierge::v1::{
-	DisableUserRequest, DisableUserResponse, GetMeRequest, ReinstateUserRequest, ReinstateUserResponse, RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse,
-	UpdateProfileRequest, UserProfile, user_directory_server::UserDirectory,
+	AdminUserSummary, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse,
+	RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
+	user_directory_server::UserDirectory,
 };
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::infrastructure::users::PgUsers;
+use crate::infrastructure::users::{AdminUserRow, PgUsers};
 
 /// The user directory/profile service, backed by Postgres. Cheaply cloneable (the repo
 /// and allowlist are behind `Arc`s). `admins` is the config allowlist of canonical user
@@ -47,10 +49,6 @@ impl Directory {
 	pub fn new(users: Arc<PgUsers>, admins: Arc<[String]>) -> Self {
 		Self { users, admins }
 	}
-
-	fn is_admin(&self, subject: &str) -> bool {
-		self.admins.iter().any(|s| s == subject)
-	}
 }
 
 /// The authenticated caller's own user id (from the access-token `sub`). A self-service
@@ -64,15 +62,10 @@ fn caller_id<T>(request: &Request<T>) -> Result<UserId, Status> {
 	parse_user_id(&claims.sub)
 }
 
-/// Gate an RPC on the admin allowlist. Only a human access token can be an admin — a
-/// service token (distinct `typ`) never qualifies, even if its `sub` matched.
-fn require_admin<T>(directory: &Directory, request: &Request<T>) -> Result<(), Status> {
-	let claims: &Claims = claims_of(request).ok_or_else(|| Status::unauthenticated("missing claims"))?;
-	if claims.is_access() && directory.is_admin(&claims.sub) {
-		Ok(())
-	} else {
-		Err(Status::permission_denied("admin only"))
-	}
+/// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix,
+/// resolved from the caller's persisted role (with the `ADMIN_SUBJECTS` break-glass).
+async fn require_permission<T>(directory: &Directory, request: &Request<T>, permission: Permission) -> Result<(), Status> {
+	crate::authz::require_permission(&directory.users, &directory.admins, request, permission).await
 }
 
 fn parse_user_id(raw: &str) -> Result<UserId, Status> {
@@ -128,7 +121,7 @@ impl UserDirectory for Directory {
 	}
 
 	async fn revoke_tokens(&self, request: Request<RevokeTokensRequest>) -> Result<Response<RevokeTokensResponse>, Status> {
-		require_admin(self, &request)?;
+		require_permission(self, &request, Permission::UserRevoke).await?;
 		let target = parse_user_id(&request.get_ref().user_id)?;
 		let user = self.users.revoke_tokens(target).await.map_err(map_err)?;
 		Ok(Response::new(RevokeTokensResponse {
@@ -137,25 +130,54 @@ impl UserDirectory for Directory {
 	}
 
 	async fn disable_user(&self, request: Request<DisableUserRequest>) -> Result<Response<DisableUserResponse>, Status> {
-		require_admin(self, &request)?;
+		require_permission(self, &request, Permission::UserSuspend).await?;
 		let target = parse_user_id(&request.get_ref().user_id)?;
 		self.users.disable_user(target).await.map_err(map_err)?;
 		Ok(Response::new(DisableUserResponse {}))
 	}
 
 	async fn reinstate_user(&self, request: Request<ReinstateUserRequest>) -> Result<Response<ReinstateUserResponse>, Status> {
-		require_admin(self, &request)?;
+		require_permission(self, &request, Permission::UserSuspend).await?;
 		let target = parse_user_id(&request.get_ref().user_id)?;
 		self.users.enable_user(target).await.map_err(map_err)?;
 		Ok(Response::new(ReinstateUserResponse {}))
 	}
 
 	async fn set_kyc_level(&self, request: Request<SetKycLevelRequest>) -> Result<Response<SetKycLevelResponse>, Status> {
-		require_admin(self, &request)?;
+		require_permission(self, &request, Permission::KycManage).await?;
 		let req = request.into_inner();
 		let target = parse_user_id(&req.user_id)?;
 		let user = self.users.set_kyc_level(target, req.kyc_level).await.map_err(map_err)?;
 		Ok(Response::new(SetKycLevelResponse { kyc_level: user.kyc_level() }))
+	}
+
+	async fn list_users(&self, request: Request<ListUsersRequest>) -> Result<Response<ListUsersResponse>, Status> {
+		require_permission(self, &request, Permission::UserRead).await?;
+		let req = request.into_inner();
+		let limit = if req.limit == 0 { 50 } else { (req.limit as i64).clamp(1, 200) };
+		let (rows, total) = self.users.list(&req.query, &req.role, &req.status, limit, req.offset as i64).await.map_err(map_err)?;
+		Ok(Response::new(ListUsersResponse {
+			users: rows.into_iter().map(summary_to_proto).collect(),
+			total: total as u64,
+		}))
+	}
+
+	async fn get_user(&self, request: Request<GetUserRequest>) -> Result<Response<UserProfile>, Status> {
+		require_permission(self, &request, Permission::UserRead).await?;
+		let id = parse_user_id(&request.get_ref().user_id)?;
+		let user = self.users.find_by_id(id).await.map_err(map_err)?.ok_or_else(|| Status::not_found("user"))?;
+		Ok(Response::new(user_to_proto(&user)))
+	}
+
+	async fn set_role(&self, request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
+		require_permission(self, &request, Permission::RoleGrant).await?;
+		let req = request.into_inner();
+		let target = parse_user_id(&req.user_id)?;
+		let role = Role::parse(&req.role).map_err(map_err)?;
+		let user = self.users.set_role(target, role).await.map_err(map_err)?;
+		Ok(Response::new(SetRoleResponse {
+			role: user.role().as_str().to_owned(),
+		}))
 	}
 }
 
@@ -176,6 +198,21 @@ fn user_to_proto(user: &User) -> UserProfile {
 		language: user.language().unwrap_or_default().to_owned(),
 		base_currency: user.base_currency().unwrap_or_default().to_owned(),
 		timezone: user.timezone().unwrap_or_default().to_owned(),
+		kyc_level: user.kyc_level(),
+		role: user.role().as_str().to_owned(),
+	}
+}
+
+/// Map an operator-console list row (a lightweight SQL projection) to its wire shape.
+fn summary_to_proto(row: AdminUserRow) -> AdminUserSummary {
+	AdminUserSummary {
+		user_id: row.id.to_string(),
+		email: row.email.unwrap_or_default(),
+		status: row.status,
+		kyc_level: row.kyc_level as u32,
+		role: row.role,
+		token_version: row.token_version as u64,
+		created_at: row.created_at,
 	}
 }
 
@@ -220,6 +257,7 @@ fn summary(user: &User) -> ProvisionedUser {
 		email: user.email().as_str().to_owned(),
 		status: user.status().as_str().to_owned(),
 		token_version: user.token_version(),
+		role: user.role().as_str().to_owned(),
 	}
 }
 

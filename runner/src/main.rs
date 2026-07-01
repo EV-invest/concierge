@@ -9,7 +9,7 @@
 //! no money plane here.
 
 use anyhow::Context;
-use concierge::{bridge, config::Config, directory, infrastructure, log, notification};
+use concierge::{bridge, config::Config, directory, infrastructure, log, notification, platform};
 use ev::error_monitoring::{self, Config as SentryConfig};
 use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
@@ -18,6 +18,7 @@ use evconcierge_contracts::concierge::v1::{
 	health_service_server::{HealthService, HealthServiceServer},
 	log_service_server::LogServiceServer,
 	notification_service_server::NotificationServiceServer,
+	platform_service_server::PlatformServiceServer,
 	user_directory_server::UserDirectoryServer,
 	user_events_server::UserEventsServer,
 };
@@ -109,13 +110,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// a user access token. Unconfigured (`BRIDGE_SERVICE_TOKEN` unset) it fails closed.
 	let bridge = bridge::Bridge::new(pool.clone(), config.bridge_service_token);
 
+	// The admin allowlist is shared by the directory and platform services (the
+	// break-glass superadmin bootstrap for the RBAC gate).
+	let admins: std::sync::Arc<[String]> = config.admin_subjects.into();
+	let platform_repo = std::sync::Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
+
 	Server::builder()
 		.accept_http1(true)
 		.layer(ServiceBuilder::new().layer(TraceLayer::new_for_grpc()).layer(GrpcWebLayer::new()).into_inner())
 		.add_service(HealthServiceServer::new(Health))
 		.add_service(AuthServiceServer::new(auth_service))
 		.add_service(UserEventsServer::new(bridge))
-		.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users, config.admin_subjects.into()))))
+		.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), admins.clone()))))
+		.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users, admins, platform_repo))))
 		.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
 		.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 		.serve(config.bind_addr)
