@@ -19,3 +19,4 @@ pub mod log;
 pub mod notification;
 pub mod platform;
 pub mod ports;
+pub mod support;

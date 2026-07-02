@@ -12,14 +12,17 @@
 
 use std::sync::Arc;
 
-use domain::{authz::Permission, error::DomainError};
+use domain::authz::Permission;
 use evconcierge_contracts::concierge::v1::{
 	FeatureFlag, GetPlatformConfigRequest, PlatformConfig, SetAnnouncementRequest, SetFeatureFlagRequest, SetMaintenanceModeRequest,
 	platform_service_server::PlatformService as PlatformServiceRpc,
 };
 use tonic::{Request, Response, Status};
 
-use crate::ports::{PlatformConfigRepository, UserDirectoryRepository};
+use crate::{
+	ports::{PlatformConfigRepository, UserDirectoryRepository},
+	support::domain_to_status,
+};
 
 /// The platform-config service. Cheaply cloneable (repos + allowlist behind `Arc`s).
 /// Holds the user repo + admin allowlist only to reuse the shared authz gate.
@@ -37,8 +40,8 @@ impl Platform {
 
 	/// Read the whole config into its wire shape (one authoritative snapshot).
 	async fn snapshot(&self) -> Result<PlatformConfig, Status> {
-		let cfg = self.config.config().await.map_err(map_err)?;
-		let flags = self.config.flags().await.map_err(map_err)?;
+		let cfg = self.config.config().await.map_err(domain_to_status)?;
+		let flags = self.config.flags().await.map_err(domain_to_status)?;
 		Ok(PlatformConfig {
 			maintenance_mode: cfg.maintenance_mode,
 			announcement_title: cfg.announcement_title,
@@ -66,14 +69,14 @@ impl PlatformServiceRpc for Platform {
 
 	async fn set_maintenance_mode(&self, request: Request<SetMaintenanceModeRequest>) -> Result<Response<PlatformConfig>, Status> {
 		crate::authz::require_permission(self.users.as_ref(), &self.admins, &request, Permission::PlatformManage).await?;
-		self.config.set_maintenance(request.get_ref().enabled).await.map_err(map_err)?;
+		self.config.set_maintenance(request.get_ref().enabled).await.map_err(domain_to_status)?;
 		Ok(Response::new(self.snapshot().await?))
 	}
 
 	async fn set_announcement(&self, request: Request<SetAnnouncementRequest>) -> Result<Response<PlatformConfig>, Status> {
 		crate::authz::require_permission(self.users.as_ref(), &self.admins, &request, Permission::PlatformManage).await?;
 		let req = request.into_inner();
-		self.config.set_announcement(&req.title, &req.body, req.active).await.map_err(map_err)?;
+		self.config.set_announcement(&req.title, &req.body, req.active).await.map_err(domain_to_status)?;
 		Ok(Response::new(self.snapshot().await?))
 	}
 
@@ -83,17 +86,10 @@ impl PlatformServiceRpc for Platform {
 		if req.key.trim().is_empty() {
 			return Err(Status::invalid_argument("flag key required"));
 		}
-		self.config.upsert_flag(&req.key, &req.description, req.enabled, req.rollout as i32).await.map_err(map_err)?;
+		self.config
+			.upsert_flag(&req.key, &req.description, req.enabled, req.rollout as i32)
+			.await
+			.map_err(domain_to_status)?;
 		Ok(Response::new(self.snapshot().await?))
-	}
-}
-
-fn map_err(err: DomainError) -> Status {
-	match err {
-		DomainError::NotFound { .. } => Status::not_found(err.to_string()),
-		DomainError::Validation(_) => Status::invalid_argument(err.to_string()),
-		DomainError::Forbidden(_) => Status::permission_denied(err.to_string()),
-		DomainError::Conflict(_) => Status::already_exists(err.to_string()),
-		DomainError::Repository(_) => Status::unavailable("internal error"),
 	}
 }

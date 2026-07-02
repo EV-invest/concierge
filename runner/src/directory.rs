@@ -23,9 +23,9 @@ use std::sync::Arc;
 use domain::{
 	authz::{Permission, Role},
 	error::DomainError,
-	users::{AuthSubject, Email, ProfileFields, User, UserId, UserStatus},
+	users::{AuthSubject, Email, ProfileFields, User, UserId},
 };
-use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser, claims_of};
+use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser};
 use evconcierge_contracts::concierge::v1::{
 	AdminUserSummary, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse,
 	RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::{infrastructure::users::AdminUserRow, ports::UserDirectoryRepository};
+use crate::{infrastructure::users::AdminUserRow, ports::UserDirectoryRepository, support::domain_to_status};
 
 /// The user directory/profile service, backed by the [`UserDirectoryRepository`]
 /// port. Cheaply cloneable (the repo and allowlist are behind `Arc`s). `admins` is
@@ -54,28 +54,14 @@ impl Directory {
 
 impl Directory {
 	/// The authenticated caller's own user id (from the access-token `sub`), gated on live
-	/// revocation state. A self-service RPC acts *as a user*, so only a `typ=access` token
-	/// qualifies (a service token is rejected regardless of whether its `sub` parses); and
-	/// the caller must be an active user whose `token_version` is not below the persisted
-	/// floor. This mirrors the admin gate ([`crate::authz`]) for the self-service surface,
-	/// so a suspended or revoked user cannot keep reading/editing their profile for the
-	/// remaining access-token TTL (the stateless verifier can't see status/revocation).
+	/// revocation state via the shared [`crate::authz::caller_gate`]: a self-service RPC
+	/// acts *as a user*, so only a `typ=access` token qualifies, and a suspended or
+	/// revoked user cannot keep reading/editing their profile for the remaining
+	/// access-token TTL (the stateless verifier can't see status/revocation).
 	async fn active_caller_id<T>(&self, request: &Request<T>) -> Result<UserId, Status> {
-		// Clone the small facts out so the `Claims` borrow ends before the async lookup.
-		let (id, token_version) = {
-			let claims = claims_of(request).ok_or_else(|| Status::unauthenticated("missing claims"))?;
-			if !claims.is_access() {
-				return Err(Status::permission_denied("access token required"));
-			}
-			(parse_user_id(&claims.sub)?, claims.token_version)
-		};
-		let record = self.users.authz_record(id).await.map_err(map_err)?.ok_or_else(|| Status::not_found("user"))?;
-		if record.status == UserStatus::Disabled {
-			return Err(Status::permission_denied("user is disabled"));
-		}
-		if token_version < record.token_version {
-			return Err(Status::unauthenticated("tokens revoked"));
-		}
+		let caller = crate::authz::caller_gate(self.users.as_ref(), request).await?;
+		let id = caller.id.ok_or_else(|| Status::unauthenticated("subject is not a user id"))?;
+		caller.record.ok_or_else(|| Status::not_found("user"))?;
 		Ok(id)
 	}
 }
@@ -94,22 +80,11 @@ fn optional(raw: &str) -> Option<String> {
 	if raw.is_empty() { None } else { Some(raw.to_owned()) }
 }
 
-/// Map a domain error to a gRPC status without leaking control-plane internals.
-fn map_err(err: DomainError) -> Status {
-	match err {
-		DomainError::NotFound { .. } => Status::not_found(err.to_string()),
-		DomainError::Validation(_) => Status::invalid_argument(err.to_string()),
-		DomainError::Forbidden(_) => Status::permission_denied(err.to_string()),
-		DomainError::Conflict(_) => Status::already_exists(err.to_string()),
-		DomainError::Repository(_) => Status::unavailable("internal error"),
-	}
-}
-
 #[tonic::async_trait]
 impl UserDirectory for Directory {
 	async fn get_me(&self, request: Request<GetMeRequest>) -> Result<Response<UserProfile>, Status> {
 		let id = self.active_caller_id(&request).await?;
-		let user = self.users.find_by_id(id).await.map_err(map_err)?.ok_or_else(|| Status::not_found("user"))?;
+		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
 		Ok(Response::new(user_to_proto(&user)))
 	}
 
@@ -134,14 +109,14 @@ impl UserDirectory for Directory {
 				},
 			)
 			.await
-			.map_err(map_err)?;
+			.map_err(domain_to_status)?;
 		Ok(Response::new(user_to_proto(&user)))
 	}
 
 	async fn revoke_tokens(&self, request: Request<RevokeTokensRequest>) -> Result<Response<RevokeTokensResponse>, Status> {
 		require_permission(self, &request, Permission::UserRevoke).await?;
 		let target = parse_user_id(&request.get_ref().user_id)?;
-		let user = self.users.revoke_tokens(target).await.map_err(map_err)?;
+		let user = self.users.revoke_tokens(target).await.map_err(domain_to_status)?;
 		Ok(Response::new(RevokeTokensResponse {
 			token_version: user.token_version(),
 		}))
@@ -150,14 +125,14 @@ impl UserDirectory for Directory {
 	async fn disable_user(&self, request: Request<DisableUserRequest>) -> Result<Response<DisableUserResponse>, Status> {
 		require_permission(self, &request, Permission::UserSuspend).await?;
 		let target = parse_user_id(&request.get_ref().user_id)?;
-		self.users.disable_user(target).await.map_err(map_err)?;
+		self.users.disable_user(target).await.map_err(domain_to_status)?;
 		Ok(Response::new(DisableUserResponse {}))
 	}
 
 	async fn reinstate_user(&self, request: Request<ReinstateUserRequest>) -> Result<Response<ReinstateUserResponse>, Status> {
 		require_permission(self, &request, Permission::UserSuspend).await?;
 		let target = parse_user_id(&request.get_ref().user_id)?;
-		self.users.enable_user(target).await.map_err(map_err)?;
+		self.users.enable_user(target).await.map_err(domain_to_status)?;
 		Ok(Response::new(ReinstateUserResponse {}))
 	}
 
@@ -165,7 +140,7 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Permission::KycManage).await?;
 		let req = request.into_inner();
 		let target = parse_user_id(&req.user_id)?;
-		let user = self.users.set_kyc_level(target, req.kyc_level).await.map_err(map_err)?;
+		let user = self.users.set_kyc_level(target, req.kyc_level).await.map_err(domain_to_status)?;
 		Ok(Response::new(SetKycLevelResponse { kyc_level: user.kyc_level() }))
 	}
 
@@ -173,7 +148,7 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Permission::UserRead).await?;
 		let req = request.into_inner();
 		let limit = if req.limit == 0 { 50 } else { (req.limit as i64).clamp(1, 200) };
-		let (rows, total) = self.users.list(&req.query, &req.role, &req.status, limit, req.offset as i64).await.map_err(map_err)?;
+		let (rows, total) = self.users.list(&req.query, &req.role, &req.status, limit, req.offset as i64).await.map_err(domain_to_status)?;
 		Ok(Response::new(ListUsersResponse {
 			users: rows.into_iter().map(summary_to_proto).collect(),
 			total: total as u64,
@@ -183,7 +158,7 @@ impl UserDirectory for Directory {
 	async fn get_user(&self, request: Request<GetUserRequest>) -> Result<Response<UserProfile>, Status> {
 		require_permission(self, &request, Permission::UserRead).await?;
 		let id = parse_user_id(&request.get_ref().user_id)?;
-		let user = self.users.find_by_id(id).await.map_err(map_err)?.ok_or_else(|| Status::not_found("user"))?;
+		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
 		Ok(Response::new(user_to_proto(&user)))
 	}
 
@@ -191,8 +166,8 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Permission::RoleGrant).await?;
 		let req = request.into_inner();
 		let target = parse_user_id(&req.user_id)?;
-		let role = Role::parse(&req.role).map_err(map_err)?;
-		let user = self.users.set_role(target, role).await.map_err(map_err)?;
+		let role = Role::parse(&req.role).map_err(domain_to_status)?;
+		let user = self.users.set_role(target, role).await.map_err(domain_to_status)?;
 		Ok(Response::new(SetRoleResponse {
 			role: user.role().as_str().to_owned(),
 		}))
