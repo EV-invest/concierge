@@ -116,6 +116,11 @@ impl Verifier {
 		{
 			return Ok(());
 		}
+		// Stamp the ATTEMPT before the RPC, so a FAILED refresh is throttled too. Otherwise
+		// a flood of forged unknown-`kid` tokens would re-dial an already-degraded hub on
+		// essentially every miss (the success-only throttle voids both guards during an
+		// outage). A genuine key rotation heals at most `MIN_REFRESH_INTERVAL` later.
+		*last_refresh = Some(Instant::now());
 
 		let mut client = wired.client.clone();
 		let response = client
@@ -136,7 +141,6 @@ impl Verifier {
 			return Err(AuthError::JwksFetch("concierge published no Ed25519 keys".into()));
 		}
 		wired.cache.write().await.replace(keys);
-		*last_refresh = Some(Instant::now());
 		Ok(())
 	}
 }

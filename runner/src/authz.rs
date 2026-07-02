@@ -14,7 +14,7 @@
 use domain::{
 	authz::{Permission, Role, grants},
 	error::DomainError,
-	users::UserId,
+	users::{UserId, UserStatus},
 };
 use evconcierge_auth::{Claims, claims_of};
 use tonic::{Request, Status};
@@ -26,19 +26,36 @@ use crate::infrastructure::users::PgUsers;
 /// `Unauthenticated`.
 pub async fn require_permission<T>(users: &PgUsers, admins: &[String], request: &Request<T>, permission: Permission) -> Result<(), Status> {
 	// Clone the small facts out so the `Claims` borrow of `request` ends before the
-	// async `role_of` lookup.
-	let (is_access, sub) = {
+	// async `authz_record` lookup. `token_version` is the version the token was minted
+	// under; the persisted value is the authoritative floor.
+	let (is_access, sub, token_version) = {
 		let claims: &Claims = claims_of(request).ok_or_else(|| Status::unauthenticated("missing claims"))?;
-		(claims.is_access(), claims.sub.clone())
+		(claims.is_access(), claims.sub.clone(), claims.token_version)
 	};
 	if !is_access {
 		return Err(Status::permission_denied("access token required"));
 	}
 	let role = if admins.iter().any(|s| s == &sub) {
+		// Break-glass superadmin bootstrap: config-listed subjects hold Owner without a
+		// persisted record, so the first operator can grant roles before any role exists.
 		Role::Owner
 	} else {
 		let id = Uuid::parse_str(&sub).map(UserId::from_raw).map_err(|_| Status::unauthenticated("subject is not a user id"))?;
-		users.role_of(id).await.map_err(map_err)?.unwrap_or_default()
+		// An unknown user holds nothing — fail closed rather than defaulting to Investor's
+		// (empty) grant set with no status/revocation check.
+		let record = users.authz_record(id).await.map_err(map_err)?.ok_or_else(|| Status::permission_denied("insufficient role"))?;
+		// A suspended principal loses the operator console immediately, even while an
+		// unexpired access token still verifies (the stateless verifier can't see status).
+		if record.status == UserStatus::Disabled {
+			return Err(Status::permission_denied("user is disabled"));
+		}
+		// "Revoke all" bumps the authoritative `token_version`; reject a token minted under
+		// an older version so a revoke takes effect on the privileged surface at once, not
+		// only after the short access-token TTL expires.
+		if token_version < record.token_version {
+			return Err(Status::unauthenticated("tokens revoked"));
+		}
+		record.role
 	};
 	if grants(role, permission) {
 		Ok(())
