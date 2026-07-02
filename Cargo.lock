@@ -588,6 +588,7 @@ dependencies = [
  "evconcierge_auth",
  "evconcierge_contracts",
  "sqlx",
+ "subtle",
  "tokio",
  "tonic",
  "tonic-web",
