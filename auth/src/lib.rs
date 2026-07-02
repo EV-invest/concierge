@@ -77,6 +77,11 @@ pub enum AuthError {
 	/// unverifiable assertion.
 	#[error("identity provider error: {0}")]
 	Provider(String),
+	/// The plane's own user directory refused the provisioning/lookup (unknown user,
+	/// invalid input, conflicting state) — a first-party outcome, never the IdP's
+	/// fault, so it must not render as a provider error.
+	#[error("user directory rejected the request: {0}")]
+	Directory(String),
 	/// The JWKS could not be refreshed from the concierge plane.
 	#[error("jwks refresh failed: {0}")]
 	JwksFetch(String),
@@ -98,6 +103,7 @@ impl From<&AuthError> for tonic::Status {
 			InvalidToken => tonic::Status::unauthenticated("invalid or expired token"),
 			UnknownKid(_) => tonic::Status::unauthenticated("unknown signing key"),
 			Provider(_) => tonic::Status::unauthenticated("identity provider rejected the request"),
+			Directory(_) => tonic::Status::unauthenticated("user directory rejected the request"),
 			NotConfigured => tonic::Status::unavailable("auth not configured"),
 			Unavailable => tonic::Status::unavailable("auth service unavailable"),
 			JwksFetch(_) => tonic::Status::unavailable("could not refresh signing keys"),

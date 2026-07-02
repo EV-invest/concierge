@@ -157,9 +157,10 @@ struct Wired {
 	policy: VerifyPolicy,
 	/// A long-lived lazy channel to the plane's auth service; reconnects under the hood.
 	client: AuthServiceClient<Channel>,
-	/// Single-flight + throttle guard: holds the last successful refresh instant
-	/// (`None` until the first). Held across the refresh so concurrent misses await
-	/// one network call instead of each issuing their own.
+	/// Single-flight + throttle guard: holds the last refresh ATTEMPT instant (`None`
+	/// until the first) — attempts, not successes, so a failing refresh is throttled
+	/// too. Held across the refresh so concurrent misses await one network call
+	/// instead of each issuing their own.
 	last_refresh: Mutex<Option<Instant>>,
 }
 

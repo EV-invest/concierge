@@ -10,7 +10,10 @@
 //! `auth_choke_point.rs`); here we drive the repository — the load-bearing write path
 //! — and assert both the user row and the `user_outbox` rows it emits in the same tx.
 
-use concierge::infrastructure::{db, users::PgUsers};
+use concierge::{
+	infrastructure::{db, users::PgUsers},
+	ports::UserDirectoryRepository,
+};
 use domain::{
 	authz::Role,
 	users::{AuthSubject, Email, UserStatus},
@@ -156,7 +159,8 @@ async fn role_change_emits_role_changed_carrying_the_new_role() {
 
 	let promoted = repo.set_role(user.id(), Role::Admin).await.unwrap();
 	assert_eq!(promoted.role(), Role::Admin, "role persisted on the aggregate");
-	assert_eq!(repo.role_of(user.id()).await.unwrap(), Some(Role::Admin), "role_of reads it back for the gate");
+	let record = repo.authz_record(user.id()).await.unwrap().expect("authz record exists");
+	assert_eq!(record.role, Role::Admin, "authz_record reads it back for the gate");
 
 	let row = outbox_for(&pool, user.id().raw()).await.pop().expect("a row");
 	assert_eq!(row.kind, "ROLE_CHANGED");

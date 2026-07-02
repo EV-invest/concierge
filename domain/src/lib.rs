@@ -5,14 +5,17 @@
 //! frontends (it stays wasm-safe). It never depends on the runner, on
 //! `evconcierge_auth`, or on any adapter.
 //!
-//! Scaffold: this seeds the cross-cutting [`error::DomainError`], re-exports the
-//! `ev` architecture building blocks, and declares the identity bounded context.
-//! The context module is a placeholder — value objects and ports land there as
-//! real features arrive.
+//! It carries the cross-cutting [`error::DomainError`], re-exports the `ev`
+//! architecture building blocks, and holds the live identity bounded contexts:
+//! [`auth`] (the IdP-asserted [`AuthSubject`](auth::AuthSubject)), [`authz`] (the
+//! role/permission RBAC matrix), and [`users`] (the [`User`](users::User)
+//! aggregate and its cross-plane lifecycle events).
 
-pub mod error;
+pub mod auth;
 
 pub mod authz;
+
+pub mod error;
 
 pub mod users;
 

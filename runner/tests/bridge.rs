@@ -13,6 +13,7 @@
 use concierge::{
 	bridge::Bridge,
 	infrastructure::{db, users::PgUsers},
+	ports::UserDirectoryRepository,
 };
 use domain::users::{AuthSubject, Email};
 use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, user_events_server::UserEvents, user_lifecycle_event::Kind};

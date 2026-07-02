@@ -9,6 +9,7 @@
 use concierge::{
 	authz::require_permission,
 	infrastructure::{db, users::PgUsers},
+	ports::UserDirectoryRepository,
 };
 use domain::{
 	authz::{Permission, Role},
@@ -95,6 +96,37 @@ async fn gate_enforces_role_status_and_revocation() {
 	svc.typ = TokenType::Service;
 	let svc_denied = require_permission(&users, &no_admins, &request_as(svc), Permission::UserRead).await.unwrap_err();
 	assert_eq!(svc_denied.code(), Code::PermissionDenied, "a service token is not a user principal");
+}
+
+#[tokio::test]
+async fn allowlisted_operator_is_still_gated_by_status_and_revocation() {
+	let Some(users) = setup().await else {
+		return;
+	};
+	// The allowlist grants a role, never an exemption: once a record exists, DisableUser
+	// and RevokeTokens must bite the break-glass principals too.
+	let user = users.provision(unique_subject(), Email::parse("breakglass@example.com").unwrap(), true).await.unwrap();
+	let sub = user.id().to_string();
+	let admins = vec![sub.clone()];
+
+	require_permission(&users, &admins, &request_as(access_claims(&sub, 0)), Permission::RoleGrant)
+		.await
+		.expect("an active allowlisted operator holds Owner");
+
+	users.disable_user(user.id()).await.unwrap();
+	let suspended = require_permission(&users, &admins, &request_as(access_claims(&sub, 0)), Permission::RoleGrant).await.unwrap_err();
+	assert_eq!(suspended.code(), Code::PermissionDenied, "a disabled allowlisted operator is denied");
+
+	users.enable_user(user.id()).await.unwrap();
+	let revoked = users.revoke_tokens(user.id()).await.unwrap();
+	let stale = require_permission(&users, &admins, &request_as(access_claims(&sub, revoked.token_version() - 1)), Permission::RoleGrant)
+		.await
+		.unwrap_err();
+	assert_eq!(stale.code(), Code::Unauthenticated, "an allowlisted token below the revocation floor is rejected");
+
+	require_permission(&users, &admins, &request_as(access_claims(&sub, revoked.token_version())), Permission::RoleGrant)
+		.await
+		.expect("an allowlisted token at the current floor is Owner again");
 }
 
 #[tokio::test]

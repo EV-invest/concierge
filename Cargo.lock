@@ -581,12 +581,14 @@ name = "concierge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "domain",
  "dotenvy",
  "ev_lib",
  "evconcierge_auth",
  "evconcierge_contracts",
  "sqlx",
+ "subtle",
  "tokio",
  "tonic",
  "tonic-web",
