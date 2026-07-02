@@ -34,8 +34,9 @@ service UserDirectory {
   // level now in effect.
   rpc SetKycLevel(SetKycLevelRequest) returns (SetKycLevelResponse);
 
-  // Admin (UserRead): list/search users for the operator console — paginated, with
-  // optional role/KYC/status filters. Returns lightweight summaries, not full profiles.
+  // Admin (UserRead): list/search users for the operator console — paginated, with a
+  // free-text query and optional role/status filters (see ListUsersRequest). Returns
+  // lightweight summaries, not full profiles.
   rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
 
   // Admin (UserRead): the full profile of ANY user by id (the admin sibling of the
