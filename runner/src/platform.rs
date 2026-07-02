@@ -86,6 +86,11 @@ impl PlatformServiceRpc for Platform {
 		if req.key.trim().is_empty() {
 			return Err(Status::invalid_argument("flag key required"));
 		}
+		// Validate BEFORE the `as i32` narrowing: a rollout ≥ 2^31 would wrap negative
+		// and silently clamp to 0 instead of being rejected.
+		if req.rollout > 100 {
+			return Err(Status::invalid_argument("rollout must be between 0 and 100"));
+		}
 		self.config
 			.upsert_flag(&req.key, &req.description, req.enabled, req.rollout as i32)
 			.await
