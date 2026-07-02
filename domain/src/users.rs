@@ -14,7 +14,7 @@
 //! by the (host-only) application layer, so this stays compilable to wasm and
 //! trivially testable.
 
-use ev::architecture::{AggregateRoot, Entity, Id};
+use ev::architecture::{AggregateRoot, DomainEvent, EmitsEvents, Entity, Id};
 use serde::{Deserialize, Serialize};
 
 use crate::{authz::Role, error::DomainError};
@@ -288,11 +288,6 @@ impl User {
 		self.pending.push(event);
 	}
 
-	/// Drain the accumulated cross-plane events (the adapter writes them to the outbox).
-	pub fn drain_events(&mut self) -> Vec<UserEvent> {
-		core::mem::take(&mut self.pending)
-	}
-
 	pub fn id(&self) -> UserId {
 		self.id
 	}
@@ -386,11 +381,19 @@ impl AggregateRoot for User {
 	const NAME: &'static str = "user";
 }
 
+impl EmitsEvents for User {
+	type Event = UserEvent;
+
+	fn drain_events(&mut self) -> Vec<UserEvent> {
+		core::mem::take(&mut self.pending)
+	}
+}
+
 /// The cross-plane lifecycle facts the [`User`] aggregate raises. Each maps to a
 /// `user_outbox` row (one bridge `Kind`) the banking money plane consumes to
 /// gate/freeze money ops. Identity-internal mutations (email, profile) carry no
 /// `Kind` and are not represented here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserEvent {
 	Created,
 	SessionsRevoked,
@@ -398,6 +401,10 @@ pub enum UserEvent {
 	Reinstated,
 	KycChanged,
 	RoleChanged,
+}
+
+impl DomainEvent for UserEvent {
+	const KIND: &'static str = "users";
 }
 
 impl UserEvent {

@@ -11,6 +11,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use domain::{
+	architecture::EmitsEvents,
 	authz::Role,
 	error::DomainError,
 	users::{AuthSubject, Email, ProfileFields, User, UserId, UserStatus},
