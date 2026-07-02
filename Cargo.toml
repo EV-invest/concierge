@@ -10,6 +10,8 @@ resolver = "3"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+# Dyn-compatible async port traits (`Arc<dyn …>`), mirroring banking's ports layer.
+async-trait = "0.1.89"
 dotenvy = "0.15.7"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 ev = { version = "0.2.1", package = "ev_lib", default-features = false, features = ["architecture"] }

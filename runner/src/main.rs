@@ -3,6 +3,7 @@
 //! `concierge` is the identity/platform plane (a sibling to the banking money
 //! plane). One runner binary mounts its internal modules — `auth` (token issuance,
 //! served by [`evconcierge_auth::AuthService`]), `directory` (user profile/admin),
+//! `bridge` (the cross-plane producer), `platform` (platform/cabinet config),
 //! `notification`, and `log` — on a single tonic server. It opens the Postgres
 //! control plane and applies its migrations on boot (the identity records + the
 //! cross-plane bridge outbox). Notifications and logs are DEFERRED stubs. There is
@@ -66,8 +67,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	tracing::info!(bind = %config.bind_addr, "concierge listening");
 
 	// The user directory repository: the only writer of the identity control plane and
-	// the cross-plane outbox. Shared by the directory service and the provisioner loop.
-	let users = std::sync::Arc::new(infrastructure::users::PgUsers::new(pool.clone()));
+	// the cross-plane outbox. Shared by the directory service and the provisioner loop,
+	// both of which see only the port.
+	let users: std::sync::Arc<dyn concierge::ports::UserDirectoryRepository> = std::sync::Arc::new(infrastructure::users::PgUsers::new(pool.clone()));
 
 	// Auth issuance. `AuthConfig` is host-only (signing key, Google client, refresh
 	// TTLs); with no `AUTH_SIGNING_KEY_PEM` configured the service runs inert. The
@@ -75,6 +77,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// (called from `Exchange`/`Refresh`), and the directory keeps the receiver and
 	// drains it against Postgres — provisioning/looking-up/revoking the matching user.
 	let auth_config = AuthConfig::from_env().context("failed to load auth configuration")?;
+	// The inbound verifier must expect exactly what issuance stamps, so read the
+	// issuer/audience off the loaded (env-resolved, plane-asserted) `auth_config`
+	// before it moves into the service — never re-read the env with copied defaults.
+	let issuer = auth_config.issuer.clone();
+	let audiences = auth_config.client_audience.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
 	let (provisioner, provision_rx) = provisioner_channel();
 	tokio::spawn(directory::run_provisioner(provision_rx, users.clone()));
 	let auth_service = AuthService::try_new(auth_config, provisioner).await.context("failed to build the auth service")?;
@@ -83,12 +90,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// Built lazily so boot does not block on a self-dial; the first verify warms the
 	// cache. With no signing key, the served JWKS is empty and every inbound verify
 	// fails closed (`UnknownKid`/`JwksFetch` → UNAUTHENTICATED/UNAVAILABLE), so no
-	// directory/admin mutation can run unauthenticated.
+	// directory/admin mutation can run unauthenticated. The JWKS is dialed at an
+	// override env, else this plane's own bind address (it serves its own JWKS
+	// in-process).
 	let verifier_config = VerifierConfig {
-		issuer: auth_config_issuer(),
-		audiences: client_audiences(),
+		issuer,
+		audiences,
 		allowed_types: vec![evconcierge_auth::TokenType::Access],
-		jwks_grpc_endpoint: jwks_grpc_endpoint(&config.bind_addr),
+		jwks_grpc_endpoint: std::env::var("AUTH_JWKS_GRPC_ENDPOINT").unwrap_or_else(|_| format!("http://{}", config.bind_addr)),
 	};
 	verifier_config.assert_plane().context("verifier config carries a cross-plane identity")?;
 	let verifier = Verifier::try_new(verifier_config).context("failed to build the inbound token verifier")?;
@@ -113,7 +122,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// The admin allowlist is shared by the directory and platform services (the
 	// break-glass superadmin bootstrap for the RBAC gate).
 	let admins: std::sync::Arc<[String]> = config.admin_subjects.into();
-	let platform_repo = std::sync::Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
+	let platform_repo: std::sync::Arc<dyn concierge::ports::PlatformConfigRepository> = std::sync::Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
 
 	Server::builder()
 		.accept_http1(true)
@@ -125,27 +134,43 @@ async fn run(config: Config) -> anyhow::Result<()> {
 		.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users, admins, platform_repo))))
 		.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
 		.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
-		.serve(config.bind_addr)
+		.serve_with_shutdown(config.bind_addr, await_signal())
 		.await
 		.context("concierge gRPC server error")
 }
 
-/// The plane's issuer, read with the same default `evconcierge_auth` uses, so the
-/// inbound verifier expects exactly what issuance stamps.
-fn auth_config_issuer() -> String {
-	std::env::var("AUTH_ISSUER").unwrap_or_else(|_| "https://auth.concierge.ev".to_string())
-}
-
-/// The client audience(s) the inbound choke point accepts — user access tokens only.
-fn client_audiences() -> Vec<String> {
-	let raw = std::env::var("AUTH_CLIENT_AUDIENCE").unwrap_or_else(|_| "concierge".to_string());
-	raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
-}
-
-/// Where the inbound verifier dials the `Jwks` RPC: an override env, else this plane's
-/// own bind address (it serves its own JWKS in the same process).
-fn jwks_grpc_endpoint(bind_addr: &std::net::SocketAddr) -> String {
-	std::env::var("AUTH_JWKS_GRPC_ENDPOINT").unwrap_or_else(|_| format!("http://{bind_addr}"))
+/// Resolve on SIGTERM or ctrl-c so the server drains in-flight RPCs instead of
+/// dropping them (banking's `await_signal`, scaled down to the one listener this
+/// plane runs). If a listener can't be installed, never resolve — the server then
+/// runs until the process is killed, exactly the pre-graceful behaviour.
+async fn await_signal() {
+	#[cfg(unix)]
+	{
+		use tokio::signal::unix::{SignalKind, signal};
+		match signal(SignalKind::terminate()) {
+			Ok(mut term) => {
+				tokio::select! {
+					result = tokio::signal::ctrl_c() => {
+						if let Err(err) = result {
+							tracing::error!("failed to listen for ctrl_c: {err}");
+							std::future::pending::<()>().await;
+						}
+					},
+					_ = term.recv() => {},
+				}
+			}
+			Err(err) => {
+				tracing::error!("failed to install SIGTERM handler: {err}");
+				std::future::pending::<()>().await;
+			}
+		}
+	}
+	#[cfg(not(unix))]
+	if let Err(err) = tokio::signal::ctrl_c().await {
+		tracing::error!("failed to listen for ctrl_c: {err}");
+		std::future::pending::<()>().await;
+	}
+	tracing::info!("shutdown signal received — draining");
 }
 
 /// Liveness probe for the gRPC surface.

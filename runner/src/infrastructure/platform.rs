@@ -5,8 +5,11 @@
 //! rather than `domain`. Runtime queries (not the compile-time macros) keep
 //! `cargo build` independent of a live database, mirroring the users adapter.
 
+use async_trait::async_trait;
 use domain::error::DomainError;
 use sqlx::PgPool;
+
+use crate::ports::PlatformConfigRepository;
 
 pub struct PgPlatform {
 	pool: PgPool,
@@ -38,22 +41,25 @@ impl PgPlatform {
 	pub fn new(pool: PgPool) -> Self {
 		Self { pool }
 	}
+}
 
-	pub async fn config(&self) -> Result<PlatformConfigRow, DomainError> {
+#[async_trait]
+impl PlatformConfigRepository for PgPlatform {
+	async fn config(&self) -> Result<PlatformConfigRow, DomainError> {
 		sqlx::query_as::<_, PlatformConfigRow>("SELECT maintenance_mode, announcement_title, announcement_body, announcement_active FROM platform_config WHERE id = TRUE")
 			.fetch_one(&self.pool)
 			.await
 			.map_err(repo_err)
 	}
 
-	pub async fn flags(&self) -> Result<Vec<FeatureFlagRow>, DomainError> {
+	async fn flags(&self) -> Result<Vec<FeatureFlagRow>, DomainError> {
 		sqlx::query_as::<_, FeatureFlagRow>("SELECT key, description, enabled, rollout FROM feature_flags ORDER BY key ASC")
 			.fetch_all(&self.pool)
 			.await
 			.map_err(repo_err)
 	}
 
-	pub async fn set_maintenance(&self, enabled: bool) -> Result<(), DomainError> {
+	async fn set_maintenance(&self, enabled: bool) -> Result<(), DomainError> {
 		sqlx::query("UPDATE platform_config SET maintenance_mode = $1, updated_at = now() WHERE id = TRUE")
 			.bind(enabled)
 			.execute(&self.pool)
@@ -62,7 +68,7 @@ impl PgPlatform {
 		Ok(())
 	}
 
-	pub async fn set_announcement(&self, title: &str, body: &str, active: bool) -> Result<(), DomainError> {
+	async fn set_announcement(&self, title: &str, body: &str, active: bool) -> Result<(), DomainError> {
 		sqlx::query("UPDATE platform_config SET announcement_title = $1, announcement_body = $2, announcement_active = $3, updated_at = now() WHERE id = TRUE")
 			.bind(title)
 			.bind(body)
@@ -73,7 +79,7 @@ impl PgPlatform {
 		Ok(())
 	}
 
-	pub async fn upsert_flag(&self, key: &str, description: &str, enabled: bool, rollout: i32) -> Result<(), DomainError> {
+	async fn upsert_flag(&self, key: &str, description: &str, enabled: bool, rollout: i32) -> Result<(), DomainError> {
 		sqlx::query(
 			"INSERT INTO feature_flags (key, description, enabled, rollout) VALUES ($1, $2, $3, $4) \
 			 ON CONFLICT (key) DO UPDATE SET description = EXCLUDED.description, enabled = EXCLUDED.enabled, rollout = EXCLUDED.rollout, updated_at = now()",

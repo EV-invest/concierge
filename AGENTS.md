@@ -31,7 +31,7 @@ mounted OUTSIDE the user auth layer; graduate to mTLS/SPIFFE at platform scale.
 | ----- | ------ |
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
-| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **notification**, **log**. `directory` + `bridge` are live; `notification` + `log` are DEFERRED stubs | [`runner/`](./runner) |
+| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `platform` are live; `notification` + `log` are DEFERRED stubs | [`runner/`](./runner) |
 | `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation with reuse detection · `Exchange`/`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`) provisioning users to the directory over an in-process `Provisioner` channel, **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
@@ -92,9 +92,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   a Postgres-backed user repository (provision/profile/admin) that emits cross-plane
   lifecycle events to `user_outbox` in the write tx. The **bridge** module serves
   those rows to banking over `UserEvents.PullUserLifecycle` (read-only; shared bridge
-  token; mounted outside the user auth layer). `notification` and `log` stay
-  DEFERRED stubs (`tonic::Status::unimplemented`); their application layers are
-  placeholders to grow into. Health returns `"ok"`.
+  token; mounted outside the user auth layer). The **platform** module is the
+  operator console's platform/cabinet config surface (maintenance mode, announcement
+  banner, feature flags) behind the shared RBAC gate (`authz`). `notification` and
+  `log` stay DEFERRED stubs (`tonic::Status::unimplemented`); their application
+  layers are placeholders to grow into. Health returns `"ok"`.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.

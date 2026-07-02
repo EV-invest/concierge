@@ -26,6 +26,12 @@
             treefmt = {
               enable = true;
               packageOverrides.treefmt = pkgs.treefmt;
+              # Auto-format and re-stage instead of failing the commit; resolved from
+              # PATH (the dev shell provides treefmt) so the generated hook survives
+              # store-path churn. Mirrors banking's hook shape.
+              entry = pkgs.lib.mkForce "bash -c 'treefmt --no-cache \"$@\" && git add -u' --";
+              # `git add -u` needs exclusive access to the index lock.
+              require_serial = true;
             };
           };
         };

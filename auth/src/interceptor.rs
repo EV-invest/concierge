@@ -97,7 +97,7 @@ where
 				}
 				Err(err) => {
 					if err.is_unexpected() {
-						ev::error_monitoring::report(&err);
+						crate::telemetry::report(&err);
 					}
 					Ok(status_response(&err))
 				}

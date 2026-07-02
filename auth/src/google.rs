@@ -119,7 +119,7 @@ impl GoogleOauth {
 	}
 
 	fn cached_key(&self, kid: &str) -> Option<DecodingKey> {
-		self.certs.lock().expect("certs cache poisoned").keys.get(kid).cloned()
+		self.certs.lock().unwrap_or_else(|e| e.into_inner()).keys.get(kid).cloned()
 	}
 
 	/// Re-fetch Google's certs, honoring the `Cache-Control: max-age` window of the
@@ -128,7 +128,7 @@ impl GoogleOauth {
 	/// is held under a `Mutex` (not across the await): whoever loses the race re-reads
 	/// the now-fresh `refresh_after` and skips the redundant call.
 	async fn refresh_certs(&self) -> Result<(), AuthError> {
-		if let Some(at) = self.certs.lock().expect("certs cache poisoned").refresh_after
+		if let Some(at) = self.certs.lock().unwrap_or_else(|e| e.into_inner()).refresh_after
 			&& Instant::now() < at
 		{
 			return Ok(());
@@ -150,7 +150,7 @@ impl GoogleOauth {
 			keys.insert(kid, key);
 		}
 
-		let mut cache = self.certs.lock().expect("certs cache poisoned");
+		let mut cache = self.certs.lock().unwrap_or_else(|e| e.into_inner());
 		cache.keys = keys;
 		cache.refresh_after = Some(Instant::now() + max_age.max(MIN_CERTS_REFRESH));
 		Ok(())

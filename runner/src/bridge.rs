@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, PullUserLifecycleResponse, UserLifecycleEvent, user_events_server::UserEvents, user_lifecycle_event::Kind};
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use tonic::{Request, Response, Status};
 
 /// The largest page the bridge will serve, regardless of the request's `limit`. Caps a
@@ -46,14 +47,15 @@ impl Bridge {
 		}
 	}
 
-	/// Authenticate the service-to-service caller against the shared bridge token. A
+	/// Authenticate the service-to-service caller against the shared bridge token
+	/// (compared in constant time, so verification leaks nothing via timing). A
 	/// missing configured token fails closed; a wrong/absent bearer is rejected.
 	fn authenticate<T>(&self, request: &Request<T>) -> Result<(), Status> {
 		let Some(expected) = self.token.as_deref() else {
 			return Err(Status::unavailable("bridge not configured"));
 		};
 		match bearer_token(request) {
-			Some(presented) if constant_time_eq(presented.as_bytes(), expected.as_bytes()) => Ok(()),
+			Some(presented) if bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) => Ok(()),
 			_ => Err(Status::unauthenticated("invalid bridge service token")),
 		}
 	}
@@ -109,7 +111,11 @@ impl UserEvents for Bridge {
 		.bind(limit)
 		.fetch_all(&self.pool)
 		.await
-		.map_err(|err| Status::unavailable(format!("outbox read failed: {err}")))?;
+		// Log the real cause; never put sqlx internals on the wire.
+		.map_err(|err| {
+			tracing::error!("outbox read failed: {err}");
+			Status::unavailable("internal error")
+		})?;
 
 		// `next_position` advances to the last row served, or stays put if none matched.
 		let next_position = rows.last().map(|r| r.position).unwrap_or(req.after_position);
@@ -136,15 +142,6 @@ fn kind_to_proto(kind: &str) -> Kind {
 fn bearer_token<T>(request: &Request<T>) -> Option<String> {
 	let value = request.metadata().get("authorization")?.to_str().ok()?;
 	value.strip_prefix("Bearer ").map(str::to_owned)
-}
-
-/// Length-aware constant-time compare, so token verification doesn't leak length or
-/// content via timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-	if a.len() != b.len() {
-		return false;
-	}
-	a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
