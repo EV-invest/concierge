@@ -133,9 +133,43 @@ async fn run(config: Config) -> anyhow::Result<()> {
 		.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users, admins, platform_repo))))
 		.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
 		.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
-		.serve(config.bind_addr)
+		.serve_with_shutdown(config.bind_addr, await_signal())
 		.await
 		.context("concierge gRPC server error")
+}
+
+/// Resolve on SIGTERM or ctrl-c so the server drains in-flight RPCs instead of
+/// dropping them (banking's `await_signal`, scaled down to the one listener this
+/// plane runs). If a listener can't be installed, never resolve — the server then
+/// runs until the process is killed, exactly the pre-graceful behaviour.
+async fn await_signal() {
+	#[cfg(unix)]
+	{
+		use tokio::signal::unix::{SignalKind, signal};
+		match signal(SignalKind::terminate()) {
+			Ok(mut term) => {
+				tokio::select! {
+					result = tokio::signal::ctrl_c() => {
+						if let Err(err) = result {
+							tracing::error!("failed to listen for ctrl_c: {err}");
+							std::future::pending::<()>().await;
+						}
+					},
+					_ = term.recv() => {},
+				}
+			}
+			Err(err) => {
+				tracing::error!("failed to install SIGTERM handler: {err}");
+				std::future::pending::<()>().await;
+			}
+		}
+	}
+	#[cfg(not(unix))]
+	if let Err(err) = tokio::signal::ctrl_c().await {
+		tracing::error!("failed to listen for ctrl_c: {err}");
+		std::future::pending::<()>().await;
+	}
+	tracing::info!("shutdown signal received — draining");
 }
 
 /// Liveness probe for the gRPC surface.

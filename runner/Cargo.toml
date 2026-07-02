@@ -28,7 +28,7 @@ evconcierge_auth.workspace = true
 evconcierge_contracts.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "migrate"] }
 subtle.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tonic.workspace = true
 tonic-web.workspace = true
 tower.workspace = true
