@@ -1,25 +1,23 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    v_flakes.url = "github:valeratrades/v_flakes?ref=v1.6";
+    v_flakes.inputs.nixpkgs.follows = "nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
     pre-commit-hooks.url = "github:cachix/git-hooks.nix";
+    pre-commit-hooks.inputs.nixpkgs.follows = "nixpkgs";
   };
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, pre-commit-hooks }:
+  outputs = { self, nixpkgs, v_flakes, flake-utils, pre-commit-hooks }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
-          inherit system overlays;
+          inherit system;
           allowUnfree = true;
         };
-        # NB: can't load rust-bin from nightly.latest, as there are weak guarantees
-        # of which components will be available on each day.
-        rust = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
-          extensions = [ "rust-src" "rust-analyzer" "rust-docs" "rustc-codegen-cranelift-preview" ];
-          targets = [ "wasm32-unknown-unknown" ];
-        });
+        # Canonical toolchain pinned in v_flakes — byte-identical across repos, so
+        # the nix store dedups it and sccache cross-references compilations.
+        rust = v_flakes.rs.default_nightly system;
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
           hooks = {
@@ -140,9 +138,7 @@
             env.RUST_LIB_BACKTRACE = 0;
             env.PROTOC = "${pkgs.protobuf}/bin/protoc";
             env.DYLD_FALLBACK_LIBRARY_PATH = "${rust}/lib";
-            # shared compile cache across builds; incremental off (incompatible with sccache)
             env.RUSTC_WRAPPER = "sccache";
-            env.CARGO_INCREMENTAL = "0";
           };
       }
     );
