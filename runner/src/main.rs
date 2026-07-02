@@ -76,6 +76,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// (called from `Exchange`/`Refresh`), and the directory keeps the receiver and
 	// drains it against Postgres — provisioning/looking-up/revoking the matching user.
 	let auth_config = AuthConfig::from_env().context("failed to load auth configuration")?;
+	// The inbound verifier must expect exactly what issuance stamps, so read the
+	// issuer/audience off the loaded (env-resolved, plane-asserted) `auth_config`
+	// before it moves into the service — never re-read the env with copied defaults.
+	let issuer = auth_config.issuer.clone();
+	let audiences = auth_config.client_audience.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
 	let (provisioner, provision_rx) = provisioner_channel();
 	tokio::spawn(directory::run_provisioner(provision_rx, users.clone()));
 	let auth_service = AuthService::try_new(auth_config, provisioner).await.context("failed to build the auth service")?;
@@ -84,12 +89,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// Built lazily so boot does not block on a self-dial; the first verify warms the
 	// cache. With no signing key, the served JWKS is empty and every inbound verify
 	// fails closed (`UnknownKid`/`JwksFetch` → UNAUTHENTICATED/UNAVAILABLE), so no
-	// directory/admin mutation can run unauthenticated.
+	// directory/admin mutation can run unauthenticated. The JWKS is dialed at an
+	// override env, else this plane's own bind address (it serves its own JWKS
+	// in-process).
 	let verifier_config = VerifierConfig {
-		issuer: auth_config_issuer(),
-		audiences: client_audiences(),
+		issuer,
+		audiences,
 		allowed_types: vec![evconcierge_auth::TokenType::Access],
-		jwks_grpc_endpoint: jwks_grpc_endpoint(&config.bind_addr),
+		jwks_grpc_endpoint: std::env::var("AUTH_JWKS_GRPC_ENDPOINT").unwrap_or_else(|_| format!("http://{}", config.bind_addr)),
 	};
 	verifier_config.assert_plane().context("verifier config carries a cross-plane identity")?;
 	let verifier = Verifier::try_new(verifier_config).context("failed to build the inbound token verifier")?;
@@ -129,24 +136,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
 		.serve(config.bind_addr)
 		.await
 		.context("concierge gRPC server error")
-}
-
-/// The plane's issuer, read with the same default `evconcierge_auth` uses, so the
-/// inbound verifier expects exactly what issuance stamps.
-fn auth_config_issuer() -> String {
-	std::env::var("AUTH_ISSUER").unwrap_or_else(|_| "https://auth.concierge.ev".to_string())
-}
-
-/// The client audience(s) the inbound choke point accepts — user access tokens only.
-fn client_audiences() -> Vec<String> {
-	let raw = std::env::var("AUTH_CLIENT_AUDIENCE").unwrap_or_else(|_| "concierge".to_string());
-	raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
-}
-
-/// Where the inbound verifier dials the `Jwks` RPC: an override env, else this plane's
-/// own bind address (it serves its own JWKS in the same process).
-fn jwks_grpc_endpoint(bind_addr: &std::net::SocketAddr) -> String {
-	std::env::var("AUTH_JWKS_GRPC_ENDPOINT").unwrap_or_else(|_| format!("http://{bind_addr}"))
 }
 
 /// Liveness probe for the gRPC surface.
