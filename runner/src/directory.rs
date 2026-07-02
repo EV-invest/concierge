@@ -233,7 +233,7 @@ async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand) 
 		}
 		ProvisionCommand::Lookup { user_id } => {
 			let id = parse_id(&user_id)?;
-			let user = users.find_by_id(id).await.map_err(to_auth)?.ok_or_else(|| AuthError::Provider("unknown user".into()))?;
+			let user = users.find_by_id(id).await.map_err(to_auth)?.ok_or_else(|| AuthError::Directory("unknown user".into()))?;
 			Ok(summary(&user))
 		}
 		ProvisionCommand::RevokeAll { user_id } => {
@@ -255,7 +255,7 @@ fn summary(user: &User) -> ProvisionedUser {
 }
 
 fn parse_id(raw: &str) -> Result<UserId, AuthError> {
-	Uuid::parse_str(raw).map(UserId::from_raw).map_err(|_| AuthError::Provider("invalid user id".into()))
+	Uuid::parse_str(raw).map(UserId::from_raw).map_err(|_| AuthError::Directory("invalid user id".into()))
 }
 
 fn invalid_identity(_: DomainError) -> AuthError {
@@ -266,6 +266,9 @@ fn to_auth(err: DomainError) -> AuthError {
 	match err {
 		// A control-plane failure is operational (maps to gRPC UNAVAILABLE upstream).
 		DomainError::Repository(_) => AuthError::Unavailable,
-		other => AuthError::Provider(other.to_string()),
+		// A directory outcome (NotFound/Conflict/Validation) is first-party — never
+		// rendered as "identity provider rejected the request" (Google is not to blame
+		// for a directory miss).
+		other => AuthError::Directory(other.to_string()),
 	}
 }
