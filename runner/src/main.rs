@@ -3,6 +3,7 @@
 //! `concierge` is the identity/platform plane (a sibling to the banking money
 //! plane). One runner binary mounts its internal modules — `auth` (token issuance,
 //! served by [`evconcierge_auth::AuthService`]), `directory` (user profile/admin),
+//! `bridge` (the cross-plane producer), `platform` (platform/cabinet config),
 //! `notification`, and `log` — on a single tonic server. It opens the Postgres
 //! control plane and applies its migrations on boot (the identity records + the
 //! cross-plane bridge outbox). Notifications and logs are DEFERRED stubs. There is

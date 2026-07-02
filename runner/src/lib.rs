@@ -7,7 +7,11 @@
 //! Hexagonal layout over the shared `domain`:
 //!   directory       — the user/profile gRPC service + the auth→directory provisioner loop
 //!   bridge          — the cross-plane (identity→money) producer over the user_outbox
-//!   infrastructure  — driven adapters (Postgres control plane + the user directory repo)
+//!   platform        — the platform/cabinet config service (maintenance · announcement · flags)
+//!   authz           — the shared RBAC gate (persisted role + status/revocation enforcement)
+//!   ports           — the driven-port traits (`UserDirectoryRepository`, `PlatformConfigRepository`)
+//!   infrastructure  — driven adapters (Postgres control plane + the port implementations)
+//!   support         — cross-module gRPC plumbing (domain-error → Status mapping)
 //!   notification/log — DEFERRED stubs (no platform messaging/audit yet)
 
 pub mod authz;
