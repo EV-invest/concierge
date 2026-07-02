@@ -189,6 +189,41 @@ async fn unconfigured_bridge_fails_closed() {
 	assert_eq!(err.code(), tonic::Code::Unavailable, "no configured token ⇒ never serve the outbox");
 }
 
+#[tokio::test]
+async fn outbox_append_serializes_position_with_commit_order() {
+	let Some((repo, pool)) = setup().await else {
+		return;
+	};
+	let repo = std::sync::Arc::new(repo);
+	let user = repo.provision(unique_subject(), Email::parse("lock@example.com").unwrap(), true).await.unwrap();
+
+	// Hold the outbox advisory lock in an open transaction — mimicking another writer
+	// mid-append. This is the mechanism that forces `position` (BIGSERIAL) assignment order
+	// to match COMMIT order, so the banking high-water cursor can never skip a committed row.
+	let mut holder = pool.begin().await.unwrap();
+	sqlx::query("SELECT pg_advisory_xact_lock($1)")
+		.bind(concierge::infrastructure::users::USER_OUTBOX_ADVISORY_LOCK)
+		.execute(&mut *holder)
+		.await
+		.unwrap();
+
+	// A real mutation that must append an outbox row cannot proceed while the lock is held.
+	let writer = repo.clone();
+	let id = user.id();
+	let mutation = tokio::spawn(async move { writer.set_kyc_level(id, 1).await });
+
+	tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+	assert!(!mutation.is_finished(), "the outbox append must block while the lock is held elsewhere");
+
+	// Releasing the holder lets the blocked writer acquire the lock and commit.
+	holder.rollback().await.unwrap();
+	tokio::time::timeout(std::time::Duration::from_secs(10), mutation)
+		.await
+		.expect("the blocked writer completes once the lock is free")
+		.expect("join the mutation task")
+		.expect("set_kyc_level succeeds");
+}
+
 async fn first_position_for(pool: &PgPool, user_id: Uuid) -> i64 {
 	sqlx::query_scalar::<_, i64>("SELECT MIN(position) FROM user_outbox WHERE user_id = $1")
 		.bind(user_id)

@@ -18,6 +18,12 @@ use domain::{
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+/// Stable, arbitrary key for the transaction-scoped advisory lock that serializes
+/// `user_outbox` appends (`pg_advisory_xact_lock`). Every path that appends an outbox
+/// row MUST take this lock, so `position` (BIGSERIAL) order equals commit order — see
+/// [`drain_outbox`]. Exported so integration tests can assert the contention.
+pub const USER_OUTBOX_ADVISORY_LOCK: i64 = 0x4f55_5442_4f58; // "OUTBOX"
+
 pub struct PgUsers {
 	pool: PgPool,
 }
@@ -103,6 +109,16 @@ pub struct AdminUserRow {
 	pub role: String,
 	pub token_version: i64,
 	pub created_at: i64,
+}
+
+/// The fields the admin authz gate decides on: the persisted access role, the account
+/// status (a suspended principal is denied even while an unexpired token still verifies),
+/// and the authoritative `token_version` (a "revoke all" bumps it, so a token minted
+/// under an older version is rejected at the privileged surface at once).
+pub struct AuthzRecord {
+	pub role: Role,
+	pub status: UserStatus,
+	pub token_version: u64,
 }
 
 fn repo_err(err: sqlx::Error) -> DomainError {
@@ -239,6 +255,26 @@ impl PgUsers {
 		raw.map(|r| Role::parse(&r)).transpose()
 	}
 
+	/// The role + status + authoritative `token_version` for a user id, read together so
+	/// the admin authz gate can deny a suspended or revoked principal at request time —
+	/// the stateless token verifier can't see either (it validates only the signed
+	/// claims). `None` when the user does not exist.
+	pub async fn authz_record(&self, id: UserId) -> Result<Option<AuthzRecord>, DomainError> {
+		let row: Option<(String, String, i64)> = sqlx::query_as("SELECT role, status, token_version FROM users WHERE id = $1")
+			.bind(id.raw())
+			.fetch_optional(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		row.map(|(role, status, token_version)| {
+			Ok(AuthzRecord {
+				role: Role::parse(&role)?,
+				status: UserStatus::parse(&status)?,
+				token_version: token_version as u64,
+			})
+		})
+		.transpose()
+	}
+
 	/// The operator console's user list: filtered + paginated summaries plus the total
 	/// matching the filters. Empty-string filters are treated as "no filter" so the
 	/// query stays a single static statement (sqlx 0.9 needs a `&'static str`).
@@ -333,8 +369,28 @@ async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(), DomainEr
 /// all. Each row carries the bridge `Kind`, the per-user `sequence` (the user's
 /// `row_version`), and the identity snapshot the banking consumer materializes from.
 async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Result<(), DomainError> {
+	let events = user.drain_events();
+	if events.is_empty() {
+		return Ok(());
+	}
+
+	// Serialize outbox appends against COMMIT order. `position` is a BIGSERIAL assigned at
+	// INSERT time, but two concurrent transactions can be assigned positions in one order
+	// and commit in the opposite order. The banking bridge consumer advances a high-water
+	// `position` cursor (`WHERE position > after_position`), so a lower-positioned row that
+	// commits AFTER the cursor has already passed a higher one is skipped forever — a
+	// dropped SUSPENDED/SESSIONS_REVOKED would leave a revoked user un-frozen on the money
+	// plane. Holding this transaction-scoped advisory lock from before the first INSERT
+	// (which assigns the BIGSERIAL) until commit makes position order equal commit order,
+	// so the cursor can never skip a committed event.
+	sqlx::query("SELECT pg_advisory_xact_lock($1)")
+		.bind(USER_OUTBOX_ADVISORY_LOCK)
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+
 	let occurred_at = unix_now();
-	for event in user.drain_events() {
+	for event in events {
 		sqlx::query(
 			"INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject, email, email_verified, token_version, role) \
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",

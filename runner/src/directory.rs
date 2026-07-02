@@ -22,7 +22,7 @@ use std::sync::Arc;
 use domain::{
 	authz::{Permission, Role},
 	error::DomainError,
-	users::{AuthSubject, Email, ProfileFields, User, UserId},
+	users::{AuthSubject, Email, ProfileFields, User, UserId, UserStatus},
 };
 use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser, claims_of};
 use evconcierge_contracts::concierge::v1::{
@@ -51,15 +51,32 @@ impl Directory {
 	}
 }
 
-/// The authenticated caller's own user id (from the access-token `sub`). A self-service
-/// RPC acts *as a user*, so only a `typ=access` token qualifies — a service token is
-/// rejected here regardless of whether its `sub` parses as a UUID.
-fn caller_id<T>(request: &Request<T>) -> Result<UserId, Status> {
-	let claims = claims_of(request).ok_or_else(|| Status::unauthenticated("missing claims"))?;
-	if !claims.is_access() {
-		return Err(Status::permission_denied("access token required"));
+impl Directory {
+	/// The authenticated caller's own user id (from the access-token `sub`), gated on live
+	/// revocation state. A self-service RPC acts *as a user*, so only a `typ=access` token
+	/// qualifies (a service token is rejected regardless of whether its `sub` parses); and
+	/// the caller must be an active user whose `token_version` is not below the persisted
+	/// floor. This mirrors the admin gate ([`crate::authz`]) for the self-service surface,
+	/// so a suspended or revoked user cannot keep reading/editing their profile for the
+	/// remaining access-token TTL (the stateless verifier can't see status/revocation).
+	async fn active_caller_id<T>(&self, request: &Request<T>) -> Result<UserId, Status> {
+		// Clone the small facts out so the `Claims` borrow ends before the async lookup.
+		let (id, token_version) = {
+			let claims = claims_of(request).ok_or_else(|| Status::unauthenticated("missing claims"))?;
+			if !claims.is_access() {
+				return Err(Status::permission_denied("access token required"));
+			}
+			(parse_user_id(&claims.sub)?, claims.token_version)
+		};
+		let record = self.users.authz_record(id).await.map_err(map_err)?.ok_or_else(|| Status::not_found("user"))?;
+		if record.status == UserStatus::Disabled {
+			return Err(Status::permission_denied("user is disabled"));
+		}
+		if token_version < record.token_version {
+			return Err(Status::unauthenticated("tokens revoked"));
+		}
+		Ok(id)
 	}
-	parse_user_id(&claims.sub)
 }
 
 /// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix,
@@ -90,13 +107,13 @@ fn map_err(err: DomainError) -> Status {
 #[tonic::async_trait]
 impl UserDirectory for Directory {
 	async fn get_me(&self, request: Request<GetMeRequest>) -> Result<Response<UserProfile>, Status> {
-		let id = caller_id(&request)?;
+		let id = self.active_caller_id(&request).await?;
 		let user = self.users.find_by_id(id).await.map_err(map_err)?.ok_or_else(|| Status::not_found("user"))?;
 		Ok(Response::new(user_to_proto(&user)))
 	}
 
 	async fn update_profile(&self, request: Request<UpdateProfileRequest>) -> Result<Response<UserProfile>, Status> {
-		let id = caller_id(&request)?;
+		let id = self.active_caller_id(&request).await?;
 		let req = request.into_inner();
 		let user = self
 			.users
