@@ -17,6 +17,9 @@
 use ev::architecture::{AggregateRoot, DomainEvent, EmitsEvents, Entity, Id};
 use serde::{Deserialize, Serialize};
 
+// Re-exported so existing `domain::users::AuthSubject` paths keep working; the type
+// itself lives in the `auth` bounded context (mirroring banking).
+pub use crate::auth::AuthSubject;
 use crate::{authz::Role, error::DomainError};
 
 /// The platform's canonical user id (a UUID). **This** value is the `sub` of the
@@ -24,39 +27,6 @@ use crate::{authz::Role, error::DomainError};
 pub type UserId = Id<UserTag>;
 /// Phantom tag making [`UserId`] a distinct, incompatible identity type.
 pub struct UserTag;
-
-/// The immutable external identity asserted by the identity provider (Google's
-/// `sub` claim). It is the stable natural key both planes provision a [`User`]
-/// against: never reused, never changing for a person, and distinct from the plane's
-/// own canonical [`UserId`] (which is what the first-party JWT carries as its `sub`).
-///
-/// Serializes transparently as the bare string so the wire/storage shape is just the
-/// subject value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AuthSubject(String);
-
-impl AuthSubject {
-	/// Parse a provider subject, rejecting an empty value. Trimmed but otherwise
-	/// opaque — the IdP owns its format.
-	pub fn parse(raw: &str) -> Result<Self, DomainError> {
-		let trimmed = raw.trim();
-		if trimmed.is_empty() {
-			return Err(DomainError::Validation("auth subject must not be empty".into()));
-		}
-		Ok(Self(trimmed.to_owned()))
-	}
-
-	pub fn as_str(&self) -> &str {
-		&self.0
-	}
-}
-
-impl core::fmt::Display for AuthSubject {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		f.write_str(&self.0)
-	}
-}
 
 /// A user email. Parse-don't-validate: lowercased and trimmed on construction, so
 /// equality and the storage form are normalized. Deliberately **not** a unique key —

@@ -10,9 +10,11 @@
 //! The context module is a placeholder — value objects and ports land there as
 //! real features arrive.
 
-pub mod error;
+pub mod auth;
 
 pub mod authz;
+
+pub mod error;
 
 pub mod users;
 
