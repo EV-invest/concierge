@@ -19,19 +19,19 @@ use evconcierge_contracts::concierge::v1::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::infrastructure::{platform::PgPlatform, users::PgUsers};
+use crate::ports::{PlatformConfigRepository, UserDirectoryRepository};
 
 /// The platform-config service. Cheaply cloneable (repos + allowlist behind `Arc`s).
 /// Holds the user repo + admin allowlist only to reuse the shared authz gate.
 #[derive(Clone)]
 pub struct Platform {
-	users: Arc<PgUsers>,
+	users: Arc<dyn UserDirectoryRepository>,
 	admins: Arc<[String]>,
-	config: Arc<PgPlatform>,
+	config: Arc<dyn PlatformConfigRepository>,
 }
 
 impl Platform {
-	pub fn new(users: Arc<PgUsers>, admins: Arc<[String]>, config: Arc<PgPlatform>) -> Self {
+	pub fn new(users: Arc<dyn UserDirectoryRepository>, admins: Arc<[String]>, config: Arc<dyn PlatformConfigRepository>) -> Self {
 		Self { users, admins, config }
 	}
 
@@ -60,25 +60,25 @@ impl Platform {
 #[tonic::async_trait]
 impl PlatformServiceRpc for Platform {
 	async fn get_platform_config(&self, request: Request<GetPlatformConfigRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(&self.users, &self.admins, &request, Permission::PlatformRead).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.admins, &request, Permission::PlatformRead).await?;
 		Ok(Response::new(self.snapshot().await?))
 	}
 
 	async fn set_maintenance_mode(&self, request: Request<SetMaintenanceModeRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(&self.users, &self.admins, &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.admins, &request, Permission::PlatformManage).await?;
 		self.config.set_maintenance(request.get_ref().enabled).await.map_err(map_err)?;
 		Ok(Response::new(self.snapshot().await?))
 	}
 
 	async fn set_announcement(&self, request: Request<SetAnnouncementRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(&self.users, &self.admins, &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.admins, &request, Permission::PlatformManage).await?;
 		let req = request.into_inner();
 		self.config.set_announcement(&req.title, &req.body, req.active).await.map_err(map_err)?;
 		Ok(Response::new(self.snapshot().await?))
 	}
 
 	async fn set_feature_flag(&self, request: Request<SetFeatureFlagRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(&self.users, &self.admins, &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.admins, &request, Permission::PlatformManage).await?;
 		let req = request.into_inner();
 		if req.key.trim().is_empty() {
 			return Err(Status::invalid_argument("flag key required"));

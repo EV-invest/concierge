@@ -1,6 +1,7 @@
 //! `directory` module — the identity plane's user/profile control surface.
 //!
-//! Two faces over one Postgres-backed [`PgUsers`] repository:
+//! Two faces over one [`UserDirectoryRepository`] port (Postgres-backed in
+//! production):
 //!
 //! - The [`UserDirectory`] gRPC service: `GetMe`/`UpdateProfile` (self-service on the
 //!   caller's own `sub`) and `RevokeTokens`/`DisableUser`/`ReinstateUser`/`SetKycLevel`
@@ -34,19 +35,19 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::infrastructure::users::{AdminUserRow, PgUsers};
+use crate::{infrastructure::users::AdminUserRow, ports::UserDirectoryRepository};
 
-/// The user directory/profile service, backed by Postgres. Cheaply cloneable (the repo
-/// and allowlist are behind `Arc`s). `admins` is the config allowlist of canonical user
-/// ids permitted to call the admin RPCs.
+/// The user directory/profile service, backed by the [`UserDirectoryRepository`]
+/// port. Cheaply cloneable (the repo and allowlist are behind `Arc`s). `admins` is
+/// the config allowlist of canonical user ids permitted to call the admin RPCs.
 #[derive(Clone)]
 pub struct Directory {
-	users: Arc<PgUsers>,
+	users: Arc<dyn UserDirectoryRepository>,
 	admins: Arc<[String]>,
 }
 
 impl Directory {
-	pub fn new(users: Arc<PgUsers>, admins: Arc<[String]>) -> Self {
+	pub fn new(users: Arc<dyn UserDirectoryRepository>, admins: Arc<[String]>) -> Self {
 		Self { users, admins }
 	}
 }
@@ -82,7 +83,7 @@ impl Directory {
 /// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix,
 /// resolved from the caller's persisted role (with the `ADMIN_SUBJECTS` break-glass).
 async fn require_permission<T>(directory: &Directory, request: &Request<T>, permission: Permission) -> Result<(), Status> {
-	crate::authz::require_permission(&directory.users, &directory.admins, request, permission).await
+	crate::authz::require_permission(directory.users.as_ref(), &directory.admins, request, permission).await
 }
 
 fn parse_user_id(raw: &str) -> Result<UserId, Status> {
@@ -235,7 +236,7 @@ fn summary_to_proto(row: AdminUserRow) -> AdminUserSummary {
 
 /// Drain provisioning requests from the auth task until the channel closes — the
 /// receiving end of the [`Provisioner`](evconcierge_auth::Provisioner) channel.
-pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<PgUsers>) {
+pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<dyn UserDirectoryRepository>) {
 	while let Some(request) = rx.recv().await {
 		let result = handle(users.as_ref(), request.command).await;
 		// The auth task may have given up; a dropped responder is not our problem.
@@ -243,7 +244,7 @@ pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Ar
 	}
 }
 
-async fn handle(users: &PgUsers, command: ProvisionCommand) -> Result<ProvisionedUser, AuthError> {
+async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand) -> Result<ProvisionedUser, AuthError> {
 	match command {
 		ProvisionCommand::Provision {
 			auth_subject,

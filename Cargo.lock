@@ -581,6 +581,7 @@ name = "concierge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "domain",
  "dotenvy",
  "ev_lib",

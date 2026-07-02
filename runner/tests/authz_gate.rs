@@ -9,6 +9,7 @@
 use concierge::{
 	authz::require_permission,
 	infrastructure::{db, users::PgUsers},
+	ports::UserDirectoryRepository,
 };
 use domain::{
 	authz::{Permission, Role},

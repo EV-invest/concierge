@@ -23,11 +23,11 @@ use evconcierge_auth::{Claims, claims_of};
 use tonic::{Request, Status};
 use uuid::Uuid;
 
-use crate::infrastructure::users::PgUsers;
+use crate::ports::UserDirectoryRepository;
 
 /// Authorize `request` for `permission`, or return a gRPC `PermissionDenied`/
 /// `Unauthenticated`.
-pub async fn require_permission<T>(users: &PgUsers, admins: &[String], request: &Request<T>, permission: Permission) -> Result<(), Status> {
+pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, admins: &[String], request: &Request<T>, permission: Permission) -> Result<(), Status> {
 	// Clone the small facts out so the `Claims` borrow of `request` ends before the
 	// async `authz_record` lookup. `token_version` is the version the token was minted
 	// under; the persisted value is the authoritative floor.

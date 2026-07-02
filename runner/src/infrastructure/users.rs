@@ -11,14 +11,17 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use domain::{
-	architecture::EmitsEvents,
+	architecture::{EmitsEvents, Reader, Repository},
 	authz::Role,
 	error::DomainError,
 	users::{AuthSubject, Email, ProfileFields, User, UserId, UserStatus},
 };
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
+
+use crate::ports::UserDirectoryRepository;
 
 /// Stable, arbitrary key for the transaction-scoped advisory lock that serializes
 /// `user_outbox` appends (`pg_advisory_xact_lock`). Every path that appends an outbox
@@ -34,6 +37,14 @@ impl PgUsers {
 	pub fn new(pool: PgPool) -> Self {
 		Self { pool }
 	}
+}
+
+impl Repository for PgUsers {
+	type Aggregate = User;
+}
+
+impl Reader for PgUsers {
+	type Aggregate = User;
 }
 
 #[derive(sqlx::FromRow)]
@@ -127,8 +138,9 @@ fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
 }
 
-impl PgUsers {
-	pub async fn find_by_id(&self, id: UserId) -> Result<Option<User>, DomainError> {
+#[async_trait]
+impl UserDirectoryRepository for PgUsers {
+	async fn find_by_id(&self, id: UserId) -> Result<Option<User>, DomainError> {
 		let row = sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1"))
 			.bind(id.raw())
 			.fetch_optional(&self.pool)
@@ -140,7 +152,7 @@ impl PgUsers {
 	/// Upsert the user behind a verified identity. First sign-in inserts (emitting
 	/// `Created`); a repeat sign-in applies the IdP's current email. Idempotent under a
 	/// concurrent first-login race via `ON CONFLICT DO NOTHING` + re-read.
-	pub async fn provision(&self, subject: AuthSubject, email: Email, email_verified: bool) -> Result<User, DomainError> {
+	async fn provision(&self, subject: AuthSubject, email: Email, email_verified: bool) -> Result<User, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 
 		let existing = sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE auth_subject = $1 FOR UPDATE"))
@@ -199,69 +211,53 @@ impl PgUsers {
 		Ok(user)
 	}
 
-	/// Full-replace the caller's editable profile fields.
-	pub async fn update_profile(&self, id: UserId, fields: ProfileFields) -> Result<User, DomainError> {
+	async fn update_profile(&self, id: UserId, fields: ProfileFields) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.update_profile(fields);
 		})
 		.await
 	}
 
-	/// Bump the user's authoritative `token_version` ("revoke all"); emits SESSIONS_REVOKED.
-	pub async fn revoke_tokens(&self, id: UserId) -> Result<User, DomainError> {
+	async fn revoke_tokens(&self, id: UserId) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.revoke_tokens();
 		})
 		.await
 	}
 
-	/// Disable a user (freeze sign-in/refresh); emits SUSPENDED.
-	pub async fn disable_user(&self, id: UserId) -> Result<User, DomainError> {
+	async fn disable_user(&self, id: UserId) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.disable();
 		})
 		.await
 	}
 
-	/// Re-enable a disabled user; emits REINSTATED.
-	pub async fn enable_user(&self, id: UserId) -> Result<User, DomainError> {
+	async fn enable_user(&self, id: UserId) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.enable();
 		})
 		.await
 	}
 
-	/// Set a user's KYC level; emits KYC_CHANGED.
-	pub async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError> {
+	async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.set_kyc_level(level);
 		})
 		.await
 	}
 
-	/// Set a user's platform access role; emits ROLE_CHANGED across the bridge.
-	pub async fn set_role(&self, id: UserId, role: Role) -> Result<User, DomainError> {
+	async fn set_role(&self, id: UserId, role: Role) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.set_role(role);
 		})
 		.await
 	}
 
-	/// The persisted role for a user id, if the user exists. Used by the authz gate.
-	pub async fn role_of(&self, id: UserId) -> Result<Option<Role>, DomainError> {
-		let raw: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
-			.bind(id.raw())
-			.fetch_optional(&self.pool)
-			.await
-			.map_err(repo_err)?;
-		raw.map(|r| Role::parse(&r)).transpose()
-	}
-
 	/// The role + status + authoritative `token_version` for a user id, read together so
 	/// the admin authz gate can deny a suspended or revoked principal at request time —
 	/// the stateless token verifier can't see either (it validates only the signed
 	/// claims). `None` when the user does not exist.
-	pub async fn authz_record(&self, id: UserId) -> Result<Option<AuthzRecord>, DomainError> {
+	async fn authz_record(&self, id: UserId) -> Result<Option<AuthzRecord>, DomainError> {
 		let row: Option<(String, String, i64)> = sqlx::query_as("SELECT role, status, token_version FROM users WHERE id = $1")
 			.bind(id.raw())
 			.fetch_optional(&self.pool)
@@ -277,10 +273,9 @@ impl PgUsers {
 		.transpose()
 	}
 
-	/// The operator console's user list: filtered + paginated summaries plus the total
-	/// matching the filters. Empty-string filters are treated as "no filter" so the
-	/// query stays a single static statement (sqlx 0.9 needs a `&'static str`).
-	pub async fn list(&self, query: &str, role: &str, status: &str, limit: i64, offset: i64) -> Result<(Vec<AdminUserRow>, i64), DomainError> {
+	/// Empty-string filters are treated as "no filter" so the query stays a single
+	/// static statement (sqlx 0.9 needs a `&'static str`).
+	async fn list(&self, query: &str, role: &str, status: &str, limit: i64, offset: i64) -> Result<(Vec<AdminUserRow>, i64), DomainError> {
 		let rows = sqlx::query_as::<_, AdminUserRow>(
 			"SELECT id, email, status, kyc_level, role, token_version, \
 			 EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at \
@@ -314,7 +309,9 @@ impl PgUsers {
 
 		Ok((rows, total))
 	}
+}
 
+impl PgUsers {
 	/// Load-mutate-persist in one transaction: read the row `FOR UPDATE`, run the
 	/// aggregate command, write the row back, and drain its events to the outbox.
 	async fn mutate(&self, id: UserId, command: impl FnOnce(&mut User)) -> Result<User, DomainError> {

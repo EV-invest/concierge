@@ -66,8 +66,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	tracing::info!(bind = %config.bind_addr, "concierge listening");
 
 	// The user directory repository: the only writer of the identity control plane and
-	// the cross-plane outbox. Shared by the directory service and the provisioner loop.
-	let users = std::sync::Arc::new(infrastructure::users::PgUsers::new(pool.clone()));
+	// the cross-plane outbox. Shared by the directory service and the provisioner loop,
+	// both of which see only the port.
+	let users: std::sync::Arc<dyn concierge::ports::UserDirectoryRepository> = std::sync::Arc::new(infrastructure::users::PgUsers::new(pool.clone()));
 
 	// Auth issuance. `AuthConfig` is host-only (signing key, Google client, refresh
 	// TTLs); with no `AUTH_SIGNING_KEY_PEM` configured the service runs inert. The
@@ -113,7 +114,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// The admin allowlist is shared by the directory and platform services (the
 	// break-glass superadmin bootstrap for the RBAC gate).
 	let admins: std::sync::Arc<[String]> = config.admin_subjects.into();
-	let platform_repo = std::sync::Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
+	let platform_repo: std::sync::Arc<dyn concierge::ports::PlatformConfigRepository> = std::sync::Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
 
 	Server::builder()
 		.accept_http1(true)
