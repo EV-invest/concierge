@@ -3,8 +3,9 @@
 //! Each mutating method opens one transaction, writes the user row, and appends the
 //! aggregate's drained lifecycle events to `user_outbox` in that same transaction —
 //! the single ACID point that keeps the cross-plane bridge consistent with the
-//! identity record. Each outbox row is stamped with the new `row_version` as the
-//! bridge `sequence` and a snapshot of the identity payload the banking consumer needs.
+//! identity record. Each outbox row is stamped with the `row_version` at which its
+//! event was emitted as the bridge `sequence`, plus a snapshot of the identity
+//! payload the banking consumer needs.
 //! Runtime queries (`sqlx::query*`, not the compile-time macros) keep `cargo build`
 //! independent of a live database, mirroring banking.
 
@@ -367,8 +368,9 @@ async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(), DomainEr
 
 /// Drain the aggregate's pending lifecycle events into `user_outbox` on the open
 /// transaction, so identity state and the cross-plane events commit together or not at
-/// all. Each row carries the bridge `Kind`, the per-user `sequence` (the user's
-/// `row_version`), and the identity snapshot the banking consumer materializes from.
+/// all. Each row carries the bridge `Kind`, the per-user `sequence` (the `row_version`
+/// at which the event was emitted), and the identity snapshot the banking consumer
+/// materializes from.
 async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Result<(), DomainError> {
 	let events = user.drain_events();
 	if events.is_empty() {
@@ -391,7 +393,14 @@ async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Result<(), Do
 		.map_err(repo_err)?;
 
 	let occurred_at = unix_now();
-	for event in events {
+	// Every emit path bumps `row_version` exactly once per event (`bump_and_emit`), so
+	// the i-th of n drained events was minted at `row_version - (n - 1 - i)`. Stamping
+	// the FINAL `row_version` on every row would give a multi-event command duplicate
+	// sequences, and the banking consumer's per-user monotonic gate would drop every
+	// event after the first — losing a SUSPENDED/SESSIONS_REVOKED.
+	let count = events.len() as u64;
+	for (i, event) in events.into_iter().enumerate() {
+		let sequence = user.row_version() - (count - 1 - i as u64);
 		sqlx::query(
 			"INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject, email, email_verified, token_version, role) \
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
@@ -400,7 +409,7 @@ async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Result<(), Do
 		.bind(event.kind())
 		.bind(user.kyc_level() as i32)
 		.bind(occurred_at)
-		.bind(user.row_version() as i64)
+		.bind(sequence as i64)
 		.bind(user.auth_subject().as_str())
 		.bind(user.email().as_str())
 		.bind(user.email_verified())
