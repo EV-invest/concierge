@@ -14,6 +14,12 @@
 //!   This is the only place the auth crate's primitive DTOs become domain value objects,
 //!   so `domain` never depends on `evconcierge_auth` and vice-versa.
 //!
+//! Every role this module RETURNS — provisioner summaries (the issued session's
+//! `UserSummary`), `GetMe`/`GetUser`, `ListUsers` — is the caller's/target's
+//! *effective* role ([`crate::authz::effective_role`]), so `ADMIN_SUBJECTS` break-glass
+//! elevation is visible to the session and the operator console, while the persisted
+//! `users.role` is only ever written by `SetRole` (and is what the bridge mirrors).
+//!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.
 #![allow(clippy::result_large_err)]
@@ -64,6 +70,13 @@ impl Directory {
 		caller.record.ok_or_else(|| Status::not_found("user"))?;
 		Ok(id)
 	}
+
+	/// The role the plane reports for `user`: the persisted role with the
+	/// `ADMIN_SUBJECTS` break-glass elevation applied, so profile/admin reads show the
+	/// same authority the RBAC gate grants.
+	fn effective_role_of(&self, user: &User) -> Role {
+		crate::authz::effective_role(user.role(), &user.id().to_string(), &self.admins)
+	}
 }
 
 /// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix,
@@ -85,7 +98,7 @@ impl UserDirectory for Directory {
 	async fn get_me(&self, request: Request<GetMeRequest>) -> Result<Response<UserProfile>, Status> {
 		let id = self.active_caller_id(&request).await?;
 		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
-		Ok(Response::new(user_to_proto(&user)))
+		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user))))
 	}
 
 	async fn update_profile(&self, request: Request<UpdateProfileRequest>) -> Result<Response<UserProfile>, Status> {
@@ -110,7 +123,7 @@ impl UserDirectory for Directory {
 			)
 			.await
 			.map_err(domain_to_status)?;
-		Ok(Response::new(user_to_proto(&user)))
+		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user))))
 	}
 
 	async fn revoke_tokens(&self, request: Request<RevokeTokensRequest>) -> Result<Response<RevokeTokensResponse>, Status> {
@@ -150,7 +163,17 @@ impl UserDirectory for Directory {
 		let limit = if req.limit == 0 { 50 } else { (req.limit as i64).clamp(1, 200) };
 		let (rows, total) = self.users.list(&req.query, &req.role, &req.status, limit, req.offset as i64).await.map_err(domain_to_status)?;
 		Ok(Response::new(ListUsersResponse {
-			users: rows.into_iter().map(summary_to_proto).collect(),
+			users: rows
+				.into_iter()
+				.map(|row| {
+					let role = match Role::parse(&row.role) {
+						Ok(persisted) => crate::authz::effective_role(persisted, &row.id.to_string(), &self.admins).as_str().to_owned(),
+						// A corrupt stored role must not fail the whole list — surface it verbatim.
+						Err(_) => row.role.clone(),
+					};
+					summary_to_proto(row, role)
+				})
+				.collect(),
 			total: total as u64,
 		}))
 	}
@@ -159,7 +182,7 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Permission::UserRead).await?;
 		let id = parse_user_id(&request.get_ref().user_id)?;
 		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
-		Ok(Response::new(user_to_proto(&user)))
+		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user))))
 	}
 
 	async fn set_role(&self, request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
@@ -174,7 +197,7 @@ impl UserDirectory for Directory {
 	}
 }
 
-fn user_to_proto(user: &User) -> UserProfile {
+fn user_to_proto(user: &User, role: Role) -> UserProfile {
 	UserProfile {
 		user_id: user.id().to_string(),
 		email: user.email().as_str().to_owned(),
@@ -192,18 +215,19 @@ fn user_to_proto(user: &User) -> UserProfile {
 		base_currency: user.base_currency().unwrap_or_default().to_owned(),
 		timezone: user.timezone().unwrap_or_default().to_owned(),
 		kyc_level: user.kyc_level(),
-		role: user.role().as_str().to_owned(),
+		role: role.as_str().to_owned(),
 	}
 }
 
-/// Map an operator-console list row (a lightweight SQL projection) to its wire shape.
-fn summary_to_proto(row: AdminUserRow) -> AdminUserSummary {
+/// Map an operator-console list row (a lightweight SQL projection) to its wire shape;
+/// `role` is the pre-resolved effective role (or the raw stored string on a corrupt row).
+fn summary_to_proto(row: AdminUserRow, role: String) -> AdminUserSummary {
 	AdminUserSummary {
 		user_id: row.id.to_string(),
 		email: row.email.unwrap_or_default(),
 		status: row.status,
 		kyc_level: row.kyc_level as u32,
-		role: row.role,
+		role,
 		token_version: row.token_version as u64,
 		created_at: row.created_at,
 	}
@@ -211,15 +235,19 @@ fn summary_to_proto(row: AdminUserRow) -> AdminUserSummary {
 
 /// Drain provisioning requests from the auth task until the channel closes — the
 /// receiving end of the [`Provisioner`](evconcierge_auth::Provisioner) channel.
-pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<dyn UserDirectoryRepository>) {
+/// `admins` is the break-glass allowlist: the summaries returned here become the
+/// issued session's `UserSummary` (Exchange AND Refresh), so they carry the
+/// effective role and the BFF gates the admin console on the same authority the
+/// RBAC gate grants.
+pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<dyn UserDirectoryRepository>, admins: Arc<[String]>) {
 	while let Some(request) = rx.recv().await {
-		let result = handle(users.as_ref(), request.command).await;
+		let result = handle(users.as_ref(), request.command, &admins).await;
 		// The auth task may have given up; a dropped responder is not our problem.
 		let _ = request.respond_to.send(result);
 	}
 }
 
-async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand) -> Result<ProvisionedUser, AuthError> {
+async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand, admins: &[String]) -> Result<ProvisionedUser, AuthError> {
 	match command {
 		ProvisionCommand::Provision {
 			auth_subject,
@@ -229,28 +257,28 @@ async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand) 
 			let subject = AuthSubject::parse(&auth_subject).map_err(invalid_identity)?;
 			let email = Email::parse(&email).map_err(invalid_identity)?;
 			let user = users.provision(subject, email, email_verified).await.map_err(to_auth)?;
-			Ok(summary(&user))
+			Ok(summary(&user, admins))
 		}
 		ProvisionCommand::Lookup { user_id } => {
 			let id = parse_id(&user_id)?;
 			let user = users.find_by_id(id).await.map_err(to_auth)?.ok_or_else(|| AuthError::Directory("unknown user".into()))?;
-			Ok(summary(&user))
+			Ok(summary(&user, admins))
 		}
 		ProvisionCommand::RevokeAll { user_id } => {
 			let id = parse_id(&user_id)?;
 			let user = users.revoke_tokens(id).await.map_err(to_auth)?;
-			Ok(summary(&user))
+			Ok(summary(&user, admins))
 		}
 	}
 }
 
-fn summary(user: &User) -> ProvisionedUser {
+fn summary(user: &User, admins: &[String]) -> ProvisionedUser {
 	ProvisionedUser {
 		user_id: user.id().to_string(),
 		email: user.email().as_str().to_owned(),
 		status: user.status().as_str().to_owned(),
 		token_version: user.token_version(),
-		role: user.role().as_str().to_owned(),
+		role: crate::authz::effective_role(user.role(), &user.id().to_string(), admins).as_str().to_owned(),
 	}
 }
 

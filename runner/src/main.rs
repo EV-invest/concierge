@@ -82,8 +82,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// before it moves into the service — never re-read the env with copied defaults.
 	let issuer = auth_config.issuer.clone();
 	let audiences = auth_config.client_audience.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
+	// The admin allowlist is shared by the directory and platform services (the
+	// break-glass superadmin bootstrap for the RBAC gate) and by the provisioner loop,
+	// so issued sessions carry the effective role.
+	let admins: std::sync::Arc<[String]> = config.admin_subjects.into();
 	let (provisioner, provision_rx) = provisioner_channel();
-	tokio::spawn(directory::run_provisioner(provision_rx, users.clone()));
+	tokio::spawn(directory::run_provisioner(provision_rx, users.clone(), admins.clone()));
 	let auth_service = AuthService::try_new(auth_config, provisioner).await.context("failed to build the auth service")?;
 
 	// Inbound verification choke point: a `Verifier` over this plane's own `Jwks` RPC.
@@ -119,9 +123,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
 	// a user access token. Unconfigured (`BRIDGE_SERVICE_TOKEN` unset) it fails closed.
 	let bridge = bridge::Bridge::new(pool.clone(), config.bridge_service_token);
 
-	// The admin allowlist is shared by the directory and platform services (the
-	// break-glass superadmin bootstrap for the RBAC gate).
-	let admins: std::sync::Arc<[String]> = config.admin_subjects.into();
 	let platform_repo: std::sync::Arc<dyn concierge::ports::PlatformConfigRepository> = std::sync::Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
 
 	Server::builder()
