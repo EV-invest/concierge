@@ -3,10 +3,14 @@
 //! Resolves the caller's persisted [`Role`] from the verified access-token `sub` and
 //! checks it against the RBAC matrix ([`grants`]). An `ADMIN_SUBJECTS`-listed subject
 //! is treated as [`Role::Owner`] (break-glass bootstrap, so the first operator can
-//! grant roles before any role is persisted) — but the allowlist is only a ROLE
-//! override: a persisted record's status and `token_version` floor are enforced for
-//! everyone, so disabling or revoking an allowlisted operator still takes effect. A
-//! service token, or a missing/unknown user, holds nothing — the gate fails closed.
+//! grant roles before any role is persisted) — [`effective_role`] is that one rule,
+//! shared by the gate AND every surface where the plane reports a role (the issued
+//! session's `UserSummary`, `GetMe`/`GetUser`, `ListUsers`), so elevation is visible
+//! wherever it acts. The allowlist is only a ROLE override: a persisted record's
+//! status and `token_version` floor are enforced for everyone, so disabling or
+//! revoking an allowlisted operator still takes effect, and it never writes the
+//! persisted `users.role` (`SetRole` remains the only writer). A service token, or a
+//! missing/unknown user, holds nothing — the gate fails closed.
 //! Shared by the `directory` and `platform` services so the matrix is enforced in
 //! exactly one place; [`caller_gate`] is the same live-record enforcement the
 //! self-service surface (`directory::active_caller_id`) reuses.
@@ -72,6 +76,13 @@ pub async fn caller_gate<T>(users: &dyn UserDirectoryRepository, request: &Reque
 	Ok(CallerGate { sub, id, record })
 }
 
+/// The role a subject effectively holds — and the one the plane surfaces: the
+/// persisted role, elevated to [`Role::Owner`] when the subject is
+/// `ADMIN_SUBJECTS`-listed. The single source of truth for the break-glass rule.
+pub fn effective_role(persisted: Role, sub: &str, admins: &[String]) -> Role {
+	if admins.iter().any(|s| s == sub) { Role::Owner } else { persisted }
+}
+
 /// Authorize `request` for `permission`, or return a gRPC `PermissionDenied`/
 /// `Unauthenticated`.
 pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, admins: &[String], request: &Request<T>, permission: Permission) -> Result<(), Status> {
@@ -79,17 +90,18 @@ pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, admins: 
 	// The allowlist is applied AFTER the live-record gate, so DisableUser and
 	// RevokeTokens bite the most privileged principals too — it grants a role, never
 	// an exemption from status/revocation.
-	let role = if admins.iter().any(|s| s == &caller.sub) {
+	let role = if let Some(record) = caller.record {
+		effective_role(record.role, &caller.sub, admins)
+	} else if admins.iter().any(|s| s == &caller.sub) {
 		// Break-glass superadmin bootstrap: config-listed subjects hold Owner even with no
 		// persisted record, so the first operator can grant roles before any role exists.
 		Role::Owner
+	} else if caller.id.is_none() {
+		return Err(Status::unauthenticated("subject is not a user id"));
 	} else {
-		if caller.id.is_none() {
-			return Err(Status::unauthenticated("subject is not a user id"));
-		}
 		// An unknown user holds nothing — fail closed rather than defaulting to Investor's
 		// (empty) grant set with no status/revocation check.
-		caller.record.ok_or_else(|| Status::permission_denied("insufficient role"))?.role
+		return Err(Status::permission_denied("insufficient role"));
 	};
 	if grants(role, permission) {
 		Ok(())
