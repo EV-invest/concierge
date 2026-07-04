@@ -14,12 +14,16 @@ pub struct Config {
 	/// and the bridge outbox reads). `DB_MAX_CONNECTIONS`; defaults to the sqlx
 	/// default (10) — raise it for production.
 	pub db_max_connections: u32,
-	/// Break-glass superadmin allowlist for the RBAC gate: a listed subject is treated as
-	/// [`Role::Owner`](domain::authz::Role) so the first operator can grant roles before any
-	/// role is persisted. `ADMIN_SUBJECTS` is a comma-separated list (empty ⇒ no bootstrap
-	/// admins). NOTE: these are CONCIERGE canonical user ids — the banking plane's identical
-	/// env is keyed on its OWN (disjoint) user id space, so the same human is a different
-	/// UUID on each plane; a wrong id fails closed to Investor.
+	/// Break-glass superadmin allowlist: a listed subject is treated as
+	/// [`Role::Owner`](domain::authz::Role) — a ROLE override surfaced everywhere the plane
+	/// reports a role (the issued session's `UserSummary`, `GetMe`/`GetUser`, `ListUsers`),
+	/// not only the RPC gate, so a listed subject can open the cabinet admin console before
+	/// any role is persisted. It never exempts from status/`token_version` enforcement and
+	/// never writes `users.role` (`SetRole` is the only writer) — empty the list once the
+	/// bootstrap operator has persisted a real role. `ADMIN_SUBJECTS` is a comma-separated
+	/// list (empty ⇒ no bootstrap admins). NOTE: these are CONCIERGE canonical user ids —
+	/// the banking plane's identical env is keyed on its OWN (disjoint) user id space, so
+	/// the same human is a different UUID on each plane; a wrong id fails closed to Investor.
 	pub admin_subjects: Vec<String>,
 	/// Shared bearer token the banking money plane presents on the cross-plane bridge
 	/// (`UserEvents.PullUserLifecycle`). `BRIDGE_SERVICE_TOKEN`; `None` ⇒ the bridge is

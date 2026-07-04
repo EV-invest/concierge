@@ -1,10 +1,13 @@
 //! `platform` module — the platform/cabinet control surface (the admin console's
 //! "Cabinet" screen).
 //!
-//! Maintenance mode, the announcement banner, and feature flags. Reads require
-//! `PlatformRead` (operator+), writes require `PlatformManage` (admin+), both via the
-//! shared [`crate::authz`] gate. Every mutating RPC returns the full config so the
-//! caller re-renders from one authoritative snapshot.
+//! Maintenance mode, the announcement banner, and feature flags. The read is open to
+//! ANY authenticated principal — the config is user-facing by nature (the cabinet
+//! shows the announcement/maintenance banner and evaluates flags for every signed-in
+//! user), so `GetPlatformConfig` only requires the verified claims the auth layer
+//! injected. Writes require `PlatformManage` (admin+) via the shared [`crate::authz`]
+//! gate. Every mutating RPC returns the full config so the caller re-renders from one
+//! authoritative snapshot.
 //!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.
@@ -13,6 +16,7 @@
 use std::sync::Arc;
 
 use domain::authz::Permission;
+use evconcierge_auth::claims_of;
 use evconcierge_contracts::concierge::v1::{
 	FeatureFlag, GetPlatformConfigRequest, PlatformConfig, SetAnnouncementRequest, SetFeatureFlagRequest, SetMaintenanceModeRequest,
 	platform_service_server::PlatformService as PlatformServiceRpc,
@@ -63,7 +67,10 @@ impl Platform {
 #[tonic::async_trait]
 impl PlatformServiceRpc for Platform {
 	async fn get_platform_config(&self, request: Request<GetPlatformConfigRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), &self.admins, &request, Permission::PlatformRead).await?;
+		// User-facing read: any authenticated principal may see the config. The auth
+		// layer already verified the token — require its claims (defense in depth against
+		// an unwrapped mount), but no role.
+		claims_of(&request).ok_or_else(|| Status::unauthenticated("missing claims"))?;
 		Ok(Response::new(self.snapshot().await?))
 	}
 
