@@ -109,11 +109,12 @@ impl RefreshStore {
 
 	/// Classify a presented refresh handle by its SECRET without rotating it — the
 	/// credential check for the session-management RPCs and the pre-rotation gate for
-	/// refresh. See [`RefreshInspect`].
-	pub async fn inspect(&self, token: &str) -> Result<RefreshInspect, AuthError> {
+	/// refresh. Honours the same absolute/sliding/idle bounds as [`Self::rotate`], so an
+	/// expired family never authorizes. See [`RefreshInspect`].
+	pub async fn inspect(&self, token: &str, bounds: SessionBounds) -> Result<RefreshInspect, AuthError> {
 		match self {
-			Self::InProcess(s) => Ok(s.inspect(token)),
-			Self::Redis(s) => s.inspect(token).await,
+			Self::InProcess(s) => Ok(s.inspect(token, bounds)),
+			Self::Redis(s) => s.inspect(token, bounds).await,
 		}
 	}
 
@@ -239,7 +240,7 @@ impl InProcessRefreshStore {
 
 	/// Classify a presented handle by its secret (constant-time), without mutating the
 	/// family. `current` ⇒ the live credential; a rotated-out `prev` ⇒ replay/theft.
-	pub fn inspect(&self, token: &str) -> RefreshInspect {
+	pub fn inspect(&self, token: &str, bounds: SessionBounds) -> RefreshInspect {
 		let Some((family, secret)) = token.split_once('.') else {
 			return RefreshInspect::Invalid;
 		};
@@ -247,6 +248,14 @@ impl InProcessRefreshStore {
 		let Some(fam) = map.get(family) else {
 			return RefreshInspect::Invalid;
 		};
+		// An expired family is not a live credential: mirror `rotate`'s absolute/idle/sliding
+		// gate so a past-deadline handle cannot authorize the session-management RPCs, which
+		// gate on inspect alone with no subsequent rotation to catch the expiry.
+		let now = get_current_timestamp();
+		let idle_expired = bounds.idle_timeout_secs != 0 && now.saturating_sub(fam.last_seen) > bounds.idle_timeout_secs;
+		if now >= fam.absolute_expires_at || idle_expired || now >= fam.expires_at {
+			return RefreshInspect::Invalid;
+		}
 		if ct_eq(&fam.current, secret) {
 			RefreshInspect::Current { user_id: fam.user_id.clone() }
 		} else if fam.prev.as_deref().is_some_and(|prev| ct_eq(prev, secret)) {
@@ -330,6 +339,8 @@ pub struct RedisRefreshStore {
 	conn: ConnectionManager,
 }
 impl RedisRefreshStore {
+	const FAM_PREFIX: &str = "refresh:fam:";
+
 	pub async fn connect(url: &str) -> anyhow::Result<Self> {
 		let client = redis::Client::open(url)?;
 		let conn = client.get_connection_manager().await?;
@@ -337,7 +348,7 @@ impl RedisRefreshStore {
 	}
 
 	fn fam_key(family: &str) -> String {
-		format!("refresh:fam:{family}")
+		format!("{}{family}", Self::FAM_PREFIX)
 	}
 
 	fn user_key(user_id: &str) -> String {
@@ -436,13 +447,25 @@ impl RedisRefreshStore {
 
 	/// Classify a presented handle by its secret without mutating the family (the Redis
 	/// twin of [`InProcessRefreshStore::inspect`]).
-	pub async fn inspect(&self, token: &str) -> Result<RefreshInspect, AuthError> {
+	pub async fn inspect(&self, token: &str, bounds: SessionBounds) -> Result<RefreshInspect, AuthError> {
 		let Some((family, secret)) = token.split_once('.') else {
 			return Ok(RefreshInspect::Invalid);
 		};
 		let mut conn = self.conn.clone();
 		let fields: HashMap<String, String> = redis::cmd("HGETALL").arg(Self::fam_key(family)).query_async(&mut conn).await.map_err(redis_err)?;
 		if fields.is_empty() {
+			return Ok(RefreshInspect::Invalid);
+		}
+		// Same expiry gate as `rotate` (see the in-process twin): a past-deadline family is
+		// not a live credential for the session-management RPCs. Absent/unparseable deadlines
+		// fail closed to expired.
+		let now = get_current_timestamp();
+		let field_u64 = |k: &str| fields.get(k).and_then(|v| v.parse::<u64>().ok());
+		let absolute = field_u64("absolute_expires_at").unwrap_or(0);
+		let expires = field_u64("expires_at").unwrap_or(0);
+		let last_seen = field_u64("last_seen").unwrap_or(0);
+		let idle_expired = bounds.idle_timeout_secs != 0 && now.saturating_sub(last_seen) > bounds.idle_timeout_secs;
+		if now >= absolute || idle_expired || now >= expires {
 			return Ok(RefreshInspect::Invalid);
 		}
 		let user_id = fields.get("user_id").cloned().unwrap_or_default();
@@ -467,15 +490,17 @@ impl RedisRefreshStore {
 
 	pub async fn revoke_user(&self, user_id: &str) -> Result<(), AuthError> {
 		let mut conn = self.conn.clone();
-		let families: Vec<String> = redis::cmd("SMEMBERS").arg(Self::user_key(user_id)).query_async(&mut conn).await.map_err(redis_err)?;
-		let mut pipe = redis::pipe();
-		pipe.atomic();
-		for family in &families {
-			pipe.del(Self::fam_key(family));
-		}
-		pipe.del(Self::user_key(user_id));
-		pipe.exec_async(&mut conn).await.map_err(redis_err)?;
-		Ok(())
+		// One atomic script, NOT SMEMBERS-then-pipe: a concurrent `issue` landing between the
+		// member read and the deletes would SADD a family the snapshot missed, and the blanket
+		// user-key DEL would then orphan its still-live hash — a session that outlives
+		// logout-everywhere and is invisible to any later revoke. The script reads and deletes
+		// under one Redis execution, so no `issue` can interleave.
+		REVOKE_USER_SCRIPT
+			.key(Self::user_key(user_id))
+			.arg(Self::FAM_PREFIX)
+			.invoke_async::<()>(&mut conn)
+			.await
+			.map_err(redis_err)
 	}
 
 	pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<SessionView>, AuthError> {
@@ -584,6 +609,22 @@ end
 	)
 });
 
+/// Atomically revoke every refresh family for a user (logout-everywhere / revoke-all).
+/// KEYS[1] = the per-user family index set. ARGV[1] = the family-key prefix. Runs the
+/// member read and the deletes as one script so a concurrent `issue` cannot interleave
+/// and orphan a freshly-issued family past the revoke.
+static REVOKE_USER_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+	redis::Script::new(
+		r#"
+local families = redis.call('SMEMBERS', KEYS[1])
+for _, fam in ipairs(families) do
+  redis.call('DEL', ARGV[1] .. fam)
+end
+redis.call('DEL', KEYS[1])
+"#,
+	)
+});
+
 fn redis_err(e: redis::RedisError) -> AuthError {
 	crate::telemetry::report(&e);
 	AuthError::Unavailable
@@ -640,7 +681,7 @@ mod tests {
 		let store = InProcessRefreshStore::new();
 		let issued = issue(&store, "user-1");
 		let rotated = store.rotate(&issued.token, bounds()).unwrap();
-		assert!(matches!(store.inspect(&rotated.refresh.token), RefreshInspect::Current { user_id } if user_id == "user-1"));
+		assert!(matches!(store.inspect(&rotated.refresh.token, bounds()), RefreshInspect::Current { user_id } if user_id == "user-1"));
 		// The original (now rotated-out) secret is a reuse → family revoked.
 		assert!(store.rotate(&issued.token, bounds()).is_err());
 		// And the just-issued one is now dead too.
@@ -663,23 +704,23 @@ mod tests {
 		let issued = store.issue("user-1", 5, bounds(), String::new(), String::new());
 
 		// The live token authorizes as its family's user.
-		match store.inspect(&issued.token) {
+		match store.inspect(&issued.token, bounds()) {
 			RefreshInspect::Current { user_id } => assert_eq!(user_id, "user-1"),
 			_ => panic!("a live token must inspect as Current"),
 		}
 		// A right-family / wrong-secret handle (the family-id prefix alone) is NOT a
 		// credential — this is the session-RPC hardening.
 		let (family, _) = issued.token.split_once('.').unwrap();
-		assert!(matches!(store.inspect(&format!("{family}.not-the-secret")), RefreshInspect::Invalid));
-		assert!(matches!(store.inspect("no-dot"), RefreshInspect::Invalid));
+		assert!(matches!(store.inspect(&format!("{family}.not-the-secret"), bounds()), RefreshInspect::Invalid));
+		assert!(matches!(store.inspect("no-dot", bounds()), RefreshInspect::Invalid));
 
 		// After a rotation the prior secret inspects as Reuse (theft signal) WITHOUT being
 		// mutated by the inspection, and the new secret is Current.
 		let rotated = store.rotate(&issued.token, bounds()).unwrap();
-		assert!(matches!(store.inspect(&issued.token), RefreshInspect::Reuse { .. }));
-		assert!(matches!(store.inspect(&rotated.refresh.token), RefreshInspect::Current { .. }));
+		assert!(matches!(store.inspect(&issued.token, bounds()), RefreshInspect::Reuse { .. }));
+		assert!(matches!(store.inspect(&rotated.refresh.token, bounds()), RefreshInspect::Current { .. }));
 		// Inspection did not revoke the family (unlike a rotate of the reused secret).
-		assert!(matches!(store.inspect(&rotated.refresh.token), RefreshInspect::Current { .. }));
+		assert!(matches!(store.inspect(&rotated.refresh.token, bounds()), RefreshInspect::Current { .. }));
 	}
 
 	#[test]
@@ -775,6 +816,56 @@ mod tests {
 		store.backdate(&rotated.refresh.token, 1800);
 		assert!(store.rotate(&rotated.refresh.token, bounds).is_ok());
 	}
+
+	#[test]
+	fn inspect_rejects_a_family_past_the_sliding_window() {
+		// ttl 0 ⇒ `expires_at` equals issue time, so the sliding window is already closed:
+		// the handle is dead for rotate and must not authorize the session RPCs either.
+		let bounds = SessionBounds {
+			ttl_secs: 0,
+			max_session_secs: 7_776_000,
+			idle_timeout_secs: 0,
+		};
+		let store = InProcessRefreshStore::new();
+		let issued = store.issue("user-1", 0, bounds, String::new(), String::new());
+		assert!(matches!(store.inspect(&issued.token, bounds), RefreshInspect::Invalid));
+	}
+
+	#[test]
+	fn inspect_rejects_a_family_past_the_absolute_cap() {
+		// A family past its absolute cap is dead for rotation; it must also stop authorizing
+		// the session-management RPCs, which gate on inspect alone (no rotate to catch it).
+		let bounds = SessionBounds {
+			ttl_secs: 2_592_000,
+			max_session_secs: 86_400,
+			idle_timeout_secs: 0,
+		};
+		let store = InProcessRefreshStore::new();
+		let issued = store.issue("user-1", 0, bounds, String::new(), String::new());
+		assert!(
+			matches!(store.inspect(&issued.token, bounds), RefreshInspect::Current { .. }),
+			"a live handle inspects as Current"
+		);
+		store.backdate(&issued.token, 86_401);
+		assert!(
+			matches!(store.inspect(&issued.token, bounds), RefreshInspect::Invalid),
+			"a past-cap handle is no longer a credential"
+		);
+	}
+
+	#[test]
+	fn inspect_rejects_an_idle_expired_family() {
+		// No activity past the idle window revokes the credential for inspect too, not just rotate.
+		let bounds = SessionBounds {
+			ttl_secs: 2_592_000,
+			max_session_secs: 7_776_000,
+			idle_timeout_secs: 3600,
+		};
+		let store = InProcessRefreshStore::new();
+		let issued = store.issue("user-1", 0, bounds, String::new(), String::new());
+		store.backdate(&issued.token, 3601);
+		assert!(matches!(store.inspect(&issued.token, bounds), RefreshInspect::Invalid));
+	}
 }
 
 /// Real-Redis round-trips for [`RedisRefreshStore`]. No mocks — these hit the Redis at
@@ -809,7 +900,7 @@ mod redis_tests {
 		let issued = store.issue(&user, 7, bounds(), "agent".into(), "1.2.3.4".into()).await.unwrap();
 		let rotated = store.rotate(&issued.token, bounds()).await.unwrap();
 		assert_eq!(rotated.token_version_snapshot, 7);
-		assert!(matches!(store.inspect(&rotated.refresh.token).await.unwrap(), RefreshInspect::Current { user_id } if user_id == user));
+		assert!(matches!(store.inspect(&rotated.refresh.token, bounds()).await.unwrap(), RefreshInspect::Current { user_id } if user_id == user));
 		// Reuse of the rotated-out secret revokes the whole family.
 		assert!(store.rotate(&issued.token, bounds()).await.is_err());
 		assert!(store.rotate(&rotated.refresh.token, bounds()).await.is_err());
@@ -878,6 +969,48 @@ mod redis_tests {
 		let issued = store.issue(&user, 0, bounds, String::new(), String::new()).await.unwrap();
 		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 		assert!(store.rotate(&issued.token, bounds).await.is_err());
+		assert!(store.list_for_user(&user).await.unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn inspect_rejects_an_expired_family() {
+		let Some((store, user)) = store().await else {
+			return;
+		};
+		// A 1s idle window; after 2s the handle is expired. It must inspect as Invalid so the
+		// session-management RPCs (which gate on inspect alone) stop honouring it.
+		let bounds = SessionBounds {
+			ttl_secs: 3600,
+			max_session_secs: 7_776_000,
+			idle_timeout_secs: 1,
+		};
+		let issued = store.issue(&user, 0, bounds, String::new(), String::new()).await.unwrap();
+		assert!(matches!(store.inspect(&issued.token, bounds).await.unwrap(), RefreshInspect::Current { .. }));
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+		assert!(matches!(store.inspect(&issued.token, bounds).await.unwrap(), RefreshInspect::Invalid));
+		store.revoke_user(&user).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn revoke_user_does_not_orphan_a_concurrent_issue() {
+		let Some((store, user)) = store().await else {
+			return;
+		};
+		// Race a login against logout-everywhere. With the old non-atomic SMEMBERS-then-pipe,
+		// an issue landing between the read and the deletes leaves a live family hash while the
+		// user index is blanket-deleted — an orphan that survives the revoke and is invisible
+		// to any later revoke. The atomic script leaves no such orphan: after both settle a
+		// second revoke still addresses every family, so nothing survives. (Deterministically
+		// green on the fix; catches a regression whenever the interleaving hits the window.)
+		let issuer = {
+			let store = store.clone();
+			let user = user.clone();
+			tokio::spawn(async move { store.issue(&user, 0, bounds(), String::new(), String::new()).await.unwrap() })
+		};
+		store.revoke_user(&user).await.unwrap();
+		let issued = issuer.await.unwrap();
+		store.revoke_user(&user).await.unwrap();
+		assert!(store.rotate(&issued.token, bounds()).await.is_err(), "no family may survive logout-everywhere");
 		assert!(store.list_for_user(&user).await.unwrap().is_empty());
 	}
 }
