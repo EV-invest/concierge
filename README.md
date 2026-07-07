@@ -32,10 +32,15 @@ contracts/auth crates.
 Every app is a flake app. `nix run` resolves the repo root at runtime, so
 there's no need to enter the dev shell first.
 
+The dev topology (ports, database URLs) lives in the flake's `ports` attrset —
+a single shared Postgres cluster and Redis serve every ev_invest repo, so there
+are no hardcoded ports here.
+
 | Command | Brings up |
 | ------- | --------- |
-| `nix run .#db` | local Postgres (cluster under `.pg/`, trust auth; creates `ev_concierge`) |
-| `nix run .#concierge` | the runner binary (all gRPC modules in-process; applies DB migrations on boot — needs `.#db`) |
+| `nix run .#db` | ensure the shared ev_invest Postgres is up (+ this repo's `concierge` database) |
+| `nix run .#redis` | ensure the shared ev_invest Redis is up |
+| `nix run .#concierge` | the runner binary (all gRPC modules in-process; applies DB migrations on boot; ensures the shared Postgres + Redis first) |
 
 Equivalently, from the dev shell: `cargo run -p concierge`.
 
