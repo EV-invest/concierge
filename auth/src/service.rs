@@ -151,7 +151,7 @@ impl AuthServiceRpc for AuthService {
 		// rotated-out token) trip reuse detection and revoke the whole family. Reuse
 		// detection is preserved: a replayed rotated-out secret is caught here as `Reuse`
 		// and revokes the family, exactly as the destructive rotate would.
-		let user_id = match engine.refresh.inspect(&req.refresh_token).await? {
+		let user_id = match engine.refresh.inspect(&req.refresh_token, engine.session_bounds).await? {
 			RefreshInspect::Current { user_id } => user_id,
 			RefreshInspect::Reuse { user_id } => {
 				engine.refresh.revoke_user(&user_id).await?;
@@ -185,7 +185,7 @@ impl AuthServiceRpc for AuthService {
 		let req = request.into_inner();
 		// Authorize on the full credential (the secret), not the family-id prefix, so a
 		// leaked/rotated-out token cannot force-logout a victim.
-		let RefreshInspect::Current { user_id, .. } = engine.refresh.inspect(&req.refresh_token).await? else {
+		let RefreshInspect::Current { user_id, .. } = engine.refresh.inspect(&req.refresh_token, engine.session_bounds).await? else {
 			return Err(AuthError::InvalidToken.into());
 		};
 		if req.revoke_all {
@@ -208,7 +208,7 @@ impl AuthServiceRpc for AuthService {
 		let req = request.into_inner();
 		// Authorize on the secret, not the family-id prefix — else a leaked handle would
 		// disclose every session's device/IP metadata for the family.
-		let RefreshInspect::Current { user_id, .. } = engine.refresh.inspect(&req.refresh_token).await? else {
+		let RefreshInspect::Current { user_id, .. } = engine.refresh.inspect(&req.refresh_token, engine.session_bounds).await? else {
 			return Err(AuthError::InvalidToken.into());
 		};
 		let current_id = engine.refresh.family_id_of(&req.refresh_token).await?;
@@ -234,7 +234,7 @@ impl AuthServiceRpc for AuthService {
 		let req = request.into_inner();
 		// Authorize on the secret, not the family-id prefix — else a leaked handle could
 		// revoke any of the victim's sessions (targeted DoS).
-		let RefreshInspect::Current { user_id, .. } = engine.refresh.inspect(&req.refresh_token).await? else {
+		let RefreshInspect::Current { user_id, .. } = engine.refresh.inspect(&req.refresh_token, engine.session_bounds).await? else {
 			return Err(AuthError::InvalidToken.into());
 		};
 		engine.refresh.revoke_by_id(&user_id, &req.session_id).await?;
@@ -364,7 +364,7 @@ mod tests {
 		let issued = engine.refresh.issue("user-1", 0, engine.session_bounds, String::new(), String::new()).await.unwrap();
 		let rotated = engine.refresh.rotate(&issued.token, engine.session_bounds).await.unwrap();
 		// The live token belongs to the family's user.
-		assert!(matches!(engine.refresh.inspect(&rotated.refresh.token).await.unwrap(), RefreshInspect::Current { user_id } if user_id == "user-1"));
+		assert!(matches!(engine.refresh.inspect(&rotated.refresh.token, engine.session_bounds).await.unwrap(), RefreshInspect::Current { user_id } if user_id == "user-1"));
 		// Replaying the original (now rotated-out) token is reuse → family revoked.
 		assert!(engine.refresh.rotate(&issued.token, engine.session_bounds).await.is_err());
 		assert!(engine.refresh.rotate(&rotated.refresh.token, engine.session_bounds).await.is_err());
