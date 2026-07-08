@@ -39,6 +39,8 @@
         # values in its flake). Postgres database name == app name. Redis has no
         # named dbs — numeric mapping: 0=banking, 1=concierge.
         ports = {
+          POSTGRES_PORT = "5432";
+          REDIS_PORT = "6379";
           CONCIERGE_PORT = "55670";
         };
         # DEFAULTS, not overrides: anything already set in the environment (or a
