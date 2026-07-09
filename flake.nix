@@ -67,7 +67,7 @@
         # defaults; anything already set in the environment or `.env` wins.
         runConcierge = pkgs.writeShellApplication {
           name = "run-concierge";
-          runtimeInputs = with pkgs; [ rust pkg-config protobuf git ];
+          runtimeInputs = with pkgs; [ rust clang mold pkg-config protobuf git ];
           text = ''
             ${dyldFallback}
             ${protocEnv}
@@ -185,7 +185,9 @@
               openssl
               pkg-config
               protobuf
-              clang-tools
+              # wrapped clang (knows glibc's crt paths) — cargo config uses linker=clang;
+              # NOT clang-tools, which ships an unwrapped clang that shadows the wrapper
+              clang
               rust
               sccache
               mold
