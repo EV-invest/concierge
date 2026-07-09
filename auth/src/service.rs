@@ -253,15 +253,15 @@ mod tests {
 		claims::TokenType,
 		config::SigningConfig,
 		jwks::{VerifyPolicy, verify_token},
-		provisioner::provisioner_channel,
+		provisioner::{ProvisionCommand, provisioner_channel},
 	};
 
 	// Same throwaway Ed25519 keypair as the signer tests.
 	const TEST_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIKolOSMXwE+tafZkX+jkKYJbmJ066f4E12wAwTIkKps6\n-----END PRIVATE KEY-----\n";
 	const TEST_JWK_X: &str = "Z6BCmq9-_wo9d7co5CDW84Wn0sAC3BA0XWK2AOstpV4";
 
-	async fn configured() -> AuthService {
-		let config = AuthConfig {
+	fn test_config() -> AuthConfig {
+		AuthConfig {
 			issuer: "https://auth.test".into(),
 			client_audience: "concierge".into(),
 			service_audience: "concierge-services".into(),
@@ -276,9 +276,41 @@ mod tests {
 				jwks_json: format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","x":"{TEST_JWK_X}","kid":"test-kid","alg":"EdDSA","use":"sig"}}]}}"#),
 			}),
 			google: None,
-		};
+		}
+	}
+
+	async fn configured() -> AuthService {
 		let (provisioner, _rx) = provisioner_channel();
-		AuthService::try_new(config, provisioner).await.unwrap()
+		AuthService::try_new(test_config(), provisioner).await.unwrap()
+	}
+
+	/// A configured service whose directory half is a stub loop answering every
+	/// provisioning command with `respond`'s result — so refresh's post-lookup
+	/// branches (disabled user, token_version bump, successful mint) are drivable
+	/// through the RPC handler without Postgres.
+	async fn configured_with_directory<F>(mut respond: F) -> AuthService
+	where
+		F: FnMut(ProvisionCommand) -> Result<ProvisionedUser, AuthError> + Send + 'static, {
+		let (provisioner, mut rx) = provisioner_channel();
+		tokio::spawn(async move {
+			while let Some(req) = rx.recv().await {
+				let _ = req.respond_to.send(respond(req.command));
+			}
+		});
+		AuthService::try_new(test_config(), provisioner).await.unwrap()
+	}
+
+	// Distinct user ids per test: with `REDIS_URL` set the refresh store is one shared
+	// Redis, and these tests revoke whole families — a shared id would let parallel
+	// tests revoke each other's.
+	fn active_user(user_id: &str, token_version: u64) -> ProvisionedUser {
+		ProvisionedUser {
+			user_id: user_id.into(),
+			email: "user@test".into(),
+			status: "active".into(),
+			token_version,
+			role: "investor".into(),
+		}
 	}
 
 	// Jwks publishes the configured public key so a downstream verifier can verify a
@@ -293,27 +325,7 @@ mod tests {
 
 		let signer = service.engine.signer.as_ref().unwrap();
 		let (token, _) = signer.mint_access("00000000-0000-0000-0000-000000000001", 3).unwrap();
-		let (cache, _) = load_jwks(
-			&AuthConfig {
-				issuer: "https://auth.test".into(),
-				client_audience: "concierge".into(),
-				service_audience: "concierge-services".into(),
-				access_ttl_secs: 900,
-				refresh_ttl_secs: 3600,
-				max_session_secs: 7_776_000,
-				idle_timeout_secs: 0,
-				service_ttl_secs: 300,
-				signing: Some(SigningConfig {
-					signing_key_pem: TEST_PEM.into(),
-					kid: "test-kid".into(),
-					jwks_json: format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","x":"{TEST_JWK_X}","kid":"test-kid","alg":"EdDSA","use":"sig"}}]}}"#),
-				}),
-				google: None,
-			}
-			.signing
-			.unwrap(),
-		)
-		.unwrap();
+		let (cache, _) = load_jwks(&test_config().signing.unwrap()).unwrap();
 
 		let access_policy = VerifyPolicy {
 			issuer: "https://auth.test".into(),
@@ -352,21 +364,112 @@ mod tests {
 		assert_eq!(status.code(), tonic::Code::Unavailable);
 	}
 
-	// Refresh rotation + reuse detection runs through the real service surface (the
-	// in-process refresh store), independent of the directory: a rotated-out refresh
-	// token replayed against Refresh fails. Exercises the management hardening end to
-	// end via the AuthService, with no DB and no signer needed for the rotation itself.
+	// Reuse detection through the Refresh RPC itself: replaying a rotated-out handle
+	// answers Unauthenticated AND revokes the whole family — the sibling CURRENT
+	// token dies with it. (The reuse branch precedes the directory lookup, so the
+	// dropped provisioner receiver is never reached.)
 	#[tokio::test]
-	async fn refresh_reuse_is_detected_through_the_service() {
+	async fn refresh_rpc_revokes_the_family_on_reuse() {
 		let service = configured().await;
 		let engine = &service.engine;
 		// Open a family directly via the store (provisioning is the directory's job).
-		let issued = engine.refresh.issue("user-1", 0, engine.session_bounds, String::new(), String::new()).await.unwrap();
+		let issued = engine.refresh.issue("user-reuse", 0, engine.session_bounds, String::new(), String::new()).await.unwrap();
 		let rotated = engine.refresh.rotate(&issued.token, engine.session_bounds).await.unwrap();
-		// The live token belongs to the family's user.
-		assert!(matches!(engine.refresh.inspect(&rotated.refresh.token, engine.session_bounds).await.unwrap(), RefreshInspect::Current { user_id } if user_id == "user-1"));
-		// Replaying the original (now rotated-out) token is reuse → family revoked.
-		assert!(engine.refresh.rotate(&issued.token, engine.session_bounds).await.is_err());
-		assert!(engine.refresh.rotate(&rotated.refresh.token, engine.session_bounds).await.is_err());
+
+		let status = service.refresh(Request::new(RefreshRequest { refresh_token: issued.token })).await.unwrap_err();
+		assert_eq!(status.code(), tonic::Code::Unauthenticated);
+		assert!(matches!(
+			engine.refresh.inspect(&rotated.refresh.token, engine.session_bounds).await.unwrap(),
+			RefreshInspect::Invalid
+		));
+	}
+
+	// The inspect→lookup→rotate ordering invariant: a transient directory failure must
+	// NOT advance the family, or the client's legitimate retry (same token) would trip
+	// reuse detection and revoke every session. The retry must instead mint — which
+	// also pins the token_version comparison as strict (an equal version passes).
+	#[tokio::test]
+	async fn refresh_rpc_survives_a_transient_directory_failure() {
+		let mut fail_once = true;
+		let service = configured_with_directory(move |_| {
+			if std::mem::take(&mut fail_once) {
+				Err(AuthError::Unavailable)
+			} else {
+				Ok(active_user("user-retry", 0))
+			}
+		})
+		.await;
+		let engine = &service.engine;
+		let issued = engine.refresh.issue("user-retry", 0, engine.session_bounds, String::new(), String::new()).await.unwrap();
+
+		let status = service
+			.refresh(Request::new(RefreshRequest {
+				refresh_token: issued.token.clone(),
+			}))
+			.await
+			.unwrap_err();
+		assert_eq!(status.code(), tonic::Code::Unavailable);
+		// Not rotated: the same handle is still the family's CURRENT secret.
+		assert!(matches!(engine.refresh.inspect(&issued.token, engine.session_bounds).await.unwrap(), RefreshInspect::Current { user_id } if user_id == "user-retry"));
+
+		let response = service
+			.refresh(Request::new(RefreshRequest {
+				refresh_token: issued.token.clone(),
+			}))
+			.await
+			.unwrap()
+			.into_inner();
+		assert!(!response.access_token.is_empty());
+		assert_eq!(response.user.unwrap().user_id, "user-retry");
+		// The retry rotated the family: the presented handle is now spent.
+		assert!(matches!(
+			engine.refresh.inspect(&issued.token, engine.session_bounds).await.unwrap(),
+			RefreshInspect::Reuse { .. }
+		));
+	}
+
+	// An operator "revoke all" (authoritative token_version bump) beats a refresh
+	// token minted under the old version: Unauthenticated, and the family is dropped
+	// so no handle from it — including the one just rotated in — survives.
+	#[tokio::test]
+	async fn refresh_rpc_drops_the_family_after_a_token_version_bump() {
+		let service = configured_with_directory(|_| Ok(active_user("user-bump", 1))).await;
+		let engine = &service.engine;
+		let issued = engine.refresh.issue("user-bump", 0, engine.session_bounds, String::new(), String::new()).await.unwrap();
+
+		let status = service
+			.refresh(Request::new(RefreshRequest {
+				refresh_token: issued.token.clone(),
+			}))
+			.await
+			.unwrap_err();
+		assert_eq!(status.code(), tonic::Code::Unauthenticated);
+		assert_eq!(status.message(), "tokens revoked");
+		// Invalid, not Reuse: the family is gone entirely, not merely rotated past.
+		assert!(matches!(engine.refresh.inspect(&issued.token, engine.session_bounds).await.unwrap(), RefreshInspect::Invalid));
+	}
+
+	// A user disabled since sign-in cannot refresh: PermissionDenied, and the whole
+	// family is revoked.
+	#[tokio::test]
+	async fn refresh_rpc_revokes_the_family_of_a_disabled_user() {
+		let service = configured_with_directory(|_| {
+			Ok(ProvisionedUser {
+				status: "disabled".into(),
+				..active_user("user-disabled", 0)
+			})
+		})
+		.await;
+		let engine = &service.engine;
+		let issued = engine.refresh.issue("user-disabled", 0, engine.session_bounds, String::new(), String::new()).await.unwrap();
+
+		let status = service
+			.refresh(Request::new(RefreshRequest {
+				refresh_token: issued.token.clone(),
+			}))
+			.await
+			.unwrap_err();
+		assert_eq!(status.code(), tonic::Code::PermissionDenied);
+		assert!(matches!(engine.refresh.inspect(&issued.token, engine.session_bounds).await.unwrap(), RefreshInspect::Invalid));
 	}
 }
