@@ -12,6 +12,7 @@
 //!   ports           — the driven-port traits (`UserDirectoryRepository`, `PlatformConfigRepository`)
 //!   infrastructure  — driven adapters (Postgres control plane + the port implementations)
 //!   support         — cross-module gRPC plumbing (domain-error → Status mapping)
+//!   web             — the site-level auth HTTP surface (login/callback/session cookies)
 //!   notification/log — DEFERRED stubs (no platform messaging/audit yet)
 
 pub mod authz;
@@ -24,3 +25,4 @@ pub mod notification;
 pub mod platform;
 pub mod ports;
 pub mod support;
+pub mod web;
