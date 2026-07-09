@@ -1,6 +1,6 @@
 use std::{env, net::SocketAddr};
 
-use anyhow::Context;
+use color_eyre::eyre::{Context, Result};
 
 /// Runner configuration, sourced from environment variables (and `.env` in
 /// development via `dotenvy`).
@@ -37,10 +37,16 @@ pub struct Config {
 	/// PostHog ingestion host; `None` falls back to the library default.
 	pub posthog_host: Option<String>,
 	pub app_env: String,
+	/// HTTP listener for the site-level auth surface (`web` module). The conductor
+	/// rewrites `/api/auth/*` + `/api/callback/auth/*` here.
+	pub web_bind_addr: SocketAddr,
+	/// The user-facing origin the conductor serves; builds the OAuth redirect_uri
+	/// (`{PUBLIC_ORIGIN}/api/callback/auth/google` — register it with Google).
+	pub public_origin: String,
 }
 
 impl Config {
-	pub fn from_env() -> anyhow::Result<Self> {
+	pub fn from_env() -> Result<Self> {
 		let database_url = env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
 		let bind_addr = env::var("CONCIERGE_BIND")
 			.unwrap_or_else(|_| "127.0.0.1:50061".to_string())
@@ -63,6 +69,11 @@ impl Config {
 		let posthog_key = env::var("POSTHOG_KEY").ok().filter(|s| !s.is_empty());
 		let posthog_host = env::var("POSTHOG_HOST").ok().filter(|s| !s.is_empty());
 		let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+		let web_bind_addr = env::var("CONCIERGE_WEB_BIND")
+			.unwrap_or_else(|_| "127.0.0.1:55671".to_string())
+			.parse()
+			.context("CONCIERGE_WEB_BIND must be a valid socket address, e.g. 127.0.0.1:55671")?;
+		let public_origin = env::var("PUBLIC_ORIGIN").unwrap_or_else(|_| "http://localhost:58843".to_string());
 		Ok(Self {
 			database_url,
 			bind_addr,
@@ -73,6 +84,8 @@ impl Config {
 			posthog_key,
 			posthog_host,
 			app_env,
+			web_bind_addr,
+			public_origin,
 		})
 	}
 }

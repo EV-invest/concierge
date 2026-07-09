@@ -36,13 +36,13 @@ pub struct AuthService {
 impl AuthService {
 	/// Build the service from config and the [`Provisioner`] handle into the directory.
 	/// With no signing key configured, every issuance route answers `NotConfigured`.
-	pub async fn try_new(config: AuthConfig, provisioner: Provisioner) -> anyhow::Result<Self> {
+	pub async fn try_new(config: AuthConfig, provisioner: Provisioner) -> color_eyre::Result<Self> {
 		let (signer, jwks) = match &config.signing {
 			Some(signing) => {
-				let signer = Signer::try_new(signing, &config).map_err(|e| anyhow::anyhow!("auth signer init failed: {e}"))?;
+				let signer = Signer::try_new(signing, &config).map_err(|e| color_eyre::eyre::eyre!("auth signer init failed: {e}"))?;
 				// The keyring is only the runner's inbound-verify concern (via the
 				// Verifier over the Jwks RPC); issuance publishes the wire JWKs and mints.
-				let (_keyring, jwks) = load_jwks(signing).map_err(|e| anyhow::anyhow!("auth jwks load failed: {e}"))?;
+				let (_keyring, jwks) = load_jwks(signing).map_err(|e| color_eyre::eyre::eyre!("auth jwks load failed: {e}"))?;
 				(Some(signer), jwks)
 			}
 			None => (None, Vec::new()),

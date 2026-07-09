@@ -42,6 +42,9 @@
           POSTGRES_PORT = "5432";
           REDIS_PORT = "6379";
           CONCIERGE_PORT = "55670";
+          # The site-level auth HTTP surface (runner/src/web); the conductor
+          # rewrites /api/auth/* + /api/callback/auth/* here.
+          CONCIERGE_WEB_PORT = "55671";
         };
         # DEFAULTS, not overrides: anything already set in the environment (or a
         # sourced `.env`) wins — machines with non-standard ports stay working.
@@ -84,6 +87,7 @@
             ${portEnv}
             export DATABASE_URL="''${DATABASE_URL:-postgres://postgres@localhost:$POSTGRES_PORT/concierge}"
             export CONCIERGE_BIND="''${CONCIERGE_BIND:-0.0.0.0:$CONCIERGE_PORT}"
+            export CONCIERGE_WEB_BIND="''${CONCIERGE_WEB_BIND:-0.0.0.0:$CONCIERGE_WEB_PORT}"
             export REDIS_URL="''${REDIS_URL:-redis://127.0.0.1:$REDIS_PORT/1}"
             # The inbound verifier dials its own in-process Jwks RPC.
             export AUTH_JWKS_GRPC_ENDPOINT="''${AUTH_JWKS_GRPC_ENDPOINT:-http://127.0.0.1:$CONCIERGE_PORT}"

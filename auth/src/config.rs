@@ -8,7 +8,7 @@
 
 use std::env;
 
-use anyhow::Context;
+use color_eyre::eyre::{Context, Result, ensure};
 
 use crate::claims::TokenType;
 
@@ -21,8 +21,8 @@ use crate::claims::TokenType;
 /// environment in the first place.
 const PLANE: &str = "concierge";
 
-fn assert_plane(field: &str, value: &str) -> anyhow::Result<()> {
-	anyhow::ensure!(
+fn assert_plane(field: &str, value: &str) -> Result<()> {
+	ensure!(
 		value.contains(PLANE),
 		"auth config {field} {value:?} does not carry this plane's identity ({PLANE:?}) — refusing to start with a cross-plane (or shared-environment) auth config"
 	);
@@ -57,7 +57,7 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-	pub fn from_env() -> anyhow::Result<Self> {
+	pub fn from_env() -> Result<Self> {
 		let signing = match (env::var("AUTH_SIGNING_KEY_PEM").ok(), env::var("AUTH_SIGNING_KID").ok(), env::var("AUTH_JWKS_JSON").ok()) {
 			(Some(pem), Some(kid), Some(jwks)) if !pem.is_empty() && !kid.is_empty() && !jwks.is_empty() => Some(SigningConfig {
 				signing_key_pem: pem,
@@ -93,7 +93,7 @@ impl AuthConfig {
 	/// plane's identity — so concierge can never mint (or verify) under banking's
 	/// issuer/audience even if launched from a shared environment that overrides the
 	/// per-binary defaults.
-	pub fn assert_plane(&self) -> anyhow::Result<()> {
+	pub fn assert_plane(&self) -> Result<()> {
 		assert_plane("AUTH_ISSUER", &self.issuer)?;
 		assert_plane("AUTH_CLIENT_AUDIENCE", &self.client_audience)?;
 		assert_plane("AUTH_SERVICE_AUDIENCE", &self.service_audience)
@@ -156,7 +156,7 @@ pub struct VerifierConfig {
 }
 
 impl VerifierConfig {
-	pub fn from_env() -> anyhow::Result<Self> {
+	pub fn from_env() -> Result<Self> {
 		let config = Self {
 			issuer: env::var("AUTH_ISSUER").unwrap_or_else(|_| "https://auth.concierge.ev".to_string()),
 			audiences: split_csv(&env::var("AUTH_CLIENT_AUDIENCE").unwrap_or_else(|_| "concierge".to_string())),
@@ -172,7 +172,7 @@ impl VerifierConfig {
 	/// banking's issuer/audience and accept banking tokens. Callers that build a
 	/// [`VerifierConfig`] by hand (not via [`from_env`](Self::from_env)) MUST invoke this
 	/// at boot to get the same guard.
-	pub fn assert_plane(&self) -> anyhow::Result<()> {
+	pub fn assert_plane(&self) -> Result<()> {
 		assert_plane("issuer", &self.issuer)?;
 		for audience in &self.audiences {
 			assert_plane("audience", audience)?;
@@ -181,7 +181,7 @@ impl VerifierConfig {
 	}
 }
 
-fn parse_secs(key: &str, default: u64) -> anyhow::Result<u64> {
+fn parse_secs(key: &str, default: u64) -> Result<u64> {
 	match env::var(key) {
 		Ok(v) if !v.is_empty() => v.parse().with_context(|| format!("{key} must be a positive integer (seconds)")),
 		_ => Ok(default),

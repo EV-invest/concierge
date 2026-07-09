@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
-anyhow.workspace = true
+color-eyre.workspace = true
 ev = { workspace = true, features = ["error_monitoring"] }
 evconcierge_contracts.workspace = true
 http.workspace = true

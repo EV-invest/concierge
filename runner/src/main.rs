@@ -9,8 +9,8 @@
 //! cross-plane bridge outbox). Notifications and logs are DEFERRED stubs. There is
 //! no money plane here.
 
-use anyhow::Context;
-use concierge::{bridge, config::Config, directory, infrastructure, log, notification, platform};
+use color_eyre::{Result, eyre::Context};
+use concierge::{bridge, config::Config, directory, infrastructure, log, notification, platform, web};
 use ev::error_monitoring::{self, Config as SentryConfig};
 use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
@@ -29,7 +29,8 @@ use tower::{Layer, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 
 // Sentry must be initialised before the async runtime starts — no #[tokio::main].
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
+	color_eyre::install()?;
 	dotenvy::dotenv().ok();
 
 	let config = Config::from_env().context("failed to load configuration")?;
@@ -51,7 +52,7 @@ fn main() -> anyhow::Result<()> {
 		.block_on(run(config))
 }
 
-async fn run(config: Config) -> anyhow::Result<()> {
+async fn run(config: Config) -> Result<()> {
 	// The plane applies pending control-plane migrations on boot (idempotent). New
 	// migration FILES are authored with the sqlx CLI (`sqlx migrate add …`), never
 	// hand-written.
@@ -125,19 +126,37 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
 	let platform_repo: std::sync::Arc<dyn concierge::ports::PlatformConfigRepository> = std::sync::Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
 
-	Server::builder()
-		.accept_http1(true)
-		.layer(ServiceBuilder::new().layer(TraceLayer::new_for_grpc()).layer(GrpcWebLayer::new()).into_inner())
-		.add_service(HealthServiceServer::new(Health))
-		.add_service(AuthServiceServer::new(auth_service))
-		.add_service(UserEventsServer::new(bridge))
-		.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), admins.clone()))))
-		.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users, admins, platform_repo))))
-		.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
-		.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
-		.serve_with_shutdown(config.bind_addr, await_signal())
-		.await
-		.context("concierge gRPC server error")
+	// The site-level auth HTTP surface: the conductor rewrites the shared origin's
+	// `/api/auth/*` + `/api/callback/auth/*` here, so login/session cookies land
+	// first-party for every zone. Calls the SAME issuance service in-process.
+	let web_state = web::WebState::new(auth_service.clone(), config.public_origin.clone(), config.app_env == "production");
+	let web_listener = tokio::net::TcpListener::bind(config.web_bind_addr).await.context("failed to bind the auth web listener")?;
+	tracing::info!(bind = %config.web_bind_addr, "auth web surface listening");
+	let web_server = async {
+		axum::serve(web_listener, web::router(web_state))
+			.with_graceful_shutdown(await_signal())
+			.await
+			.context("concierge auth web server error")
+	};
+
+	let grpc_server = async {
+		Server::builder()
+			.accept_http1(true)
+			.layer(ServiceBuilder::new().layer(TraceLayer::new_for_grpc()).layer(GrpcWebLayer::new()).into_inner())
+			.add_service(HealthServiceServer::new(Health))
+			.add_service(AuthServiceServer::new(auth_service))
+			.add_service(UserEventsServer::new(bridge))
+			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), admins.clone()))))
+			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users, admins, platform_repo))))
+			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
+			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
+			.serve_with_shutdown(config.bind_addr, await_signal())
+			.await
+			.context("concierge gRPC server error")
+	};
+
+	tokio::try_join!(grpc_server, web_server)?;
+	Ok(())
 }
 
 /// Resolve on SIGTERM or ctrl-c so the server drains in-flight RPCs instead of
