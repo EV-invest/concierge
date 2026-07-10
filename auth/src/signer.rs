@@ -39,17 +39,6 @@ pub struct Signer {
 	#[allow(dead_code)]
 	service_ttl_secs: u64,
 }
-
-impl fmt::Debug for Signer {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("Signer")
-			.field("kid", &self.kid)
-			.field("issuer", &self.issuer)
-			.field("encoding", &"<redacted>")
-			.finish_non_exhaustive()
-	}
-}
-
 impl Signer {
 	pub fn try_new(signing: &SigningConfig, config: &AuthConfig) -> Result<Self, AuthError> {
 		let encoding = EncodingKey::from_ed_pem(signing.signing_key_pem.as_bytes()).map_err(|_| AuthError::NotConfigured)?;
@@ -97,6 +86,16 @@ impl Signer {
 	#[allow(dead_code)]
 	pub fn mint_service(&self, service_name: &str) -> Result<(String, u64), AuthError> {
 		self.mint(service_name, &self.service_audience, TokenType::Service, self.service_ttl_secs, 0)
+	}
+}
+
+impl fmt::Debug for Signer {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Signer")
+			.field("kid", &self.kid)
+			.field("issuer", &self.issuer)
+			.field("encoding", &"<redacted>")
+			.finish_non_exhaustive()
 	}
 }
 

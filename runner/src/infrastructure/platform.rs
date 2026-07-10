@@ -14,6 +14,11 @@ use crate::ports::PlatformConfigRepository;
 pub struct PgPlatform {
 	pool: PgPool,
 }
+impl PgPlatform {
+	pub fn new(pool: PgPool) -> Self {
+		Self { pool }
+	}
+}
 
 /// The singleton platform config (maintenance + announcement).
 #[derive(sqlx::FromRow)]
@@ -35,12 +40,6 @@ pub struct FeatureFlagRow {
 
 fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
-}
-
-impl PgPlatform {
-	pub fn new(pool: PgPool) -> Self {
-		Self { pool }
-	}
 }
 
 #[async_trait]

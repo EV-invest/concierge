@@ -32,19 +32,6 @@ use time::Duration;
 
 use crate::web::{oauth::OAuthTxStore, session::WebSessions};
 
-/// An opaque identifier: `n` bytes of CSPRNG entropy, base64url-encoded (no padding).
-fn random_token(n: usize) -> String {
-	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-	let mut buf = vec![0u8; n];
-	getrandom::fill(&mut buf).expect("CSPRNG unavailable");
-	URL_SAFE_NO_PAD.encode(buf)
-}
-
-/// Current unix time in seconds (matches the proto `*_expires_at` fields).
-fn now_secs() -> i64 {
-	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-}
-
 /// Cookie names + shared attributes. `__Host-` prefixed when secure (production);
 /// bare in http dev, since the prefix requires `Secure`.
 pub struct CookieNames {
@@ -54,7 +41,6 @@ pub struct CookieNames {
 	pub oauth_tx: String,
 	secure: bool,
 }
-
 impl CookieNames {
 	pub fn new(secure: bool) -> Self {
 		let prefix = if secure { "__Host-" } else { "" };
@@ -98,22 +84,6 @@ impl CookieNames {
 pub struct WebState {
 	inner: Arc<Inner>,
 }
-
-struct Inner {
-	/// The issuance service, called IN-PROCESS through its gRPC trait — the web
-	/// layer is just another (local) client of the same `Exchange`/`Refresh`/
-	/// `Logout` surface, so issuance semantics live in exactly one place.
-	auth: AuthService,
-	oauth: OAuthTxStore,
-	sessions: WebSessions,
-	cookies: CookieNames,
-	/// Public OAuth client id; `None` ⇒ login answers 503 (mirrors the inert plane).
-	google_client_id: Option<String>,
-	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
-	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/google`.
-	public_origin: String,
-}
-
 impl WebState {
 	pub fn new(auth: AuthService, public_origin: String, secure_cookies: bool) -> Self {
 		Self {
@@ -141,4 +111,31 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/logout", post(routes::logout))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
 		.with_state(state)
+}
+/// An opaque identifier: `n` bytes of CSPRNG entropy, base64url-encoded (no padding).
+fn random_token(n: usize) -> String {
+	use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+	let mut buf = vec![0u8; n];
+	getrandom::fill(&mut buf).expect("CSPRNG unavailable");
+	URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// Current unix time in seconds (matches the proto `*_expires_at` fields).
+fn now_secs() -> i64 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+struct Inner {
+	/// The issuance service, called IN-PROCESS through its gRPC trait — the web
+	/// layer is just another (local) client of the same `Exchange`/`Refresh`/
+	/// `Logout` surface, so issuance semantics live in exactly one place.
+	auth: AuthService,
+	oauth: OAuthTxStore,
+	sessions: WebSessions,
+	cookies: CookieNames,
+	/// Public OAuth client id; `None` ⇒ login answers 503 (mirrors the inert plane).
+	google_client_id: Option<String>,
+	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
+	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/google`.
+	public_origin: String,
 }

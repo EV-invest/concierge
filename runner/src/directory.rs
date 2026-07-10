@@ -56,9 +56,7 @@ impl Directory {
 	pub fn new(users: Arc<dyn UserDirectoryRepository>, admins: Arc<[String]>) -> Self {
 		Self { users, admins }
 	}
-}
 
-impl Directory {
 	/// The authenticated caller's own user id (from the access-token `sub`), gated on live
 	/// revocation state via the shared [`crate::authz::caller_gate`]: a self-service RPC
 	/// acts *as a user*, so only a `typ=access` token qualifies, and a suspended or
@@ -79,6 +77,19 @@ impl Directory {
 	}
 }
 
+/// Drain provisioning requests from the auth task until the channel closes — the
+/// receiving end of the [`Provisioner`](evconcierge_auth::Provisioner) channel.
+/// `admins` is the break-glass allowlist: the summaries returned here become the
+/// issued session's `UserSummary` (Exchange AND Refresh), so they carry the
+/// effective role and the BFF gates the admin console on the same authority the
+/// RBAC gate grants.
+pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<dyn UserDirectoryRepository>, admins: Arc<[String]>) {
+	while let Some(request) = rx.recv().await {
+		let result = handle(users.as_ref(), request.command, &admins).await;
+		// The auth task may have given up; a dropped responder is not our problem.
+		let _ = request.respond_to.send(result);
+	}
+}
 /// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix,
 /// resolved from the caller's persisted role (with the `ADMIN_SUBJECTS` break-glass).
 async fn require_permission<T>(directory: &Directory, request: &Request<T>, permission: Permission) -> Result<(), Status> {
@@ -230,20 +241,6 @@ fn summary_to_proto(row: AdminUserRow, role: String) -> AdminUserSummary {
 		role,
 		token_version: row.token_version as u64,
 		created_at: row.created_at,
-	}
-}
-
-/// Drain provisioning requests from the auth task until the channel closes — the
-/// receiving end of the [`Provisioner`](evconcierge_auth::Provisioner) channel.
-/// `admins` is the break-glass allowlist: the summaries returned here become the
-/// issued session's `UserSummary` (Exchange AND Refresh), so they carry the
-/// effective role and the BFF gates the admin console on the same authority the
-/// RBAC gate grants.
-pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<dyn UserDirectoryRepository>, admins: Arc<[String]>) {
-	while let Some(request) = rx.recv().await {
-		let result = handle(users.as_ref(), request.command, &admins).await;
-		// The auth task may have given up; a dropped responder is not our problem.
-		let _ = request.respond_to.send(result);
 	}
 }
 

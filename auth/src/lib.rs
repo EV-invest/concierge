@@ -1,3 +1,4 @@
+#![feature(default_field_values)]
 //! The concierge plane's auth — a service **and** a shared verification flow.
 //!
 //! Two facets, one crate. Pick the half you need:

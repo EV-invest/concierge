@@ -1,3 +1,4 @@
+#![feature(default_field_values)]
 //! Shared domain crate — the identity/platform plane.
 //!
 //! The single source of truth for `concierge` domain types. The runner binary

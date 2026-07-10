@@ -372,11 +372,6 @@ pub enum UserEvent {
 	KycChanged,
 	RoleChanged,
 }
-
-impl DomainEvent for UserEvent {
-	const KIND: &'static str = "users";
-}
-
 impl UserEvent {
 	/// The stored `user_outbox.kind` discriminant — the bridge `Kind`. Kept in lockstep
 	/// with `concierge.v1.UserLifecycleEvent.Kind` so the puller maps it straight through.
@@ -390,6 +385,10 @@ impl UserEvent {
 			Self::RoleChanged => "ROLE_CHANGED",
 		}
 	}
+}
+
+impl DomainEvent for UserEvent {
+	const KIND: &'static str = "users";
 }
 
 #[cfg(test)]

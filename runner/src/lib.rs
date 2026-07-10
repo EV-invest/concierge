@@ -1,3 +1,4 @@
+#![feature(default_field_values)]
 //! `concierge` — the identity/platform-plane runner library.
 //!
 //! The modular monolith's internal modules, exposed as a library so the binary

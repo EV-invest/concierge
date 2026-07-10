@@ -37,6 +37,24 @@ impl PgUsers {
 	pub fn new(pool: PgPool) -> Self {
 		Self { pool }
 	}
+
+	/// Load-mutate-persist in one transaction: read the row `FOR UPDATE`, run the
+	/// aggregate command, write the row back, and drain its events to the outbox.
+	async fn mutate(&self, id: UserId, command: impl FnOnce(&mut User)) -> Result<User, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let row = sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1 FOR UPDATE"))
+			.bind(id.raw())
+			.fetch_optional(&mut *tx)
+			.await
+			.map_err(repo_err)?
+			.ok_or_else(|| DomainError::NotFound { entity: "user", id: id.to_string() })?;
+		let mut user = row.into_domain()?;
+		command(&mut user);
+		update_row(&mut tx, &user).await?;
+		drain_outbox(&mut tx, &mut user).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(user)
+	}
 }
 
 impl Repository for PgUsers {
@@ -47,6 +65,28 @@ impl Reader for PgUsers {
 	type Aggregate = User;
 }
 
+/// A lightweight, read-only projection for the operator console's user list — mapped
+/// straight from SQL (not rehydrated through the aggregate) so it can carry the
+/// DB-managed `created_at` the identity aggregate deliberately omits.
+#[derive(sqlx::FromRow)]
+pub struct AdminUserRow {
+	pub id: Uuid,
+	pub email: Option<String>,
+	pub status: String,
+	pub kyc_level: i32,
+	pub role: String,
+	pub token_version: i64,
+	pub created_at: i64,
+}
+/// The fields the admin authz gate decides on: the persisted access role, the account
+/// status (a suspended principal is denied even while an unexpired token still verifies),
+/// and the authoritative `token_version` (a "revoke all" bumps it, so a token minted
+/// under an older version is rejected at the privileged surface at once).
+pub struct AuthzRecord {
+	pub role: Role,
+	pub status: UserStatus,
+	pub token_version: u64,
+}
 #[derive(sqlx::FromRow)]
 struct UserRow {
 	id: Uuid,
@@ -108,30 +148,6 @@ macro_rules! user_columns {
 		legal_name, preferred_name, phone, date_of_birth, nationality, tax_residence, \
 		residential_address, language, base_currency, timezone, row_version"
 	};
-}
-
-/// A lightweight, read-only projection for the operator console's user list — mapped
-/// straight from SQL (not rehydrated through the aggregate) so it can carry the
-/// DB-managed `created_at` the identity aggregate deliberately omits.
-#[derive(sqlx::FromRow)]
-pub struct AdminUserRow {
-	pub id: Uuid,
-	pub email: Option<String>,
-	pub status: String,
-	pub kyc_level: i32,
-	pub role: String,
-	pub token_version: i64,
-	pub created_at: i64,
-}
-
-/// The fields the admin authz gate decides on: the persisted access role, the account
-/// status (a suspended principal is denied even while an unexpired token still verifies),
-/// and the authoritative `token_version` (a "revoke all" bumps it, so a token minted
-/// under an older version is rejected at the privileged surface at once).
-pub struct AuthzRecord {
-	pub role: Role,
-	pub status: UserStatus,
-	pub token_version: u64,
 }
 
 fn repo_err(err: sqlx::Error) -> DomainError {
@@ -308,26 +324,6 @@ impl UserDirectoryRepository for PgUsers {
 		.map_err(repo_err)?;
 
 		Ok((rows, total))
-	}
-}
-
-impl PgUsers {
-	/// Load-mutate-persist in one transaction: read the row `FOR UPDATE`, run the
-	/// aggregate command, write the row back, and drain its events to the outbox.
-	async fn mutate(&self, id: UserId, command: impl FnOnce(&mut User)) -> Result<User, DomainError> {
-		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		let row = sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1 FOR UPDATE"))
-			.bind(id.raw())
-			.fetch_optional(&mut *tx)
-			.await
-			.map_err(repo_err)?
-			.ok_or_else(|| DomainError::NotFound { entity: "user", id: id.to_string() })?;
-		let mut user = row.into_domain()?;
-		command(&mut user);
-		update_row(&mut tx, &user).await?;
-		drain_outbox(&mut tx, &mut user).await?;
-		tx.commit().await.map_err(repo_err)?;
-		Ok(user)
 	}
 }
 

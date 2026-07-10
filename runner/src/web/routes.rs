@@ -32,22 +32,11 @@ pub struct CallbackQuery {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionUser {
-	user_id: String,
-	email: String,
-	status: String,
-	role: String,
-	is_admin: bool,
-}
-
-#[derive(Serialize)]
 pub struct SessionInfo {
 	authenticated: bool,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	user: Option<SessionUser>,
 }
-
 impl SessionInfo {
 	fn authenticated(user: cc::UserSummary) -> Self {
 		let is_admin = !user.role.is_empty() && user.role != "investor";
@@ -82,7 +71,6 @@ pub async fn login(State(st): State<WebState>, jar: CookieJar, Query(q): Query<L
 	let jar = jar.add(st.cookies.server_cookie(st.cookies.oauth_tx.clone(), tx_id, OAUTH_TX_TTL));
 	Ok((jar, Redirect::to(&url)))
 }
-
 /// `GET /callback/auth/google` — validate the state against the stored transaction,
 /// exchange the code for this plane's tokens (in-process), open a session, and
 /// redirect back to where the user came from.
@@ -139,7 +127,6 @@ pub async fn callback(State(st): State<WebState>, jar: CookieJar, headers: Heade
 		}
 	}
 }
-
 /// `GET /auth/session` — who-am-I for the browser, refreshing the access token (and
 /// its zone-shared cookie) transparently. Never returns a token in the body.
 pub async fn session(State(st): State<WebState>, jar: CookieJar) -> (CookieJar, Json<SessionInfo>) {
@@ -158,7 +145,6 @@ pub async fn session(State(st): State<WebState>, jar: CookieJar) -> (CookieJar, 
 		None => (clear_session(st, jar), Json(SessionInfo::anonymous())),
 	}
 }
-
 /// `POST /auth/logout` — CSRF-checked: drop the session, revoke the refresh family
 /// upstream (best-effort), and clear the cookies.
 pub async fn logout(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Result<(CookieJar, Json<Value>), (StatusCode, &'static str)> {
@@ -181,17 +167,6 @@ pub async fn logout(State(st): State<WebState>, jar: CookieJar, headers: HeaderM
 	}
 	Ok((clear_session(st, jar), Json(json!({ "ok": true }))))
 }
-
-#[derive(Serialize)]
-struct SessionEntry {
-	id: String,
-	user_agent: String,
-	ip: String,
-	created_at: String,
-	last_seen: String,
-	current: bool,
-}
-
 /// `GET /auth/sessions` — the caller's active sessions (refresh-token families),
 /// proven by the server-side refresh token (never exposed to the browser).
 pub async fn list_sessions(State(st): State<WebState>, jar: CookieJar) -> Result<Json<Value>, (StatusCode, &'static str)> {
@@ -215,7 +190,6 @@ pub async fn list_sessions(State(st): State<WebState>, jar: CookieJar) -> Result
 		.collect();
 	Ok(Json(json!({ "sessions": sessions })))
 }
-
 /// `DELETE /auth/sessions` — CSRF-checked: revoke one session by id (must belong to
 /// the caller; revoking the current one acts like a sign-out of this device).
 pub async fn revoke_session(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, body: Option<Json<Value>>) -> Result<Json<Value>, (StatusCode, &'static str)> {
@@ -232,6 +206,25 @@ pub async fn revoke_session(State(st): State<WebState>, jar: CookieJar, headers:
 		.await
 		.map_err(|_| (StatusCode::BAD_GATEWAY, "session revoke failed"))?;
 	Ok(Json(json!({ "ok": true })))
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionUser {
+	user_id: String,
+	email: String,
+	status: String,
+	role: String,
+	is_admin: bool,
+}
+
+#[derive(Serialize)]
+struct SessionEntry {
+	id: String,
+	user_agent: String,
+	ip: String,
+	created_at: String,
+	last_seen: String,
+	current: bool,
 }
 
 impl super::Inner {

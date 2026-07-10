@@ -10,6 +10,8 @@
 //! asserting ordered events, the advancing `next_position` cursor, and that a
 //! wrong/absent bridge token is rejected.
 
+use std::sync::Arc;
+
 use concierge::{
 	bridge::Bridge,
 	infrastructure::{db, users::PgUsers},
@@ -195,7 +197,7 @@ async fn outbox_append_serializes_position_with_commit_order() {
 	let Some((repo, pool)) = setup().await else {
 		return;
 	};
-	let repo = std::sync::Arc::new(repo);
+	let repo = Arc::new(repo);
 	let user = repo.provision(unique_subject(), Email::parse("lock@example.com").unwrap(), true).await.unwrap();
 
 	// Hold the outbox advisory lock in an open transaction — mimicking another writer

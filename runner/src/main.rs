@@ -9,6 +9,8 @@
 //! cross-plane bridge outbox). Notifications and logs are DEFERRED stubs. There is
 //! no money plane here.
 
+use std::sync::Arc;
+
 use color_eyre::{Result, eyre::Context};
 use concierge::{bridge, config::Config, directory, infrastructure, log, notification, platform, web};
 use ev::error_monitoring::{self, Config as SentryConfig};
@@ -70,7 +72,7 @@ async fn run(config: Config) -> Result<()> {
 	// The user directory repository: the only writer of the identity control plane and
 	// the cross-plane outbox. Shared by the directory service and the provisioner loop,
 	// both of which see only the port.
-	let users: std::sync::Arc<dyn concierge::ports::UserDirectoryRepository> = std::sync::Arc::new(infrastructure::users::PgUsers::new(pool.clone()));
+	let users: Arc<dyn concierge::ports::UserDirectoryRepository> = Arc::new(infrastructure::users::PgUsers::new(pool.clone()));
 
 	// Auth issuance. `AuthConfig` is host-only (signing key, Google client, refresh
 	// TTLs); with no `AUTH_SIGNING_KEY_PEM` configured the service runs inert. The
@@ -86,7 +88,7 @@ async fn run(config: Config) -> Result<()> {
 	// The admin allowlist is shared by the directory and platform services (the
 	// break-glass superadmin bootstrap for the RBAC gate) and by the provisioner loop,
 	// so issued sessions carry the effective role.
-	let admins: std::sync::Arc<[String]> = config.admin_subjects.into();
+	let admins: Arc<[String]> = config.admin_subjects.into();
 	let (provisioner, provision_rx) = provisioner_channel();
 	tokio::spawn(directory::run_provisioner(provision_rx, users.clone(), admins.clone()));
 	let auth_service = AuthService::try_new(auth_config, provisioner).await.context("failed to build the auth service")?;
@@ -124,7 +126,7 @@ async fn run(config: Config) -> Result<()> {
 	// a user access token. Unconfigured (`BRIDGE_SERVICE_TOKEN` unset) it fails closed.
 	let bridge = bridge::Bridge::new(pool.clone(), config.bridge_service_token);
 
-	let platform_repo: std::sync::Arc<dyn concierge::ports::PlatformConfigRepository> = std::sync::Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
+	let platform_repo: Arc<dyn concierge::ports::PlatformConfigRepository> = Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
 
 	// The site-level auth HTTP surface: the conductor rewrites the shared origin's
 	// `/api/auth/*` + `/api/callback/auth/*` here, so login/session cookies land

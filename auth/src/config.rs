@@ -21,14 +21,6 @@ use crate::claims::TokenType;
 /// environment in the first place.
 const PLANE: &str = "concierge";
 
-fn assert_plane(field: &str, value: &str) -> Result<()> {
-	ensure!(
-		value.contains(PLANE),
-		"auth config {field} {value:?} does not carry this plane's identity ({PLANE:?}) — refusing to start with a cross-plane (or shared-environment) auth config"
-	);
-	Ok(())
-}
-
 /// Configuration for the auth **service** (the token-issuing side). Construct with
 /// [`AuthConfig::from_env`] in the composition root.
 #[derive(Clone, Debug)]
@@ -55,7 +47,6 @@ pub struct AuthConfig {
 	/// Google OAuth2 client credentials. `None` ⇒ the `Exchange` route is disabled.
 	pub google: Option<GoogleConfig>,
 }
-
 impl AuthConfig {
 	pub fn from_env() -> Result<Self> {
 		let signing = match (env::var("AUTH_SIGNING_KEY_PEM").ok(), env::var("AUTH_SIGNING_KID").ok(), env::var("AUTH_JWKS_JSON").ok()) {
@@ -116,17 +107,6 @@ pub struct SigningConfig {
 	/// `kid` and any retired-but-still-valid keys (make-before-break rotation).
 	pub jwks_json: String,
 }
-
-impl std::fmt::Debug for SigningConfig {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("SigningConfig")
-			.field("signing_key_pem", &"<redacted>")
-			.field("kid", &self.kid)
-			.field("jwks_json", &self.jwks_json)
-			.finish()
-	}
-}
-
 /// Google OAuth2 confidential-client credentials. `Debug` is hand-written to redact
 /// the client secret (same footgun as [`SigningConfig`]).
 #[derive(Clone)]
@@ -134,13 +114,6 @@ pub struct GoogleConfig {
 	pub client_id: String,
 	pub client_secret: String,
 }
-
-impl std::fmt::Debug for GoogleConfig {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("GoogleConfig").field("client_id", &self.client_id).field("client_secret", &"<redacted>").finish()
-	}
-}
-
 /// Configuration a **downstream service** uses to build a [`Verifier`](crate::verifier::Verifier).
 #[derive(Clone, Debug)]
 pub struct VerifierConfig {
@@ -154,7 +127,6 @@ pub struct VerifierConfig {
 	/// gRPC address of the concierge auth service, dialed to refresh the JWKS cache.
 	pub jwks_grpc_endpoint: String,
 }
-
 impl VerifierConfig {
 	pub fn from_env() -> Result<Self> {
 		let config = Self {
@@ -181,6 +153,30 @@ impl VerifierConfig {
 	}
 }
 
+fn assert_plane(field: &str, value: &str) -> Result<()> {
+	ensure!(
+		value.contains(PLANE),
+		"auth config {field} {value:?} does not carry this plane's identity ({PLANE:?}) — refusing to start with a cross-plane (or shared-environment) auth config"
+	);
+	Ok(())
+}
+
+impl std::fmt::Debug for SigningConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SigningConfig")
+			.field("signing_key_pem", &"<redacted>")
+			.field("kid", &self.kid)
+			.field("jwks_json", &self.jwks_json)
+			.finish()
+	}
+}
+
+impl std::fmt::Debug for GoogleConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("GoogleConfig").field("client_id", &self.client_id).field("client_secret", &"<redacted>").finish()
+	}
+}
+
 fn parse_secs(key: &str, default: u64) -> Result<u64> {
 	match env::var(key) {
 		Ok(v) if !v.is_empty() => v.parse().with_context(|| format!("{key} must be a positive integer (seconds)")),
@@ -194,6 +190,8 @@ fn split_csv(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Mutex;
+
 	use super::*;
 
 	#[test]
@@ -279,7 +277,7 @@ mod tests {
 	// process environment (unsafe in edition 2024) shared by all tests in this binary.
 	#[test]
 	fn from_env_rejects_banking_issuer_at_boot() {
-		static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+		static ENV_GUARD: Mutex<()> = Mutex::new(());
 		let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
 		let prior = env::var("AUTH_ISSUER").ok();
 		unsafe { env::set_var("AUTH_ISSUER", "https://auth.banking.ev") };
