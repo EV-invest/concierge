@@ -133,6 +133,8 @@ impl WebState {
 /// `/api/auth/:rest*` → `/auth/:rest*`, `/api/callback/auth/*` → `/callback/auth/*`.
 pub fn router(state: WebState) -> Router {
 	Router::new()
+		// k8s liveness/readiness probe target — the only unauthenticated route.
+		.route("/health", get(|| async { "ok" }))
 		.route("/auth/login", get(routes::login))
 		.route("/callback/auth/google", get(routes::callback))
 		.route("/auth/session", get(routes::session))

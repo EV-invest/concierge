@@ -21,7 +21,7 @@ use crate::error::DomainError;
 /// The platform-wide user role, ordered least→most privileged. `Investor` is the
 /// default (every provisioned user); roles above it unlock the admin console and
 /// `Owner` additionally manages roles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
 	#[default]
@@ -64,7 +64,7 @@ impl Role {
 
 /// A capability in the IDENTITY/PLATFORM plane. Money capabilities live in the
 /// banking plane's own `Permission` — the sets are deliberately disjoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Permission {
 	/// List/read any user (identities, KYC, sessions, roles).
 	UserRead,

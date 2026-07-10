@@ -29,7 +29,7 @@ const ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.google.com"
 const MIN_CERTS_REFRESH: Duration = Duration::from_secs(30);
 
 /// The verified identity extracted from a Google `id_token`.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct GoogleIdentity {
 	pub subject: String,
 	pub email: String,

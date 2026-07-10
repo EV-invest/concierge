@@ -76,8 +76,12 @@ venv/
 ## Env
 .env
 .env.local
+## App config
+/config.toml
+config.toml
 ## LLMs
 AGENTS.md
 CLAUDE.md
 .claude/
 .pre-commit-config.yaml
+

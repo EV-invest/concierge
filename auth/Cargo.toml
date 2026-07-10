@@ -6,9 +6,6 @@ description = "The concierge plane's auth: the user/session AuthService skeleton
 license = "BlueOak-1.0.0"
 publish = false
 
-[lints]
-workspace = true
-
 [dependencies]
 color-eyre.workspace = true
 ev = { workspace = true, features = ["error_monitoring"] }
@@ -28,3 +25,6 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[lints]
+workspace = true

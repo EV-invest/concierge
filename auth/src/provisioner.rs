@@ -38,7 +38,7 @@ pub struct ProvisionRequest {
 }
 
 /// The snapshot the directory returns after provisioning/looking up a user.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct ProvisionedUser {
 	pub user_id: String,
 	pub email: String,

@@ -15,9 +15,6 @@ path = "src/lib.rs"
 name = "concierge"
 path = "src/main.rs"
 
-[lints]
-workspace = true
-
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
@@ -26,17 +23,17 @@ base64.workspace = true
 color-eyre.workspace = true
 domain.workspace = true
 dotenvy.workspace = true
+ev = { workspace = true, features = ["analytics", "error_monitoring"] }
+evconcierge_auth.workspace = true
+evconcierge_contracts.workspace = true
 form_urlencoded.workspace = true
 getrandom.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
-time.workspace = true
-ev = { workspace = true, features = ["analytics", "error_monitoring"] }
-evconcierge_auth.workspace = true
-evconcierge_contracts.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "migrate"] }
 subtle.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tonic.workspace = true
 tonic-web.workspace = true
@@ -45,3 +42,6 @@ tower-http = { workspace = true, features = ["trace"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid.workspace = true
+
+[lints]
+workspace = true

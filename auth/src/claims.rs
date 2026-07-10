@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// before `aud` is checked. A verifier states the `typ`s it accepts in its
 /// [`VerifyPolicy`](crate::jwks::VerifyPolicy). (Refresh tokens are **not** JWTs —
 /// they are opaque, rotated, server-side handles — so they have no `typ`.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TokenType {
 	/// A short-TTL access token for an http client (the cabinet's user), scoped to
@@ -39,7 +39,7 @@ impl TokenType {
 /// "revoke all" bumps the stored version). It is checked where the authoritative
 /// value is reachable — at refresh time by the auth service — not by stateless
 /// downstream verifiers, which rely on the short access-token TTL instead.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Claims {
 	/// Subject — the principal id (user UUID or service name).
 	pub sub: String,

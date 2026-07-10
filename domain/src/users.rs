@@ -32,7 +32,7 @@ pub struct UserTag;
 /// equality and the storage form are normalized. Deliberately **not** a unique key —
 /// a person may change the email behind a stable [`AuthSubject`]. Serializes
 /// transparently as the bare string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct Email(String);
 
@@ -61,7 +61,7 @@ impl core::fmt::Display for Email {
 
 /// The minimal user lifecycle. `Disabled` freezes sign-in/refresh without deleting
 /// the record (the audit trail must outlive a deactivation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserStatus {
 	Active,
@@ -88,7 +88,7 @@ impl UserStatus {
 /// The caller's editable profile fields (the full-replace set). All optional —
 /// `None`/an empty value clears the field. Identity/auth fields (email, status) are
 /// deliberately absent: they are not user-editable here.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProfileFields {
 	pub legal_name: Option<String>,
 	pub preferred_name: Option<String>,
@@ -106,7 +106,7 @@ pub struct ProfileFields {
 /// (first sign-in, raises [`UserEvent::Provisioned`]) or [`User::rehydrate`] (load
 /// from the store, no events). Mutating transitions accumulate [`UserEvent`]s drained
 /// by the adapter into the cross-plane outbox in the same unit of work.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct User {
 	id: UserId,
 	auth_subject: AuthSubject,
@@ -363,7 +363,7 @@ impl EmitsEvents for User {
 /// `user_outbox` row (one bridge `Kind`) the banking money plane consumes to
 /// gate/freeze money ops. Identity-internal mutations (email, profile) carry no
 /// `Kind` and are not represented here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum UserEvent {
 	Created,
 	SessionsRevoked,

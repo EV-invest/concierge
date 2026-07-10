@@ -1,23 +1,106 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     v_flakes.url = "github:valeratrades/v_flakes?ref=v1.6";
     v_flakes.inputs.nixpkgs.follows = "nixpkgs";
+    v_flakes.inputs.rust-overlay.follows = "rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
     pre-commit-hooks.url = "github:cachix/git-hooks.nix";
     pre-commit-hooks.inputs.nixpkgs.follows = "nixpkgs";
   };
-  outputs = { self, nixpkgs, v_flakes, flake-utils, pre-commit-hooks }:
+  outputs = { self, nixpkgs, rust-overlay, v_flakes, flake-utils, pre-commit-hooks }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
+        overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
-          inherit system;
+          inherit system overlays;
           allowUnfree = true;
         };
         # Canonical toolchain pinned in v_flakes — byte-identical across repos, so
         # the nix store dedups it and sccache cross-references compilations.
         rust = v_flakes.rs.default_nightly system;
+        # Lean toolchain for the production image build: rustc + cargo + std only,
+        # keeping the fat dev toolchain out of the release closure (mirrors site_conductor).
+        rustBuild = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.minimal);
+        pname = "concierge";
+        runnerCargo = (builtins.fromTOML (builtins.readFile ./runner/Cargo.toml)).package;
+
+        rs = v_flakes.rs { inherit pkgs rust; };
+        github = v_flakes.github {
+          inherit pkgs pname rs;
+          enable = true;
+          # Public repo → public Cachix (`ev-invest`); pull deps + push built paths.
+          cache = { cachix = "ev-invest"; };
+          lastSupportedVersion = "nightly-2026-05-12";
+          containerRelease = { registry = "ghcr.io/ev-invest"; };
+          gitignore.extra = ''
+            ## Local Postgres
+            .pg/
+            ## Env
+            .env
+            .env.local
+            ## App config
+            /config.toml
+            config.toml
+            ## LLMs
+            AGENTS.md
+            CLAUDE.md
+            .claude/
+            .pre-commit-config.yaml
+          '';
+        };
+        combined = v_flakes.utils.combine { inherit rust; modules = [ rs github ]; };
+
+        # ── production runner: binary + OCI image ───────────────────────────
+        rustPlatform = pkgs.makeRustPlatform { cargo = rustBuild; rustc = rustBuild; };
+        conciergeSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          # .cargo holds dev-only accelerators (sccache rustc-wrapper) the hermetic
+          # sandbox lacks — let nix's vendor config drive the build instead.
+          filter = path: _type:
+            ! builtins.elem (baseNameOf path) [ "target" ".direnv" ".git" ".cargo" "tmp" "result" ];
+        };
+        conciergeBin = rustPlatform.buildRustPackage {
+          pname = runnerCargo.name;
+          version = runnerCargo.version;
+          src = conciergeSrc;
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [ "-p" "concierge" "--bin" "concierge" ];
+          nativeBuildInputs = with pkgs; [ protobuf pkg-config ];
+          buildInputs = [ pkgs.openssl ];
+          PROTOC = "${pkgs.protobuf}/bin/protoc";
+          doCheck = false;
+        };
+        # ONE container: the runner binary serves gRPC (:55670) AND the auth web
+        # surface (:55671) in-process. The contract's port/healthPath describe the
+        # web surface (http probes); gitops patches the Service to expose both.
+        # Secret env (signing key, JWKS, Google OAuth, bridge token) arrives via
+        # the automatic optional `kubernetes-concierge` envFrom — never baked in.
+        containerStd = v_flakes.container.implement {
+          inherit pkgs pname;
+          containers."" = {
+            port = 55671;
+            healthPath = "/health";
+            criticality = "normal";
+            entrypoint = [ "/bin/concierge" ];
+            contents = [ conciergeBin ];
+            env = {
+              DATABASE_URL = "postgres://evinvest@10.42.0.1:5432/concierge";
+              REDIS_URL = "redis://10.42.0.1:6379/1";
+              CONCIERGE_BIND = "0.0.0.0:55670";
+              CONCIERGE_WEB_BIND = "0.0.0.0:55671";
+              # The inbound verifier dials its own in-process Jwks RPC over loopback.
+              AUTH_JWKS_GRPC_ENDPOINT = "http://127.0.0.1:55670";
+              PUBLIC_ORIGIN = "https://evinvest.ltd";
+              AUTH_SIGNING_KID = "prod-1";
+              APP_ENV = "production";
+              RUST_LOG = "info";
+            };
+          };
+        };
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
           hooks = {
@@ -165,21 +248,56 @@
             echo "postgres ready on 127.0.0.1:$POSTGRES_PORT (databases ensured: $dbs)"
           '';
         };
+        # ── bump latest remote vX.Y.Z tag and push: `.#publish major|minor|patch` ──
+        runPublish = pkgs.writeShellApplication {
+          name = "publish";
+          runtimeInputs = with pkgs; [ git ];
+          text = ''
+                        part="''${1:-}"
+                        case "$part" in major|minor|patch) ;; *) echo "usage: nix run .#publish -- major|minor|patch" >&2; exit 1 ;; esac
+                        [ -z "$(git status --porcelain)" ] || { echo "uncommitted changes — commit or stash first" >&2; exit 1; }
+
+                        git fetch --tags --force origin >/dev/null 2>&1
+                        last="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
+                        ver="''${last#v}"; [ -n "$ver" ] || ver="0.0.0"
+                        IFS=. read -r ma mi pa <<EOF
+            $ver
+            EOF
+                        case "$part" in
+                          major) ma=$((ma+1)); mi=0; pa=0 ;;
+                          minor) mi=$((mi+1)); pa=0 ;;
+                          patch) pa=$((pa+1)) ;;
+                        esac
+                        next="v$ma.$mi.$pa"
+                        echo "$last → $next"
+                        git tag "$next"
+                        git push origin "$next"
+          '';
+        };
       in
       {
         # `nix run .#concierge` → the runner binary (auth/directory/notification/log modules in-process; applies DB migrations on boot; ensures shared postgres + redis first)
         # `nix run .#db`        → ensure the SHARED ev_invest Postgres is up (+ this repo's `concierge` database)
         # `nix run .#redis`     → ensure the SHARED ev_invest Redis is up
+        # `nix run .#publish`   → bump latest remote vX.Y.Z tag (major|minor|patch) + push
         apps = {
           concierge = { type = "app"; program = "${runConcierge}/bin/run-concierge"; };
           db = { type = "app"; program = "${runPostgres}/bin/run-postgres"; };
           redis = { type = "app"; program = "${runRedis}/bin/run-redis"; };
+          publish = { type = "app"; program = "${runPublish}/bin/publish"; };
         };
+
+        packages = {
+          default = conciergeBin;
+          concierge = conciergeBin;
+        } // containerStd.packages;
+
+        containers = containerStd.containers;
 
         devShells.default =
           with pkgs;
           mkShell {
-            inherit (pre-commit-check) shellHook;
+            shellHook = pre-commit-check.shellHook + combined.shellHook;
 
             packages = [
               openssl
@@ -195,7 +313,7 @@
               redis
               treefmt
               nixpkgs-fmt
-            ] ++ pre-commit-check.enabledPackages;
+            ] ++ pre-commit-check.enabledPackages ++ combined.enabledPackages;
 
             env.RUST_BACKTRACE = 1;
             env.RUST_LIB_BACKTRACE = 0;

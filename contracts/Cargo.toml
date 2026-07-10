@@ -6,9 +6,6 @@ description = "gRPC wire contracts for the EV concierge plane — generated toni
 license = "BlueOak-1.0.0"
 publish = false
 
-[lints]
-workspace = true
-
 [dependencies]
 prost.workspace = true
 tonic.workspace = true
@@ -16,3 +13,6 @@ tonic-prost.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
+
+[lints]
+workspace = true
