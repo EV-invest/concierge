@@ -23,6 +23,17 @@ use uuid::Uuid;
 
 use crate::ports::UserDirectoryRepository;
 
+/// The full column projection for the [`UserRow`] reads. sqlx 0.9 requires a
+/// `&'static str` query, so each `SELECT` splices this literal in via `concat!` rather
+/// than a runtime `format!` — keep this list in sync with [`UserRow`].
+macro_rules! user_columns {
+	() => {
+		"id, auth_subject, email, email_verified, status, token_version, kyc_level, role, \
+		legal_name, preferred_name, phone, date_of_birth, nationality, tax_residence, \
+		residential_address, language, base_currency, timezone, row_version"
+	};
+}
+
 /// Stable, arbitrary key for the transaction-scoped advisory lock that serializes
 /// `user_outbox` appends (`pg_advisory_xact_lock`). Every path that appends an outbox
 /// row MUST take this lock, so `position` (BIGSERIAL) order equals commit order — see
@@ -137,17 +148,6 @@ impl UserRow {
 			self.row_version as u64,
 		))
 	}
-}
-
-/// The full column projection for the [`UserRow`] reads. sqlx 0.9 requires a
-/// `&'static str` query, so each `SELECT` splices this literal in via `concat!` rather
-/// than a runtime `format!` — keep this list in sync with [`UserRow`].
-macro_rules! user_columns {
-	() => {
-		"id, auth_subject, email, email_verified, status, token_version, kyc_level, role, \
-		legal_name, preferred_name, phone, date_of_birth, nationality, tax_residence, \
-		residential_address, language, base_currency, timezone, row_version"
-	};
 }
 
 fn repo_err(err: sqlx::Error) -> DomainError {
