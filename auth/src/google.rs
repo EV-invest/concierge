@@ -198,12 +198,15 @@ struct GoogleIdClaims {
 mod tests {
 	use std::{
 		io::{Read, Write},
-		net::TcpListener,
+		net::{SocketAddr, TcpListener},
 		sync::{
 			Mutex,
 			atomic::{AtomicUsize, Ordering},
 		},
 	};
+
+	use jsonwebtoken::{EncodingKey, Header, encode, get_current_timestamp};
+	use serde::Serialize;
 
 	use super::*;
 
@@ -253,5 +256,221 @@ mod tests {
 		google.refresh_certs().await.unwrap();
 
 		assert_eq!(HITS.load(Ordering::SeqCst), 1, "second refresh within the window must reuse the cache");
+	}
+
+	// A throwaway RSA-2048 keypair for exercising `verify_id_token`, generated with
+	// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`; the public
+	// modulus (JWK `n`, `e` = AQAB) is precomputed so the test JWKS needs no RSA
+	// dependency.
+	const TEST_RSA_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDOOeT0L7CsVClj
+ny8j4ke4aCFs+TNYnhA6UkxLnfUaHDrvvqgtgLUwyTXYHGlG1m02UaV7NLYDthu5
++mbYIirVzWqqrnNME2L3gPOyFAI2kuZtmxO5HfLmQNLk6Qts4Sin+mgC6A2aBxqP
+lEv6y7tSPe+G08IAn45AIdD4KbBvZGUL2wdDqr4eCoFkkh/2tSFcorsFtjvaECCN
+ZFKBWVAIGFdW4X7uy++9bZShYtXVQvWuckv+yV4OIhGSjXxosHzM1xhBek+VRo1X
+KZeKxEOancBwjH8wMuDC+OXxLq+u/VHhDqJ4/9Rmx+4AtTAMV8lNxxtu0bwzVhgm
+OM8mBngrAgMBAAECggEADIqiZrDfyOf1YtGZ4RzJyWhlYAABV2Pr2+zu87C16NIx
+419wHhRNvWgyYuPKozw3Hntb2cccd21QkloTSkgJqUCTOn4Re11Sdd4QJyxNIvSC
+fvftyYkNh8mf1ojPR3fWxe08lhcQSX9VGWMNAkH3/ZbQRYRrSY5qhqWH1KlayYTw
+vw0ym3tPLvaw4UOv/pmVKOVQxcj8dabFSpqcWAnGWnwbM+wFGrfub0bvq74udXbA
+rSSsdoAksVG1kkSPz7uGHxhcyVRzApt+rZ3VZwhZjHaOB44yKf0zGsGoTy3nkM2k
+Es953aqjiBwDmQL8y+g3FigMyMOQY5FKODy2IK/hgQKBgQDrLH6Wl3x88aPX2E21
+LVHG8wI2TJo6TwfqOZad5TOq79HlcukXVeALUR797kmdNfgP3LI9jjs6W+s87wZo
+CX8Oc3YCm8Rp3QIdfBKohoe7dEFR53D/Rah5v7LF0DDEmyRiidkJZUxeSLNiFw7I
+OFvfGrgVEEmtj4+/cbTBNdu8KQKBgQDgfSRtPM8fut+8QUKW1LG7EA7jlg385zb9
+M6SP9NsI0QAX3Lk87RMt2gdVeWCBQIMhLPmBIfLavQFBhmjVnKQN/PvP9p0oyVIF
+1B6nLRPmfeoYH+hqUpWwMBWGIC6BnaLFLQ0dUeVUpLz0NbAanbU47E4+vNoYqgnn
+3k8hUr+cMwKBgQDZhNEdZsZNJo+eEEJnxqAx/QjZwmaQchLnERb/ukTc4W7p5Cw2
+WkadEQ4yXtmV4JotybrO9qRPqT9en9L0HXx4mFDZvsugAzx2mxEC8VPQDYpxQDmi
+0wIugiHPl23UG48+2TN23kwRlPreSmdwx7gqFqOXT/Zl4zhZIcnHP5KbaQKBgACD
+iM/PMdIqxVRS+eoKdpWtBbuznjiT9uZBdgD2WIH+qHdlg+8Fw+N4+kdRzcy97w7m
+YXPQNhQWFqilvBuxDhcSGylwsQ9k1pE42REc40zFwQFpIUkNA1ax5Xq3HCQjzjmR
+TtRgWZwF/IC6lrqY3c9RiyRNnlosGXW0Zo32+IVNAoGACwiyaGHEuo6faLPBdRA7
+2NSEFEn7E2u66sO/0zR7MFMCRGxwW98sMz7N+8Qape4Ih6E1ym7BxhAnzeSM0Ksj
+LpH611KSWYWbHz7VnuC87LrzqdOXDJG5jpTjnWXejGrb/w8vIxuSgUAP2wUNuSEA
+JVo7HVcH1N/2KX+Xqrzf6AU=
+-----END PRIVATE KEY-----
+";
+	const TEST_RSA_JWK_N: &str = "zjnk9C-wrFQpY58vI-JHuGghbPkzWJ4QOlJMS531Ghw6776oLYC1MMk12BxpRtZtNlGlezS2A7Ybufpm2CIq1c1qqq5zTBNi94DzshQCNpLmbZsTuR3y5kDS5OkLbOEop_poAugNmgcaj5RL-su7Uj3vhtPCAJ-OQCHQ-Cmwb2RlC9sHQ6q-HgqBZJIf9rUhXKK7BbY72hAgjWRSgVlQCBhXVuF-7svvvW2UoWLV1UL1rnJL_sleDiIRko18aLB8zNcYQXpPlUaNVymXisRDmp3AcIx_MDLgwvjl8S6vrv1R4Q6ieP_UZsfuALUwDFfJTccbbtG8M1YYJjjPJgZ4Kw";
+	const TEST_KID: &str = "google-test-kid";
+
+	// A second throwaway RSA key that is NOT in the served JWKS — its signatures must
+	// fail verification even under the known `kid`.
+	const ROGUE_RSA_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD3v7anKVU7C20q
+A7HQRZuz9jQL/baBiBG7P59olyA7MSWERLnbWC0G/jSMri/xLwhOdr+v08E5wLcs
+fcClGaFnhavQKV9gRQO5yzQY9lhJTkiHNaXq8uVjlkzMdd6t2H3N3rwVC35BoFXX
+gzpsVy5qn4rNdny28cQcOpt1UrocnMRRN4E1LBQD8g+fpzmRFsTYawf5tlIczXhS
+N4cwESoDXAxEOqnK09I+143Q6fVqikyJf7LoGNWaNUv0CqnbG7l/21gUSZni5rL3
+5PJWWH7Ol6ap/x77nODa8n7guaKe0S+gBK1SY/C/s9s3yv9YUGTkv5cPrAn07MSh
+04FmDANrAgMBAAECggEAXzRoe+9ZxeFbt2AJFjiRn4P2tz7twfQooDTQTNB6fdSi
+jqQcaeqGDyBj0EXlvYCt5/0hJ2+v2sIwgePnQmrJiC8pecpUUPnkdyLb59XO0ojH
+PVJD6rghp3XsGEwZYOQHYDP+QfYTNCPpqPJQYq7T8vxRSiiEv4bDrndlIx5Bz9k6
+1XzdbUHNS6w2mgYArvSnHIYA8T1GzR7PvTMyyUb5ZjTsZqUkPiRiWfXizZYkyR1j
+ZEKSysJOTpjSjU3k7JPcO75S9Byc9Iea5WeGR0Yy5RCuSS9oGG0UI/cLzW1T2UcC
+m18KzDvPrJT7+yC2u2qX17QqNmPZtmb/vX8lL36wEQKBgQD99l2oSV69E3/085Z8
+TQ8qdxxdTxe2aWc1yjYUFx4oMYFlc/Kw18CSm6OyNnT+iG9sdk+pbdy5Ocb/Sqiy
+nnjLDrtiVn0l5L6mcAn9/RBeKSwku4AGKl4EYoI+ogDkAUHBGseM/4rRXqc0Dwzk
+a3I7Qjbx23llEOkic7ymkJj5UQKBgQD5vJXS+8d1aLZuL2qOFI+W6XyEI4O5+7os
+WeXfRLOm7X6XYzXf9grFY9JNQ2zDNkTuzr35qEqVycjVFafRNHIXMTeOUYVEXQKn
+GWx5efuUEmsVBn55Wc9xMaHk3f7VnNhXWw12AF+Z5MVPNJu1Uy9rO0m4SHNvRd2A
+0t1j7CJB+wKBgQCfn4IujC8n2GHMrG4hoq2tm0AQxe25kXZ1sKtc5UrnKHaUNdSM
+oo8/luPE18WhVk/ydEqNy6e4JECXpW1zF3gE6TWOEZ6Hesb6BeHB6pWnGWnNjKxj
+M630Q5Zpl5nHtaKGpTZXwSaXgk7Fwc/wojgiVvQCAFjE1WQza1tftfLwgQKBgBpv
+LMi1X+p8l/rXyAacBIrr0gNGoxXXoGA7b8qPQhjkQKcTmEtJhuBX7ZXCEkwjfW5t
+scwwVRy/zCNJ9IZ/b6gmzIOi+2E+Gx7G4SWGlOuae30xP8fmir+nikRofyXrQTcV
+6znXVkc64Ou+XND3qihGkUoRWS6pDYYqS8bc4s9rAoGBAL/HaoF+9qfExwAettFa
+FIQxCyu41U1+mnWSkGSpelruZp9C9KksfyJuGfSyM7JpeUaRjZmWGU6NuNw5HCV2
+iTjbqCev5bkRC+SGrObajKjwRttvaFRG31VPG3nD8G3GUQblaJ3OaVICCYq9eFJ1
+vDYvLc+HvAu+fITPD3S9Dvg0
+-----END PRIVATE KEY-----
+";
+
+	const CLIENT_ID: &str = "ev-client-id";
+	const NONCE: &str = "nonce-123";
+
+	/// Serve a JWKS holding the test key from a local socket, mirroring
+	/// [`refresh_is_throttled_within_cache_window`].
+	fn serve_jwks() -> SocketAddr {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = listener.local_addr().unwrap();
+		std::thread::spawn(move || {
+			for stream in listener.incoming() {
+				let mut stream = stream.unwrap();
+				let mut buf = [0u8; 1024];
+				let _ = stream.read(&mut buf);
+				let body = format!(r#"{{"keys":[{{"kty":"RSA","alg":"RS256","use":"sig","kid":"{TEST_KID}","n":"{TEST_RSA_JWK_N}","e":"AQAB"}}]}}"#);
+				let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+				let _ = stream.write_all(resp.as_bytes());
+			}
+		});
+		addr
+	}
+
+	fn google() -> GoogleOauth {
+		GoogleOauth {
+			client_id: CLIENT_ID.into(),
+			client_secret: "secret".into(),
+			http: reqwest::Client::new(),
+			certs_endpoint: format!("http://{}/certs", serve_jwks()),
+			certs: Mutex::new(CertCache::default()),
+		}
+	}
+
+	#[derive(Serialize)]
+	struct IdClaims {
+		iss: String,
+		aud: String,
+		sub: String,
+		exp: u64,
+		iat: u64,
+		email: String,
+		email_verified: bool,
+		nonce: String,
+	}
+
+	fn id_claims() -> IdClaims {
+		IdClaims {
+			iss: ISSUERS[0].into(),
+			aud: CLIENT_ID.into(),
+			sub: "google-sub-1".into(),
+			exp: get_current_timestamp() + 600,
+			iat: get_current_timestamp(),
+			email: "user@example.com".into(),
+			email_verified: true,
+			nonce: NONCE.into(),
+		}
+	}
+
+	fn mint(claims: &IdClaims, pem: &str, kid: &str) -> String {
+		let key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+		let mut header = Header::new(Algorithm::RS256);
+		header.kid = Some(kid.into());
+		encode(&header, claims, &key).unwrap()
+	}
+
+	#[tokio::test]
+	async fn accepts_a_well_formed_id_token() {
+		// The accept case proves the harness itself is sound — every rejection below
+		// fails on the checked property, not a broken fixture.
+		let identity = google().verify_id_token(&mint(&id_claims(), TEST_RSA_PEM, TEST_KID), NONCE).await.unwrap();
+		assert_eq!(identity.subject, "google-sub-1");
+		assert_eq!(identity.email, "user@example.com");
+		assert!(identity.email_verified);
+	}
+
+	#[tokio::test]
+	async fn rejects_non_rs256_algorithm() {
+		// An HS256 token (secret = the public JWK, the classic key-confusion downgrade)
+		// must be refused by the alg pin before any key lookup.
+		let mut header = Header::new(Algorithm::HS256);
+		header.kid = Some(TEST_KID.into());
+		let token = encode(&header, &id_claims(), &EncodingKey::from_secret(TEST_RSA_JWK_N.as_bytes())).unwrap();
+		assert!(matches!(google().verify_id_token(&token, NONCE).await, Err(AuthError::Provider(_))));
+	}
+
+	#[tokio::test]
+	async fn rejects_unsigned_alg_none_token() {
+		// base64url of `{"alg":"none"}` + `{}` with an empty signature.
+		let token = "eyJhbGciOiJub25lIn0.e30.";
+		assert!(matches!(google().verify_id_token(token, NONCE).await, Err(AuthError::Provider(_))));
+	}
+
+	#[tokio::test]
+	async fn rejects_wrong_audience() {
+		let mut claims = id_claims();
+		claims.aud = "another-client".into();
+		assert!(matches!(
+			google().verify_id_token(&mint(&claims, TEST_RSA_PEM, TEST_KID), NONCE).await,
+			Err(AuthError::Provider(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn rejects_wrong_issuer() {
+		let mut claims = id_claims();
+		claims.iss = "https://accounts.evil.example".into();
+		assert!(matches!(
+			google().verify_id_token(&mint(&claims, TEST_RSA_PEM, TEST_KID), NONCE).await,
+			Err(AuthError::Provider(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn rejects_expired_token() {
+		let mut claims = id_claims();
+		claims.exp = get_current_timestamp() - 3600;
+		assert!(matches!(
+			google().verify_id_token(&mint(&claims, TEST_RSA_PEM, TEST_KID), NONCE).await,
+			Err(AuthError::Provider(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn rejects_signature_from_a_key_outside_the_jwks() {
+		// Signed by the rogue key but stamped with the known kid: the key lookup
+		// succeeds and the RSA signature itself must fail.
+		assert!(matches!(
+			google().verify_id_token(&mint(&id_claims(), ROGUE_RSA_PEM, TEST_KID), NONCE).await,
+			Err(AuthError::Provider(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn rejects_unknown_kid_after_refresh() {
+		// An unrecognized kid forces a certs refresh; the served JWKS still has no
+		// match, so verification must fail rather than fall through.
+		assert!(matches!(
+			google().verify_id_token(&mint(&id_claims(), TEST_RSA_PEM, "no-such-kid"), NONCE).await,
+			Err(AuthError::Provider(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn rejects_nonce_mismatch() {
+		assert!(matches!(
+			google().verify_id_token(&mint(&id_claims(), TEST_RSA_PEM, TEST_KID), "a-different-nonce").await,
+			Err(AuthError::Provider(_))
+		));
 	}
 }
