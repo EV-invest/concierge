@@ -20,6 +20,7 @@ mod oauth;
 mod routes;
 mod session;
 
+// The one session-store name tests exercise the persistence invariant through.
 use std::sync::Arc;
 
 use axum::{
@@ -28,9 +29,10 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use evconcierge_auth::AuthService;
+pub use session::WebSessions;
 use time::Duration;
 
-use crate::web::{oauth::OAuthTxStore, session::WebSessions};
+use crate::web::oauth::OAuthTxStore;
 
 /// Cookie names + shared attributes. `__Host-` prefixed when secure (production);
 /// bare in http dev, since the prefix requires `Secure`.
@@ -85,17 +87,17 @@ pub struct WebState {
 	inner: Arc<Inner>,
 }
 impl WebState {
-	pub fn new(auth: AuthService, public_origin: String, secure_cookies: bool) -> Self {
-		Self {
+	pub async fn try_new(auth: AuthService, public_origin: String, secure_cookies: bool) -> color_eyre::Result<Self> {
+		Ok(Self {
 			inner: Arc::new(Inner {
 				auth,
 				oauth: OAuthTxStore::new(),
-				sessions: WebSessions::new(),
+				sessions: WebSessions::from_env().await?,
 				cookies: CookieNames::new(secure_cookies),
 				google_client_id: std::env::var("GOOGLE_CLIENT_ID").ok().filter(|v| !v.is_empty()),
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 			}),
-		}
+		})
 	}
 }
 

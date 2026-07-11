@@ -107,8 +107,13 @@ pub async fn callback(State(st): State<WebState>, jar: CookieJar, headers: Heade
 		Ok(response) => {
 			let tokens = response.into_inner();
 			let access_token = tokens.access_token.clone();
-			let Some((id, csrf, max_age)) = st.sessions.put(tokens).await else {
-				return fail(st, jar, &return_to, "exchange");
+			let (id, csrf, max_age) = match st.sessions.put(tokens).await {
+				Ok(Some(opened)) => opened,
+				Ok(None) => return fail(st, jar, &return_to, "exchange"),
+				Err(e) => {
+					tracing::error!(error = ?e, "auth callback: session store put failed");
+					return fail(st, jar, &return_to, "session");
+				}
 			};
 			let jar = jar
 				.add(st.cookies.server_cookie(st.cookies.session.clone(), id, max_age))
@@ -129,13 +134,15 @@ pub async fn callback(State(st): State<WebState>, jar: CookieJar, headers: Heade
 }
 /// `GET /auth/session` — who-am-I for the browser, refreshing the access token (and
 /// its zone-shared cookie) transparently. Never returns a token in the body.
-pub async fn session(State(st): State<WebState>, jar: CookieJar) -> (CookieJar, Json<SessionInfo>) {
+pub async fn session(State(st): State<WebState>, jar: CookieJar) -> Result<(CookieJar, Json<SessionInfo>), (StatusCode, &'static str)> {
 	let st = &st.inner;
 	let fresh = match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
-		Some(id) => st.sessions.fresh(&id, &st.auth).await,
+		// A store failure means the session's fate is UNKNOWN — 500 and keep the
+		// cookies, never sign the user out over a Redis blip.
+		Some(id) => st.sessions.fresh(&id, &st.auth).await.map_err(store_err)?,
 		None => None,
 	};
-	match fresh {
+	Ok(match fresh {
 		Some(fresh) => {
 			let jar = jar.add(st.cookies.server_cookie(st.cookies.access.clone(), fresh.access_token, fresh.remaining_secs));
 			(jar, Json(SessionInfo::authenticated(fresh.user)))
@@ -143,17 +150,17 @@ pub async fn session(State(st): State<WebState>, jar: CookieJar) -> (CookieJar, 
 		// The session is gone but the browser may still hold the cookies — clear them
 		// so zone middlewares stop treating requests as signed-in.
 		None => (clear_session(st, jar), Json(SessionInfo::anonymous())),
-	}
+	})
 }
 /// `POST /auth/logout` — CSRF-checked: drop the session, revoke the refresh family
 /// upstream (best-effort), and clear the cookies.
 pub async fn logout(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Result<(CookieJar, Json<Value>), (StatusCode, &'static str)> {
 	let st = &st.inner;
-	if !verify_csrf(st, &jar, &headers).await {
+	if !verify_csrf(st, &jar, &headers).await? {
 		return Err((StatusCode::FORBIDDEN, "csrf check failed"));
 	}
 	if let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_string())
-		&& let Some(refresh) = st.sessions.forget(&id).await
+		&& let Some(refresh) = st.sessions.forget(&id).await.map_err(store_err)?
 	{
 		// The session is already gone locally; an upstream blip must not block logout.
 		let _ = AuthRpc::logout(
@@ -171,7 +178,7 @@ pub async fn logout(State(st): State<WebState>, jar: CookieJar, headers: HeaderM
 /// proven by the server-side refresh token (never exposed to the browser).
 pub async fn list_sessions(State(st): State<WebState>, jar: CookieJar) -> Result<Json<Value>, (StatusCode, &'static str)> {
 	let st = &st.inner;
-	let refresh = refresh_of(st, &jar).await.ok_or((StatusCode::UNAUTHORIZED, "unauthenticated"))?;
+	let refresh = refresh_of(st, &jar).await?.ok_or((StatusCode::UNAUTHORIZED, "unauthenticated"))?;
 	let response = AuthRpc::list_sessions(&st.auth, tonic::Request::new(cc::ListSessionsRequest { refresh_token: refresh }))
 		.await
 		.map_err(|_| (StatusCode::BAD_GATEWAY, "session listing failed"))?
@@ -194,10 +201,10 @@ pub async fn list_sessions(State(st): State<WebState>, jar: CookieJar) -> Result
 /// the caller; revoking the current one acts like a sign-out of this device).
 pub async fn revoke_session(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, body: Option<Json<Value>>) -> Result<Json<Value>, (StatusCode, &'static str)> {
 	let st = &st.inner;
-	if !verify_csrf(st, &jar, &headers).await {
+	if !verify_csrf(st, &jar, &headers).await? {
 		return Err((StatusCode::FORBIDDEN, "csrf check failed"));
 	}
-	let refresh = refresh_of(st, &jar).await.ok_or((StatusCode::UNAUTHORIZED, "unauthenticated"))?;
+	let refresh = refresh_of(st, &jar).await?.ok_or((StatusCode::UNAUTHORIZED, "unauthenticated"))?;
 	let session_id = body.as_ref().and_then(|Json(v)| v.get("session_id")).and_then(|x| x.as_str()).unwrap_or("").to_string();
 	if session_id.is_empty() {
 		return Err((StatusCode::BAD_REQUEST, "session_id required"));
@@ -234,26 +241,35 @@ impl super::Inner {
 	}
 }
 
-async fn refresh_of(st: &super::Inner, jar: &CookieJar) -> Option<String> {
-	let id = jar.get(&st.cookies.session)?.value().to_string();
-	st.sessions.refresh_token(&id).await
+/// A session-store failure is a 500, never an auth verdict: the session may well
+/// still exist, so neither cookies nor upstream state may be touched off it.
+fn store_err(e: color_eyre::Report) -> (StatusCode, &'static str) {
+	tracing::error!(error = ?e, "web session store failed");
+	(StatusCode::INTERNAL_SERVER_ERROR, "session store unavailable")
+}
+
+async fn refresh_of(st: &super::Inner, jar: &CookieJar) -> Result<Option<String>, (StatusCode, &'static str)> {
+	let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) else {
+		return Ok(None);
+	};
+	st.sessions.refresh_token(&id).await.map_err(store_err)
 }
 
 /// CSRF double-submit, hardened with the server-side session copy: the `x-ev-csrf`
 /// header must equal the readable csrf cookie AND the value stored on the session.
-async fn verify_csrf(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> bool {
+async fn verify_csrf(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<bool, (StatusCode, &'static str)> {
 	let Some(cookie) = jar.get(&st.cookies.csrf).map(|c| c.value().to_string()) else {
-		return false;
+		return Ok(false);
 	};
 	let Some(header) = headers.get("x-ev-csrf").and_then(|v| v.to_str().ok()) else {
-		return false;
+		return Ok(false);
 	};
 	if cookie != header {
-		return false;
+		return Ok(false);
 	}
 	match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
-		Some(id) => st.sessions.csrf(&id).await.as_deref() == Some(header),
-		None => false,
+		Some(id) => Ok(st.sessions.csrf(&id).await.map_err(store_err)?.as_deref() == Some(header)),
+		None => Ok(false),
 	}
 }
 

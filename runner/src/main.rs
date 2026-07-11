@@ -158,7 +158,9 @@ async fn run(config: AppConfig) -> Result<()> {
 	// The site-level auth HTTP surface: the conductor rewrites the shared origin's
 	// `/api/auth/*` + `/api/callback/auth/*` here, so login/session cookies land
 	// first-party for every zone. Calls the SAME issuance service in-process.
-	let web_state = web::WebState::new(auth_service.clone(), config.public_origin.clone(), config.app_env == "production");
+	let web_state = web::WebState::try_new(auth_service.clone(), config.public_origin.clone(), config.app_env == "production")
+		.await
+		.context("failed to build the auth web state")?;
 	let web_listener = tokio::net::TcpListener::bind(config.web_bind).await.context("failed to bind the auth web listener")?;
 	tracing::info!(bind = %config.web_bind, "auth web surface listening");
 	let web_server = async {
