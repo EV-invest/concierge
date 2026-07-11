@@ -291,11 +291,12 @@
         };
       in
       {
-        # `nix run .#concierge` → the runner binary (auth/directory/notification/log modules in-process; applies DB migrations on boot; ensures shared postgres + redis first)
+        # `nix run` (default = .#concierge) → the runner binary (auth/directory/notification/log modules in-process; applies DB migrations on boot; ensures shared postgres + redis first)
         # `nix run .#db`        → ensure the SHARED ev_invest Postgres is up (+ this repo's `concierge` database)
         # `nix run .#redis`     → ensure the SHARED ev_invest Redis is up
         # `nix run .#publish`   → bump latest remote vX.Y.Z tag (major|minor|patch) + push
         apps = {
+          default = { type = "app"; program = "${runConcierge}/bin/run-concierge"; };
           concierge = { type = "app"; program = "${runConcierge}/bin/run-concierge"; };
           db = { type = "app"; program = "${runPostgres}/bin/run-postgres"; };
           redis = { type = "app"; program = "${runRedis}/bin/run-redis"; };
