@@ -200,7 +200,7 @@ mod tests {
 		io::{Read, Write},
 		net::{SocketAddr, TcpListener},
 		sync::{
-			Mutex,
+			Arc, Mutex,
 			atomic::{AtomicUsize, Ordering},
 		},
 	};
@@ -220,22 +220,20 @@ mod tests {
 		assert_eq!(max_age_of(&empty), Duration::ZERO);
 	}
 
-	/// A second refresh inside the cache window must not hit the certs endpoint again,
-	/// so each login no longer round-trips Google. Serves one canned JWKS from a local
-	/// socket and counts inbound connections.
-	#[tokio::test]
-	async fn refresh_is_throttled_within_cache_window() {
-		static HITS: AtomicUsize = AtomicUsize::new(0);
+	/// Serve a canned certs body from a local socket (with the `Cache-Control: max-age`
+	/// the real endpoint sends), counting inbound connections so a test can assert how
+	/// often the endpoint was actually hit.
+	fn serve(body: String) -> (SocketAddr, Arc<AtomicUsize>) {
 		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 		let addr = listener.local_addr().unwrap();
-
+		let hits = Arc::new(AtomicUsize::new(0));
+		let counter = Arc::clone(&hits);
 		std::thread::spawn(move || {
 			for stream in listener.incoming() {
 				let mut stream = stream.unwrap();
 				let mut buf = [0u8; 1024];
 				let _ = stream.read(&mut buf);
-				HITS.fetch_add(1, Ordering::SeqCst);
-				let body = r#"{"keys":[]}"#;
+				counter.fetch_add(1, Ordering::SeqCst);
 				let resp = format!(
 					"HTTP/1.1 200 OK\r\nCache-Control: max-age=3600\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
 					body.len()
@@ -243,7 +241,14 @@ mod tests {
 				let _ = stream.write_all(resp.as_bytes());
 			}
 		});
+		(addr, hits)
+	}
 
+	/// A second refresh inside the cache window must not hit the certs endpoint again,
+	/// so each login no longer round-trips Google.
+	#[tokio::test]
+	async fn refresh_is_throttled_within_cache_window() {
+		let (addr, hits) = serve(r#"{"keys":[]}"#.into());
 		let google = GoogleOauth {
 			client_id: "test".into(),
 			client_secret: "test".into(),
@@ -255,7 +260,7 @@ mod tests {
 		google.refresh_certs().await.unwrap();
 		google.refresh_certs().await.unwrap();
 
-		assert_eq!(HITS.load(Ordering::SeqCst), 1, "second refresh within the window must reuse the cache");
+		assert_eq!(hits.load(Ordering::SeqCst), 1, "second refresh within the window must reuse the cache");
 	}
 
 	// A throwaway RSA-2048 keypair for exercising `verify_id_token`, generated with
@@ -329,31 +334,35 @@ vDYvLc+HvAu+fITPD3S9Dvg0
 	const CLIENT_ID: &str = "ev-client-id";
 	const NONCE: &str = "nonce-123";
 
-	/// Serve a JWKS holding the test key from a local socket, mirroring
-	/// [`refresh_is_throttled_within_cache_window`].
-	fn serve_jwks() -> SocketAddr {
-		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-		let addr = listener.local_addr().unwrap();
-		std::thread::spawn(move || {
-			for stream in listener.incoming() {
-				let mut stream = stream.unwrap();
-				let mut buf = [0u8; 1024];
-				let _ = stream.read(&mut buf);
-				let body = format!(r#"{{"keys":[{{"kty":"RSA","alg":"RS256","use":"sig","kid":"{TEST_KID}","n":"{TEST_RSA_JWK_N}","e":"AQAB"}}]}}"#);
-				let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
-				let _ = stream.write_all(resp.as_bytes());
-			}
-		});
-		addr
+	fn jwks_body() -> String {
+		format!(r#"{{"keys":[{{"kty":"RSA","alg":"RS256","use":"sig","kid":"{TEST_KID}","n":"{TEST_RSA_JWK_N}","e":"AQAB"}}]}}"#)
 	}
 
 	fn google() -> GoogleOauth {
-		GoogleOauth {
+		google_with_cache(CertCache::default()).0
+	}
+
+	fn google_with_cache(cache: CertCache) -> (GoogleOauth, Arc<AtomicUsize>) {
+		let (addr, hits) = serve(jwks_body());
+		let google = GoogleOauth {
 			client_id: CLIENT_ID.into(),
 			client_secret: "secret".into(),
 			http: reqwest::Client::new(),
-			certs_endpoint: format!("http://{}/certs", serve_jwks()),
-			certs: Mutex::new(CertCache::default()),
+			certs_endpoint: format!("http://{addr}/certs"),
+			certs: Mutex::new(cache),
+		};
+		(google, hits)
+	}
+
+	/// Every failure in `verify_id_token` maps to `AuthError::Provider`, so a bare
+	/// `is_err` cannot tell WHICH check fired — a broken fixture (certs fetch failing)
+	/// would satisfy every rejection test. Returning the message lets each test pin
+	/// its own rejection reason.
+	async fn rejection(google: &GoogleOauth, token: &str, nonce: &str) -> String {
+		match google.verify_id_token(token, nonce).await {
+			Err(AuthError::Provider(msg)) => msg,
+			Ok(_) => panic!("id_token was unexpectedly accepted"),
+			Err(other) => panic!("unexpected error variant: {other:?}"),
 		}
 	}
 
@@ -402,75 +411,86 @@ vDYvLc+HvAu+fITPD3S9Dvg0
 	#[tokio::test]
 	async fn rejects_non_rs256_algorithm() {
 		// An HS256 token (secret = the public JWK, the classic key-confusion downgrade)
-		// must be refused by the alg pin before any key lookup.
+		// must be refused by the explicit alg pin BEFORE any key lookup — the pinned
+		// message proves that layer fired, not `decode`'s own algorithm check (which
+		// would also reject, letting the pin silently disappear).
 		let mut header = Header::new(Algorithm::HS256);
 		header.kid = Some(TEST_KID.into());
 		let token = encode(&header, &id_claims(), &EncodingKey::from_secret(TEST_RSA_JWK_N.as_bytes())).unwrap();
-		assert!(matches!(google().verify_id_token(&token, NONCE).await, Err(AuthError::Provider(_))));
+		let msg = rejection(&google(), &token, NONCE).await;
+		assert!(msg.contains("unexpected google id_token algorithm"), "must be refused by the alg pin, got: {msg}");
 	}
 
 	#[tokio::test]
 	async fn rejects_unsigned_alg_none_token() {
-		// base64url of `{"alg":"none"}` + `{}` with an empty signature.
-		let token = "eyJhbGciOiJub25lIn0.e30.";
-		assert!(matches!(google().verify_id_token(token, NONCE).await, Err(AuthError::Provider(_))));
+		// An alg-none forgery carrying the FULL valid claims payload and the known kid
+		// (header is base64url of `{"alg":"none","kid":"google-test-kid"}`, claims
+		// spliced from a well-formed token, empty signature) — so nothing but the
+		// missing signature / forbidden algorithm can be the rejection reason.
+		let minted = mint(&id_claims(), TEST_RSA_PEM, TEST_KID);
+		let claims = minted.split('.').nth(1).unwrap();
+		let token = format!("eyJhbGciOiJub25lIiwia2lkIjoiZ29vZ2xlLXRlc3Qta2lkIn0.{claims}.");
+		let msg = rejection(&google(), &token, NONCE).await;
+		assert!(msg.contains("header") || msg.contains("algorithm"), "must be refused on the header/alg, got: {msg}");
 	}
 
 	#[tokio::test]
 	async fn rejects_wrong_audience() {
 		let mut claims = id_claims();
 		claims.aud = "another-client".into();
-		assert!(matches!(
-			google().verify_id_token(&mint(&claims, TEST_RSA_PEM, TEST_KID), NONCE).await,
-			Err(AuthError::Provider(_))
-		));
+		let msg = rejection(&google(), &mint(&claims, TEST_RSA_PEM, TEST_KID), NONCE).await;
+		assert!(msg.contains("InvalidAudience"), "must be refused on aud, got: {msg}");
 	}
 
 	#[tokio::test]
 	async fn rejects_wrong_issuer() {
 		let mut claims = id_claims();
 		claims.iss = "https://accounts.evil.example".into();
-		assert!(matches!(
-			google().verify_id_token(&mint(&claims, TEST_RSA_PEM, TEST_KID), NONCE).await,
-			Err(AuthError::Provider(_))
-		));
+		let msg = rejection(&google(), &mint(&claims, TEST_RSA_PEM, TEST_KID), NONCE).await;
+		assert!(msg.contains("InvalidIssuer"), "must be refused on iss, got: {msg}");
 	}
 
 	#[tokio::test]
 	async fn rejects_expired_token() {
 		let mut claims = id_claims();
 		claims.exp = get_current_timestamp() - 3600;
-		assert!(matches!(
-			google().verify_id_token(&mint(&claims, TEST_RSA_PEM, TEST_KID), NONCE).await,
-			Err(AuthError::Provider(_))
-		));
+		let msg = rejection(&google(), &mint(&claims, TEST_RSA_PEM, TEST_KID), NONCE).await;
+		assert!(msg.contains("ExpiredSignature"), "must be refused on exp, got: {msg}");
 	}
 
 	#[tokio::test]
 	async fn rejects_signature_from_a_key_outside_the_jwks() {
 		// Signed by the rogue key but stamped with the known kid: the key lookup
 		// succeeds and the RSA signature itself must fail.
-		assert!(matches!(
-			google().verify_id_token(&mint(&id_claims(), ROGUE_RSA_PEM, TEST_KID), NONCE).await,
-			Err(AuthError::Provider(_))
-		));
+		let msg = rejection(&google(), &mint(&id_claims(), ROGUE_RSA_PEM, TEST_KID), NONCE).await;
+		assert!(msg.contains("InvalidSignature"), "must be refused on the signature, got: {msg}");
 	}
 
 	#[tokio::test]
 	async fn rejects_unknown_kid_after_refresh() {
 		// An unrecognized kid forces a certs refresh; the served JWKS still has no
 		// match, so verification must fail rather than fall through.
-		assert!(matches!(
-			google().verify_id_token(&mint(&id_claims(), TEST_RSA_PEM, "no-such-kid"), NONCE).await,
-			Err(AuthError::Provider(_))
-		));
+		let msg = rejection(&google(), &mint(&id_claims(), TEST_RSA_PEM, "no-such-kid"), NONCE).await;
+		assert!(msg.contains("no matching google signing key"), "must be refused on the kid, got: {msg}");
 	}
 
 	#[tokio::test]
 	async fn rejects_nonce_mismatch() {
-		assert!(matches!(
-			google().verify_id_token(&mint(&id_claims(), TEST_RSA_PEM, TEST_KID), "a-different-nonce").await,
-			Err(AuthError::Provider(_))
-		));
+		let msg = rejection(&google(), &mint(&id_claims(), TEST_RSA_PEM, TEST_KID), "a-different-nonce").await;
+		assert!(msg.contains("nonce mismatch"), "must be refused on the nonce, got: {msg}");
+	}
+
+	#[tokio::test]
+	async fn refreshes_a_warm_cache_when_google_rotates_keys() {
+		// A cache already populated by an earlier fetch (whose refresh window has
+		// elapsed) must re-fetch when a token arrives under a kid it does not hold —
+		// otherwise a Google key rotation strands every login until restart.
+		let stale = CertCache {
+			keys: HashMap::from([("retired-kid".to_string(), DecodingKey::from_rsa_components(TEST_RSA_JWK_N, "AQAB").unwrap())]),
+			refresh_after: Some(Instant::now()),
+		};
+		let (google, hits) = google_with_cache(stale);
+		google.verify_id_token(&mint(&id_claims(), TEST_RSA_PEM, TEST_KID), NONCE).await.unwrap();
+		assert_eq!(hits.load(Ordering::SeqCst), 1, "an unknown kid on a warm cache must re-fetch the certs");
 	}
 }
