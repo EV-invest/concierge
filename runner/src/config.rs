@@ -1,18 +1,23 @@
-use std::{env, net::SocketAddr};
+use std::net::SocketAddr;
 
-use color_eyre::eyre::{Context, Result};
+use smart_default::SmartDefault;
+use v_utils::macros as v_macros;
 
-/// Runner configuration, sourced from environment variables (and `.env` in
-/// development via `dotenvy`).
-#[derive(Clone, Debug)]
-pub struct Config {
+/// Runner configuration (LiveSettings). Prod runs `--config` on the baked
+/// `deploy/config.nix` result — `{ env = "VAR" }` refs there assert the var's
+/// presence at startup. Dev runs config-less from the flake-exported env
+/// (`#[settings(use_env = true)]` aliases each field to its SHOUTY name).
+#[derive(Clone, Debug, v_macros::LiveSettings, v_macros::MyConfigPrimitives, v_macros::Settings, SmartDefault)]
+#[settings(use_env = true)]
+pub struct AppConfig {
 	pub database_url: String,
 	/// gRPC listener address for the modular-monolith surface (auth + directory +
 	/// notification + log + health, all mounted on one server).
-	pub bind_addr: SocketAddr,
+	#[default(SocketAddr::from(([127, 0, 0, 1], 50061)))]
+	pub bind: SocketAddr,
 	/// Max connections for the request-serving Postgres pool (the directory handlers
-	/// and the bridge outbox reads). `DB_MAX_CONNECTIONS`; defaults to the sqlx
-	/// default (10) — raise it for production.
+	/// and the bridge outbox reads).
+	#[default(10)]
 	pub db_max_connections: u32,
 	/// Break-glass superadmin allowlist: a listed subject is treated as
 	/// [`Role::Owner`](domain::authz::Role) — a ROLE override surfaced everywhere the plane
@@ -20,72 +25,30 @@ pub struct Config {
 	/// not only the RPC gate, so a listed subject can open the cabinet admin console before
 	/// any role is persisted. It never exempts from status/`token_version` enforcement and
 	/// never writes `users.role` (`SetRole` is the only writer) — empty the list once the
-	/// bootstrap operator has persisted a real role. `ADMIN_SUBJECTS` is a comma-separated
-	/// list (empty ⇒ no bootstrap admins). NOTE: these are CONCIERGE canonical user ids —
-	/// the banking plane's identical env is keyed on its OWN (disjoint) user id space, so
-	/// the same human is a different UUID on each plane; a wrong id fails closed to Investor.
+	/// bootstrap operator has persisted a real role. Comma-separated (empty ⇒ no bootstrap
+	/// admins). NOTE: these are CONCIERGE canonical user ids — the banking plane's identical
+	/// env is keyed on its OWN (disjoint) user id space, so the same human is a different
+	/// UUID on each plane; a wrong id fails closed to Investor.
+	#[serde(default)]
 	pub admin_subjects: Vec<String>,
 	/// Shared bearer token the banking money plane presents on the cross-plane bridge
-	/// (`UserEvents.PullUserLifecycle`). `BRIDGE_SERVICE_TOKEN`; `None` ⇒ the bridge is
-	/// not served (every pull is rejected), so an unconfigured plane never leaks the
-	/// outbox. Graduate to mTLS/SPIFFE at platform scale.
-	pub bridge_service_token: Option<String>,
+	/// (`UserEvents.PullUserLifecycle`). Graduate to mTLS/SPIFFE at platform scale.
+	pub bridge_service_token: String,
 	pub sentry_dsn: Option<String>,
 	/// PostHog project key for native product-analytics capture. `None` disables
 	/// capture (a silent no-op), so the same code runs unconfigured (local, CI).
 	pub posthog_key: Option<String>,
 	/// PostHog ingestion host; `None` falls back to the library default.
 	pub posthog_host: Option<String>,
+	// No Rust-side default: published v_utils_macros can't synthesize serde
+	// defaults for PrivateValue-wrapped (String) fields. Dev exports APP_ENV /
+	// PUBLIC_ORIGIN (flake run script); prod sets literals in deploy/config.nix.
 	pub app_env: String,
 	/// HTTP listener for the site-level auth surface (`web` module). The conductor
 	/// rewrites `/api/auth/*` + `/api/callback/auth/*` here.
-	pub web_bind_addr: SocketAddr,
+	#[default(SocketAddr::from(([127, 0, 0, 1], 55671)))]
+	pub web_bind: SocketAddr,
 	/// The user-facing origin the conductor serves; builds the OAuth redirect_uri
-	/// (`{PUBLIC_ORIGIN}/api/callback/auth/google` — register it with Google).
+	/// (`{public_origin}/api/callback/auth/google` — register it with Google).
 	pub public_origin: String,
-}
-
-impl Config {
-	pub fn from_env() -> Result<Self> {
-		let database_url = env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
-		let bind_addr = env::var("CONCIERGE_BIND")
-			.unwrap_or_else(|_| "127.0.0.1:50061".to_string())
-			.parse()
-			.context("CONCIERGE_BIND must be a valid socket address, e.g. 127.0.0.1:50061")?;
-		let db_max_connections = env::var("DB_MAX_CONNECTIONS")
-			.ok()
-			.map(|v| v.parse().context("DB_MAX_CONNECTIONS must be a positive integer"))
-			.transpose()?
-			.unwrap_or(10);
-		let admin_subjects = env::var("ADMIN_SUBJECTS")
-			.unwrap_or_default()
-			.split(',')
-			.map(str::trim)
-			.filter(|s| !s.is_empty())
-			.map(str::to_owned)
-			.collect();
-		let bridge_service_token = env::var("BRIDGE_SERVICE_TOKEN").ok().filter(|s| !s.is_empty());
-		let sentry_dsn = env::var("SENTRY_DSN").ok().filter(|s| !s.is_empty());
-		let posthog_key = env::var("POSTHOG_KEY").ok().filter(|s| !s.is_empty());
-		let posthog_host = env::var("POSTHOG_HOST").ok().filter(|s| !s.is_empty());
-		let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
-		let web_bind_addr = env::var("CONCIERGE_WEB_BIND")
-			.unwrap_or_else(|_| "127.0.0.1:55671".to_string())
-			.parse()
-			.context("CONCIERGE_WEB_BIND must be a valid socket address, e.g. 127.0.0.1:55671")?;
-		let public_origin = env::var("PUBLIC_ORIGIN").unwrap_or_else(|_| "http://localhost:58843".to_string());
-		Ok(Self {
-			database_url,
-			bind_addr,
-			db_max_connections,
-			admin_subjects,
-			bridge_service_token,
-			sentry_dsn,
-			posthog_key,
-			posthog_host,
-			app_env,
-			web_bind_addr,
-			public_origin,
-		})
-	}
 }

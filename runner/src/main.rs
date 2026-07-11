@@ -11,8 +11,12 @@
 
 use std::sync::Arc;
 
-use color_eyre::{Result, eyre::Context};
-use concierge::{bridge, config::Config, directory, infrastructure, log, notification, platform, web};
+use clap::Parser;
+use color_eyre::{
+	Result,
+	eyre::{Context, ensure},
+};
+use concierge::{bridge, config, config::AppConfig, directory, infrastructure, log, notification, platform, web};
 use ev::error_monitoring::{self, Config as SentryConfig};
 use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
@@ -30,12 +34,21 @@ use tonic_web::GrpcWebLayer;
 use tower::{Layer, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 
+#[derive(Parser)]
+struct Cli {
+	#[clap(flatten)]
+	settings_flags: config::SettingsFlags,
+}
+
 // Sentry must be initialised before the async runtime starts — no #[tokio::main].
 fn main() -> Result<()> {
 	color_eyre::install()?;
 	dotenvy::dotenv().ok();
 
-	let config = Config::from_env().context("failed to load configuration")?;
+	let cli = Cli::parse();
+	// One snapshot at boot; hot reload is unused. A missing `{ env = "VAR" }` ref
+	// in the prod config fails HERE, before anything binds.
+	let config = config::LiveSettings::new(cli.settings_flags, std::time::Duration::from_secs(60))?.config()?;
 
 	// Guard must stay alive for the duration of main — dropping it flushes events.
 	// `None` DSN → `init` returns `None`, so this binding is simply inert.
@@ -54,7 +67,7 @@ fn main() -> Result<()> {
 		.block_on(run(config))
 }
 
-async fn run(config: Config) -> Result<()> {
+async fn run(config: AppConfig) -> Result<()> {
 	// The plane applies pending control-plane migrations on boot (idempotent). New
 	// migration FILES are authored with the sqlx CLI (`sqlx migrate add …`), never
 	// hand-written.
@@ -67,7 +80,7 @@ async fn run(config: Config) -> Result<()> {
 	// silent no-op, so this is safe to construct unconfigured.
 	let _analytics = ev::analytics::Analytics::new(config.posthog_key.clone(), config.posthog_host.clone());
 
-	tracing::info!(bind = %config.bind_addr, "concierge listening");
+	tracing::info!(bind = %config.bind, "concierge listening");
 
 	// The user directory repository: the only writer of the identity control plane and
 	// the cross-plane outbox. Shared by the directory service and the provisioner loop,
@@ -80,6 +93,20 @@ async fn run(config: Config) -> Result<()> {
 	// (called from `Exchange`/`Refresh`), and the directory keeps the receiver and
 	// drains it against Postgres — provisioning/looking-up/revoking the matching user.
 	let auth_config = AuthConfig::from_env().context("failed to load auth configuration")?;
+	// The auth crate's optional seams (absent ⇒ inert plane) are a dev/CI
+	// affordance; production must never boot inert. Same for the session/refresh
+	// stores' in-process fallback — restart-lossy, dev-only.
+	if config.app_env == "production" {
+		ensure!(
+			auth_config.signing.is_some(),
+			"production requires the auth signing triple (AUTH_SIGNING_KEY_PEM/AUTH_SIGNING_KID/AUTH_JWKS_JSON)"
+		);
+		ensure!(auth_config.google.is_some(), "production requires GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET");
+		ensure!(
+			std::env::var("REDIS_URL").is_ok_and(|v| !v.is_empty()),
+			"production requires REDIS_URL (web sessions + refresh state must survive restarts)"
+		);
+	}
 	// The inbound verifier must expect exactly what issuance stamps, so read the
 	// issuer/audience off the loaded (env-resolved, plane-asserted) `auth_config`
 	// before it moves into the service — never re-read the env with copied defaults.
@@ -104,7 +131,7 @@ async fn run(config: Config) -> Result<()> {
 		issuer,
 		audiences,
 		allowed_types: vec![evconcierge_auth::TokenType::Access],
-		jwks_grpc_endpoint: std::env::var("AUTH_JWKS_GRPC_ENDPOINT").unwrap_or_else(|_| format!("http://{}", config.bind_addr)),
+		jwks_grpc_endpoint: std::env::var("AUTH_JWKS_GRPC_ENDPOINT").unwrap_or_else(|_| format!("http://{}", config.bind)),
 	};
 	verifier_config.assert_plane().context("verifier config carries a cross-plane identity")?;
 	let verifier = Verifier::try_new(verifier_config).context("failed to build the inbound token verifier")?;
@@ -123,8 +150,8 @@ async fn run(config: Config) -> Result<()> {
 	// The cross-plane bridge producer: the one-way identity→money seam the banking
 	// plane PULLS from. Mounted OUTSIDE the user `auth` layer — it is a
 	// service-to-service seam authenticated by its own shared bridge service token, not
-	// a user access token. Unconfigured (`BRIDGE_SERVICE_TOKEN` unset) it fails closed.
-	let bridge = bridge::Bridge::new(pool.clone(), config.bridge_service_token);
+	// a user access token.
+	let bridge = bridge::Bridge::new(pool.clone(), Some(config.bridge_service_token));
 
 	let platform_repo: Arc<dyn concierge::ports::PlatformConfigRepository> = Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
 
@@ -132,8 +159,8 @@ async fn run(config: Config) -> Result<()> {
 	// `/api/auth/*` + `/api/callback/auth/*` here, so login/session cookies land
 	// first-party for every zone. Calls the SAME issuance service in-process.
 	let web_state = web::WebState::new(auth_service.clone(), config.public_origin.clone(), config.app_env == "production");
-	let web_listener = tokio::net::TcpListener::bind(config.web_bind_addr).await.context("failed to bind the auth web listener")?;
-	tracing::info!(bind = %config.web_bind_addr, "auth web surface listening");
+	let web_listener = tokio::net::TcpListener::bind(config.web_bind).await.context("failed to bind the auth web listener")?;
+	tracing::info!(bind = %config.web_bind, "auth web surface listening");
 	let web_server = async {
 		axum::serve(web_listener, web::router(web_state))
 			.with_graceful_shutdown(await_signal())
@@ -152,7 +179,7 @@ async fn run(config: Config) -> Result<()> {
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users, admins, platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
-			.serve_with_shutdown(config.bind_addr, await_signal())
+			.serve_with_shutdown(config.bind, await_signal())
 			.await
 			.context("concierge gRPC server error")
 	};

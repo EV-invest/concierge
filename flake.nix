@@ -79,24 +79,25 @@
         # web surface (http probes); gitops patches the Service to expose both.
         # Secret env (signing key, JWKS, Google OAuth, bridge token) arrives via
         # the automatic optional `kubernetes-concierge` envFrom — never baked in.
+        # Topology literals live in deploy/config.nix (baked to JSON below); the
+        # contract env keeps only what the binary reads as env: the config's
+        # `{ env = ... }` refs plus the direct env seams (redis stores, verifier
+        # JWKS dial, signing kid).
+        prodConfig = pkgs.writeText "config.json" (builtins.toJSON (import ./deploy/config.nix));
         containerStd = v_flakes.container.implement {
           inherit pkgs pname;
           containers."" = {
             port = 55671;
             healthPath = "/health";
             criticality = "normal";
-            entrypoint = [ "/bin/concierge" ];
+            entrypoint = [ "/bin/concierge" "--config" "${prodConfig}" ];
             contents = [ conciergeBin ];
             env = {
               DATABASE_URL = "postgres://evinvest@10.42.0.1:5432/concierge";
               REDIS_URL = "redis://10.42.0.1:6379/1";
-              CONCIERGE_BIND = "0.0.0.0:55670";
-              CONCIERGE_WEB_BIND = "0.0.0.0:55671";
               # The inbound verifier dials its own in-process Jwks RPC over loopback.
               AUTH_JWKS_GRPC_ENDPOINT = "http://127.0.0.1:55670";
-              PUBLIC_ORIGIN = "https://evinvest.ltd";
               AUTH_SIGNING_KID = "prod-1";
-              APP_ENV = "production";
               RUST_LOG = "info";
             };
           };
@@ -169,13 +170,18 @@
 
             ${portEnv}
             export DATABASE_URL="''${DATABASE_URL:-postgres://postgres@localhost:$POSTGRES_PORT/concierge}"
-            export CONCIERGE_BIND="''${CONCIERGE_BIND:-0.0.0.0:$CONCIERGE_PORT}"
-            export CONCIERGE_WEB_BIND="''${CONCIERGE_WEB_BIND:-0.0.0.0:$CONCIERGE_WEB_PORT}"
+            # Env aliases mirror AppConfig field names (LiveSettings `use_env`).
+            export BIND="''${BIND:-0.0.0.0:$CONCIERGE_PORT}"
+            export WEB_BIND="''${WEB_BIND:-0.0.0.0:$CONCIERGE_WEB_PORT}"
             export REDIS_URL="''${REDIS_URL:-redis://127.0.0.1:$REDIS_PORT/1}"
             # The inbound verifier dials its own in-process Jwks RPC.
             export AUTH_JWKS_GRPC_ENDPOINT="''${AUTH_JWKS_GRPC_ENDPOINT:-http://127.0.0.1:$CONCIERGE_PORT}"
             # Shared bridge token the banking money plane presents on PullUserLifecycle.
             export BRIDGE_SERVICE_TOKEN="''${BRIDGE_SERVICE_TOKEN:-dev-bridge-token}"
+            # LiveSettings has no Rust-side defaults for these (String fields);
+            # dev topology is owned here, prod literals live in deploy/config.nix.
+            export APP_ENV="''${APP_ENV:-development}"
+            export PUBLIC_ORIGIN="''${PUBLIC_ORIGIN:-http://localhost:58843}"
             export RUST_LOG="''${RUST_LOG:-info,concierge=debug,evconcierge_auth=debug}"
             exec cargo run -p concierge
           '';
