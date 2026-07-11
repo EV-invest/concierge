@@ -99,6 +99,15 @@
               AUTH_JWKS_GRPC_ENDPOINT = "http://127.0.0.1:55670";
               AUTH_SIGNING_KID = "prod-1";
               RUST_LOG = "info";
+              # Transition compat: pre-LiveSettings images read topology from the
+              # Deployment env, and a rollback must land on a working pod. Values
+              # duplicate deploy/config.nix EXACTLY (the settings env aliases beat
+              # the file, so any drift here would win — keep them identical).
+              # Drop once the fleet is confidently past pre-LiveSettings tags.
+              CONCIERGE_BIND = "0.0.0.0:55670";
+              CONCIERGE_WEB_BIND = "0.0.0.0:55671";
+              PUBLIC_ORIGIN = "https://evinvest.ltd";
+              APP_ENV = "production";
             };
           };
         };
