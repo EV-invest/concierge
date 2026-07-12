@@ -123,17 +123,20 @@ impl AuthServiceRpc for AuthService {
 		let req = request.into_inner();
 
 		// `exchange` is served on the public, un-wrapped server — outside the reporting
-		// interceptor — so an operational IdP failure must be reported here or never.
-		let identity = google.exchange_code(&req.auth_code, &req.code_verifier, &req.redirect_uri, &req.nonce).await.inspect_err(|err| {
-			if err.is_unexpected() {
-				crate::telemetry::report(err);
-			}
-		})?;
+		// interceptor — so operational failures must be reported here or never.
+		let identity = google
+			.exchange_code(&req.auth_code, &req.code_verifier, &req.redirect_uri, &req.nonce)
+			.await
+			.inspect_err(crate::telemetry::report_unexpected)?;
 		// Policy: an unverified Google email may sign in (the account is keyed by the
 		// stable `sub`, and `email_verified` is persisted and surfaced end-to-end so
 		// nothing is silently trusted); the directory never downgrades an already-verified
 		// stored email to an unverified one.
-		let summary = engine.provisioner.provision(identity.subject, identity.email, identity.email_verified).await?;
+		let summary = engine
+			.provisioner
+			.provision(identity.subject, identity.email, identity.email_verified)
+			.await
+			.inspect_err(crate::telemetry::report_unexpected)?;
 		if summary.is_disabled() {
 			return Err(Status::permission_denied("user is disabled"));
 		}
@@ -166,7 +169,9 @@ impl AuthServiceRpc for AuthService {
 			RefreshInspect::Invalid => return Err(AuthError::InvalidToken.into()),
 		};
 
-		let summary = engine.provisioner.lookup(user_id).await?;
+		// Same un-wrapped public server as `exchange`: a directory outage here must
+		// alert too, not just render UNAVAILABLE.
+		let summary = engine.provisioner.lookup(user_id).await.inspect_err(crate::telemetry::report_unexpected)?;
 		if summary.is_disabled() {
 			engine.refresh.revoke_user(&summary.user_id).await?;
 			return Err(Status::permission_denied("user is disabled"));

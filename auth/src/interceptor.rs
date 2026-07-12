@@ -96,9 +96,7 @@ where
 					inner.call(req).await
 				}
 				Err(err) => {
-					if err.is_unexpected() {
-						crate::telemetry::report(&err);
-					}
+					crate::telemetry::report_unexpected(&err);
 					Ok(status_response(&err))
 				}
 			}
