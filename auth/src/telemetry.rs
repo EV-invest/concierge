@@ -13,3 +13,11 @@
 pub fn report(err: &dyn std::error::Error) {
 	ev::error_monitoring::report(err);
 }
+
+/// Reports `err` only when [`AuthError::is_unexpected`](crate::AuthError::is_unexpected)
+/// says it is an operational incident; expected client outcomes stay quiet.
+pub fn report_unexpected(err: &crate::AuthError) {
+	if err.is_unexpected() {
+		report(err);
+	}
+}
