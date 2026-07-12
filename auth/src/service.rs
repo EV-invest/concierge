@@ -122,7 +122,13 @@ impl AuthServiceRpc for AuthService {
 		let google = engine.google.as_ref().ok_or(AuthError::NotConfigured)?;
 		let req = request.into_inner();
 
-		let identity = google.exchange_code(&req.auth_code, &req.code_verifier, &req.redirect_uri, &req.nonce).await?;
+		// `exchange` is served on the public, un-wrapped server — outside the reporting
+		// interceptor — so an operational IdP failure must be reported here or never.
+		let identity = google.exchange_code(&req.auth_code, &req.code_verifier, &req.redirect_uri, &req.nonce).await.inspect_err(|err| {
+			if err.is_unexpected() {
+				crate::telemetry::report(err);
+			}
+		})?;
 		// Policy: an unverified Google email may sign in (the account is keyed by the
 		// stable `sub`, and `email_verified` is persisted and surfaced end-to-end so
 		// nothing is silently trusted); the directory never downgrades an already-verified

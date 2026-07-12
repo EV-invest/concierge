@@ -78,6 +78,11 @@ pub enum AuthError {
 	/// unverifiable assertion.
 	#[error("identity provider error: {0}")]
 	Provider(String),
+	/// The upstream identity provider could not be reached or answered abnormally
+	/// (transport failure, 5xx, malformed response) — an operational incident, never
+	/// the caller's fault, so it must not render as a credential rejection.
+	#[error("identity provider unavailable: {0}")]
+	ProviderUnavailable(String),
 	/// The plane's own user directory refused the provisioning/lookup (unknown user,
 	/// invalid input, conflicting state) — a first-party outcome, never the IdP's
 	/// fault, so it must not render as a provider error.
@@ -92,7 +97,7 @@ impl AuthError {
 	/// Whether this is an operational incident worth reporting (5xx territory),
 	/// versus an expected client/dev outcome.
 	pub fn is_unexpected(&self) -> bool {
-		matches!(self, Self::Unavailable | Self::JwksFetch(_))
+		matches!(self, Self::Unavailable | Self::JwksFetch(_) | Self::ProviderUnavailable(_))
 	}
 }
 
@@ -104,6 +109,7 @@ impl From<&AuthError> for tonic::Status {
 			InvalidToken => tonic::Status::unauthenticated("invalid or expired token"),
 			UnknownKid(_) => tonic::Status::unauthenticated("unknown signing key"),
 			Provider(_) => tonic::Status::unauthenticated("identity provider rejected the request"),
+			ProviderUnavailable(_) => tonic::Status::unavailable("identity provider unavailable"),
 			Directory(_) => tonic::Status::unauthenticated("user directory rejected the request"),
 			NotConfigured => tonic::Status::unavailable("auth not configured"),
 			Unavailable => tonic::Status::unavailable("auth service unavailable"),
@@ -115,5 +121,24 @@ impl From<&AuthError> for tonic::Status {
 impl From<AuthError> for tonic::Status {
 	fn from(err: AuthError) -> Self {
 		(&err).into()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// The two IdP failure classes must stay separable on the wire: a genuine
+	// rejection renders UNAUTHENTICATED and stays quiet; an operational failure
+	// renders UNAVAILABLE (retry may help) and alerts.
+	#[test]
+	fn provider_failure_classes_map_to_distinct_statuses() {
+		let rejection = AuthError::Provider("invalid_grant".into());
+		assert_eq!(tonic::Status::from(&rejection).code(), tonic::Code::Unauthenticated);
+		assert!(!rejection.is_unexpected());
+
+		let outage = AuthError::ProviderUnavailable("google returned 503".into());
+		assert_eq!(tonic::Status::from(&outage).code(), tonic::Code::Unavailable);
+		assert!(outage.is_unexpected());
 	}
 }

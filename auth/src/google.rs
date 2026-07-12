@@ -41,6 +41,7 @@ pub struct GoogleOauth {
 	client_id: String,
 	client_secret: String,
 	http: reqwest::Client,
+	token_endpoint: String,
 	certs_endpoint: String,
 	certs: Mutex<CertCache>,
 }
@@ -50,6 +51,7 @@ impl GoogleOauth {
 			client_id: config.client_id.clone(),
 			client_secret: config.client_secret.clone(),
 			http: reqwest::Client::new(),
+			token_endpoint: TOKEN_ENDPOINT.to_string(),
 			certs_endpoint: CERTS_ENDPOINT.to_string(),
 			certs: Mutex::new(CertCache::default()),
 		}
@@ -60,7 +62,7 @@ impl GoogleOauth {
 	pub async fn exchange_code(&self, auth_code: &str, code_verifier: &str, redirect_uri: &str, nonce: &str) -> Result<GoogleIdentity, AuthError> {
 		let response = self
 			.http
-			.post(TOKEN_ENDPOINT)
+			.post(&self.token_endpoint)
 			.form(&[
 				("code", auth_code),
 				("client_id", &self.client_id),
@@ -71,14 +73,23 @@ impl GoogleOauth {
 			])
 			.send()
 			.await
-			.map_err(|e| AuthError::Provider(format!("google token request failed: {e}")))?;
+			.map_err(|e| AuthError::ProviderUnavailable(format!("google token request failed: {e}")))?;
 
-		if !response.status().is_success() {
-			return Err(AuthError::Provider(format!("google token endpoint returned {}", response.status())));
+		// A 4xx is Google REJECTING the grant (bad/expired code, PKCE mismatch) — the
+		// caller's problem. Anything else non-success is Google failing — an incident.
+		let status = response.status();
+		if status.is_client_error() {
+			return Err(AuthError::Provider(format!("google token endpoint returned {status}")));
+		}
+		if !status.is_success() {
+			return Err(AuthError::ProviderUnavailable(format!("google token endpoint returned {status}")));
 		}
 
-		let token: GoogleTokenResponse = response.json().await.map_err(|e| AuthError::Provider(format!("malformed google token response: {e}")))?;
-		let id_token = token.id_token.ok_or_else(|| AuthError::Provider("google response had no id_token".into()))?;
+		let token: GoogleTokenResponse = response
+			.json()
+			.await
+			.map_err(|e| AuthError::ProviderUnavailable(format!("malformed google token response: {e}")))?;
+		let id_token = token.id_token.ok_or_else(|| AuthError::ProviderUnavailable("google response had no id_token".into()))?;
 
 		self.verify_id_token(&id_token, nonce).await
 	}
@@ -139,14 +150,14 @@ impl GoogleOauth {
 			.get(&self.certs_endpoint)
 			.send()
 			.await
-			.map_err(|e| AuthError::Provider(format!("google certs request failed: {e}")))?;
+			.map_err(|e| AuthError::ProviderUnavailable(format!("google certs request failed: {e}")))?;
 		let max_age = max_age_of(response.headers());
-		let certs: JwkSet = response.json().await.map_err(|e| AuthError::Provider(format!("malformed google certs: {e}")))?;
+		let certs: JwkSet = response.json().await.map_err(|e| AuthError::ProviderUnavailable(format!("malformed google certs: {e}")))?;
 
 		let mut keys = HashMap::new();
 		for jwk in &certs.keys {
 			let Some(kid) = jwk.common.key_id.clone() else { continue };
-			let key = DecodingKey::from_jwk(jwk).map_err(|e| AuthError::Provider(format!("bad google jwk: {e}")))?;
+			let key = DecodingKey::from_jwk(jwk).map_err(|e| AuthError::ProviderUnavailable(format!("bad google jwk: {e}")))?;
 			keys.insert(kid, key);
 		}
 
@@ -253,6 +264,7 @@ mod tests {
 			client_id: "test".into(),
 			client_secret: "test".into(),
 			http: reqwest::Client::new(),
+			token_endpoint: TOKEN_ENDPOINT.into(),
 			certs_endpoint: format!("http://{addr}/certs"),
 			certs: Mutex::new(CertCache::default()),
 		};
@@ -348,16 +360,17 @@ vDYvLc+HvAu+fITPD3S9Dvg0
 			client_id: CLIENT_ID.into(),
 			client_secret: "secret".into(),
 			http: reqwest::Client::new(),
+			token_endpoint: TOKEN_ENDPOINT.into(),
 			certs_endpoint: format!("http://{addr}/certs"),
 			certs: Mutex::new(cache),
 		};
 		(google, hits)
 	}
 
-	/// Every failure in `verify_id_token` maps to `AuthError::Provider`, so a bare
-	/// `is_err` cannot tell WHICH check fired — a broken fixture (certs fetch failing)
-	/// would satisfy every rejection test. Returning the message lets each test pin
-	/// its own rejection reason.
+	/// Every rejection in `verify_id_token` maps to `AuthError::Provider`, so a bare
+	/// `is_err` cannot tell WHICH check fired — a broken fixture (certs fetch failing,
+	/// now `ProviderUnavailable`) would otherwise satisfy every rejection test.
+	/// Returning the message lets each test pin its own rejection reason.
 	async fn rejection(google: &GoogleOauth, token: &str, nonce: &str) -> String {
 		match google.verify_id_token(token, nonce).await {
 			Err(AuthError::Provider(msg)) => msg,
@@ -478,6 +491,93 @@ vDYvLc+HvAu+fITPD3S9Dvg0
 	async fn rejects_nonce_mismatch() {
 		let msg = rejection(&google(), &mint(&id_claims(), TEST_RSA_PEM, TEST_KID), "a-different-nonce").await;
 		assert!(msg.contains("nonce mismatch"), "must be refused on the nonce, got: {msg}");
+	}
+
+	/// Serve a canned raw response with the given status line, so the failure-
+	/// classification tests can pin how each token-endpoint outcome maps onto
+	/// `AuthError`.
+	fn serve_status(status: &'static str, body: &'static str) -> SocketAddr {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = listener.local_addr().unwrap();
+		std::thread::spawn(move || {
+			for stream in listener.incoming() {
+				let mut stream = stream.unwrap();
+				let mut buf = [0u8; 2048];
+				let _ = stream.read(&mut buf);
+				let resp = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+				let _ = stream.write_all(resp.as_bytes());
+			}
+		});
+		addr
+	}
+
+	/// A port that refuses connections: bound to reserve it, then dropped.
+	fn dead_endpoint() -> SocketAddr {
+		TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+	}
+
+	fn google_with_token_endpoint(addr: SocketAddr) -> GoogleOauth {
+		GoogleOauth {
+			client_id: CLIENT_ID.into(),
+			client_secret: "secret".into(),
+			http: reqwest::Client::new(),
+			token_endpoint: format!("http://{addr}/token"),
+			certs_endpoint: CERTS_ENDPOINT.into(),
+			certs: Mutex::new(CertCache::default()),
+		}
+	}
+
+	async fn exchange_failure(google: &GoogleOauth) -> AuthError {
+		google.exchange_code("code", "verifier", "https://cb.example", NONCE).await.unwrap_err()
+	}
+
+	// A network failure reaching the token endpoint is an incident (UNAVAILABLE +
+	// Sentry), NOT a credential rejection — during a partition every login would
+	// otherwise read as "user auth failure" with zero telemetry.
+	#[tokio::test]
+	async fn exchange_transport_failure_is_operational() {
+		let err = exchange_failure(&google_with_token_endpoint(dead_endpoint())).await;
+		assert!(matches!(err, AuthError::ProviderUnavailable(_)), "got: {err:?}");
+		assert!(err.is_unexpected(), "a transport failure must alert");
+	}
+
+	#[tokio::test]
+	async fn exchange_google_5xx_is_operational() {
+		let err = exchange_failure(&google_with_token_endpoint(serve_status("503 Service Unavailable", ""))).await;
+		assert!(matches!(err, AuthError::ProviderUnavailable(_)), "got: {err:?}");
+		assert!(err.is_unexpected(), "a Google 5xx must alert");
+	}
+
+	#[tokio::test]
+	async fn exchange_malformed_token_response_is_operational() {
+		let err = exchange_failure(&google_with_token_endpoint(serve_status("200 OK", "not-json"))).await;
+		assert!(matches!(err, AuthError::ProviderUnavailable(_)), "got: {err:?}");
+	}
+
+	// A 4xx is Google REJECTING the grant (bad/expired code, PKCE mismatch): it must
+	// stay a quiet UNAUTHENTICATED-class rejection, not page on-call.
+	#[tokio::test]
+	async fn exchange_google_4xx_stays_a_rejection() {
+		let err = exchange_failure(&google_with_token_endpoint(serve_status("400 Bad Request", r#"{"error":"invalid_grant"}"#))).await;
+		assert!(matches!(err, AuthError::Provider(_)), "got: {err:?}");
+		assert!(!err.is_unexpected(), "a rejected grant is not an incident");
+	}
+
+	// The certs fetch inside id_token verification is the same class: unreachable
+	// certs endpoint → operational failure, not "your token was rejected".
+	#[tokio::test]
+	async fn certs_transport_failure_is_operational() {
+		let google = GoogleOauth {
+			client_id: CLIENT_ID.into(),
+			client_secret: "secret".into(),
+			http: reqwest::Client::new(),
+			token_endpoint: TOKEN_ENDPOINT.into(),
+			certs_endpoint: format!("http://{}/certs", dead_endpoint()),
+			certs: Mutex::new(CertCache::default()),
+		};
+		let err = google.verify_id_token(&mint(&id_claims(), TEST_RSA_PEM, TEST_KID), NONCE).await.unwrap_err();
+		assert!(matches!(err, AuthError::ProviderUnavailable(_)), "got: {err:?}");
+		assert!(err.is_unexpected(), "an unreachable certs endpoint must alert");
 	}
 
 	#[tokio::test]
