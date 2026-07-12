@@ -22,7 +22,7 @@ use domain::{
 	users::{AuthSubject, Email},
 };
 use evconcierge_auth::{Claims, TokenType, provisioner_channel};
-use evconcierge_contracts::concierge::v1::{GetMeRequest, GetUserRequest, ListUsersRequest, user_directory_server::UserDirectory};
+use evconcierge_contracts::concierge::v1::{DisableUserRequest, GetMeRequest, GetUserRequest, ListUsersRequest, user_directory_server::UserDirectory};
 use tonic::{Code, Request};
 use uuid::Uuid;
 
@@ -199,6 +199,30 @@ async fn provisioner_summaries_surface_the_effective_role() {
 	// Non-allowlisted control: summaries keep the persisted role.
 	let stranger = provisioner.provision(unique_subject().as_str().to_owned(), "stranger@example.com".into(), true).await.unwrap();
 	assert_eq!(stranger.role, "investor", "a non-allowlisted summary keeps the persisted role");
+}
+
+#[tokio::test]
+async fn malformed_admin_target_user_id_is_invalid_argument() {
+	let Some(users) = setup().await else {
+		return;
+	};
+	// The caller passes the gate (record-less break-glass Owner); a malformed TARGET field
+	// is bad input (code 3), never UNAUTHENTICATED — a code 16 here reads as an expired
+	// session to the console.
+	let sub = Uuid::new_v4().to_string();
+	let directory = Directory::new(Arc::new(users), vec![sub.clone()].into());
+
+	let bad_read = directory
+		.get_user(request_with(access_claims(&sub, 0), GetUserRequest { user_id: "123-not-a-uuid".into() }))
+		.await
+		.unwrap_err();
+	assert_eq!(bad_read.code(), Code::InvalidArgument, "a malformed target user_id is bad input, not an auth failure");
+
+	let bad_write = directory
+		.disable_user(request_with(access_claims(&sub, 0), DisableUserRequest { user_id: "123-not-a-uuid".into() }))
+		.await
+		.unwrap_err();
+	assert_eq!(bad_write.code(), Code::InvalidArgument, "mutations agree with reads on the target-field status code");
 }
 
 #[tokio::test]
