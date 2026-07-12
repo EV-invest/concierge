@@ -96,8 +96,12 @@ async fn require_permission<T>(directory: &Directory, request: &Request<T>, perm
 	crate::authz::require_permission(directory.users.as_ref(), &directory.admins, request, permission).await
 }
 
-fn parse_user_id(raw: &str) -> Result<UserId, Status> {
-	Uuid::parse_str(raw).map(UserId::from_raw).map_err(|_| Status::unauthenticated("subject is not a user id"))
+/// Parse an admin-supplied target `user_id` request field. The caller is already
+/// authorized (`require_permission`), so a malformed value is bad input —
+/// `INVALID_ARGUMENT` — never an auth failure; `UNAUTHENTICATED` is reserved for
+/// the caller's own `sub` in [`Directory::active_caller_id`].
+fn parse_target_id(raw: &str) -> Result<UserId, Status> {
+	Uuid::parse_str(raw).map(UserId::from_raw).map_err(|_| Status::invalid_argument("user_id is not a valid UUID"))
 }
 
 fn optional(raw: &str) -> Option<String> {
@@ -139,7 +143,7 @@ impl UserDirectory for Directory {
 
 	async fn revoke_tokens(&self, request: Request<RevokeTokensRequest>) -> Result<Response<RevokeTokensResponse>, Status> {
 		require_permission(self, &request, Permission::UserRevoke).await?;
-		let target = parse_user_id(&request.get_ref().user_id)?;
+		let target = parse_target_id(&request.get_ref().user_id)?;
 		let user = self.users.revoke_tokens(target).await.map_err(domain_to_status)?;
 		Ok(Response::new(RevokeTokensResponse {
 			token_version: user.token_version(),
@@ -148,14 +152,14 @@ impl UserDirectory for Directory {
 
 	async fn disable_user(&self, request: Request<DisableUserRequest>) -> Result<Response<DisableUserResponse>, Status> {
 		require_permission(self, &request, Permission::UserSuspend).await?;
-		let target = parse_user_id(&request.get_ref().user_id)?;
+		let target = parse_target_id(&request.get_ref().user_id)?;
 		self.users.disable_user(target).await.map_err(domain_to_status)?;
 		Ok(Response::new(DisableUserResponse {}))
 	}
 
 	async fn reinstate_user(&self, request: Request<ReinstateUserRequest>) -> Result<Response<ReinstateUserResponse>, Status> {
 		require_permission(self, &request, Permission::UserSuspend).await?;
-		let target = parse_user_id(&request.get_ref().user_id)?;
+		let target = parse_target_id(&request.get_ref().user_id)?;
 		self.users.enable_user(target).await.map_err(domain_to_status)?;
 		Ok(Response::new(ReinstateUserResponse {}))
 	}
@@ -163,7 +167,7 @@ impl UserDirectory for Directory {
 	async fn set_kyc_level(&self, request: Request<SetKycLevelRequest>) -> Result<Response<SetKycLevelResponse>, Status> {
 		require_permission(self, &request, Permission::KycManage).await?;
 		let req = request.into_inner();
-		let target = parse_user_id(&req.user_id)?;
+		let target = parse_target_id(&req.user_id)?;
 		let user = self.users.set_kyc_level(target, req.kyc_level).await.map_err(domain_to_status)?;
 		Ok(Response::new(SetKycLevelResponse { kyc_level: user.kyc_level() }))
 	}
@@ -191,7 +195,7 @@ impl UserDirectory for Directory {
 
 	async fn get_user(&self, request: Request<GetUserRequest>) -> Result<Response<UserProfile>, Status> {
 		require_permission(self, &request, Permission::UserRead).await?;
-		let id = parse_user_id(&request.get_ref().user_id)?;
+		let id = parse_target_id(&request.get_ref().user_id)?;
 		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
 		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user))))
 	}
@@ -199,7 +203,7 @@ impl UserDirectory for Directory {
 	async fn set_role(&self, request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
 		require_permission(self, &request, Permission::RoleGrant).await?;
 		let req = request.into_inner();
-		let target = parse_user_id(&req.user_id)?;
+		let target = parse_target_id(&req.user_id)?;
 		let role = Role::parse(&req.role).map_err(domain_to_status)?;
 		let user = self.users.set_role(target, role).await.map_err(domain_to_status)?;
 		Ok(Response::new(SetRoleResponse {
