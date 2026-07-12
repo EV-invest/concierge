@@ -83,6 +83,14 @@ impl PlatformServiceRpc for Platform {
 	async fn set_announcement(&self, request: Request<SetAnnouncementRequest>) -> Result<Response<PlatformConfig>, Status> {
 		crate::authz::require_permission(self.users.as_ref(), &self.admins, &request, Permission::PlatformManage).await?;
 		let req = request.into_inner();
+		// Empty title/body stays legal — that is how the banner is cleared; only the
+		// caps apply (the banner renders to every signed-in user).
+		if req.title.chars().count() > 200 {
+			return Err(Status::invalid_argument("announcement title must be at most 200 characters"));
+		}
+		if req.body.chars().count() > 2000 {
+			return Err(Status::invalid_argument("announcement body must be at most 2000 characters"));
+		}
 		self.config.set_announcement(&req.title, &req.body, req.active).await.map_err(domain_to_status)?;
 		Ok(Response::new(self.snapshot().await?))
 	}
@@ -90,8 +98,11 @@ impl PlatformServiceRpc for Platform {
 	async fn set_feature_flag(&self, request: Request<SetFeatureFlagRequest>) -> Result<Response<PlatformConfig>, Status> {
 		crate::authz::require_permission(self.users.as_ref(), &self.admins, &request, Permission::PlatformManage).await?;
 		let req = request.into_inner();
-		if req.key.trim().is_empty() {
-			return Err(Status::invalid_argument("flag key required"));
+		if !is_flag_key(&req.key) {
+			return Err(Status::invalid_argument("flag key must be 1-64 characters of [a-z0-9_-] and start with a letter or digit"));
+		}
+		if req.description.chars().count() > 500 {
+			return Err(Status::invalid_argument("flag description must be at most 500 characters"));
 		}
 		// Validate BEFORE the `as i32` narrowing: a rollout ≥ 2^31 would wrap negative
 		// and silently clamp to 0 instead of being rejected.
@@ -104,4 +115,13 @@ impl PlatformServiceRpc for Platform {
 			.map_err(domain_to_status)?;
 		Ok(Response::new(self.snapshot().await?))
 	}
+}
+
+/// The slug shape `^[a-z0-9][a-z0-9_-]{0,63}$`: the key is a TEXT PRIMARY KEY
+/// rendered across the console and evaluated by clients, so keep it a bounded
+/// machine-readable slug.
+fn is_flag_key(key: &str) -> bool {
+	let mut bytes = key.bytes();
+	let Some(first) = bytes.next() else { return false };
+	key.len() <= 64 && (first.is_ascii_lowercase() || first.is_ascii_digit()) && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
