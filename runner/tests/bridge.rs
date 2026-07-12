@@ -168,6 +168,25 @@ async fn wrong_token_is_rejected() {
 }
 
 #[tokio::test]
+async fn equal_length_wrong_token_is_rejected() {
+	let Some((_repo, pool)) = setup().await else {
+		return;
+	};
+	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
+
+	// Flip TOKEN's last byte: same length, shared prefix, so a regression to a
+	// length-only, prefix, or truncated compare would accept it — only the full
+	// per-byte compare rejects it.
+	let mut forged = TOKEN.to_string().into_bytes();
+	*forged.last_mut().unwrap() ^= 1;
+	let forged = String::from_utf8(forged).unwrap();
+	let mut wrong = Request::new(PullUserLifecycleRequest { after_position: 0, limit: 10 });
+	wrong.metadata_mut().insert("authorization", MetadataValue::try_from(format!("Bearer {forged}")).unwrap());
+	let err = bridge.pull_user_lifecycle(wrong).await.unwrap_err();
+	assert_eq!(err.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test]
 async fn absent_token_is_rejected() {
 	let Some((_repo, pool)) = setup().await else {
 		return;
