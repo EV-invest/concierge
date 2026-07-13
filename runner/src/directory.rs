@@ -49,12 +49,19 @@ use crate::{infrastructure::users::AdminUserRow, ports::UserDirectoryRepository,
 #[derive(Clone)]
 pub struct Directory {
 	users: Arc<dyn UserDirectoryRepository>,
-	admins: Arc<[String]>,
+	settings: Arc<crate::config::LiveSettings>,
 }
 
 impl Directory {
-	pub fn new(users: Arc<dyn UserDirectoryRepository>, admins: Arc<[String]>) -> Self {
-		Self { users, admins }
+	pub fn new(users: Arc<dyn UserDirectoryRepository>, settings: Arc<crate::config::LiveSettings>) -> Self {
+		Self { users, settings }
+	}
+
+	/// The break-glass allowlist, read LIVE from the hot-reloaded config so editing the
+	/// mounted file applies without a restart. A config-read error yields an empty list —
+	/// fail closed (no elevation); LiveSettings serves the last-good value across a bad edit.
+	fn admins(&self) -> Vec<String> {
+		self.settings.config().map(|c| c.admin_subjects).unwrap_or_default()
 	}
 
 	/// The authenticated caller's own user id (from the access-token `sub`), gated on live
@@ -73,7 +80,7 @@ impl Directory {
 	/// `ADMIN_SUBJECTS` break-glass elevation applied, so profile/admin reads show the
 	/// same authority the RBAC gate grants.
 	fn effective_role_of(&self, user: &User) -> Role {
-		crate::authz::effective_role(user.role(), &user.id().to_string(), &self.admins)
+		crate::authz::effective_role(user.role(), &user.id().to_string(), &self.admins())
 	}
 }
 
@@ -83,8 +90,10 @@ impl Directory {
 /// issued session's `UserSummary` (Exchange AND Refresh), so they carry the
 /// effective role and the BFF gates the admin console on the same authority the
 /// RBAC gate grants.
-pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<dyn UserDirectoryRepository>, admins: Arc<[String]>) {
+pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<dyn UserDirectoryRepository>, settings: Arc<crate::config::LiveSettings>) {
 	while let Some(request) = rx.recv().await {
+		// Read the allowlist LIVE per request; fail closed (empty) on a config-read error.
+		let admins = settings.config().map(|c| c.admin_subjects).unwrap_or_default();
 		let result = handle(users.as_ref(), request.command, &admins).await;
 		// The auth task may have given up; a dropped responder is not our problem.
 		let _ = request.respond_to.send(result);
@@ -93,7 +102,7 @@ pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Ar
 /// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix,
 /// resolved from the caller's persisted role (with the `ADMIN_SUBJECTS` break-glass).
 async fn require_permission<T>(directory: &Directory, request: &Request<T>, permission: Permission) -> Result<(), Status> {
-	crate::authz::require_permission(directory.users.as_ref(), &directory.admins, request, permission).await
+	crate::authz::require_permission(directory.users.as_ref(), &directory.admins(), request, permission).await
 }
 
 /// Parse an admin-supplied target `user_id` request field. The caller is already
@@ -189,12 +198,13 @@ impl UserDirectory for Directory {
 			UserStatus::parse(&req.status).map_err(domain_to_status)?;
 		}
 		let (rows, total) = self.users.list(&query, &req.role, &req.status, limit, req.offset as i64).await.map_err(domain_to_status)?;
+		let admins = self.admins();
 		Ok(Response::new(ListUsersResponse {
 			users: rows
 				.into_iter()
 				.map(|row| {
 					let role = match Role::parse(&row.role) {
-						Ok(persisted) => crate::authz::effective_role(persisted, &row.id.to_string(), &self.admins).as_str().to_owned(),
+						Ok(persisted) => crate::authz::effective_role(persisted, &row.id.to_string(), &admins).as_str().to_owned(),
 						// A corrupt stored role must not fail the whole list — surface it verbatim.
 						Err(_) => row.role.clone(),
 					};
