@@ -51,7 +51,8 @@ impl PgUsers {
 
 	/// Load-mutate-persist in one transaction: read the row `FOR UPDATE`, run the
 	/// aggregate command, write the row back, and drain its events to the outbox.
-	async fn mutate(&self, id: UserId, command: impl FnOnce(&mut User)) -> Result<User, DomainError> {
+	/// A command error (e.g. profile validation) rolls the transaction back.
+	async fn mutate(&self, id: UserId, command: impl FnOnce(&mut User) -> Result<(), DomainError>) -> Result<User, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let row = sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1 FOR UPDATE"))
 			.bind(id.raw())
@@ -60,7 +61,7 @@ impl PgUsers {
 			.map_err(repo_err)?
 			.ok_or_else(|| DomainError::NotFound { entity: "user", id: id.to_string() })?;
 		let mut user = row.into_domain()?;
-		command(&mut user);
+		command(&mut user)?;
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
 		tx.commit().await.map_err(repo_err)?;
@@ -228,15 +229,13 @@ impl UserDirectoryRepository for PgUsers {
 	}
 
 	async fn update_profile(&self, id: UserId, fields: ProfileFields) -> Result<User, DomainError> {
-		self.mutate(id, |user| {
-			user.update_profile(fields);
-		})
-		.await
+		self.mutate(id, |user| user.update_profile(fields)).await
 	}
 
 	async fn revoke_tokens(&self, id: UserId) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.revoke_tokens();
+			Ok(())
 		})
 		.await
 	}
@@ -244,6 +243,7 @@ impl UserDirectoryRepository for PgUsers {
 	async fn disable_user(&self, id: UserId) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.disable();
+			Ok(())
 		})
 		.await
 	}
@@ -251,6 +251,7 @@ impl UserDirectoryRepository for PgUsers {
 	async fn enable_user(&self, id: UserId) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.enable();
+			Ok(())
 		})
 		.await
 	}
@@ -258,6 +259,7 @@ impl UserDirectoryRepository for PgUsers {
 	async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.set_kyc_level(level);
+			Ok(())
 		})
 		.await
 	}
@@ -265,6 +267,7 @@ impl UserDirectoryRepository for PgUsers {
 	async fn set_role(&self, id: UserId, role: Role) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.set_role(role);
+			Ok(())
 		})
 		.await
 	}

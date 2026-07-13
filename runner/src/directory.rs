@@ -29,7 +29,7 @@ use std::sync::Arc;
 use domain::{
 	authz::{Permission, Role},
 	error::DomainError,
-	users::{AuthSubject, Email, ProfileFields, User, UserId},
+	users::{AuthSubject, Email, ProfileFields, User, UserId, UserStatus},
 };
 use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser};
 use evconcierge_contracts::concierge::v1::{
@@ -119,25 +119,22 @@ impl UserDirectory for Directory {
 	async fn update_profile(&self, request: Request<UpdateProfileRequest>) -> Result<Response<UserProfile>, Status> {
 		let id = self.active_caller_id(&request).await?;
 		let req = request.into_inner();
-		let user = self
-			.users
-			.update_profile(
-				id,
-				ProfileFields {
-					legal_name: optional(&req.legal_name),
-					preferred_name: optional(&req.preferred_name),
-					phone: optional(&req.phone),
-					date_of_birth: optional(&req.date_of_birth),
-					nationality: optional(&req.nationality),
-					tax_residence: optional(&req.tax_residence),
-					residential_address: optional(&req.residential_address),
-					language: optional(&req.language),
-					base_currency: optional(&req.base_currency),
-					timezone: optional(&req.timezone),
-				},
-			)
-			.await
-			.map_err(domain_to_status)?;
+		// Parse before touching the store: a bad field is INVALID_ARGUMENT with the
+		// field named, and never opens a write transaction.
+		let fields = ProfileFields::parse(ProfileFields {
+			legal_name: optional(&req.legal_name),
+			preferred_name: optional(&req.preferred_name),
+			phone: optional(&req.phone),
+			date_of_birth: optional(&req.date_of_birth),
+			nationality: optional(&req.nationality),
+			tax_residence: optional(&req.tax_residence),
+			residential_address: optional(&req.residential_address),
+			language: optional(&req.language),
+			base_currency: optional(&req.base_currency),
+			timezone: optional(&req.timezone),
+		})
+		.map_err(domain_to_status)?;
+		let user = self.users.update_profile(id, fields).await.map_err(domain_to_status)?;
 		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user))))
 	}
 
@@ -168,6 +165,12 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Permission::KycManage).await?;
 		let req = request.into_inner();
 		let target = parse_target_id(&req.user_id)?;
+		// No authoritative range exists anywhere in the plane (the proto carries a bare
+		// uint32 and banking mirrors it verbatim), so bound it to the conventional KYC
+		// tiers rather than accept any 32-bit value onto the bridge.
+		if req.kyc_level > 3 {
+			return Err(Status::invalid_argument("kyc_level must be between 0 and 3"));
+		}
 		let user = self.users.set_kyc_level(target, req.kyc_level).await.map_err(domain_to_status)?;
 		Ok(Response::new(SetKycLevelResponse { kyc_level: user.kyc_level() }))
 	}
@@ -176,7 +179,16 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Permission::UserRead).await?;
 		let req = request.into_inner();
 		let limit = if req.limit == 0 { 50 } else { (req.limit as i64).clamp(1, 200) };
-		let (rows, total) = self.users.list(&req.query, &req.role, &req.status, limit, req.offset as i64).await.map_err(domain_to_status)?;
+		// Truncate rather than reject: the free-text query is a filter, not stored data.
+		let query: String = req.query.trim().chars().take(200).collect();
+		// Empty string = no filter; anything else must be a known enum value.
+		if !req.role.is_empty() {
+			Role::parse(&req.role).map_err(domain_to_status)?;
+		}
+		if !req.status.is_empty() {
+			UserStatus::parse(&req.status).map_err(domain_to_status)?;
+		}
+		let (rows, total) = self.users.list(&query, &req.role, &req.status, limit, req.offset as i64).await.map_err(domain_to_status)?;
 		Ok(Response::new(ListUsersResponse {
 			users: rows
 				.into_iter()
