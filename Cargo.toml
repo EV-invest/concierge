@@ -23,7 +23,7 @@ color-eyre = "0.6"
 # token-verification flow from one place.
 domain = { path = "domain" }
 dotenvy = "0.15.7"
-ev = { version = "0.6.0", package = "ev_lib", default-features = false, features = ["architecture"] }
+ev = { version = "0.6.2", package = "ev_lib", default-features = false, features = ["architecture"] }
 evconcierge_auth = { path = "auth" }
 evconcierge_contracts = { path = "contracts" }
 form_urlencoded = "1"
