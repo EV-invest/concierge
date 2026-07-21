@@ -67,7 +67,12 @@
           pname = runnerCargo.name;
           version = runnerCargo.version;
           src = conciergeSrc;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # ev_lib is a git dep (patched via [patch.crates-io]); allowBuiltinFetchGit
+            # lets Nix fetch it directly instead of requiring an outputHashes entry.
+            allowBuiltinFetchGit = true;
+          };
           cargoBuildFlags = [ "-p" "concierge" "--bin" "concierge" ];
           nativeBuildInputs = with pkgs; [ protobuf pkg-config ];
           buildInputs = [ pkgs.openssl ];
