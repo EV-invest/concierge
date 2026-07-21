@@ -81,28 +81,29 @@
         # the automatic optional `kubernetes-concierge` envFrom — never baked in.
         # Topology literals are set directly as contract env vars (read by
         # ev::settings! from_env). deploy/config.nix is kept for reference only.
-        inherit pkgs pname;
-        containers."" = {
-          port = 55671;
-          healthPath = "/health";
-          criticality = "normal";
-          entrypoint = [ "/bin/concierge" ];
-          contents = [ conciergeBin ];
-          env = {
-            DATABASE_URL = "postgres://evinvest@10.42.0.1:5432/concierge";
-            REDIS_URL = "redis://10.42.0.1:6379/1";
-            # The inbound verifier dials its own in-process Jwks RPC over loopback.
-            AUTH_JWKS_GRPC_ENDPOINT = "http://127.0.0.1:55670";
-            AUTH_SIGNING_KID = "prod-1";
-            RUST_LOG = "info";
-            # These env vars are read directly by ev::settings! (from_env).
-            # deploy/config.nix is kept for reference.
-            BIND = "0.0.0.0:55670";
-            WEB_BIND = "0.0.0.0:55671";
-            PUBLIC_ORIGIN = "https://evinvest.ltd";
-            APP_ENV = "production";
+        containerStd = v_flakes.container.implement {
+          inherit pkgs pname;
+          containers."" = {
+            port = 55671;
+            healthPath = "/health";
+            criticality = "normal";
+            entrypoint = [ "/bin/concierge" ];
+            contents = [ conciergeBin ];
+            env = {
+              DATABASE_URL = "postgres://evinvest@10.42.0.1:5432/concierge";
+              REDIS_URL = "redis://10.42.0.1:6379/1";
+              # The inbound verifier dials its own in-process Jwks RPC over loopback.
+              AUTH_JWKS_GRPC_ENDPOINT = "http://127.0.0.1:55670";
+              AUTH_SIGNING_KID = "prod-1";
+              RUST_LOG = "info";
+              # These env vars are read directly by ev::settings! (from_env).
+              # deploy/config.nix is kept for reference.
+              BIND = "0.0.0.0:55670";
+              WEB_BIND = "0.0.0.0:55671";
+              PUBLIC_ORIGIN = "https://evinvest.ltd";
+              APP_ENV = "production";
+            };
           };
-        };
         };
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
