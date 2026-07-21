@@ -79,37 +79,30 @@
         # web surface (http probes); gitops patches the Service to expose both.
         # Secret env (signing key, JWKS, Google OAuth, bridge token) arrives via
         # the automatic optional `kubernetes-concierge` envFrom — never baked in.
-        # Topology literals live in deploy/config.nix (baked to JSON below); the
-        # contract env keeps only what the binary reads as env: the config's
-        # `{ env = ... }` refs plus the direct env seams (redis stores, verifier
-        # JWKS dial, signing kid).
-        prodConfig = pkgs.writeText "config.json" (builtins.toJSON (import ./deploy/config.nix));
-        containerStd = v_flakes.container.implement {
-          inherit pkgs pname;
-          containers."" = {
-            port = 55671;
-            healthPath = "/health";
-            criticality = "normal";
-            entrypoint = [ "/bin/concierge" "--config" "${prodConfig}" ];
-            contents = [ conciergeBin ];
-            env = {
-              DATABASE_URL = "postgres://evinvest@10.42.0.1:5432/concierge";
-              REDIS_URL = "redis://10.42.0.1:6379/1";
-              # The inbound verifier dials its own in-process Jwks RPC over loopback.
-              AUTH_JWKS_GRPC_ENDPOINT = "http://127.0.0.1:55670";
-              AUTH_SIGNING_KID = "prod-1";
-              RUST_LOG = "info";
-              # Transition compat: pre-LiveSettings images read topology from the
-              # Deployment env, and a rollback must land on a working pod. Values
-              # duplicate deploy/config.nix EXACTLY (the settings env aliases beat
-              # the file, so any drift here would win — keep them identical).
-              # Drop once the fleet is confidently past pre-LiveSettings tags.
-              CONCIERGE_BIND = "0.0.0.0:55670";
-              CONCIERGE_WEB_BIND = "0.0.0.0:55671";
-              PUBLIC_ORIGIN = "https://evinvest.ltd";
-              APP_ENV = "production";
-            };
+        # Topology literals are set directly as contract env vars (read by
+        # ev::settings! from_env). deploy/config.nix is kept for reference only.
+        inherit pkgs pname;
+        containers."" = {
+          port = 55671;
+          healthPath = "/health";
+          criticality = "normal";
+          entrypoint = [ "/bin/concierge" ];
+          contents = [ conciergeBin ];
+          env = {
+            DATABASE_URL = "postgres://evinvest@10.42.0.1:5432/concierge";
+            REDIS_URL = "redis://10.42.0.1:6379/1";
+            # The inbound verifier dials its own in-process Jwks RPC over loopback.
+            AUTH_JWKS_GRPC_ENDPOINT = "http://127.0.0.1:55670";
+            AUTH_SIGNING_KID = "prod-1";
+            RUST_LOG = "info";
+            # These env vars are read directly by ev::settings! (from_env).
+            # deploy/config.nix is kept for reference.
+            BIND = "0.0.0.0:55670";
+            WEB_BIND = "0.0.0.0:55671";
+            PUBLIC_ORIGIN = "https://evinvest.ltd";
+            APP_ENV = "production";
           };
+        };
         };
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
@@ -179,7 +172,7 @@
 
             ${portEnv}
             export DATABASE_URL="''${DATABASE_URL:-postgres://postgres@localhost:$POSTGRES_PORT/concierge}"
-            # Env aliases mirror AppConfig field names (LiveSettings `use_env`).
+            # Env aliases mirror AppConfig field names (ev::settings! from_env).
             export BIND="''${BIND:-0.0.0.0:$CONCIERGE_PORT}"
             export WEB_BIND="''${WEB_BIND:-0.0.0.0:$CONCIERGE_WEB_PORT}"
             export REDIS_URL="''${REDIS_URL:-redis://127.0.0.1:$REDIS_PORT/1}"
@@ -187,8 +180,8 @@
             export AUTH_JWKS_GRPC_ENDPOINT="''${AUTH_JWKS_GRPC_ENDPOINT:-http://127.0.0.1:$CONCIERGE_PORT}"
             # Shared bridge token the banking money plane presents on PullUserLifecycle.
             export BRIDGE_SERVICE_TOKEN="''${BRIDGE_SERVICE_TOKEN:-dev-bridge-token}"
-            # LiveSettings has no Rust-side defaults for these (String fields);
-            # dev topology is owned here, prod literals live in deploy/config.nix.
+            # ev::settings! defaults to "development"/None for Option fields;
+            # dev topology is owned here, deploy/config.nix kept for reference.
             export APP_ENV="''${APP_ENV:-development}"
             export PUBLIC_ORIGIN="''${PUBLIC_ORIGIN:-http://localhost:58843}"
             export RUST_LOG="''${RUST_LOG:-info,concierge=debug,evconcierge_auth=debug}"

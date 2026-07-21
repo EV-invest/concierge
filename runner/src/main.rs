@@ -11,7 +11,6 @@
 
 use std::sync::Arc;
 
-use clap::Parser;
 use color_eyre::{
 	Result,
 	eyre::{Context, ensure},
@@ -34,23 +33,12 @@ use tonic_web::GrpcWebLayer;
 use tower::{Layer, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 
-#[derive(Parser)]
-struct Cli {
-	#[clap(flatten)]
-	settings_flags: config::SettingsFlags,
-}
-
 // Sentry must be initialised before the async runtime starts — no #[tokio::main].
 fn main() -> Result<()> {
 	color_eyre::install()?;
 	dotenvy::dotenv().ok();
 
-	let cli = Cli::parse();
-	// The live handle drives hot reload (the admin allowlist is read through it at
-	// request time); the boot snapshot below feeds the infra that's built once. A
-	// missing `{ env = "VAR" }` ref in the prod config fails HERE, before anything binds.
-	let settings = Arc::new(config::LiveSettings::new(cli.settings_flags, std::time::Duration::from_secs(60))?);
-	let config = settings.config()?;
+	let config = config::AppConfig::from_env().context("failed to load configuration")?;
 
 	// Guard must stay alive for the duration of main — dropping it flushes events.
 	// `None` DSN → `init` returns `None`, so this binding is simply inert.
@@ -58,6 +46,7 @@ fn main() -> Result<()> {
 		dsn: config.sentry_dsn.clone(),
 		environment: config.app_env.clone(),
 		traces_sample_rate: SentryConfig::traces_sample_rate_for(&config.app_env),
+		release: None,
 	});
 
 	let _otel_guard = init_tracing(&config.app_env);
@@ -66,13 +55,13 @@ fn main() -> Result<()> {
 		.enable_all()
 		.build()
 		.context("failed to build tokio runtime")?
-		.block_on(run(settings))
+		.block_on(run(config))
 }
 
-async fn run(settings: Arc<config::LiveSettings>) -> Result<()> {
-	// Boot snapshot for the infra built once; the live `settings` handle is what the
-	// directory/platform services + provisioner read the admin allowlist through.
-	let config = settings.config().context("failed to load configuration")?;
+async fn run(config: config::AppConfig) -> Result<()> {
+	// The admin allowlist (pre-loaded from env) is shared by the directory and platform
+	// services and by the provisioner loop, so issued sessions carry the effective role.
+	let admin_subjects: Arc<Vec<String>> = Arc::new(config.admin_subjects.clone());
 	// The plane applies pending control-plane migrations on boot (idempotent). New
 	// migration FILES are authored with the sqlx CLI (`sqlx migrate add …`), never
 	// hand-written.
@@ -122,7 +111,7 @@ async fn run(settings: Arc<config::LiveSettings>) -> Result<()> {
 	// so issued sessions carry the effective role. Each reads it LIVE through the
 	// `settings` handle, so editing the mounted allowlist applies without a restart.
 	let (provisioner, provision_rx) = provisioner_channel();
-	tokio::spawn(directory::run_provisioner(provision_rx, users.clone(), settings.clone()));
+	tokio::spawn(directory::run_provisioner(provision_rx, users.clone(), admin_subjects.clone()));
 	let auth_service = AuthService::try_new(auth_config, provisioner).await.context("failed to build the auth service")?;
 
 	// Inbound verification choke point: a `Verifier` over this plane's own `Jwks` RPC.
@@ -182,8 +171,8 @@ async fn run(settings: Arc<config::LiveSettings>) -> Result<()> {
 			.add_service(HealthServiceServer::new(Health))
 			.add_service(AuthServiceServer::new(auth_service))
 			.add_service(UserEventsServer::new(bridge))
-			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), settings.clone()))))
-			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users, settings.clone(), platform_repo))))
+			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), admin_subjects.clone()))))
+			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users, admin_subjects.clone(), platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 			.serve_with_shutdown(config.bind, await_signal())

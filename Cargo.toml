@@ -61,6 +61,9 @@ tracing-subscriber = "^0.3.23"
 uuid = "^1.23.4"
 v_utils = { version = "=2.15.54", features = ["io", "macros", "cli", "xdg"] }
 
+[patch.crates-io]
+ev_lib = { git = "https://github.com/EV-invest/lib.git", rev = "a36056e28eb18fe8810d347d3f8dc492f0658acf" }
+
 [workspace.lints.rust]
 unused_features = "allow"
 

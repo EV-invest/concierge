@@ -1,8 +1,7 @@
-# Prod config (secret-free, committable). Evaluated to JSON at image-build time
-# by the flake — the runtime container carries no `nix`, only the baked result.
-# `{ env = ... }` refs resolve at startup from the container env (the image's
-# baked contract env + gitops' k8s Secret `envFrom`); a missing var fails the
-# boot loudly, which is the whole point.
+# Prod config reference (secret-free) — kept for documentation only.
+# The actual values are set as direct env vars in the container contract
+# (flake.nix -> containerStd.containers."".env) and read by ev::settings!
+# from_env() at runtime. No longer baked to JSON or mounted as a config file.
 {
   database_url.env = "DATABASE_URL";
   bind = "0.0.0.0:55670";

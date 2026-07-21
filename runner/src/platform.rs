@@ -33,20 +33,19 @@ use crate::{
 #[derive(Clone)]
 pub struct Platform {
 	users: Arc<dyn UserDirectoryRepository>,
-	settings: Arc<crate::config::LiveSettings>,
+	admins: Arc<Vec<String>>,
 	config: Arc<dyn PlatformConfigRepository>,
 }
 
 impl Platform {
-	pub fn new(users: Arc<dyn UserDirectoryRepository>, settings: Arc<crate::config::LiveSettings>, config: Arc<dyn PlatformConfigRepository>) -> Self {
-		Self { users, settings, config }
+	pub fn new(users: Arc<dyn UserDirectoryRepository>, admins: Arc<Vec<String>>, config: Arc<dyn PlatformConfigRepository>) -> Self {
+		Self { users, admins, config }
 	}
 
-	/// The break-glass allowlist, read LIVE from the hot-reloaded config so editing the
-	/// mounted file applies without a restart. A config-read error yields an empty list —
-	/// fail closed (no elevation); LiveSettings serves the last-good value across a bad edit.
-	fn admins(&self) -> Vec<String> {
-		self.settings.config().map(|c| c.admin_subjects).unwrap_or_default()
+	/// The break-glass allowlist, loaded once at boot. An empty list grants no
+	/// elevation (fail closed).
+	fn admins(&self) -> &[String] {
+		&self.admins
 	}
 
 	/// Read the whole config into its wire shape (one authoritative snapshot).
@@ -82,13 +81,13 @@ impl PlatformServiceRpc for Platform {
 	}
 
 	async fn set_maintenance_mode(&self, request: Request<SetMaintenanceModeRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), &self.admins(), &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), self.admins(), &request, Permission::PlatformManage).await?;
 		self.config.set_maintenance(request.get_ref().enabled).await.map_err(domain_to_status)?;
 		Ok(Response::new(self.snapshot().await?))
 	}
 
 	async fn set_announcement(&self, request: Request<SetAnnouncementRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), &self.admins(), &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), self.admins(), &request, Permission::PlatformManage).await?;
 		let req = request.into_inner();
 		// Empty title/body stays legal — that is how the banner is cleared; only the
 		// caps apply (the banner renders to every signed-in user).
@@ -103,7 +102,7 @@ impl PlatformServiceRpc for Platform {
 	}
 
 	async fn set_feature_flag(&self, request: Request<SetFeatureFlagRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), &self.admins(), &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), self.admins(), &request, Permission::PlatformManage).await?;
 		let req = request.into_inner();
 		if !is_flag_key(&req.key) {
 			return Err(Status::invalid_argument("flag key must be 1-64 characters of [a-z0-9_-] and start with a letter or digit"));
