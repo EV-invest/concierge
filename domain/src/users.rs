@@ -22,6 +22,10 @@ use serde::{Deserialize, Serialize};
 pub use crate::auth::AuthSubject;
 use crate::{authz::Role, error::DomainError};
 
+/// The IANA tz database's top-level areas — the only prefixes an `Area/Location`
+/// name may start with. Keeping the list here (vs a tz crate) preserves the no-deps
+/// rule; new areas have not been added to the database in decades.
+const IANA_AREAS: [&str; 11] = ["Africa", "America", "Antarctica", "Arctic", "Asia", "Atlantic", "Australia", "Etc", "Europe", "Indian", "Pacific"];
 /// The platform's canonical user id (a UUID). **This** value is the `sub` of the
 /// first-party session JWT — never the IdP's `sub` (see [`AuthSubject`]).
 pub type UserId = Id<UserTag>;
@@ -116,7 +120,7 @@ impl ProfileFields {
 	pub fn parse(raw: ProfileFields) -> Result<Self, DomainError> {
 		Ok(Self {
 			legal_name: parse_name("legal_name", raw.legal_name, 256)?,
-			preferred_name: parse_name("preferred_name", raw.preferred_name, 256)?,
+			preferred_name: parse_name("preferred_name", raw.preferred_name, 64)?,
 			phone: parse_phone(raw.phone)?,
 			date_of_birth: parse_date_of_birth(raw.date_of_birth)?,
 			nationality: parse_name("nationality", raw.nationality, 64)?,
@@ -127,137 +131,6 @@ impl ProfileFields {
 			timezone: parse_timezone(raw.timezone)?,
 		})
 	}
-}
-
-/// Trim, treating a blank value as a clear — the wire contract's "empty string
-/// clears the field" semantics.
-fn normalized(value: Option<String>) -> Option<String> {
-	value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
-}
-
-fn check_len(field: &'static str, value: &str, max: usize) -> Result<(), DomainError> {
-	if value.chars().count() > max {
-		return Err(DomainError::Validation(format!("{field} must be at most {max} characters")));
-	}
-	Ok(())
-}
-
-/// Human-name shape shared by names/nationality/tax residence: letters (any
-/// script), spaces, hyphen, apostrophe, period — and at least 2 letters, so
-/// single-character garbage is rejected. The allowlist excludes control characters.
-fn parse_name(field: &'static str, value: Option<String>, max: usize) -> Result<Option<String>, DomainError> {
-	let Some(value) = normalized(value) else { return Ok(None) };
-	check_len(field, &value, max)?;
-	if !value.chars().all(|c| c.is_alphabetic() || matches!(c, ' ' | '-' | '\'' | '.')) {
-		return Err(DomainError::Validation(format!("{field} may only contain letters, spaces, hyphens, apostrophes, and periods")));
-	}
-	if value.chars().filter(|c| c.is_alphabetic()).count() < 2 {
-		return Err(DomainError::Validation(format!("{field} must contain at least 2 letters")));
-	}
-	Ok(Some(value))
-}
-
-fn parse_phone(value: Option<String>) -> Result<Option<String>, DomainError> {
-	let Some(value) = normalized(value) else { return Ok(None) };
-	check_len("phone", &value, 32)?;
-	if !value.chars().all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | ' ' | '(' | ')')) {
-		return Err(DomainError::Validation("phone may only contain digits, '+', '-', spaces, and parentheses".into()));
-	}
-	if value.chars().filter(char::is_ascii_digit).count() < 5 {
-		return Err(DomainError::Validation("phone must contain at least 5 digits".into()));
-	}
-	Ok(Some(value))
-}
-
-/// Exact `YYYY-MM-DD`, a real calendar date, year 1900..=2100. Hand-rolled because
-/// this crate has no time dependency (and must not grow one).
-fn parse_date_of_birth(value: Option<String>) -> Result<Option<String>, DomainError> {
-	let Some(value) = normalized(value) else { return Ok(None) };
-	let err = || DomainError::Validation("date_of_birth must be a valid YYYY-MM-DD date with year 1900-2100".into());
-	let bytes = value.as_bytes();
-	if bytes.len() != 10 || !bytes.iter().enumerate().all(|(i, b)| if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() }) {
-		return Err(err());
-	}
-	let (year, month, day): (u32, u32, u32) = (value[0..4].parse().unwrap(), value[5..7].parse().unwrap(), value[8..10].parse().unwrap());
-	if !(1900..=2100).contains(&year) || !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
-		return Err(err());
-	}
-	Ok(Some(value))
-}
-
-fn days_in_month(year: u32, month: u32) -> u32 {
-	match month {
-		1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-		4 | 6 | 9 | 11 => 30,
-		2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => 29,
-		_ => 28,
-	}
-}
-
-fn parse_address(value: Option<String>) -> Result<Option<String>, DomainError> {
-	let Some(value) = normalized(value) else { return Ok(None) };
-	check_len("residential_address", &value, 256)?;
-	if value.chars().any(char::is_control) {
-		return Err(DomainError::Validation("residential_address must not contain control characters".into()));
-	}
-	Ok(Some(value))
-}
-
-/// Lenient BCP 47 shape: a 2-3 letter primary subtag, then optional `-`/`_`
-/// separated alphanumeric subtags of 2-8 characters ("ja", "en-US", "vi_VN") —
-/// full words like "japanese" are not codes.
-fn parse_language(value: Option<String>) -> Result<Option<String>, DomainError> {
-	let Some(value) = normalized(value) else { return Ok(None) };
-	check_len("language", &value, 16)?;
-	let err = || DomainError::Validation("language must be a BCP 47 code such as 'en' or 'en-US'".into());
-	let mut subtags = value.split(['-', '_']);
-	let primary = subtags.next().unwrap_or_default();
-	if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic()) {
-		return Err(err());
-	}
-	for subtag in subtags {
-		if !(2..=8).contains(&subtag.len()) || !subtag.bytes().all(|b| b.is_ascii_alphanumeric()) {
-			return Err(err());
-		}
-	}
-	Ok(Some(value))
-}
-
-fn parse_currency(value: Option<String>) -> Result<Option<String>, DomainError> {
-	let Some(value) = normalized(value) else { return Ok(None) };
-	if value.len() != 3 || !value.bytes().all(|b| b.is_ascii_alphabetic()) {
-		return Err(DomainError::Validation("base_currency must be a 3-letter code such as 'USD'".into()));
-	}
-	Ok(Some(value.to_ascii_uppercase()))
-}
-
-/// The IANA tz database's top-level areas — the only prefixes an `Area/Location`
-/// name may start with. Keeping the list here (vs a tz crate) preserves the no-deps
-/// rule; new areas have not been added to the database in decades.
-const IANA_AREAS: [&str; 11] = ["Africa", "America", "Antarctica", "Arctic", "Asia", "Atlantic", "Australia", "Etc", "Europe", "Indian", "Pacific"];
-
-fn parse_timezone(value: Option<String>) -> Result<Option<String>, DomainError> {
-	let Some(value) = normalized(value) else { return Ok(None) };
-	check_len("timezone", &value, 64)?;
-	if value == "UTC" || value == "GMT" {
-		return Ok(Some(value));
-	}
-	let err = || DomainError::Validation("timezone must be 'UTC', 'GMT', or an IANA name such as 'Asia/Ho_Chi_Minh'".into());
-	let mut segments = value.split('/');
-	if !IANA_AREAS.contains(&segments.next().unwrap_or_default()) {
-		return Err(err());
-	}
-	let mut locations = 0;
-	for segment in segments {
-		if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-')) {
-			return Err(err());
-		}
-		locations += 1;
-	}
-	if locations == 0 {
-		return Err(err());
-	}
-	Ok(Some(value))
 }
 
 /// The platform's canonical user identity. Construct it with [`User::provision`]
@@ -282,7 +155,6 @@ pub struct User {
 	row_version: u64,
 	pending: Vec<UserEvent>,
 }
-
 impl User {
 	/// Provision a brand-new user at first sign-in. The application layer mints the
 	/// [`UserId`] (host-only), keeping this pure.
@@ -500,26 +372,6 @@ impl User {
 	}
 }
 
-impl Entity for User {
-	type Id = UserId;
-
-	fn id(&self) -> UserId {
-		self.id
-	}
-}
-
-impl AggregateRoot for User {
-	const NAME: &'static str = "user";
-}
-
-impl EmitsEvents for User {
-	type Event = UserEvent;
-
-	fn drain_events(&mut self) -> Vec<UserEvent> {
-		core::mem::take(&mut self.pending)
-	}
-}
-
 /// The cross-plane lifecycle facts the [`User`] aggregate raises. Each maps to a
 /// `user_outbox` row (one bridge `Kind`) the banking money plane consumes to
 /// gate/freeze money ops. Identity-internal mutations (email, profile) carry no
@@ -545,6 +397,152 @@ impl UserEvent {
 			Self::KycChanged => "KYC_CHANGED",
 			Self::RoleChanged => "ROLE_CHANGED",
 		}
+	}
+}
+
+/// Trim, treating a blank value as a clear — the wire contract's "empty string
+/// clears the field" semantics.
+fn normalized(value: Option<String>) -> Option<String> {
+	value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+fn check_len(field: &'static str, value: &str, max: usize) -> Result<(), DomainError> {
+	if value.chars().count() > max {
+		return Err(DomainError::Validation(format!("{field} must be at most {max} characters")));
+	}
+	Ok(())
+}
+
+/// Human-name shape shared by names/nationality/tax residence: letters (any
+/// script), spaces, hyphen, apostrophe, period — and at least 2 letters, so
+/// single-character garbage is rejected. The allowlist excludes control characters.
+fn parse_name(field: &'static str, value: Option<String>, max: usize) -> Result<Option<String>, DomainError> {
+	let Some(value) = normalized(value) else { return Ok(None) };
+	check_len(field, &value, max)?;
+	if !value.chars().all(|c| c.is_alphabetic() || matches!(c, ' ' | '-' | '\'' | '.')) {
+		return Err(DomainError::Validation(format!("{field} may only contain letters, spaces, hyphens, apostrophes, and periods")));
+	}
+	if value.chars().filter(|c| c.is_alphabetic()).count() < 2 {
+		return Err(DomainError::Validation(format!("{field} must contain at least 2 letters")));
+	}
+	Ok(Some(value))
+}
+
+fn parse_phone(value: Option<String>) -> Result<Option<String>, DomainError> {
+	let Some(value) = normalized(value) else { return Ok(None) };
+	check_len("phone", &value, 32)?;
+	if !value.chars().all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | ' ' | '(' | ')')) {
+		return Err(DomainError::Validation("phone may only contain digits, '+', '-', spaces, and parentheses".into()));
+	}
+	if value.chars().filter(char::is_ascii_digit).count() < 5 {
+		return Err(DomainError::Validation("phone must contain at least 5 digits".into()));
+	}
+	Ok(Some(value))
+}
+
+/// Exact `YYYY-MM-DD`, a real calendar date, year 1900..=2100. Hand-rolled because
+/// this crate has no time dependency (and must not grow one).
+fn parse_date_of_birth(value: Option<String>) -> Result<Option<String>, DomainError> {
+	let Some(value) = normalized(value) else { return Ok(None) };
+	let err = || DomainError::Validation("date_of_birth must be a valid YYYY-MM-DD date with year 1900-2100".into());
+	let bytes = value.as_bytes();
+	if bytes.len() != 10 || !bytes.iter().enumerate().all(|(i, b)| if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() }) {
+		return Err(err());
+	}
+	let (year, month, day): (u32, u32, u32) = (value[0..4].parse().unwrap(), value[5..7].parse().unwrap(), value[8..10].parse().unwrap());
+	if !(1900..=2100).contains(&year) || !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
+		return Err(err());
+	}
+	Ok(Some(value))
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+	match month {
+		1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+		4 | 6 | 9 | 11 => 30,
+		2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => 29,
+		_ => 28,
+	}
+}
+
+fn parse_address(value: Option<String>) -> Result<Option<String>, DomainError> {
+	let Some(value) = normalized(value) else { return Ok(None) };
+	check_len("residential_address", &value, 256)?;
+	if value.chars().any(char::is_control) {
+		return Err(DomainError::Validation("residential_address must not contain control characters".into()));
+	}
+	Ok(Some(value))
+}
+
+/// Lenient BCP 47 shape: a 2-3 letter primary subtag, then optional `-`/`_`
+/// separated alphanumeric subtags of 2-8 characters ("ja", "en-US", "vi_VN") —
+/// full words like "japanese" are not codes.
+fn parse_language(value: Option<String>) -> Result<Option<String>, DomainError> {
+	let Some(value) = normalized(value) else { return Ok(None) };
+	check_len("language", &value, 16)?;
+	let err = || DomainError::Validation("language must be a BCP 47 code such as 'en' or 'en-US'".into());
+	let mut subtags = value.split(['-', '_']);
+	let primary = subtags.next().unwrap_or_default();
+	if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic()) {
+		return Err(err());
+	}
+	for subtag in subtags {
+		if !(2..=8).contains(&subtag.len()) || !subtag.bytes().all(|b| b.is_ascii_alphanumeric()) {
+			return Err(err());
+		}
+	}
+	Ok(Some(value))
+}
+
+fn parse_currency(value: Option<String>) -> Result<Option<String>, DomainError> {
+	let Some(value) = normalized(value) else { return Ok(None) };
+	if value.len() != 3 || !value.bytes().all(|b| b.is_ascii_alphabetic()) {
+		return Err(DomainError::Validation("base_currency must be a 3-letter code such as 'USD'".into()));
+	}
+	Ok(Some(value.to_ascii_uppercase()))
+}
+
+fn parse_timezone(value: Option<String>) -> Result<Option<String>, DomainError> {
+	let Some(value) = normalized(value) else { return Ok(None) };
+	check_len("timezone", &value, 64)?;
+	if value == "UTC" || value == "GMT" {
+		return Ok(Some(value));
+	}
+	let err = || DomainError::Validation("timezone must be 'UTC', 'GMT', or an IANA name such as 'Asia/Ho_Chi_Minh'".into());
+	let mut segments = value.split('/');
+	if !IANA_AREAS.contains(&segments.next().unwrap_or_default()) {
+		return Err(err());
+	}
+	let mut locations = 0;
+	for segment in segments {
+		if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-')) {
+			return Err(err());
+		}
+		locations += 1;
+	}
+	if locations == 0 {
+		return Err(err());
+	}
+	Ok(Some(value))
+}
+
+impl Entity for User {
+	type Id = UserId;
+
+	fn id(&self) -> UserId {
+		self.id
+	}
+}
+
+impl AggregateRoot for User {
+	const NAME: &'static str = "user";
+}
+
+impl EmitsEvents for User {
+	type Event = UserEvent;
+
+	fn drain_events(&mut self) -> Vec<UserEvent> {
+		core::mem::take(&mut self.pending)
 	}
 }
 
