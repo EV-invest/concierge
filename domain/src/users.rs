@@ -768,6 +768,26 @@ mod tests {
 	}
 
 	#[test]
+	fn profile_preferred_name_caps_at_64() {
+		let pref = |v: &str| {
+			ProfileFields::parse(ProfileFields {
+				preferred_name: Some(v.into()),
+				..ProfileFields::default()
+			})
+		};
+		assert!(pref("Ada").is_ok());
+		assert!(pref(&"a".repeat(64)).is_ok());
+		assert!(pref(&"a".repeat(65)).is_err());
+		// The message names the offending field.
+		let err = ProfileFields::parse(ProfileFields {
+			preferred_name: Some("a".repeat(65)),
+			..ProfileFields::default()
+		})
+		.unwrap_err();
+		assert!(err.to_string().contains("preferred_name"), "the message names the offending field: {err}");
+	}
+
+	#[test]
 	fn profile_address_allows_punctuation_but_not_control_chars() {
 		let addr = |v: &str| {
 			ProfileFields::parse(ProfileFields {
