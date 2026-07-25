@@ -430,14 +430,59 @@ fn parse_name(field: &'static str, value: Option<String>, max: usize) -> Result<
 
 fn parse_phone(value: Option<String>) -> Result<Option<String>, DomainError> {
 	let Some(value) = normalized(value) else { return Ok(None) };
+	// E.164: "+" followed by 7–15 digits with a valid country-code prefix.
 	check_len("phone", &value, 32)?;
-	if !value.chars().all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | ' ' | '(' | ')')) {
-		return Err(DomainError::Validation("phone may only contain digits, '+', '-', spaces, and parentheses".into()));
+	if !value.starts_with('+') {
+		return Err(DomainError::Validation("phone must start with +".into()));
 	}
-	if value.chars().filter(char::is_ascii_digit).count() < 5 {
-		return Err(DomainError::Validation("phone must contain at least 5 digits".into()));
+	let digits = &value[1..];
+	if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+		return Err(DomainError::Validation("phone must contain only digits after the +".into()));
+	}
+	let n = digits.len();
+	if n < 7 {
+		return Err(DomainError::Validation(format!("phone must have at least 7 digits (has {n})")));
+	}
+	if n > 15 {
+		return Err(DomainError::Validation(format!("phone must have at most 15 digits (has {n})")));
+	}
+	if !is_valid_country_code(digits) {
+		return Err(DomainError::Validation("unknown country code".into()));
 	}
 	Ok(Some(value))
+}
+
+/// ITU-T E.164 country codes (1–3 digits, zones 1–9).
+/// Tried longest-first so e.g. "1242" (Bahamas) matches before "1" (NANP).
+fn is_valid_country_code(digits: &str) -> bool {
+	const CODES: &[&str] = &[
+		// Zone 1 — North American Numbering Plan
+		"1", // Zone 2 — Africa
+		"20", "211", "212", "213", "216", "218", "220", "221", "222", "223", "224", "225", "226", "227", "228", "229", "230", "231", "232", "233", "234", "235", "236", "237", "238", "239",
+		"240", "241", "242", "243", "244", "245", "246", "247", "248", "249", "250", "251", "252", "253", "254", "255", "256", "257", "258", "260", "261", "262", "263", "264", "265", "266",
+		"267", "268", "269", // Zone 3 — Europe
+		"30", "31", "32", "33", "34", "350", "351", "352", "353", "354", "355", "356", "357", "358", "359", // Zone 4 — Europe (cont.)
+		"36", "370", "371", "372", "373", "374", "375", "376", "377", "378", "379", "380", "381", "382", "383", "385", "386", "387", "389", "40", "41", "42", "43", "44", "45", "46", "47",
+		"48", "49", // Zone 5 — South/Latin America
+		"500", "501", "502", "503", "504", "505", "506", "507", "508", "509", "51", "52", "53", "54", "55", "56", "57", "58", "590", "591", "592", "593", "594", "595", "596", "597", "598",
+		"599", // Zone 6 — Southeast Asia / Oceania
+		"60", "61", "62", "63", "64", "65", "66", "670", "672", "673", "674", "675", "676", "677", "678", "679", "680", "681", "682", "683", "685", "686", "687", "688", "689", "690", "691",
+		"692", // Zone 7 — Russia, Kazakhstan
+		"7", // Zone 8 — East Asia / Special services
+		"81", "82", "83", "84", "850", "852", "853", "855", "856", "86", "870", "872", "873", "874", "878", "879", "880", "881", "882", "883", "886", "888",
+		// Zone 9 — West/South Asia
+		"90", "91", "92", "93", "94", "95", "960", "961", "962", "963", "964", "965", "966", "967", "968", "969", "970", "971", "972", "973", "974", "975", "976", "977", "979", "98", "992",
+		"993", "994", "995", "996", "998",
+	];
+	for &len in &[3u8, 2, 1] {
+		if digits.len() >= len as usize {
+			let prefix = &digits[..len as usize];
+			if CODES.contains(&prefix) {
+				return true;
+			}
+		}
+	}
+	false
 }
 
 /// Exact `YYYY-MM-DD`, a real calendar date, year 1900..=2100. Hand-rolled because
@@ -711,19 +756,28 @@ mod tests {
 	}
 
 	#[test]
-	fn profile_phone_rejects_urls_and_short_numbers() {
+	fn profile_phone_rejects_invalid_and_accepts_e164() {
 		let phone = |v: &str| {
 			ProfileFields::parse(ProfileFields {
 				phone: Some(v.into()),
 				..ProfileFields::default()
 			})
 		};
-		assert!(phone("+84 (28) 3822-9284").is_ok());
-		assert!(phone(&"1".repeat(32)).is_ok());
-		// Observed junk: an https URL stored as a phone number.
-		assert!(phone("https://t.me/somejunk").is_err());
-		assert!(phone("+1-23").is_err(), "fewer than 5 digits");
-		assert!(phone(&"1".repeat(33)).is_err());
+		// Valid E.164
+		assert!(phone("+842838229284").is_ok(), "Vietnam");
+		assert!(phone("+12345678901").is_ok(), "US");
+		assert!(phone("+442012345678").is_ok(), "UK");
+		assert!(phone("+79161234567").is_ok(), "Russia");
+		assert!(phone("+85212345678").is_ok(), "Hong Kong 3-digit cc");
+		// Rejected
+		assert!(phone("+84 (28) 3822-9284").is_err(), "spaces and parens not allowed in E.164");
+		assert!(phone("+").is_err(), "no digits");
+		assert!(phone("1234567890").is_err(), "missing +");
+		assert!(phone("+1").is_err(), "too short (< 7 digits)");
+		assert!(phone("+12345678901234567").is_err(), "too long (> 15 digits)");
+		assert!(phone("+9991234567").is_err(), "unknown country code");
+		assert!(phone("https://t.me/somejunk").is_err(), "URLs rejected");
+		assert!(phone(&"+".repeat(33)).is_err(), "over 32 chars rejected");
 	}
 
 	#[test]
