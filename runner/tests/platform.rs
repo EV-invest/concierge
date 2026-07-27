@@ -56,7 +56,7 @@ async fn any_authenticated_principal_reads_config_but_cannot_write() {
 	let subject = AuthSubject::parse(&format!("platform-{}", Uuid::new_v4())).unwrap();
 	let user = users.provision(subject, Email::parse("platform@example.com").unwrap(), true).await.unwrap();
 	let sub = user.id().to_string();
-	let no_admins: Arc<[String]> = Vec::new().into();
+	let no_admins: Arc<Vec<String>> = Vec::new().into();
 	let platform = Platform::new(users, no_admins, config);
 
 	platform
@@ -90,7 +90,7 @@ async fn operator_config_writes_validate_and_round_trip() {
 	let sub = user.id().to_string();
 	// Break-glass allowlist: the caller holds Owner, so these assertions are about the
 	// validation past the gate, not the gate itself.
-	let admins: Arc<[String]> = vec![sub.clone()].into();
+	let admins: Arc<Vec<String>> = vec![sub.clone()].into();
 	let platform = Platform::new(users, admins, config);
 
 	let flag = |key: &str, rollout: u32| SetFeatureFlagRequest {

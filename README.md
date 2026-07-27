@@ -20,12 +20,12 @@ contracts/auth crates.
 
 | Path | What | Stack |
 | ---- | ---- | ----- |
-| [`runner/`](runner) | the modular-monolith binary — composition root mounting modules `auth` · `directory` · `notification` · `log`; opens the Postgres control plane and applies `runner/migrations` on boot | Rust · tonic · sqlx |
+| [`runner/`](runner) | the modular-monolith binary — composition root mounting modules `auth` · `directory` · `platform` · `notification` · `log`, plus the background email dispatcher; opens the Postgres control plane and applies `runner/migrations` on boot | Rust · tonic · sqlx |
 | [`auth/`](auth) | `evconcierge_auth` — the `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation) + the stateless token-verification flow (imported by downstream repos) | Rust · tonic · JWKS |
 | [`contracts/`](contracts) | `evconcierge_contracts` — gRPC wire contracts (`proto/concierge/v1/` → tonic stubs) | Rust · tonic-build · proto3 |
 | [`domain/`](domain) | shared identity types (pure, wasm-safe) over `ev::architecture` | Rust |
 
-`directory` is the live module; `notification` and `log` are deferred stubs.
+`directory`, `platform`, `bridge` and `notification` are live; `log` is a deferred stub.
 
 ## Run
 

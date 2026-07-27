@@ -17,8 +17,10 @@ use domain::{
 	error::DomainError,
 	users::{AuthSubject, Email, ProfileFields, User, UserId},
 };
+use uuid::Uuid;
 
 use crate::infrastructure::{
+	notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
 	platform::{FeatureFlagRow, PlatformConfigRow},
 	users::{AdminUserRow, AuthzRecord},
 };
@@ -73,4 +75,67 @@ pub trait PlatformConfigRepository: Send + Sync {
 	async fn set_announcement(&self, title: &str, body: &str, active: bool) -> Result<(), DomainError>;
 
 	async fn upsert_flag(&self, key: &str, description: &str, enabled: bool, rollout: i32) -> Result<(), DomainError>;
+}
+
+/// Port for the notification plane's read/write surface: subscribers, their
+/// per-topic subscriptions, and the in-app inbox. Plain control-plane state rather
+/// than a domain aggregate, so — like [`PlatformConfigRepository`] — no kernel markers.
+///
+/// [`Self::emit`] is the one use case that spans two tables; it is internally atomic
+/// (inbox row + queued email in one transaction), so callers never hold a transaction
+/// across the port boundary.
+#[async_trait]
+pub trait NotificationRepository: Send + Sync {
+	/// The signed-in subscriber for a user, created on first touch and kept in step
+	/// with the directory's copy of the address.
+	async fn subscriber_for_user(&self, user_id: Uuid, email: &str, email_verified: bool) -> Result<SubscriberRow, DomainError>;
+
+	async fn subscriptions(&self, subscriber_id: Uuid) -> Result<Vec<SubscriptionRow>, DomainError>;
+
+	/// Flip one or both master channel switches. `None` leaves a channel untouched.
+	/// Both may end up false — that is the supported "stop contacting me" state.
+	async fn set_channel_enabled(&self, subscriber_id: Uuid, in_app: Option<bool>, email: Option<bool>) -> Result<(), DomainError>;
+
+	async fn set_topic_subscription(&self, subscriber_id: Uuid, topic: &str, subscribed: bool, email_enabled: bool) -> Result<(), DomainError>;
+
+	/// Record a notification and queue its email copy if every gate allows it.
+	/// Idempotent on `(subscriber, dedupe_key)`.
+	#[allow(clippy::too_many_arguments)]
+	async fn emit(&self, user_id: Uuid, topic: &str, kind: &str, title: &str, body: &str, link: &str, dedupe_key: &str, occurred_at: i64) -> Result<EmitOutcome, DomainError>;
+
+	/// One page of the inbox, newest first. `cursor` is the last id of the previous page.
+	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>) -> Result<Vec<NotificationRow>, DomainError>;
+
+	async fn unread_count(&self, subscriber_id: Uuid) -> Result<i64, DomainError>;
+
+	/// Mark specific ids, or every unread one. Returns the number actually flipped.
+	async fn mark_read(&self, subscriber_id: Uuid, ids: &[Uuid], all: bool) -> Result<u64, DomainError>;
+
+	/// Account-less subscribe (double opt-in). Returns the confirmation token ONLY
+	/// when a confirmation mail was actually queued — already-confirmed addresses and
+	/// throttled repeats both return `None`, and the caller must not tell them apart.
+	async fn subscribe_anonymous(&self, email: &str, topic: &str, throttle_secs: i64) -> Result<Option<(Uuid, String)>, DomainError>;
+
+	/// Spend a confirmation token. False when it is unknown or already spent.
+	async fn confirm(&self, token: &str) -> Result<bool, DomainError>;
+
+	/// One-click unsubscribe. `None` topic switches the email channel off entirely.
+	async fn unsubscribe(&self, token: &str, topic: Option<&str>) -> Result<bool, DomainError>;
+}
+
+/// Port for draining the outbound email queue. Split from [`NotificationRepository`]
+/// so the background dispatcher depends only on the four calls it actually makes.
+#[async_trait]
+pub trait NotificationDispatchRepository: Send + Sync {
+	/// Claim up to `limit` due jobs, leasing them for `lease_secs` so concurrent
+	/// dispatchers never send the same mail twice.
+	async fn claim_due(&self, limit: i64, lease_secs: i64) -> Result<Vec<DeliveryJob>, DomainError>;
+
+	async fn mark_sent(&self, delivery_id: i64) -> Result<(), DomainError>;
+
+	/// Reschedule with backoff, or park as `failed` once `max_attempts` is reached.
+	async fn mark_failed(&self, delivery_id: i64, error: &str, backoff_secs: i64, max_attempts: i32) -> Result<(), DomainError>;
+
+	/// Sends in the trailing 24h — the input to the daily send-budget breaker.
+	async fn sent_last_24h(&self) -> Result<i64, DomainError>;
 }

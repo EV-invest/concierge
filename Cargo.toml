@@ -32,6 +32,9 @@ http = "1"
 # `rust_crypto` selects the pure-Rust provider — no C/aws-lc-rs toolchain, matching
 # the rustls-only stance.
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# Outbound SMTP for the notification plane. rustls-only (no native-tls), matching
+# the rest of the stack; `hostname` supplies a real EHLO name.
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1-rustls-tls"] }
 prost = "0.14"
 # rustls-only Redis for the issuing-side refresh-token state, matching the rustls
 # stance (no native-tls). No-op until `REDIS_URL` is set (in-process fallback).

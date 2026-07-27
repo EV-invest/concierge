@@ -10,16 +10,20 @@
 //!   bridge          — the cross-plane (identity→money) producer over the user_outbox
 //!   platform        — the platform/cabinet config service (maintenance · announcement · flags)
 //!   authz           — the shared RBAC gate (persisted role + status/revocation enforcement)
-//!   ports           — the driven-port traits (`UserDirectoryRepository`, `PlatformConfigRepository`)
+//!   ports           — the driven-port traits (`UserDirectoryRepository`, `PlatformConfigRepository`,
+//!                     `NotificationRepository`, `NotificationDispatchRepository`)
 //!   infrastructure  — driven adapters (Postgres control plane + the port implementations)
 //!   support         — cross-module gRPC plumbing (domain-error → Status mapping)
 //!   web             — the site-level auth HTTP surface (login/callback/session cookies)
-//!   notification/log — DEFERRED stubs (no platform messaging/audit yet)
+//!   notification    — the notification plane: subscribers, the in-app inbox, queued email
+//!   dispatch        — the background loop draining the outbound email queue
+//!   log             — DEFERRED stub (no platform audit surface yet)
 
 pub mod authz;
 pub mod bridge;
 pub mod config;
 pub mod directory;
+pub mod dispatch;
 pub mod infrastructure;
 pub mod log;
 pub mod notification;
