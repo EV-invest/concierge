@@ -77,11 +77,17 @@ async fn update_profile_rejects_junk_with_invalid_argument() {
 
 	let err = directory.update_profile(request_with(&sub, profile("https://t.me/junk", ""))).await.unwrap_err();
 	assert_eq!(err.code(), Code::InvalidArgument);
-	assert!(err.message().contains("phone"), "the message names the offending field: {}", err.message());
+	// Case-insensitive: the validator moved to `ev::types::PhoneNumber`, whose message
+	// opens with a capitalised "Phone number …". The assertion is about the field being
+	// named at all, not about its casing.
+	assert!(err.message().to_lowercase().contains("phone"), "the message names the offending field: {}", err.message());
 
 	// A valid set persists, with the currency normalized and blanks kept cleared.
-	let updated = directory.update_profile(request_with(&sub, profile(" +84 28 3822 9284 ", "usd"))).await.unwrap().into_inner();
-	assert_eq!(updated.phone, "+84 28 3822 9284");
+	// E.164 is digits-only after the `+` since the validator moved to
+	// `ev::types::PhoneNumber` (#29/#30) — the spaced form this fixture used to carry is
+	// now rejected outright, so a stored number is the canonical one.
+	let updated = directory.update_profile(request_with(&sub, profile(" +842838229284 ", "usd"))).await.unwrap().into_inner();
+	assert_eq!(updated.phone, "+842838229284");
 	assert_eq!(updated.base_currency, "USD");
 	assert_eq!(updated.legal_name, "", "an empty field stays a clear");
 }
