@@ -15,7 +15,14 @@ use color_eyre::{
 	Result,
 	eyre::{Context, ensure},
 };
-use concierge::{bridge, config, directory, infrastructure, log, notification, platform, web};
+use concierge::{
+	bridge, config, directory,
+	infrastructure::{
+		self,
+		email::transport::{EmailTransport, NoopTransport, SmtpTransport},
+	},
+	log, notification, platform, web,
+};
 use ev::error_monitoring::{self, Config as SentryConfig};
 use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
@@ -149,6 +156,41 @@ async fn run(config: config::AppConfig) -> Result<()> {
 
 	let platform_repo: Arc<dyn concierge::ports::PlatformConfigRepository> = Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
 
+	// The notification plane. One adapter serves both ports: the service writes the
+	// inbox + queued mail transactionally, the dispatcher drains the queue.
+	let pg_notifications = Arc::new(infrastructure::notifications::PgNotifications::new(pool.clone()));
+	let notification_repo: Arc<dyn concierge::ports::NotificationRepository> = pg_notifications.clone();
+	let dispatch_repo: Arc<dyn concierge::ports::NotificationDispatchRepository> = pg_notifications;
+
+	// Real SMTP when configured, else a logging no-op — the same "unconfigured ⇒
+	// silent no-op" contract the analytics/Sentry seams use. The whole emit → queue →
+	// render path still runs locally and in CI; only the final hop is suppressed.
+	let transport: Arc<dyn EmailTransport> = match (&config.smtp_host, &config.smtp_username, &config.smtp_password) {
+		(Some(host), Some(username), Some(password)) =>
+			Arc::new(SmtpTransport::try_new(host, config.smtp_port, username.clone(), password.clone()).context("failed to build the SMTP transport")?),
+		_ => {
+			tracing::warn!("SMTP not configured — notification emails will be logged, not delivered");
+			Arc::new(NoopTransport)
+		}
+	};
+
+	tokio::spawn(concierge::dispatch::run_dispatcher(
+		dispatch_repo,
+		transport,
+		concierge::dispatch::DispatcherConfig {
+			mail_from: config.mail_from.clone(),
+			cabinet_url: config.cabinet_url.clone(),
+			public_origin: config.public_origin.clone(),
+			daily_budget: config.notification_daily_email_budget,
+			interval: std::time::Duration::from_secs(config.notification_dispatch_interval_secs),
+		},
+	));
+
+	let subscribe_limiter = Arc::new(notification::RateLimiter::new(
+		std::time::Duration::from_secs(config.subscribe_rate_window_secs),
+		config.subscribe_rate_limit,
+	));
+
 	// The site-level auth HTTP surface: the conductor rewrites the shared origin's
 	// `/api/auth/*` + `/api/callback/auth/*` here, so login/session cookies land
 	// first-party for every zone. Calls the SAME issuance service in-process.
@@ -172,8 +214,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(AuthServiceServer::new(auth_service))
 			.add_service(UserEventsServer::new(bridge))
 			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), admin_subjects.clone()))))
-			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users, admin_subjects.clone(), platform_repo))))
-			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new())))
+			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), admin_subjects.clone(), platform_repo))))
+			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 			.serve_with_shutdown(config.bind, await_signal())
 			.await

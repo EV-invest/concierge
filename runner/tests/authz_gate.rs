@@ -183,7 +183,7 @@ async fn provisioner_summaries_surface_the_effective_role() {
 	// channel the auth task uses for Exchange (Provision) and Refresh (Lookup).
 	let subject = unique_subject();
 	let user = users.provision(subject.clone(), Email::parse("bootop@example.com").unwrap(), true).await.unwrap();
-	let admins: Arc<[String]> = vec![user.id().to_string()].into();
+	let admins: Arc<Vec<String>> = vec![user.id().to_string()].into();
 	let (provisioner, rx) = provisioner_channel();
 	tokio::spawn(directory::run_provisioner(rx, users.clone(), admins));
 

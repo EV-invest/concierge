@@ -28,6 +28,7 @@ evconcierge_auth.workspace = true
 evconcierge_contracts.workspace = true
 form_urlencoded.workspace = true
 getrandom.workspace = true
+lettre.workspace = true
 prost.workspace = true
 redis.workspace = true
 serde = { workspace = true, features = ["derive"] }

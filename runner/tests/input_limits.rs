@@ -50,11 +50,11 @@ fn request_with<T>(sub: &str, inner: T) -> Request<T> {
 
 /// An allowlisted (break-glass Owner) caller so one principal exercises both the
 /// self-service and the admin surfaces.
-async fn owner(users: &Arc<dyn UserDirectoryRepository>) -> (String, Arc<[String]>) {
+async fn owner(users: &Arc<dyn UserDirectoryRepository>) -> (String, Arc<Vec<String>>) {
 	let subject = AuthSubject::parse(&format!("limits-{}", Uuid::new_v4())).unwrap();
 	let user = users.provision(subject, Email::parse("limits@example.com").unwrap(), true).await.unwrap();
 	let sub = user.id().to_string();
-	let admins: Arc<[String]> = vec![sub.clone()].into();
+	let admins: Arc<Vec<String>> = vec![sub.clone()].into();
 	(sub, admins)
 }
 

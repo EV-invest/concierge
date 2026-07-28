@@ -2,26 +2,196 @@ syntax = "proto3";
 
 package concierge.v1;
 
-// NotificationService — DEFERRED placeholder seam.
+// NotificationService — the platform's notification plane.
 //
-// Declared now to lock the namespace and let the runner mount a stub module; the
-// real delivery pipeline (channels, templating, fan-out) is future work. The stub
-// returns UNIMPLEMENTED.
+// One service, two audiences:
+//   * service callers (aud=concierge-services) Emit notifications for a subscriber;
+//   * signed-in users read their inbox and manage how they are reached.
+//
+// DELIVERY MODEL. A notification fans out to at most two channels — the cabinet
+// inbox (in-app) and email. Both are opt-out: a subscriber may switch either or
+// BOTH off, in which case nothing is delivered and the emit is recorded as
+// suppressed. No channel is unconditional.
+//
+// SUBSCRIBERS. Account-less ("anonymous") subscribers are the SAME record as
+// signed-in ones, distinguished only by having no user id — one table, one
+// fan-out, and the read paths filter. An account-less subscriber can only ever
+// receive email, and only after confirming a double opt-in; until it confirms,
+// the single confirmation mail is the only thing ever sent to it.
 service NotificationService {
-  // Enqueue a notification to a user over some channel. Stubbed for now.
-  rpc Send(SendNotificationRequest) returns (SendNotificationResponse);
+  // Enqueue a notification for one subscriber. Service audience only. Writes the
+  // inbox row and the email delivery row in ONE transaction; `dedupe_key` makes
+  // it idempotent, so at-least-once callers are safe to retry.
+  rpc Emit(EmitRequest) returns (EmitResponse);
+
+  // ── The signed-in user's inbox ──────────────────────────────────────────────
+  rpc ListNotifications(ListNotificationsRequest) returns (ListNotificationsResponse);
+  rpc GetUnreadCount(GetUnreadCountRequest) returns (GetUnreadCountResponse);
+  rpc MarkRead(MarkReadRequest) returns (MarkReadResponse);
+
+  // ── Delivery preferences (mutations return the full snapshot) ───────────────
+  rpc GetNotificationSettings(GetNotificationSettingsRequest) returns (NotificationSettings);
+  rpc SetChannelEnabled(SetChannelEnabledRequest) returns (NotificationSettings);
+  rpc SetTopicSubscription(SetTopicSubscriptionRequest) returns (NotificationSettings);
+
+  // ── Account-less subscription (service audience; the edge supplies client_ip) ─
+  // Rate limited per IP and per address, and always double opt-in. The response
+  // is deliberately identical whether the address was new, already subscribed or
+  // rate limited, so this cannot be used to enumerate subscribers.
+  rpc SubscribeAnonymous(SubscribeAnonymousRequest) returns (SubscribeAnonymousResponse);
+  rpc ConfirmSubscription(ConfirmSubscriptionRequest) returns (ConfirmSubscriptionResponse);
+  // One-click unsubscribe by opaque token (the List-Unsubscribe target).
+  rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
 }
 
-message SendNotificationRequest {
-  // The concierge canonical user id (a UUID) to notify.
+// The channel a notification can be delivered over.
+enum Channel {
+  CHANNEL_UNSPECIFIED = 0;
+  CHANNEL_IN_APP = 1;
+  CHANNEL_EMAIL = 2;
+}
+
+message EmitRequest {
+  // Target subscriber, by concierge canonical user id (a UUID). Account-less
+  // subscribers are not addressable by Emit — they receive topic broadcasts only.
   string user_id = 1;
-  // Delivery channel hint, free-form for now (e.g. "email", "push", "sms").
-  string channel = 2;
-  // The notification body.
-  string body = 3;
+  // Topic key, e.g. "fund:quy-nhon". Must be in the server-side allowlist.
+  string topic = 2;
+  // Machine-readable event kind within the topic, e.g. "nav_updated".
+  string kind = 3;
+  string title = 4;
+  string body = 5;
+  // Relative cabinet path the notification links to, e.g. "/funds/quy-nhon".
+  string link = 6;
+  // Idempotency key, unique per subscriber. Re-emitting the same key is a no-op.
+  string dedupe_key = 7;
+  // Domain time of the underlying event, unix seconds. 0 ⇒ server clock.
+  int64 occurred_at = 8;
 }
 
-message SendNotificationResponse {
-  // True once the notification has been accepted for delivery.
+message EmitResponse {
+  // The stored notification id; empty when the emit was deduped or suppressed.
+  string notification_id = 1;
+  // False when the subscriber has the topic off, both channels off, or does not
+  // exist — the call still succeeds, it simply delivered nothing.
+  bool delivered = 2;
+  // Channels the notification was actually queued on.
+  repeated Channel channels = 3;
+}
+
+message Notification {
+  string id = 1;
+  string topic = 2;
+  string kind = 3;
+  string title = 4;
+  string body = 5;
+  string link = 6;
+  // Unix seconds.
+  int64 occurred_at = 7;
+  int64 created_at = 8;
+  // Unix seconds; 0 when unread.
+  int64 read_at = 9;
+}
+
+message ListNotificationsRequest {
+  // Opaque cursor from a previous response; empty starts at the newest.
+  string cursor = 1;
+  // Clamped server-side to [1, 100]; 0 ⇒ default.
+  uint32 limit = 2;
+  // When true, only unread notifications.
+  bool unread_only = 3;
+  // Optional topic filter; empty ⇒ every topic.
+  string topic = 4;
+}
+
+message ListNotificationsResponse {
+  repeated Notification notifications = 1;
+  // Empty when there is no further page.
+  string next_cursor = 2;
+  uint32 unread_count = 3;
+}
+
+message GetUnreadCountRequest {}
+
+message GetUnreadCountResponse {
+  uint32 unread_count = 1;
+}
+
+message MarkReadRequest {
+  // Notification ids to mark read. Ignored when `all` is set.
+  repeated string ids = 1;
+  // Mark every unread notification read.
+  bool all = 2;
+}
+
+message MarkReadResponse {
+  uint32 marked = 1;
+  uint32 unread_count = 2;
+}
+
+message GetNotificationSettingsRequest {}
+
+// One subscribable topic and the caller's stance on it.
+message TopicSubscription {
+  string topic = 1;
+  // Human-readable, server-owned so every client renders the same wording.
+  string label = 2;
+  string description = 3;
+  bool subscribed = 4;
+  // Email copy for this topic. Only meaningful while `subscribed`.
+  bool email_enabled = 5;
+}
+
+// The whole delivery surface in one authoritative snapshot.
+message NotificationSettings {
+  // Master switches. Either or both may be false.
+  bool in_app_enabled = 1;
+  bool email_enabled = 2;
+  // The address email would go to, and whether it is usable.
+  string email = 3;
+  bool email_verified = 4;
+  repeated TopicSubscription topics = 5;
+}
+
+message SetChannelEnabledRequest {
+  Channel channel = 1;
+  bool enabled = 2;
+}
+
+message SetTopicSubscriptionRequest {
+  string topic = 1;
+  bool subscribed = 2;
+  bool email_enabled = 3;
+}
+
+message SubscribeAnonymousRequest {
+  string email = 1;
+  string topic = 2;
+  // Client IP as seen by the edge, for rate limiting. Empty ⇒ every such caller
+  // shares one bucket, which is the conservative choice.
+  string client_ip = 3;
+}
+
+message SubscribeAnonymousResponse {
+  // Always true for a well-formed address. Deliberately says nothing about
+  // whether the address was new, already subscribed, or rate limited.
   bool accepted = 1;
+}
+
+message ConfirmSubscriptionRequest {
+  string token = 1;
+}
+
+message ConfirmSubscriptionResponse {
+  bool confirmed = 1;
+}
+
+message UnsubscribeRequest {
+  string token = 1;
+  // Empty ⇒ unsubscribe from everything (the List-Unsubscribe behaviour).
+  string topic = 2;
+}
+
+message UnsubscribeResponse {
+  bool unsubscribed = 1;
 }
