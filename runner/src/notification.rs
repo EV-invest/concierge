@@ -64,11 +64,6 @@ pub const TOPICS: &[Topic] = &[
 		description: "NAV updates, distributions, research notes",
 	},
 	Topic {
-		key: "fund:coastal-yield",
-		label: "Coastal Yield",
-		description: "NAV updates, distributions",
-	},
-	Topic {
 		key: "account:money-movement",
 		label: "Money movement",
 		description: "Deposits, withdrawals, redemptions",
