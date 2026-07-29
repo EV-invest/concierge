@@ -103,6 +103,19 @@ fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
 }
 
+/// 24 bytes of OS randomness, hex-encoded — the shape of every opaque token here.
+///
+/// Generated in Rust rather than with `gen_random_bytes()`: that lives in the
+/// `pgcrypto` extension, which is not installed on our cluster, so the SQL version
+/// failed at runtime even though the migration itself applied cleanly
+/// (`gen_random_uuid()` is core Postgres; `gen_random_bytes()` is not). Minting tokens
+/// here also spares the plane any need for rights to create extensions.
+fn opaque_token() -> String {
+	let mut bytes = [0u8; 24];
+	getrandom::fill(&mut bytes).expect("CSPRNG unavailable");
+	bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // NOTE: sqlx 0.9 refuses non-`'static` query strings (its SQL-injection guard), so
 // the shared column lists below are repeated verbatim at each call site rather than
 // composed with `format!`. Keep `(confirmed_at IS NOT NULL) AS confirmed` in step
@@ -117,7 +130,7 @@ impl NotificationRepository for PgNotifications {
 		// trip would be friction with no security value.
 		sqlx::query_as::<_, SubscriberRow>(
 			"INSERT INTO notification_subscribers (user_id, email, email_verified, confirmed_at, unsubscribe_token) \
-			 VALUES ($1, $2, $3, now(), encode(gen_random_bytes(24), 'hex')) \
+			 VALUES ($1, $2, $3, now(), $4) \
 			 ON CONFLICT (user_id) WHERE user_id IS NOT NULL \
 			 DO UPDATE SET email = EXCLUDED.email, email_verified = EXCLUDED.email_verified, updated_at = now() \
 			 RETURNING id, user_id, email, email_verified, in_app_enabled, email_enabled, \
@@ -126,6 +139,7 @@ impl NotificationRepository for PgNotifications {
 		.bind(user_id)
 		.bind(email)
 		.bind(email_verified)
+		.bind(opaque_token())
 		.fetch_one(&self.pool)
 		.await
 		.map_err(repo_err)
@@ -262,18 +276,26 @@ impl NotificationRepository for PgNotifications {
 	}
 
 	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>) -> Result<Vec<NotificationRow>, DomainError> {
-		// Keyset pagination on (created_at, id): the cursor row's own key is resolved
-		// in a subquery, so the caller never has to encode or trust a composite cursor.
+		// Keyset pagination on (created_at, id): the cursor row's own key is resolved in a
+		// subquery, so the caller never has to encode or trust a composite cursor.
+		//
+		// The ORDER BY is table-QUALIFIED for correctness, not neatness. The select list
+		// aliases `EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at`, and an unqualified
+		// `ORDER BY created_at` binds to that OUTPUT alias — whole seconds — while the WHERE
+		// clause can only see the table's microsecond TIMESTAMPTZ. Sorting and paging then
+		// disagree, and rows repeat across pages whenever several notifications land in the
+		// same second, which a fan-out makes routine.
+		// `inbox_paginates_by_keyset_and_marks_read` reproduces it and pins the fix.
 		sqlx::query_as::<_, NotificationRow>(
 			"SELECT id, topic, kind, title, body, link, occurred_at, \
 			        EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at, \
 			        COALESCE(EXTRACT(EPOCH FROM read_at)::BIGINT, 0) AS read_at \
 			 FROM notifications \
 			 WHERE subscriber_id = $1 \
-			   AND ($2::UUID IS NULL OR (created_at, id) < (SELECT created_at, id FROM notifications WHERE id = $2)) \
+			   AND ($2::UUID IS NULL OR (created_at, id) < ROW((SELECT created_at FROM notifications WHERE id = $2), $2)) \
 			   AND (NOT $3 OR read_at IS NULL) \
 			   AND ($4::TEXT IS NULL OR topic = $4) \
-			 ORDER BY created_at DESC, id DESC LIMIT $5",
+			 ORDER BY notifications.created_at DESC, notifications.id DESC LIMIT $5",
 		)
 		.bind(subscriber_id)
 		.bind(cursor)
@@ -319,13 +341,15 @@ impl NotificationRepository for PgNotifications {
 		// is false because there is no cabinet to show anything in.
 		let row = sqlx::query(
 			"INSERT INTO notification_subscribers (user_id, email, email_verified, in_app_enabled, email_enabled, confirm_token, unsubscribe_token) \
-			 VALUES (NULL, $1, FALSE, FALSE, TRUE, encode(gen_random_bytes(24), 'hex'), encode(gen_random_bytes(24), 'hex')) \
+			 VALUES (NULL, $1, FALSE, FALSE, TRUE, $2, $3) \
 			 ON CONFLICT (lower(email)) WHERE user_id IS NULL \
 			 DO UPDATE SET updated_at = now() \
 			 RETURNING id, confirm_token, confirmed_at IS NOT NULL AS confirmed, \
-			           COALESCE(EXTRACT(EPOCH FROM now() - confirm_sent_at)::BIGINT, $2 + 1) AS since_sent",
+			           COALESCE(EXTRACT(EPOCH FROM now() - confirm_sent_at)::BIGINT, $4 + 1) AS since_sent",
 		)
 		.bind(email)
+		.bind(opaque_token())
+		.bind(opaque_token())
 		.bind(throttle_secs)
 		.fetch_one(&mut *tx)
 		.await
