@@ -45,7 +45,20 @@ fn main() -> Result<()> {
 	color_eyre::install()?;
 	dotenvy::dotenv().ok();
 
-	let config = config::AppConfig::from_env().context("failed to load configuration")?;
+	// The deploy contract, straight out of the image: the gitops preflight runs
+	// this against the built image and diffs it with the cluster Secret's keys,
+	// so a missing variable is caught before the rollout, not as a
+	// CrashLoopBackOff after it.
+	if let Some(profile) = print_required_vars_for() {
+		for var in config::AppConfig::required_var_names(&profile) {
+			println!("{var}");
+		}
+		return Ok(());
+	}
+
+	// Exits 78 (EX_CONFIG) on a bad environment: "the config is wrong, a restart
+	// cannot help", as opposed to the 1 a dependency blip gets.
+	let config = ev::settings::or_exit(config::AppConfig::from_env());
 
 	// Guard must stay alive for the duration of main — dropping it flushes events.
 	// `None` DSN → `init` returns `None`, so this binding is simply inert.
@@ -66,6 +79,8 @@ fn main() -> Result<()> {
 }
 
 async fn run(config: config::AppConfig) -> Result<()> {
+	infrastructure::config_drift::spawn(config::AppConfig::var_names());
+
 	// The admin allowlist (pre-loaded from env) is shared by the directory and platform
 	// services and by the provisioner loop, so issued sessions carry the effective role.
 	let admin_subjects: Arc<Vec<String>> = Arc::new(config.admin_subjects.clone());
@@ -268,6 +283,22 @@ struct Health;
 impl HealthService for Health {
 	async fn check(&self, _request: Request<CheckRequest>) -> Result<Response<CheckResponse>, Status> {
 		Ok(Response::new(CheckResponse { status: "ok".to_string() }))
+	}
+}
+
+/// `--print-required-vars[=PROFILE]` (default `production`). Hand-rolled: this
+/// binary has no other CLI surface, and a whole arg parser for one flag is not
+/// worth the dependency.
+fn print_required_vars_for() -> Option<String> {
+	const FLAG: &str = "--print-required-vars";
+
+	let mut args = std::env::args().skip(1);
+	let arg = args.next()?;
+	match arg.split_once('=') {
+		Some((FLAG, profile)) => Some(profile.to_string()),
+		Some(_) => None,
+		None if arg == FLAG => Some(args.next().unwrap_or_else(|| "production".to_string())),
+		None => None,
 	}
 }
 
