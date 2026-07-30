@@ -7,7 +7,10 @@
 //! - [`notifications`] — subscribers, subscriptions, the in-app inbox, and the
 //!   outbound email queue (`emit` writes the inbox row and the queued mail in one tx).
 //! - [`email`] — the SMTP transport seam and the rendered messages that cross it.
+//! - [`config_drift`] — watches the mounted settings Secret and warns when the
+//!   values this process booted with stop matching it.
 
+pub mod config_drift;
 pub mod db;
 pub mod email;
 pub mod notifications;
