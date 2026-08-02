@@ -44,7 +44,6 @@
             AGENTS.md
             CLAUDE.md
             .claude/
-            .pre-commit-config.yaml
           '';
         };
         combined = v_flakes.utils.combine { inherit rust; modules = [ rs github ]; };
