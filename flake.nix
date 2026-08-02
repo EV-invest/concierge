@@ -1,23 +1,18 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
-    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     v_flakes.url = "github:valeratrades/v_flakes?ref=v1.6";
-    v_flakes.inputs.nixpkgs.follows = "nixpkgs";
-    v_flakes.inputs.rust-overlay.follows = "rust-overlay";
-    flake-utils.url = "github:numtide/flake-utils";
-    pre-commit-hooks.url = "github:cachix/git-hooks.nix";
-    pre-commit-hooks.inputs.nixpkgs.follows = "nixpkgs";
   };
-  outputs = { self, nixpkgs, rust-overlay, v_flakes, flake-utils, pre-commit-hooks }:
+  outputs = { self, v_flakes }:
+    let
+      inherit (v_flakes) flake-utils pre-commit-hooks rust-overlay;
+    in
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs {
-          inherit system overlays;
-          allowUnfree = true;
+        pkgs = import v_flakes.default_nixpkgs {
+          inherit system;
+          overlays = [ (import rust-overlay) ];
+          config.allowUnfree = true;
         };
         # Canonical toolchain pinned in v_flakes — byte-identical across repos, so
         # the nix store dedups it and sccache cross-references compilations.
