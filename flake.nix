@@ -101,6 +101,11 @@
               WEB_BIND = "0.0.0.0:55671";
               PUBLIC_ORIGIN = "https://evinvest.ltd";
               APP_ENV = "production";
+              # Gmail rejects a From that isn't the authenticated mailbox, so this
+              # pair must stay in step with `mail_from`'s default; the sops
+              # `concierge_smtp_password` is that mailbox's App Password.
+              SMTP_HOST = "smtp.gmail.com";
+              SMTP_USERNAME = "notifications@evinvest.ltd";
             };
           };
         };
