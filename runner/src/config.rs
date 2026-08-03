@@ -22,7 +22,11 @@ ev::settings! {
 		#[required_in("production")]
 		sentry_dsn: Option<String>,
 		/// PostHog project key for native product-analytics capture.
-		#[required_in("production")]
+		///
+		/// Deliberately NOT `required_in("production")`, unlike `sentry_dsn`: a
+		/// missing error reporter hides failures, while missing product analytics
+		/// only forgoes a metric. That must never be the reason a service refuses
+		/// to boot.
 		posthog_key: Option<String>,
 		/// PostHog ingestion host; `None` falls back to the library default.
 		posthog_host: Option<String>,
@@ -68,11 +72,13 @@ mod tests {
 	fn production_requires_the_silent_failure_surface() {
 		assert_eq!(
 			AppConfig::required_var_names("production"),
+			// POSTHOG_KEY is read (it is in the env surface above) but never
+			// required: analytics is a metric, not a safety net, so it must not be
+			// able to keep a service from booting. See the field's comment.
 			vec![
 				"DATABASE_URL",
 				"BRIDGE_SERVICE_TOKEN",
 				"SENTRY_DSN",
-				"POSTHOG_KEY",
 				"PUBLIC_ORIGIN",
 				"SMTP_HOST",
 				"SMTP_USERNAME",
@@ -98,7 +104,7 @@ mod tests {
 		let error = AppConfig::from_source(|var| if var == "APP_ENV" { Some("production".to_string()) } else { minimal_env(var) }).expect_err("production without a mailer must not boot");
 
 		let vars: Vec<&str> = error.errors.iter().map(|e| e.var.as_str()).collect();
-		assert_eq!(vars, vec!["SENTRY_DSN", "POSTHOG_KEY", "SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD"]);
+		assert_eq!(vars, vec!["SENTRY_DSN", "SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD"]);
 	}
 
 	#[test]
