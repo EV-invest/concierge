@@ -67,6 +67,10 @@ fn main() -> Result<()> {
 		environment: config.app_env.clone(),
 		traces_sample_rate: SentryConfig::traces_sample_rate_for(&config.app_env),
 		release: None,
+		// A Sentry project is a DSN and the planes share one, so without this an
+		// issue names only the pod it came from. Same name as OTEL_SERVICE_NAME, so
+		// a Sentry issue, a trace and a log line agree.
+		service: Some("concierge-runner".to_string()),
 	});
 
 	let _otel_guard = init_tracing(&config.app_env);
