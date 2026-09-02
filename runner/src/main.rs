@@ -4,10 +4,11 @@
 //! plane). One runner binary mounts its internal modules — `auth` (token issuance,
 //! served by [`evconcierge_auth::AuthService`]), `directory` (user profile/admin),
 //! `bridge` (the cross-plane producer), `platform` (platform/cabinet config),
-//! `notification`, and `log` — on a single tonic server. It opens the Postgres
-//! control plane and applies its migrations on boot (the identity records + the
-//! cross-plane bridge outbox). Notifications and logs are DEFERRED stubs. There is
-//! no money plane here.
+//! `governance` (the ownership consilium), `notification`, and `log` — on a single
+//! tonic server. It opens the Postgres control plane and applies its migrations on
+//! boot (the identity records + the cross-plane bridge outbox). Logs are a DEFERRED
+//! stub. There is no money plane here: the consilium mounted here decides OWNERSHIP,
+//! and the money plane runs its own over its own mirrored roster.
 
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use color_eyre::{
 	eyre::{Context, ensure},
 };
 use concierge::{
-	bridge, config, directory,
+	bridge, config, directory, governance,
 	infrastructure::{
 		self,
 		email::transport::{EmailTransport, NoopTransport, SmtpTransport},
@@ -28,9 +29,12 @@ use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_a
 use evconcierge_contracts::concierge::v1::{
 	CheckRequest, CheckResponse,
 	auth_service_server::AuthServiceServer,
+	governance_service_server::GovernanceServiceServer,
 	health_service_server::{HealthService, HealthServiceServer},
 	log_service_server::LogServiceServer,
+	mail_relay_service_server::MailRelayServiceServer,
 	notification_service_server::NotificationServiceServer,
+	owner_removal_approval_service_server::OwnerRemovalApprovalServiceServer,
 	platform_service_server::PlatformServiceServer,
 	user_directory_server::UserDirectoryServer,
 	user_events_server::UserEventsServer,
@@ -171,7 +175,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// plane PULLS from. Mounted OUTSIDE the user `auth` layer — it is a
 	// service-to-service seam authenticated by its own shared bridge service token, not
 	// a user access token.
-	let bridge = bridge::Bridge::new(pool.clone(), Some(config.bridge_service_token));
+	let bridge = bridge::Bridge::new(pool.clone(), Some(config.bridge_service_token.clone()));
 
 	let platform_repo: Arc<dyn concierge::ports::PlatformConfigRepository> = Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
 
@@ -180,6 +184,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	let pg_notifications = Arc::new(infrastructure::notifications::PgNotifications::new(pool.clone()));
 	let notification_repo: Arc<dyn concierge::ports::NotificationRepository> = pg_notifications.clone();
 	let dispatch_repo: Arc<dyn concierge::ports::NotificationDispatchRepository> = pg_notifications;
+
+	// The ownership consilium. The broadcast channel is only an immediacy optimisation
+	// for the live feed — each stream ALSO re-reads the revision from Postgres on an
+	// interval, so a second replica that never sees these sends still converges.
+	let governance_repo: Arc<dyn concierge::ports::GovernanceRepository> = Arc::new(infrastructure::governance::PgGovernance::new(pool.clone(), config.governance_approval_url.clone()));
+	let (governance_revisions, _) = tokio::sync::broadcast::channel(64);
 
 	// Real SMTP when configured, else a logging no-op — the same "unconfigured ⇒
 	// silent no-op" contract the analytics/Sentry seams use. The whole emit → queue →
@@ -232,6 +242,30 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(HealthServiceServer::new(Health))
 			.add_service(AuthServiceServer::new(auth_service))
 			.add_service(UserEventsServer::new(bridge))
+			// Both governance seams are mounted OUTSIDE the user auth layer, for the two
+			// different reasons the layer exists to distinguish: the approval surface is
+			// reached by a person holding an emailed token who may not be signed in, and
+			// the mail relay is a service-to-service push authenticated by the shared
+			// banking↔concierge secret, exactly like the lifecycle bridge above.
+			.add_service(OwnerRemovalApprovalServiceServer::new(governance::RemovalApproval::new(
+				governance_repo.clone(),
+				governance_revisions.clone(),
+			)))
+			.add_service(MailRelayServiceServer::new(governance::MailRelay::new(
+				users.clone(),
+				governance_repo.clone(),
+				// The SAME secret the bridge uses. One trust relationship between the two
+				// planes, one secret to rotate — and banking presents this token on both
+				// seams, so a second variable could only ever drift out of step with it.
+				Some(config.bridge_service_token.clone()),
+				config.public_origin.clone(),
+			)))
+			.add_service(auth.layer(GovernanceServiceServer::new(governance::Governance::new(
+				users.clone(),
+				admin_subjects.clone(),
+				governance_repo,
+				governance_revisions,
+			))))
 			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), admin_subjects.clone()))))
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), admin_subjects.clone(), platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))

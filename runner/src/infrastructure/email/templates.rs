@@ -90,7 +90,157 @@ pub fn confirm_subscription(topic_label: &str, confirm_url: &str, unsubscribe_ur
 	}
 }
 
+/// The target of an owner removal, told their seat is being voted on.
+///
+/// The link and the code are deliberately separate. A mail gateway will follow the
+/// link on its own; only a person who opened this message can type the code, which is
+/// what turns a scanned URL into a deliberate act — and the copy says so plainly,
+/// because someone who believes a click has already decided is someone who will not
+/// come back to finish.
+pub fn owner_removal_self_accept(initiator_email: &str, reason: &str, approval_url: &str, code: &str, expires_at: i64) -> RenderedEmail {
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Ownership"));
+	inner.push_str(&heading("Your owner seat is being voted on"));
+	inner.push_str(&paragraph(&format!(
+		"{initiator_email} has proposed removing your owner seat. You may accept it, or refuse it — and refusing does not settle it on its own: the other owners can still carry the proposal unanimously."
+	)));
+	inner.push_str(&paragraph(&format!("Their stated reason: {reason}")));
+	inner.push_str(&detail_box(&[("Proposed by", initiator_email.to_owned()), ("Answer by", fmt_ts(expires_at))]));
+	inner.push_str(&button("Open the approval page", approval_url));
+	inner.push_str(&code_panel(code));
+	inner.push_str(&paragraph(
+		"Opening the link alone does nothing. Nothing is decided until you enter the code above on that page and choose an answer.",
+	));
+
+	RenderedEmail {
+		subject: "Your EV Investment owner seat is being voted on".to_owned(),
+		html: shell("Your owner seat is being voted on", &card(&inner), FOOTER_SECURITY, "", "Ownership"),
+		text: format!(
+			"Your owner seat is being voted on\n\n{initiator_email} has proposed removing your owner seat.\n\nReason: {reason}\n\nAnswer by: {}\n\nApproval page: {approval_url}\n\nYour code: {code}\n\nOpening the link alone does nothing — nothing is decided until you enter the code on that page and choose an answer.\n\n—\n{FOOTER_SECURITY}\n",
+			fmt_ts(expires_at)
+		),
+	}
+}
+
+/// The money plane asking an owner to approve a revenue payout.
+///
+/// Everything an approver is agreeing TO is on the page: the full amount, the network,
+/// the destination in full, the memo and the payload hash the money plane will
+/// re-verify at execution. An owner must be able to approve a thing they can see.
+#[allow(clippy::too_many_arguments)]
+pub fn payout_approval(
+	consilium_id: &str,
+	initiator_email: &str,
+	network: &str,
+	address: &str,
+	amount: &str,
+	memo: &str,
+	payload_hash: &str,
+	threshold: u32,
+	owner_count: u32,
+	expires_at: i64,
+	approval_url: &str,
+	code: &str,
+) -> RenderedEmail {
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Treasury"));
+	inner.push_str(&heading("A payout needs your approval"));
+	inner.push_str(&paragraph(&format!(
+		"{initiator_email} has opened a request to pay fund revenue out on-chain. It executes only once {threshold} of {owner_count} owners have approved it."
+	)));
+	inner.push_str(&detail_box(&[
+		("Amount", amount.to_owned()),
+		("Network", network.to_owned()),
+		("Requested by", initiator_email.to_owned()),
+		("Approvals needed", format!("{threshold} of {owner_count}")),
+		("Expires", fmt_ts(expires_at)),
+		("Request", consilium_id.to_owned()),
+	]));
+	inner.push_str(&exact_value("Destination address", address));
+	inner.push_str(&exact_value("Payload hash", &hash_prefix(payload_hash)));
+	if !memo.is_empty() {
+		inner.push_str(&paragraph(&format!("Memo: {memo}")));
+	}
+	inner.push_str(&button("Review and approve", approval_url));
+	inner.push_str(&code_panel(code));
+	inner.push_str(&paragraph(
+		"Opening the link alone approves nothing. Check the destination address above against the one you expect before you enter the code — an approved payout cannot be recalled.",
+	));
+
+	RenderedEmail {
+		subject: format!("Approve a payout of {amount} on {network}"),
+		html: shell("A payout needs your approval", &card(&inner), FOOTER_SECURITY, "", "Treasury"),
+		text: format!(
+			"A payout needs your approval\n\n{initiator_email} has opened a request to pay fund revenue out on-chain.\n\nAmount: {amount}\nNetwork: {network}\nDestination address: {address}\nPayload hash: {}\nMemo: {memo}\nApprovals needed: {threshold} of {owner_count}\nExpires: {}\nRequest: {consilium_id}\n\nReview and approve: {approval_url}\n\nYour code: {code}\n\nOpening the link alone approves nothing. Check the destination address against the one you expect before you enter the code — an approved payout cannot be recalled.\n\n—\n{FOOTER_SECURITY}\n",
+			hash_prefix(payload_hash),
+			fmt_ts(expires_at)
+		),
+	}
+}
+
+/// What the owners are told after a payout request was decided, executed or failed.
+pub fn payout_outcome(consilium_id: &str, outcome: &str, network: &str, address: &str, amount: &str, detail: &str) -> RenderedEmail {
+	let headline = format!("Payout {}", outcome.to_lowercase());
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Treasury"));
+	inner.push_str(&heading(&headline));
+	inner.push_str(&detail_box(&[
+		("Outcome", outcome.to_owned()),
+		("Amount", amount.to_owned()),
+		("Network", network.to_owned()),
+		("Request", consilium_id.to_owned()),
+	]));
+	inner.push_str(&exact_value("Destination address", address));
+	if !detail.is_empty() {
+		inner.push_str(&paragraph(detail));
+	}
+	inner.push_str(&paragraph("This message needs no action from you. It is the record of what the consilium decided."));
+
+	RenderedEmail {
+		subject: format!("{headline} — {amount} on {network}"),
+		html: shell(&headline, &card(&inner), FOOTER_SECURITY, "", "Treasury"),
+		text: format!(
+			"{headline}\n\nOutcome: {outcome}\nAmount: {amount}\nNetwork: {network}\nDestination address: {address}\nRequest: {consilium_id}\n\n{detail}\n\n—\n{FOOTER_SECURITY}\n"
+		),
+	}
+}
+
 // ── building blocks ────────────────────────────────────────────────────────
+
+/// Why a governance mail has no unsubscribe link, said out loud.
+const FOOTER_SECURITY: &str =
+	"You are receiving this because you hold an owner seat. Security mail cannot be switched off — if it could, muting it would be the first thing an attacker did.";
+
+/// A value that must be read EXACTLY: rendered in full, monospace, and allowed to wrap
+/// rather than truncate. A `0x1234…abcd` in an approval mail is an invitation to
+/// approve the wrong address.
+fn exact_value(label: &str, value: &str) -> String {
+	format!(
+		r#"<p style="margin:0 0 4px;font-family:{SANS};font-size:11px;line-height:15px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:{MUTED};">{}</p><p style="margin:0 0 14px;padding:12px 14px;background:{BLACK};border:1px solid {HAIR};border-radius:8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:20px;word-break:break-all;color:{MIST};">{}</p>"#,
+		esc(label),
+		esc(value)
+	)
+}
+
+/// The secret code, set apart from the link on purpose. The link proves nothing — mail
+/// gateways follow it automatically — and this is the part only a person who opened the
+/// message can supply.
+fn code_panel(code: &str) -> String {
+	format!(
+		r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:16px 0 14px;background:{BLACK};border:1px solid {TEAL};border-radius:10px;"><tr><td align="center" style="padding:18px;"><p style="margin:0 0 6px;font-family:{SANS};font-size:11px;line-height:15px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:{MUTED};">Type this code on that page</p><p style="margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:26px;line-height:34px;font-weight:700;letter-spacing:5px;color:{TEAL};">{}</p></td></tr></table>"#,
+		esc(code)
+	)
+}
+
+/// Enough of the hash to bind an approval to one payload, without a wall of hex. The
+/// DESTINATION is never abbreviated this way — only the hash is.
+fn hash_prefix(hash: &str) -> String {
+	if hash.chars().count() > 16 {
+		format!("{}…", hash.chars().take(16).collect::<String>())
+	} else {
+		hash.to_owned()
+	}
+}
 
 fn esc(raw: &str) -> String {
 	raw.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -146,8 +296,17 @@ fn card(inner: &str) -> String {
 fn shell(preheader: &str, body: &str, footer_context: &str, unsubscribe_url: &str, topic_label: &str) -> String {
 	let preheader = esc(preheader);
 	let footer_context = esc(footer_context);
-	let unsub = esc(unsubscribe_url);
 	let topic = esc(topic_label);
+	// A security mail deliberately passes an empty target: there is no opting out of
+	// being told that your own seat, or the fund's money, is being voted on.
+	let unsub = if unsubscribe_url.is_empty() {
+		String::new()
+	} else {
+		format!(
+			r#"<p style="margin:0;font-family:{SANS};font-size:12px;line-height:16px;font-weight:500;color:{TEAL};"><a href="{}" style="color:{TEAL};text-decoration:none;">Unsubscribe from this topic</a></p>"#,
+			esc(unsubscribe_url)
+		)
+	};
 	format!(
 		r##"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"></head>
 <body style="margin:0;padding:0;background:{BLACK};">
@@ -162,7 +321,7 @@ fn shell(preheader: &str, body: &str, footer_context: &str, unsubscribe_url: &st
 <tr><td style="padding:28px;background:{BLACK};">{body}</td></tr>
 <tr><td style="padding:26px 28px 30px;background:{BLACK};border-top:1px solid {HAIR};">
 <p style="margin:0 0 8px;font-family:{SANS};font-size:12px;line-height:19px;color:{MUTED};">{footer_context}</p>
-<p style="margin:0;font-family:{SANS};font-size:12px;line-height:16px;font-weight:500;color:{TEAL};"><a href="{unsub}" style="color:{TEAL};text-decoration:none;">Unsubscribe from this topic</a></p>
+{unsub}
 </td></tr>
 </table>
 </td></tr></table></body></html>"##
@@ -195,6 +354,83 @@ fn fmt_ts(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	const LONG_ADDRESS: &str = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e";
+
+	fn approval() -> RenderedEmail {
+		payout_approval(
+			"c-1",
+			"ada@example.com",
+			"Ethereum",
+			LONG_ADDRESS,
+			"12,500.00 USDT",
+			"Q3 revenue <sweep>",
+			"9f2c1ab34d5e6f708192a3b4c5d6e7f8",
+			3,
+			5,
+			1_785_143_640,
+			"https://evinvest.ltd/approve/tok",
+			"H7K2M9PQRS",
+		)
+	}
+
+	#[test]
+	fn the_removal_invitation_separates_the_code_from_the_link() {
+		let mail = owner_removal_self_accept(
+			"ada@example.com",
+			"Repeated <policy> breaches",
+			"https://evinvest.ltd/governance/removal/tok",
+			"H7K2M9PQRS",
+			1_785_143_640,
+		);
+		assert!(mail.html.contains("https://evinvest.ltd/governance/removal/tok"), "the target cannot answer without the page");
+		assert!(mail.html.contains("H7K2M9PQRS") && mail.text.contains("H7K2M9PQRS"), "the code reaches both alternatives");
+		// Pitfall 5: someone who thinks the click decided it never comes back to finish.
+		for part in [&mail.html, &mail.text] {
+			assert!(part.contains("link alone does nothing"), "the mail must say plainly that a click decides nothing");
+		}
+		assert!(mail.html.contains("&lt;policy&gt;"), "the initiator's free text is escaped — it is not markup");
+		assert!(!mail.html.contains("Unsubscribe"), "there is no opting out of being told your own seat is being voted on");
+	}
+
+	/// Pitfall 13. A `0x1234…abcd` in an approval mail is an invitation to approve the
+	/// wrong address, so the destination is rendered whole in both alternatives.
+	#[test]
+	fn the_payout_address_is_never_truncated() {
+		let mail = approval();
+		assert!(mail.html.contains(LONG_ADDRESS), "the full destination must survive into the HTML");
+		assert!(mail.text.contains(LONG_ADDRESS), "and into the plain-text alternative");
+		assert!(!mail.html.contains("…0f44e"), "no ellipsis anywhere near the address");
+	}
+
+	#[test]
+	fn the_payout_mail_shows_everything_an_owner_is_agreeing_to() {
+		let mail = approval();
+		for expected in ["12,500.00 USDT", "Ethereum", "ada@example.com", "3 of 5", "H7K2M9PQRS", "https://evinvest.ltd/approve/tok"] {
+			assert!(mail.html.contains(expected), "the approval page must show {expected}");
+		}
+		assert!(
+			mail.html.contains("9f2c1ab34d5e6f70…"),
+			"the payload hash is shown as a prefix — enough to bind, not a wall of hex"
+		);
+		assert!(mail.html.contains("&lt;sweep&gt;"), "the memo is escaped");
+		assert!(mail.subject.contains("12,500.00 USDT"), "the subject alone tells an owner what is being asked");
+	}
+
+	#[test]
+	fn the_outcome_mail_is_a_record_and_asks_for_nothing() {
+		let mail = payout_outcome("c-1", "EXECUTED", "Ethereum", LONG_ADDRESS, "12,500.00 USDT", "Broadcast at block 21000000.");
+		assert!(mail.html.contains(LONG_ADDRESS), "the destination is shown in full here too");
+		assert!(mail.html.contains("needs no action"), "nobody should hunt for a button that is not there");
+		assert!(!mail.html.contains("Type this code"), "an outcome carries no secret");
+	}
+
+	#[test]
+	fn a_hash_shorter_than_the_prefix_is_left_alone() {
+		assert_eq!(hash_prefix("abc"), "abc");
+		assert_eq!(hash_prefix(&"a".repeat(16)), "a".repeat(16));
+		assert_eq!(hash_prefix(&"a".repeat(17)), format!("{}…", "a".repeat(16)));
+	}
 
 	#[test]
 	fn notification_renders_both_parts_and_escapes_user_copy() {

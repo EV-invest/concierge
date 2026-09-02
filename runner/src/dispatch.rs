@@ -57,11 +57,70 @@ fn backoff_secs(attempts: i32) -> i64 {
 	(60i64 << shift).min(6 * 60 * 60)
 }
 
+fn text_field(payload: &serde_json::Value, key: &str) -> String {
+	payload.get(key).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned()
+}
+
+fn int_field(payload: &serde_json::Value, key: &str) -> i64 {
+	payload.get(key).and_then(serde_json::Value::as_i64).unwrap_or_default()
+}
+
+/// Render one of the typed governance mails from its stored payload. `None` for a kind
+/// this dispatcher does not know — permanent, so the caller parks rather than retries.
+fn governance_mail(kind: &str, payload: &serde_json::Value) -> Option<templates::RenderedEmail> {
+	match kind {
+		"owner_removal_self_accept" => Some(templates::owner_removal_self_accept(
+			&text_field(payload, "initiator_email"),
+			&text_field(payload, "reason"),
+			&text_field(payload, "approval_url"),
+			&text_field(payload, "code"),
+			int_field(payload, "expires_at"),
+		)),
+		"payout_approval" => Some(templates::payout_approval(
+			&text_field(payload, "consilium_id"),
+			&text_field(payload, "initiator_email"),
+			&text_field(payload, "network"),
+			&text_field(payload, "address"),
+			&text_field(payload, "amount"),
+			&text_field(payload, "memo"),
+			&text_field(payload, "payload_hash"),
+			int_field(payload, "threshold") as u32,
+			int_field(payload, "owner_count") as u32,
+			int_field(payload, "expires_at"),
+			&text_field(payload, "approval_url"),
+			&text_field(payload, "code"),
+		)),
+		"payout_outcome" => Some(templates::payout_outcome(
+			&text_field(payload, "consilium_id"),
+			&text_field(payload, "outcome"),
+			&text_field(payload, "network"),
+			&text_field(payload, "address"),
+			&text_field(payload, "amount"),
+			&text_field(payload, "detail"),
+		)),
+		_ => None,
+	}
+}
+
 /// Render one claimed job. `None` when the row references data that has since gone,
 /// which is treated as a permanent failure rather than retried forever.
 fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &DispatcherConfig) -> Option<OutgoingEmail> {
 	let origin = cfg.public_origin.trim_end_matches('/');
 	let unsubscribe_url = format!("{origin}/notifications/unsubscribe?token={}", job.unsubscribe_token);
+
+	// Governance mail carries NO unsubscribe target, so the transport sets no
+	// List-Unsubscribe header: a security mail a recipient can switch off is not one.
+	if let Some(payload) = job.payload.as_ref()
+		&& let Some(rendered) = governance_mail(&job.kind, payload)
+	{
+		return Some(OutgoingEmail {
+			to: job.recipient.clone(),
+			subject: rendered.subject,
+			html: rendered.html,
+			text: rendered.text,
+			unsubscribe_url: String::new(),
+		});
+	}
 
 	let rendered = match job.kind.as_str() {
 		"confirm" => {

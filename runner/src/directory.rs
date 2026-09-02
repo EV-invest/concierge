@@ -20,6 +20,12 @@
 //! elevation is visible to the session and the operator console, while the persisted
 //! `users.role` is only ever written by `SetRole` (and is what the bridge mirrors).
 //!
+//! OWNERSHIP IS NOT A ROLE EDIT. [`Directory::guard_ownership`] makes `SetRole` refuse
+//! to grant or strip `Role::Owner`; both directions go through the consilium in
+//! [`crate::governance`] instead. Without that refusal every control there is
+//! decorative: one owner could mint four sock puppets and then carry a payout quorum
+//! legitimately, with every snapshot and re-validation working exactly as designed.
+//!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.
 #![allow(clippy::result_large_err)]
@@ -106,6 +112,15 @@ async fn require_permission<T>(directory: &Directory, request: &Request<T>, perm
 /// authorized (`require_permission`), so a malformed value is bad input —
 /// `INVALID_ARGUMENT` — never an auth failure; `UNAUTHENTICATED` is reserved for
 /// the caller's own `sub` in [`Directory::active_caller_id`].
+/// Persisted owners below which `SetRole` will still seat one directly.
+///
+/// An admission needs `owners \ {initiator}` to be non-empty, so it cannot produce the
+/// SECOND owner — a fund of one could never grow, and a fund of zero could never start.
+/// That is a bootstrap deadlock, not a policy, so seating is allowed only while the
+/// persisted roster is smaller than this. From two owners on, the consilium is the only
+/// way in, which is exactly where the sock-puppet attack would have to start.
+const GENESIS_OWNERS: i64 = 2;
+
 fn parse_target_id(raw: &str) -> Result<UserId, Status> {
 	Uuid::parse_str(raw).map(UserId::from_raw).map_err(|_| Status::invalid_argument("user_id is not a valid UUID"))
 }
@@ -224,10 +239,56 @@ impl UserDirectory for Directory {
 		let req = request.into_inner();
 		let target = parse_target_id(&req.user_id)?;
 		let role = Role::parse(&req.role).map_err(domain_to_status)?;
+		self.guard_ownership(target, role).await?;
 		let user = self.users.set_role(target, role).await.map_err(domain_to_status)?;
 		Ok(Response::new(SetRoleResponse {
 			role: user.role().as_str().to_owned(),
 		}))
+	}
+}
+
+impl Directory {
+	/// Refuse to grant or strip `Role::Owner` here. A seat is the consilium's to give and
+	/// to take, and this is the check that makes that true rather than merely intended.
+	///
+	/// Granting is the dangerous direction. If one owner can mint another they can mint
+	/// four, and a payout consilium of seven with a threshold of four is then carried by
+	/// the puppets alone — legitimately, with the roster snapshot and every re-validation
+	/// behaving exactly as designed. Snapshotting cannot close it, because the stuffing
+	/// happens before the proposal is opened.
+	///
+	/// Stripping is refused for the mirror reason: a bare demotion would be an expulsion
+	/// with no consilium, no floor check and no audit trail.
+	///
+	/// Re-setting the role someone already holds stays a no-op, so a console that
+	/// re-submits an unchanged form does not trip over this.
+	async fn guard_ownership(&self, target: UserId, role: Role) -> Result<(), Status> {
+		// The PERSISTED role, never `effective_role`: break-glass elevation authorizes an
+		// operator, it does not seat them, so it must not decide either branch below.
+		let holds_seat = self.users.find_by_id(target).await.map_err(domain_to_status)?.is_some_and(|user| user.role() == Role::Owner);
+
+		if role == Role::Owner && !holds_seat {
+			if self.persisted_owner_count().await? >= GENESIS_OWNERS {
+				return Err(Status::failed_precondition(
+					"granting ownership goes through GovernanceService.OpenOwnerAdmission, which every other owner must agree to — one owner may not mint another",
+				));
+			}
+			return Ok(());
+		}
+		if holds_seat && role != Role::Owner {
+			return Err(Status::failed_precondition(
+				"taking ownership away goes through GovernanceService.OpenOwnerRemoval, or ResignOwnership for your own seat",
+			));
+		}
+		Ok(())
+	}
+
+	/// How many people actually HOLD a seat. Counted from `users.role` through the same
+	/// filtered list the console uses, so it can never include an `ADMIN_SUBJECTS`
+	/// operator who merely authorizes as one.
+	async fn persisted_owner_count(&self) -> Result<i64, Status> {
+		let (_, total) = self.users.list("", Role::Owner.as_str(), "", 1, 0).await.map_err(domain_to_status)?;
+		Ok(total)
 	}
 }
 

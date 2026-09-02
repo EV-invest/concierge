@@ -9,17 +9,23 @@
 //! change (the ACID point), so callers never juggle a transaction across the port
 //! boundary. [`PlatformConfigRepository`] is the plain-config port for the
 //! platform/cabinet control surface (no aggregate, so no kernel markers).
+//!
+//! [`GovernanceRepository`] is the same contract for the ownership consilium: each
+//! method is one use case and is internally atomic, so the verdict, the seat change,
+//! the cross-plane `ROLE_CHANGED` and the audit row can never land apart.
 
 use async_trait::async_trait;
 use domain::{
 	architecture::{Reader, Repository},
 	authz::Role,
 	error::DomainError,
+	governance::{AdmissionId, AdmissionVote, RemovalId, Vote},
 	users::{AuthSubject, Email, ProfileFields, User, UserId},
 };
 use uuid::Uuid;
 
 use crate::infrastructure::{
+	governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision},
 	notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
 	platform::{FeatureFlagRow, PlatformConfigRow},
 	users::{AdminUserRow, AuthzRecord},
@@ -138,4 +144,61 @@ pub trait NotificationDispatchRepository: Send + Sync {
 
 	/// Sends in the trailing 24h — the input to the daily send-budget breaker.
 	async fn sent_last_24h(&self) -> Result<i64, DomainError>;
+}
+
+/// Persistence + read port for the ownership consilium (the `OwnerRemoval` aggregate
+/// and the roster it is decided against).
+///
+/// `now` is passed in rather than read here so the domain layer stays clock-free and
+/// every decision is reproducible from its inputs.
+#[async_trait]
+pub trait GovernanceRepository: Send + Sync {
+	/// The current owner roster, oldest seat first.
+	async fn owners(&self) -> Result<Vec<OwnerRow>, DomainError>;
+
+	/// Snapshot the peer set, mint the target's token, and queue their invitation —
+	/// one transaction, so `target_notified` can never claim a message nobody queued.
+	async fn open_removal(&self, target: UserId, initiator: UserId, reason: &str, now: i64) -> Result<RemovalRecord, DomainError>;
+
+	async fn find_removal(&self, id: RemovalId, now: i64) -> Result<Option<RemovalRecord>, DomainError>;
+
+	/// Every proposal, newest first. Nothing is filtered out: a rejected, expired or
+	/// void one stays readable.
+	async fn list_removals(&self, limit: i64, now: i64) -> Result<Vec<RemovalRecord>, DomainError>;
+
+	/// Record one peer's answer and carry the verdict if it passed.
+	async fn peer_vote(&self, id: RemovalId, voter: UserId, vote: Vote, now: i64, audit: &Audit) -> Result<RemovalRecord, DomainError>;
+
+	async fn cancel_removal(&self, id: RemovalId, by: UserId, now: i64) -> Result<RemovalRecord, DomainError>;
+
+	/// Snapshot the voter set and open a proposal to GRANT a seat. No token and no mail:
+	/// every voter is a signed-in owner, and the candidate has no say.
+	async fn open_admission(&self, candidate: UserId, initiator: UserId, reason: &str, now: i64) -> Result<AdmissionRecord, DomainError>;
+
+	async fn find_admission(&self, id: AdmissionId, now: i64) -> Result<Option<AdmissionRecord>, DomainError>;
+
+	/// Every admission, newest first. Nothing is filtered out.
+	async fn list_admissions(&self, limit: i64, now: i64) -> Result<Vec<AdmissionRecord>, DomainError>;
+
+	/// Record one owner's answer and grant the seat if the vote was unanimous.
+	async fn admission_vote(&self, id: AdmissionId, voter: UserId, vote: AdmissionVote, now: i64, audit: &Audit) -> Result<AdmissionRecord, DomainError>;
+
+	async fn cancel_admission(&self, id: AdmissionId, by: UserId, now: i64) -> Result<AdmissionRecord, DomainError>;
+
+	/// The redacted invitation behind an emailed token. STRICTLY read-only.
+	async fn invitation(&self, token: &str, now: i64) -> Result<Option<InvitationRecord>, DomainError>;
+
+	/// The target answering from their mailbox: attempt-counted, constant-time and
+	/// one-shot.
+	async fn self_decision(&self, token: &str, code: &str, vote: Vote, now: i64, audit: &Audit) -> Result<SelfDecision, DomainError>;
+
+	/// Give up a seat voluntarily. Subject to the same floor as a removal.
+	async fn resign(&self, who: UserId, now: i64) -> Result<(), DomainError>;
+
+	/// The live feed's clock, read straight from Postgres.
+	async fn revision(&self) -> Result<u64, DomainError>;
+
+	/// Queue one governance mail to a resolved recipient, bypassing notification
+	/// preferences. False when `dedupe_key` had already been accepted.
+	async fn enqueue_mail(&self, user_id: Uuid, recipient: &str, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<bool, DomainError>;
 }

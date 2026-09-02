@@ -23,7 +23,7 @@
 
 use async_trait::async_trait;
 use domain::error::DomainError;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::ports::{NotificationDispatchRepository, NotificationRepository};
@@ -97,6 +97,9 @@ pub struct DeliveryJob {
 	pub body: Option<String>,
 	pub link: Option<String>,
 	pub occurred_at: Option<i64>,
+	/// The typed fields a governance mail renders from, including the one plaintext
+	/// copy of its secret code. Nulled by [`NotificationDispatchRepository::mark_sent`].
+	pub payload: Option<serde_json::Value>,
 }
 
 fn repo_err(err: sqlx::Error) -> DomainError {
@@ -110,7 +113,7 @@ fn repo_err(err: sqlx::Error) -> DomainError {
 /// failed at runtime even though the migration itself applied cleanly
 /// (`gen_random_uuid()` is core Postgres; `gen_random_bytes()` is not). Minting tokens
 /// here also spares the plane any need for rights to create extensions.
-fn opaque_token() -> String {
+pub(crate) fn opaque_token() -> String {
 	let mut bytes = [0u8; 24];
 	getrandom::fill(&mut bytes).expect("CSPRNG unavailable");
 	bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -124,25 +127,8 @@ fn opaque_token() -> String {
 #[async_trait]
 impl NotificationRepository for PgNotifications {
 	async fn subscriber_for_user(&self, user_id: Uuid, email: &str, email_verified: bool) -> Result<SubscriberRow, DomainError> {
-		// Lazily created on first touch, then kept in step with the directory's copy of
-		// the address. A signed-in subscriber is confirmed on sight: the identity plane
-		// only ever holds an address Google already verified, so a second opt-in round
-		// trip would be friction with no security value.
-		sqlx::query_as::<_, SubscriberRow>(
-			"INSERT INTO notification_subscribers (user_id, email, email_verified, confirmed_at, unsubscribe_token) \
-			 VALUES ($1, $2, $3, now(), $4) \
-			 ON CONFLICT (user_id) WHERE user_id IS NOT NULL \
-			 DO UPDATE SET email = EXCLUDED.email, email_verified = EXCLUDED.email_verified, updated_at = now() \
-			 RETURNING id, user_id, email, email_verified, in_app_enabled, email_enabled, \
-			           (confirmed_at IS NOT NULL) AS confirmed, unsubscribe_token",
-		)
-		.bind(user_id)
-		.bind(email)
-		.bind(email_verified)
-		.bind(opaque_token())
-		.fetch_one(&self.pool)
-		.await
-		.map_err(repo_err)
+		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		upsert_subscriber(&mut conn, user_id, email, email_verified).await
 	}
 
 	async fn subscriptions(&self, subscriber_id: Uuid) -> Result<Vec<SubscriptionRow>, DomainError> {
@@ -477,7 +463,7 @@ impl NotificationDispatchRepository for PgNotifications {
 
 		let jobs = sqlx::query_as::<_, DeliveryJob>(
 			"SELECT d.id, d.kind, d.recipient, d.attempts, s.unsubscribe_token, s.confirm_token, \
-			        n.topic, n.title, n.body, n.link, n.occurred_at \
+			        n.topic, n.title, n.body, n.link, n.occurred_at, d.payload \
 			 FROM notification_deliveries d \
 			 JOIN notification_subscribers s ON s.id = d.subscriber_id \
 			 LEFT JOIN notifications n ON n.id = d.notification_id \
@@ -493,7 +479,10 @@ impl NotificationDispatchRepository for PgNotifications {
 	}
 
 	async fn mark_sent(&self, delivery_id: i64) -> Result<(), DomainError> {
-		sqlx::query("UPDATE notification_deliveries SET status = 'sent', sent_at = now(), last_error = '' WHERE id = $1")
+		// `payload` is nulled here rather than left behind: it holds the one plaintext
+		// copy of a governance mail's secret code, which has no reason to outlive the
+		// message that carried it.
+		sqlx::query("UPDATE notification_deliveries SET status = 'sent', sent_at = now(), last_error = '', payload = NULL WHERE id = $1")
 			.bind(delivery_id)
 			.execute(&self.pool)
 			.await
@@ -528,4 +517,61 @@ impl NotificationDispatchRepository for PgNotifications {
 			.map_err(repo_err)?;
 		row.try_get::<i64, _>("n").map_err(repo_err)
 	}
+}
+
+/// Create-or-refresh the subscriber row behind a signed-in user on an open connection.
+///
+/// A signed-in subscriber is confirmed on sight: the identity plane only ever holds an
+/// address Google already verified, so a second opt-in round trip would be friction
+/// with no security value. Shared with the governance adapter, which must resolve a
+/// recipient inside its own transaction.
+pub(crate) async fn upsert_subscriber(conn: &mut PgConnection, user_id: Uuid, email: &str, email_verified: bool) -> Result<SubscriberRow, DomainError> {
+	sqlx::query_as::<_, SubscriberRow>(
+		"INSERT INTO notification_subscribers (user_id, email, email_verified, confirmed_at, unsubscribe_token) \
+		 VALUES ($1, $2, $3, now(), $4) \
+		 ON CONFLICT (user_id) WHERE user_id IS NOT NULL \
+		 DO UPDATE SET email = EXCLUDED.email, email_verified = EXCLUDED.email_verified, updated_at = now() \
+		 RETURNING id, user_id, email, email_verified, in_app_enabled, email_enabled, \
+		           (confirmed_at IS NOT NULL) AS confirmed, unsubscribe_token",
+	)
+	.bind(user_id)
+	.bind(email)
+	.bind(email_verified)
+	.bind(opaque_token())
+	.fetch_one(&mut *conn)
+	.await
+	.map_err(repo_err)
+}
+
+/// Queue one governance mail, DELIBERATELY BYPASSING every notification preference.
+///
+/// `NotificationService.Emit` is opt-out on both channels and gated on a followed
+/// topic. A security mail a subscriber can silently switch off is not a security mail:
+/// an attacker who reaches the settings surface would otherwise be able to mute the
+/// warning that their own expulsion — or a payout — is being approved. So this writes
+/// straight to the queue and never consults `notification_subscriptions`.
+///
+/// Returns false when `dedupe_key` had already been accepted, which is what makes the
+/// money plane's at-least-once relay safe to retry.
+pub(crate) async fn enqueue_governance_mail(
+	conn: &mut PgConnection,
+	subscriber_id: Uuid,
+	recipient: &str,
+	kind: &str,
+	dedupe_key: &str,
+	payload: &serde_json::Value,
+) -> Result<bool, DomainError> {
+	let inserted = sqlx::query(
+		"INSERT INTO notification_deliveries (notification_id, subscriber_id, kind, recipient, dedupe_key, payload) \
+		 VALUES (NULL, $1, $2, $3, $4, $5) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING RETURNING id",
+	)
+	.bind(subscriber_id)
+	.bind(kind)
+	.bind(recipient)
+	.bind(dedupe_key)
+	.bind(payload)
+	.fetch_optional(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+	Ok(inserted.is_some())
 }
