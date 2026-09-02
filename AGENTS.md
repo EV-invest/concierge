@@ -16,12 +16,30 @@ logs. Its sibling `banking` is the **MONEY** plane (TigerBeetle ledger,
 money-operation authorization). The two run **independent auth flows** and share
 no database.
 
-The only coupling is a one-way **cross-plane bridge**: `concierge` emits
-user-lifecycle events (`events.proto` — `UserLifecycleEvent`) to its
-`user_outbox`, and `banking` **pulls** them over the `UserEvents.PullUserLifecycle`
-RPC (`bridge` module) to gate/freeze money ops. `concierge` never calls `banking`.
-The seam is authenticated by a shared bridge service token (`BRIDGE_SERVICE_TOKEN`),
-mounted OUTSIDE the user auth layer; graduate to mTLS/SPIFFE at platform scale.
+They are coupled by **two seams, both initiated by `banking`** — `concierge` still
+never calls `banking`:
+
+1. The **cross-plane bridge**: `concierge` emits user-lifecycle events
+   (`events.proto` — `UserLifecycleEvent`) to its `user_outbox`, and `banking`
+   **pulls** them over `UserEvents.PullUserLifecycle` (`bridge` module) to
+   gate/freeze money ops.
+2. The **mail relay**: `banking` **pushes** typed governance mail over
+   `MailRelayService.SendGovernanceMail` (`governance` module), because this plane
+   owns the only mailer and standing up a second one would duplicate the queue,
+   the backoff and the daily budget. The payload is TYPED, never rendered markup;
+   the recipient's address is resolved HERE from the identity record and must
+   belong to a fund owner, and every emailed link is pinned to `PUBLIC_ORIGIN` —
+   a compromised money plane must not become a phishing cannon aimed at owners.
+
+Both seams are authenticated by the SAME shared bridge service token
+(`BRIDGE_SERVICE_TOKEN`), compared in constant time and mounted OUTSIDE the user
+auth layer. One trust relationship between the planes means one secret to rotate;
+graduate to mTLS/SPIFFE at platform scale.
+
+**Ownership** (`Role::Owner`) is governed, not administered: it is granted only by
+an executed admission consilium and taken only by an executed removal, so
+`UserDirectory.SetRole` refuses both directions (`governance` module; the policy is
+`banking`'s `docs/CONSILIUM.md`).
 
 ---
 
@@ -31,7 +49,7 @@ mounted OUTSIDE the user auth layer; graduate to mTLS/SPIFFE at platform scale.
 | ----- | ------ |
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
-| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
+| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the ownership consilium: owner admission/removal + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
 | `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation with reuse detection · `Exchange`/`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`) provisioning users to the directory over an in-process `Provisioner` channel, **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
