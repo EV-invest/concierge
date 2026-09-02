@@ -22,8 +22,9 @@ use std::sync::Arc;
 
 use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, PullUserLifecycleResponse, UserLifecycleEvent, user_events_server::UserEvents, user_lifecycle_event::Kind};
 use sqlx::PgPool;
-use subtle::ConstantTimeEq;
 use tonic::{Request, Response, Status};
+
+use crate::support::authenticate_service;
 
 /// The largest page the bridge will serve, regardless of the request's `limit`. Caps a
 /// single pull so one call can't scan the whole outbox.
@@ -47,17 +48,10 @@ impl Bridge {
 		}
 	}
 
-	/// Authenticate the service-to-service caller against the shared bridge token
-	/// (compared in constant time, so verification leaks nothing via timing). A
-	/// missing configured token fails closed; a wrong/absent bearer is rejected.
+	/// Authenticate the service-to-service caller against the shared bridge token —
+	/// the same constant-time, fail-closed check the mail relay uses.
 	fn authenticate<T>(&self, request: &Request<T>) -> Result<(), Status> {
-		let Some(expected) = self.token.as_deref() else {
-			return Err(Status::unavailable("bridge not configured"));
-		};
-		match bearer_token(request) {
-			Some(presented) if bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) => Ok(()),
-			_ => Err(Status::unauthenticated("invalid bridge service token")),
-		}
+		authenticate_service(self.token.as_ref(), request, "bridge")
 	}
 }
 
@@ -137,11 +131,6 @@ fn kind_to_proto(kind: &str) -> Kind {
 		"ROLE_CHANGED" => Kind::RoleChanged,
 		_ => Kind::Unspecified,
 	}
-}
-
-fn bearer_token<T>(request: &Request<T>) -> Option<String> {
-	let value = request.metadata().get("authorization")?.to_str().ok()?;
-	value.strip_prefix("Bearer ").map(str::to_owned)
 }
 
 #[cfg(test)]

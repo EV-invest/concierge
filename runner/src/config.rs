@@ -58,6 +58,14 @@ ev::settings! {
 		/// Account-less subscribe attempts allowed per client IP per window.
 		subscribe_rate_limit: u32 = "5",
 		subscribe_rate_window_secs: u64 = "3600",
+		/// Base URL of the owner-removal approval page; the emailed token is appended as
+		/// the final path segment, so a message carries `<this>/<token>`.
+		///
+		/// It is a CABINET route (`/{locale}/cabinet/owner-removal/{token}`) served
+		/// publicly — the person opening it is the one being removed and may well not be
+		/// signed in, but there is no `/governance/*` surface on the site and a link into
+		/// one would 404 every removal invitation ever sent.
+		governance_approval_url: String = "https://evinvest.ltd/cabinet/owner-removal",
 	}
 }
 
@@ -105,6 +113,22 @@ mod tests {
 
 		let vars: Vec<&str> = error.errors.iter().map(|e| e.var.as_str()).collect();
 		assert_eq!(vars, vec!["SENTRY_DSN", "SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD"]);
+	}
+
+	/// The emailed link must point at a page that exists. It is a CABINET route served
+	/// publicly, NOT a `/governance/*` path — there is no such surface on the site, and
+	/// an invitation linking into one would 404 for every owner who ever received it.
+	///
+	/// The token is appended as the final segment, so the base must carry no trailing
+	/// slash and no query string.
+	#[test]
+	fn the_approval_link_points_into_the_cabinet() {
+		let config = AppConfig::from_source(minimal_env).expect("boot");
+		let base = &config.governance_approval_url;
+		let path = base.strip_prefix("https://evinvest.ltd").expect("the public site: {base}");
+		assert_eq!(path, "/cabinet/owner-removal", "the cabinet serves /{{locale}}/cabinet/owner-removal/{{token}}");
+		assert!(!base.ends_with('/'), "the token is appended as `<base>/<token>`");
+		assert!(!base.contains('?'), "a query string would swallow the token segment");
 	}
 
 	#[test]

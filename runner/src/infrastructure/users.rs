@@ -54,13 +54,7 @@ impl PgUsers {
 	/// A command error (e.g. profile validation) rolls the transaction back.
 	async fn mutate(&self, id: UserId, command: impl FnOnce(&mut User) -> Result<(), DomainError>) -> Result<User, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		let row = sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1 FOR UPDATE"))
-			.bind(id.raw())
-			.fetch_optional(&mut *tx)
-			.await
-			.map_err(repo_err)?
-			.ok_or_else(|| DomainError::NotFound { entity: "user", id: id.to_string() })?;
-		let mut user = row.into_domain()?;
+		let mut user = load_for_update(&mut tx, id).await?;
 		command(&mut user)?;
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
@@ -330,8 +324,21 @@ impl UserDirectoryRepository for PgUsers {
 	}
 }
 
+/// Read one user `FOR UPDATE` on an open transaction. Shared with the governance
+/// adapter, which must take a seat and append the resulting `ROLE_CHANGED` in the same
+/// transaction as the consilium's verdict — one identity writer, not two.
+pub(crate) async fn load_for_update(conn: &mut PgConnection, id: UserId) -> Result<User, DomainError> {
+	sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE id = $1 FOR UPDATE"))
+		.bind(id.raw())
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?
+		.ok_or_else(|| DomainError::NotFound { entity: "user", id: id.to_string() })?
+		.into_domain()
+}
+
 /// Persist the full editable surface, identity flags, and `row_version` of a user row.
-async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(), DomainError> {
+pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(), DomainError> {
 	sqlx::query(
 		"UPDATE users SET email = $2, email_verified = $3, status = $4, token_version = $5, kyc_level = $6, \
 		legal_name = $7, preferred_name = $8, phone = $9, date_of_birth = $10, nationality = $11, \
@@ -367,7 +374,7 @@ async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(), DomainEr
 /// all. Each row carries the bridge `Kind`, the per-user `sequence` (the `row_version`
 /// at which the event was emitted), and the identity snapshot the banking consumer
 /// materializes from.
-async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Result<(), DomainError> {
+pub(crate) async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Result<(), DomainError> {
 	let events = user.drain_events();
 	if events.is_empty() {
 		return Ok(());

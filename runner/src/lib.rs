@@ -9,6 +9,8 @@
 //!   directory       — the user/profile gRPC service + the auth→directory provisioner loop
 //!   bridge          — the cross-plane (identity→money) producer over the user_outbox
 //!   platform        — the platform/cabinet config service (maintenance · announcement · flags)
+//!   governance      — the ownership consilium: the owner roster, owner-removal proposals,
+//!                     the target's emailed approval surface, and the money plane's mail relay
 //!   authz           — the shared RBAC gate (persisted role + status/revocation enforcement)
 //!   ports           — the driven-port traits (`UserDirectoryRepository`, `PlatformConfigRepository`,
 //!                     `NotificationRepository`, `NotificationDispatchRepository`)
@@ -24,6 +26,7 @@ pub mod bridge;
 pub mod config;
 pub mod directory;
 pub mod dispatch;
+pub mod governance;
 pub mod infrastructure;
 pub mod log;
 pub mod notification;

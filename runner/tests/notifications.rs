@@ -211,6 +211,12 @@ async fn delivery_queue_claims_leases_and_backs_off() {
 	let user = Uuid::new_v4();
 	let sub = repo.subscriber_for_user(user, "queue@example.com", true).await.expect("subscriber");
 	repo.set_topic_subscription(sub.id, TOPIC, true, true).await.expect("follow");
+	// Quiet whatever a shared development database already has queued. `claim_due` takes
+	// the OLDEST due rows first, so a backlog left by another suite would fill the batch
+	// and hide the row seeded below — a failure with nothing to do with the queue. The
+	// long lease keeps the drained rows out of the way for the rest of this test.
+	while !repo.claim_due(500, 3600).await.expect("drain the queue").is_empty() {}
+
 	repo.emit(user, TOPIC, "nav", "Queued", "body", "/x", "q1", 100).await.expect("emit");
 
 	// The claim is a `FOR UPDATE SKIP LOCKED` CTE feeding an UPDATE … RETURNING, and

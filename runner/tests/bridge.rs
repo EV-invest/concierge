@@ -50,6 +50,15 @@ async fn pull_returns_ordered_events_and_advances_cursor() {
 	};
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
 
+	// Where the outbox already stands. Reading from 0 would fill the page with whatever
+	// a shared development database happens to hold — and once another suite has written
+	// more than `limit` rows, the ones seeded below fall off the end and this test fails
+	// for a reason that has nothing to do with the bridge.
+	let start = sqlx::query_scalar::<_, i64>("SELECT COALESCE(max(position), 0) FROM user_outbox")
+		.fetch_one(&pool)
+		.await
+		.expect("read the outbox head");
+
 	// Seed a known sequence of mutations across two users → multiple outbox rows.
 	let a = repo.provision(unique_subject(), Email::parse("a@example.com").unwrap(), true).await.unwrap();
 	let b = repo.provision(unique_subject(), Email::parse("b@example.com").unwrap(), true).await.unwrap();
@@ -58,15 +67,15 @@ async fn pull_returns_ordered_events_and_advances_cursor() {
 
 	// Pull the whole outbox from the beginning.
 	let resp = bridge
-		.pull_user_lifecycle(authed(PullUserLifecycleRequest { after_position: 0, limit: 1000 }))
+		.pull_user_lifecycle(authed(PullUserLifecycleRequest { after_position: start, limit: 1000 }))
 		.await
 		.expect("pull succeeds")
 		.into_inner();
 
 	assert!(resp.events.len() >= 4, "at least the four rows we seeded");
 
-	// The cursor advanced past the start of the outbox.
-	assert!(resp.next_position > 0, "cursor advanced past the start");
+	// The cursor advanced past where we started reading.
+	assert!(resp.next_position > start, "cursor advanced past the start");
 
 	// Our seeded events are present with the right kinds, in position order.
 	let a_id = a.id().to_string();
