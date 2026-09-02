@@ -1,0 +1,412 @@
+syntax = "proto3";
+
+package concierge.v1;
+
+// GovernanceService — the fund's OWNERSHIP plane: who holds `Role::Owner`, and the
+// consilium that must agree before a seat is taken away.
+//
+// WHY OWNERSHIP LIVES HERE. A seat is `users.role`, a concierge-owned fact, and the
+// bridge to the money plane is one-way. Only this plane may mutate it, so only this
+// plane can authorize the mutation. The money plane runs its own, separate consilium
+// over its own mirrored roster — neither plane trusts the other's verdict.
+//
+// THE RULE. A removal passes when EITHER
+//   (a) the target accepts it from their own mailbox, OR
+//   (b) every owner except the target and the initiator votes to remove.
+//
+// Path (b) is unanimity over `owners \ {target, initiator}`. With exactly two owners
+// that set is EMPTY and unanimity over it is vacuously true — which would let either
+// owner expel the other unilaterally. Path (b) therefore requires at least ONE eligible
+// peer voter; with two owners only path (a) exists.
+//
+// FLOOR. A removal may not leave fewer than TWO owners. Two suspends payouts — the
+// money plane's `floor(N/2)+1` threshold is unreachable below three — but that is
+// recoverable, because two owners can still admit a third. A floor of three was the
+// earlier draft and it was wrong: at exactly three owners it made a bad actor
+// unremovable forever, and a permanent deadlock is worse than a recoverable pause.
+//
+// ADMISSION IS GOVERNED TOO, and it is the reason the rest of this holds. Granting a
+// seat is its own consilium: unanimity of `owners \ {initiator}`, with at least one such
+// peer. Without it a bad actor mints sock puppets BEFORE opening an invoice and then
+// reaches quorum legitimately — 2 honest owners plus 4 puppets is N=7, threshold 4,
+// voters 6 — and snapshotting the roster cannot help, because the stuffing already
+// happened. Unanimity rather than a majority, because a minority must never be able to
+// grow itself into a majority.
+//
+// See banking's docs/CONSILIUM.md for the whole policy.
+service GovernanceService {
+  // The current owner roster (Owner only).
+  rpc ListOwners(ListOwnersRequest) returns (OwnerList);
+
+  // Propose removing an owner (Owner only). The initiator casts no vote — proposing is
+  // not agreeing, and counting it would let two owners remove a third.
+  rpc OpenOwnerRemoval(OpenOwnerRemovalRequest) returns (OwnerRemoval);
+
+  // Withdraw a proposal the caller opened, while it is still OPEN.
+  rpc CancelOwnerRemoval(CancelOwnerRemovalRequest) returns (OwnerRemoval);
+
+  // A peer owner's vote, cast in the cabinet while signed in — this is the live
+  // consilium, not an emailed link. The target and the initiator are both refused.
+  rpc SubmitPeerVote(SubmitPeerVoteRequest) returns (OwnerRemoval);
+
+  // Resign your own seat. No consilium — but the same floor applies, so the last two
+  // owners cannot leave the fund without governance.
+  rpc ResignOwnership(ResignOwnershipRequest) returns (OwnerList);
+
+  rpc GetOwnerRemoval(GetOwnerRemovalRequest) returns (OwnerRemoval);
+  rpc ListOwnerRemovals(ListOwnerRemovalsRequest) returns (OwnerRemovalList);
+
+  // Propose GRANTING a seat (Owner only). The candidate does not vote — they are not
+  // yet an owner — and neither does the initiator, so the voters are every OTHER
+  // current owner and all of them must agree. A lone owner cannot open one at all.
+  //
+  // This is the only way `Role::Owner` is granted: UserDirectory.SetRole refuses it
+  // outside an executed admission.
+  rpc OpenOwnerAdmission(OpenOwnerAdmissionRequest) returns (OwnerAdmission);
+
+  // Withdraw an admission the caller opened, while it is still OPEN.
+  rpc CancelOwnerAdmission(CancelOwnerAdmissionRequest) returns (OwnerAdmission);
+
+  // A peer owner's vote on an admission, cast in the cabinet while signed in. One
+  // REJECT ends it: admission passes only on unanimity.
+  rpc SubmitAdmissionVote(SubmitAdmissionVoteRequest) returns (OwnerAdmission);
+
+  rpc GetOwnerAdmission(GetOwnerAdmissionRequest) returns (OwnerAdmission);
+  rpc ListOwnerAdmissions(ListOwnerAdmissionsRequest) returns (OwnerAdmissionList);
+
+  // The live consilium feed (Owner only). Emits a tick whenever the governance
+  // revision moves, plus a periodic heartbeat. ONE revision covers both removals and
+  // admissions, so a single subscription follows the whole ownership surface.
+  //
+  // A tick carries a REVISION, never a tally: the client refetches the authoritative
+  // snapshot when it moves, so a stale or replayed frame can never render a wrong
+  // count. The server also re-reads on an interval, so correctness never depends on an
+  // in-process broadcast reaching every replica.
+  rpc WatchGovernance(WatchGovernanceRequest) returns (stream GovernanceTick);
+}
+
+// OwnerRemovalApprovalService — the surface the TARGET of a removal reaches from their
+// mailbox. Mounted outside the user-auth layer, like AuthService: the emailed token is
+// the credential, and the person clicking may not be signed in.
+//
+// The read is side-effect free because mail scanners issue automatic requests for every
+// URL in a message; accepting requires the secret code from the same mail.
+service OwnerRemovalApprovalService {
+  // The redacted invitation behind an emailed token. Unknown, expired, spent and
+  // wrong-state tokens all return the same NOT_FOUND.
+  rpc GetInvitation(GetRemovalInvitationRequest) returns (OwnerRemovalInvitation);
+
+  // The target accepting — or refusing — their own removal. Five failed code attempts
+  // burn the token permanently.
+  rpc SubmitSelfDecision(SubmitSelfDecisionRequest) returns (SubmitSelfDecisionResponse);
+}
+
+// MailRelayService — the one seam over which the MONEY plane asks this plane to send a
+// governance mail, because this plane owns the only mailer (lettre + the delivery queue
+// + backoff + the daily budget) and standing up a second one would duplicate all of it.
+//
+// Authenticated by the shared banking↔concierge service secret, compared in constant
+// time, and mounted outside the user-auth layer exactly as the lifecycle bridge is.
+//
+// The payload is TYPED, never rendered HTML: this plane renders it. A compromised money
+// plane must not be able to put arbitrary markup into an owner's mailbox.
+//
+// This path deliberately bypasses notification preferences. `NotificationService.Emit`
+// is opt-out on both channels, and a security mail that a subscriber can silently
+// switch off is not a security mail.
+service MailRelayService {
+  // Enqueue one governance mail. Idempotent by `dedupe_key`, so an at-least-once
+  // caller may retry without sending twice.
+  rpc SendGovernanceMail(SendGovernanceMailRequest) returns (SendGovernanceMailResponse);
+}
+
+enum OwnerRemovalState {
+  OWNER_REMOVAL_STATE_UNSPECIFIED = 0;
+  OWNER_REMOVAL_STATE_OPEN = 1;
+  // The target accepted, or the peers were unanimous. The seat is already gone.
+  OWNER_REMOVAL_STATE_EXECUTED = 2;
+  // The target refused and at least one peer withheld, or a peer voted to keep.
+  OWNER_REMOVAL_STATE_REJECTED = 3;
+  OWNER_REMOVAL_STATE_EXPIRED = 4;
+  OWNER_REMOVAL_STATE_CANCELLED = 5;
+  // Passed, but the seat could not be taken (e.g. the floor would be breached by the
+  // time it resolved, or the initiator had themselves lost ownership).
+  OWNER_REMOVAL_STATE_VOID = 6;
+}
+
+enum RemovalVote {
+  REMOVAL_VOTE_UNSPECIFIED = 0;
+  REMOVAL_VOTE_PENDING = 1;
+  // Remove the target.
+  REMOVAL_VOTE_REMOVE = 2;
+  // Keep the target. One of these ends path (b), which requires unanimity.
+  REMOVAL_VOTE_KEEP = 3;
+}
+
+// The six states a proposal of either kind can be in. A separate enum from
+// OwnerRemovalState only because proto enum VALUES share one namespace per package;
+// the states themselves are identical, and the domain models them with one type.
+enum OwnerAdmissionState {
+  OWNER_ADMISSION_STATE_UNSPECIFIED = 0;
+  OWNER_ADMISSION_STATE_OPEN = 1;
+  // Every other owner agreed. The seat has already been granted.
+  OWNER_ADMISSION_STATE_EXECUTED = 2;
+  // At least one owner voted to reject.
+  OWNER_ADMISSION_STATE_REJECTED = 3;
+  OWNER_ADMISSION_STATE_EXPIRED = 4;
+  OWNER_ADMISSION_STATE_CANCELLED = 5;
+  // Passed, but the seat could not be granted — the initiator had themselves lost
+  // ownership, or the candidate had already been seated by another admission.
+  OWNER_ADMISSION_STATE_VOID = 6;
+}
+
+// Deliberately its own enum rather than a reuse of RemovalVote: "remove/keep" and
+// "admit/reject" are different questions, and a surface that renders the wrong verb on
+// a governance vote is a surface that gets a vote cast by mistake.
+enum AdmissionVote {
+  ADMISSION_VOTE_UNSPECIFIED = 0;
+  ADMISSION_VOTE_PENDING = 1;
+  // Grant the candidate a seat.
+  ADMISSION_VOTE_ADMIT = 2;
+  // Refuse. One of these ends the admission, which passes only on unanimity.
+  ADMISSION_VOTE_REJECT = 3;
+}
+
+message Owner {
+  string user_id = 1;
+  // Masked on every surface a non-owner can reach.
+  string email = 2;
+  string display_name = 3;
+  int64 owner_since = 4;
+}
+
+message OwnerList {
+  repeated Owner items = 1;
+  // Below three, the money plane can no longer reach its payout threshold.
+  bool below_payout_floor = 2;
+}
+
+message RemovalPeer {
+  string user_id = 1;
+  string email = 2;
+  RemovalVote vote = 3;
+  int64 voted_at = 4;
+}
+
+message OwnerRemoval {
+  string id = 1;
+  OwnerRemovalState state = 2;
+  string target_user_id = 3;
+  string target_email = 4;
+  string initiator_user_id = 5;
+  string initiator_email = 6;
+  // Why, in the initiator's words. Shown to the target and to every peer.
+  string reason = 7;
+  // Every owner except the target and the initiator, with their answers. Empty means
+  // path (b) is unavailable and only the target's own acceptance can carry this.
+  repeated RemovalPeer peers = 8;
+  // How the target answered from their mailbox.
+  RemovalVote target_decision = 9;
+  int64 target_decided_at = 10;
+  bool target_notified = 11;
+  // Owners at open, and the count that would remain. The floor is checked at open AND
+  // at execution, because the roster can move underneath an open proposal.
+  uint32 owner_count = 12;
+  int64 created_at = 13;
+  int64 expires_at = 14;
+  int64 decided_at = 15;
+  string void_reason = 16;
+  uint64 version = 17;
+}
+
+message OwnerRemovalList {
+  repeated OwnerRemoval items = 1;
+}
+
+message AdmissionPeer {
+  string user_id = 1;
+  string email = 2;
+  AdmissionVote vote = 3;
+  int64 voted_at = 4;
+}
+
+message OwnerAdmission {
+  string id = 1;
+  OwnerAdmissionState state = 2;
+  string candidate_user_id = 3;
+  string candidate_email = 4;
+  string initiator_user_id = 5;
+  string initiator_email = 6;
+  // Why, in the initiator's words. Shown to every voter.
+  string reason = 7;
+  // Every owner except the initiator, with their answers. Never empty: an admission
+  // with nobody to agree is refused at open rather than left open and unpassable.
+  repeated AdmissionPeer peers = 8;
+  // Owners at open. The initiator is counted but does not vote.
+  uint32 owner_count = 9;
+  int64 created_at = 10;
+  int64 expires_at = 11;
+  int64 decided_at = 12;
+  string void_reason = 13;
+  uint64 version = 14;
+}
+
+message OwnerAdmissionList {
+  repeated OwnerAdmission items = 1;
+}
+
+message OpenOwnerAdmissionRequest {
+  // The user to seat. Must not already be an owner.
+  string candidate_user_id = 1;
+  string reason = 2;
+}
+
+message CancelOwnerAdmissionRequest {
+  string admission_id = 1;
+}
+
+message SubmitAdmissionVoteRequest {
+  string admission_id = 1;
+  AdmissionVote vote = 2;
+}
+
+message GetOwnerAdmissionRequest {
+  string admission_id = 1;
+}
+
+message ListOwnerAdmissionsRequest {
+  // 0 means the server default. Includes closed proposals — nothing is deleted.
+  uint32 limit = 1;
+}
+
+message ListOwnersRequest {}
+
+message OpenOwnerRemovalRequest {
+  string target_user_id = 1;
+  string reason = 2;
+}
+
+message CancelOwnerRemovalRequest {
+  string removal_id = 1;
+}
+
+message SubmitPeerVoteRequest {
+  string removal_id = 1;
+  RemovalVote vote = 2;
+}
+
+message ResignOwnershipRequest {
+  // Typed confirmation, so a resignation cannot be a stray click. The server checks it
+  // equals the caller's own email.
+  string confirm_email = 1;
+}
+
+message GetOwnerRemovalRequest {
+  string removal_id = 1;
+}
+
+message ListOwnerRemovalsRequest {
+  // 0 means the server default. Includes closed proposals — nothing is deleted.
+  uint32 limit = 1;
+}
+
+message WatchGovernanceRequest {}
+
+message GovernanceTick {
+  // Monotonic across the whole governance surface. Refetch when it moves.
+  uint64 revision = 1;
+  // Unix seconds the tick was produced, so a client can tell a live stream from a
+  // wedged one.
+  int64 at = 2;
+  // True for the periodic keepalive, which carries the current revision unchanged.
+  bool heartbeat = 3;
+}
+
+message GetRemovalInvitationRequest {
+  string token = 1;
+}
+
+// What the TARGET is shown before answering. No peer identities, no vote breakdown —
+// knowing exactly who voted to remove you, before you answer, is not information this
+// flow needs to hand over.
+message OwnerRemovalInvitation {
+  string removal_id = 1;
+  OwnerRemovalState state = 2;
+  string initiator_email = 3;
+  string target_email = 4;
+  string reason = 5;
+  int64 created_at = 6;
+  int64 expires_at = 7;
+  RemovalVote decision = 8;
+  uint32 attempts_remaining = 9;
+}
+
+message SubmitSelfDecisionRequest {
+  string token = 1;
+  string code = 2;
+  // REMOVE accepts the expulsion; KEEP refuses it.
+  RemovalVote vote = 3;
+  string client_ip = 4;
+  string user_agent = 5;
+}
+
+message SubmitSelfDecisionResponse {
+  OwnerRemovalInvitation invitation = 1;
+  bool decided = 2;
+}
+
+// The typed governance mails this plane knows how to render.
+enum GovernanceMailKind {
+  GOVERNANCE_MAIL_KIND_UNSPECIFIED = 0;
+  // The money plane asking an owner to approve a revenue payout.
+  GOVERNANCE_MAIL_KIND_PAYOUT_APPROVAL = 1;
+  // The money plane telling the owners a payout was decided, executed or failed.
+  GOVERNANCE_MAIL_KIND_PAYOUT_OUTCOME = 2;
+  // The money plane warning the owners that a token burned on failed code attempts.
+  GOVERNANCE_MAIL_KIND_APPROVAL_TOKEN_BURNED = 3;
+}
+
+message SendGovernanceMailRequest {
+  GovernanceMailKind kind = 1;
+  // Concierge canonical user id of the recipient. The address is resolved HERE, from
+  // the identity record, so the money plane cannot redirect a governance mail.
+  string user_id = 2;
+  // Idempotency key. The same key never sends twice.
+  string dedupe_key = 3;
+  // Typed fields the template consumes. Escaped at render; never interpreted as markup.
+  PayoutApprovalMail payout_approval = 4;
+  PayoutOutcomeMail payout_outcome = 5;
+}
+
+message PayoutApprovalMail {
+  string consilium_id = 1;
+  string initiator_email = 2;
+  string network = 3;
+  string address = 4;
+  string amount = 5;
+  string memo = 6;
+  string payload_hash = 7;
+  uint32 threshold = 8;
+  uint32 owner_count = 9;
+  int64 expires_at = 10;
+  // Absolute URL of the approval page, carrying the opaque token.
+  string approval_url = 11;
+  // The secret code the owner types on that page. Held only until the mail is sent,
+  // then cleared from the delivery row.
+  string code = 12;
+}
+
+message PayoutOutcomeMail {
+  string consilium_id = 1;
+  // APPROVED / REJECTED / EXPIRED / CANCELLED / EXECUTED / EXECUTION_FAILED.
+  string outcome = 2;
+  string network = 3;
+  string address = 4;
+  string amount = 5;
+  string detail = 6;
+}
+
+message SendGovernanceMailResponse {
+  // False when `dedupe_key` had already been accepted.
+  bool enqueued = 1;
+}
