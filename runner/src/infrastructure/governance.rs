@@ -31,7 +31,7 @@ use domain::{
 		AdmissionId, AdmissionPeer, AdmissionVote, GovernanceEvent, MAX_CODE_ATTEMPTS, MIN_OWNERS, Outcome, OwnerAdmission, OwnerRemoval, Peer, ProposalState, REMOVAL_TTL_SECS, RemovalId,
 		RemovalState, Vote, check_floor,
 	},
-	users::UserId,
+	users::{UserId, UserStatus},
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Row};
@@ -39,7 +39,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
-	genesis::{GenesisOutcome, GenesisSubject, Resolution},
+	genesis::{GenesisOutcome, GenesisSubject, Resolution, Unseatable, UnseatableReason},
 	infrastructure::{notifications, users},
 	ports::{GovernanceRepository, OwnerGenesisRepository},
 };
@@ -578,15 +578,21 @@ impl OwnerGenesisRepository for PgGovernance {
 		for subject in subjects {
 			match subject {
 				GenesisSubject::Id(id) => {
-					let exists = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE id = $1")
+					// A canonical id IS the identity, so `email_verified` is irrelevant here — the
+					// id can only have been read off the very row it names. `status` is not
+					// irrelevant: a disabled owner can neither act nor be removed.
+					let status = sqlx::query_scalar::<_, String>("SELECT status FROM users WHERE id = $1")
 						.bind(id.raw())
 						.fetch_optional(&mut *tx)
 						.await
 						.map_err(repo_err)?;
-					if exists.is_some() {
-						remember(&mut resolution.found, *id);
-					} else {
-						remember(&mut resolution.missing_ids, *id);
+					match status.as_deref() {
+						None => remember(&mut resolution.missing_ids, *id),
+						Some(status) if status == UserStatus::Active.as_str() => remember(&mut resolution.found, *id),
+						Some(_) => resolution.unseatable.push(Unseatable {
+							named: id.to_string(),
+							reason: UnseatableReason::Disabled,
+						}),
 					}
 				}
 				GenesisSubject::Mailbox(mailbox) => {
@@ -594,18 +600,53 @@ impl OwnerGenesisRepository for PgGovernance {
 					// `Email::parse`, but a row written before that normalization existed would
 					// otherwise be invisible to a list the operator can see is correct. The table
 					// is tiny and this runs once per boot, so the unindexed scan costs nothing.
-					let matches = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE lower(email) = $1 ORDER BY id")
+					//
+					// The flags come back WITH the rows rather than being filtered in SQL, so a
+					// refusal can name which problem the address has instead of looking identical
+					// to "nobody has signed in yet".
+					let rows = sqlx::query("SELECT id, email_verified, status FROM users WHERE lower(email) = $1 ORDER BY id")
 						.bind(mailbox.as_str())
 						.fetch_all(&mut *tx)
 						.await
 						.map_err(repo_err)?;
-					match matches.as_slice() {
-						[] => resolution.missing_mailboxes.push(mailbox.clone()),
+					let mut seatable: Vec<Uuid> = Vec::new();
+					let mut blocked: Option<UnseatableReason> = None;
+					for row in &rows {
+						let id: Uuid = row.try_get("id").map_err(repo_err)?;
+						let verified: bool = row.try_get("email_verified").map_err(repo_err)?;
+						let status: String = row.try_get("status").map_err(repo_err)?;
+						// AN ADDRESS IS NOT AN IDENTITY. The directory stores whatever the IdP
+						// claimed, and an unverified sign-in works on purpose so that nothing
+						// downstream trusts the address silently. This is the one path that turns a
+						// configured string into a seat, and a seat cannot be taken back, so it
+						// resolves only through verified rows.
+						if !verified {
+							blocked.get_or_insert(UnseatableReason::AddressUnverified);
+						} else if status != UserStatus::Active.as_str() {
+							blocked = Some(UnseatableReason::Disabled);
+						} else {
+							seatable.push(id);
+						}
+					}
+					match seatable.as_slice() {
+						[] => match blocked {
+							Some(reason) => resolution.unseatable.push(Unseatable {
+								named: mailbox.as_str().to_owned(),
+								reason,
+							}),
+							None => resolution.missing_mailboxes.push(mailbox.clone()),
+						},
 						[only] => remember(&mut resolution.found, UserId::from_raw(*only)),
 						// `users.email` is deliberately NOT unique (a person may change it behind a
-						// stable auth subject), so this is reachable — and a seat handed to the wrong
-						// person is one the owner floor will not let anyone take back. Refuse the
-						// whole roster rather than guess.
+						// stable auth subject, and a recreated account gets a new one), so two
+						// VERIFIED rows can still answer to one address — and a seat handed to the
+						// wrong person is one the owner floor will not let anyone take back. Refuse
+						// the whole roster rather than guess.
+						//
+						// Filtering to seatable rows BEFORE deciding this is what stops an
+						// impostor's unverified copy of a founder's address from deadlocking genesis
+						// permanently — which, leaving the registry empty, would hold emergency
+						// access open indefinitely.
 						many => {
 							return Ok(GenesisOutcome::Ambiguous {
 								mailbox: mailbox.clone(),

@@ -13,8 +13,10 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use concierge::{
-	genesis::{self, GenesisOutcome},
+	genesis::{self, GenesisOutcome, Unseatable, UnseatableReason},
 	infrastructure::{db, governance::PgGovernance, users::PgUsers},
 	ports::UserDirectoryRepository,
 };
@@ -38,6 +40,9 @@ struct Fixture {
 
 async fn setup() -> Option<Fixture> {
 	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+	// This suite clears the owner registry — a state no API can restore. Never on a
+	// database nobody has declared disposable.
+	common::assert_disposable_database();
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 
@@ -68,6 +73,18 @@ impl Fixture {
 		let address = format!("genesis-{}@example.com", Uuid::new_v4());
 		let id = self.users.provision(subject, Email::parse(&address).unwrap(), true).await.expect("provision").id();
 		(id, address)
+	}
+
+	/// A user whose address the identity provider never verified — exactly what an
+	/// ordinary Google sign-in with an unverified claim produces, which this plane keeps
+	/// working on purpose so that nothing downstream trusts an address silently.
+	async fn unverified_user(&self, address: &str) -> UserId {
+		let subject = AuthSubject::parse(&format!("genesis-unverified-{}", Uuid::new_v4())).unwrap();
+		self.users.provision(subject, Email::parse(address).unwrap(), false).await.expect("provision").id()
+	}
+
+	async fn disable(&self, id: UserId) {
+		self.users.disable_user(id).await.expect("disable");
 	}
 
 	async fn seed(&self, subjects: &[String]) -> GenesisOutcome {
@@ -187,8 +204,11 @@ async fn an_ambiguous_mailbox_seats_nobody() {
 	let (first, shared) = fx.user().await;
 	let (second, _) = fx.user().await;
 	let (third, _) = fx.user().await;
-	// Only Postgres can produce the collision; the directory always writes a fresh row per
-	// auth subject and never checks addresses against each other.
+	// Reached for directly only because it is shorter than driving two sign-ins — this
+	// collision is entirely producible through the front door. The directory writes
+	// whatever address the identity provider claimed and never compares addresses across
+	// rows, so two auth subjects naming one mailbox (a recreated Workspace account, say)
+	// is an ordinary outcome rather than a corrupted database.
 	sqlx::query("UPDATE users SET email = $1 WHERE id = $2")
 		.bind(&shared)
 		.bind(second.raw())
@@ -252,6 +272,108 @@ async fn a_populated_registry_is_never_re_seeded() {
 	assert_eq!(fx.role_of(latecomer).await, Role::Investor, "the list is inert once the fund exists");
 	assert_eq!(fx.role_of(first).await, Role::Owner);
 	assert_eq!(fx.role_of(second).await, Role::Owner);
+}
+
+/// The seat-theft path, and the reason a mailbox resolves only through a verified row.
+///
+/// An address is not an identity: the directory stores whatever the identity provider
+/// claimed, and an unverified sign-in works on purpose. So before a founder has ever
+/// signed in, anyone who can present an unverified claim for their address owns the only
+/// row that address answers to. Seating them would be permanent — the owner floor forbids
+/// taking a seat back — and would put them on the money plane's roster.
+#[tokio::test]
+async fn an_unverified_claim_on_a_founders_address_cannot_take_their_seat() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let founder_address = format!("founder-{}@example.com", Uuid::new_v4());
+	let impostor = fx.unverified_user(&founder_address).await;
+	// The real founder has not signed in yet, so this address answers to the impostor and
+	// to nobody else.
+	let (colleague, colleague_mail) = fx.user().await;
+
+	let outcome = fx.seed(&[founder_address.clone(), colleague_mail]).await;
+
+	let GenesisOutcome::TooFew(resolution) = outcome else {
+		panic!("expected a refusal, got {outcome:?}");
+	};
+	assert_eq!(resolution.found, vec![colleague], "only the verified colleague resolved");
+	assert_eq!(
+		resolution.unseatable,
+		vec![Unseatable {
+			named: founder_address,
+			reason: UnseatableReason::AddressUnverified,
+		}],
+		"the refusal has to name the address AND say why, or the operator cannot tell it from 'not signed in yet'"
+	);
+	assert_eq!(fx.role_of(impostor).await, Role::Investor, "an unverified claim is not a founder");
+	assert_eq!(fx.role_of(colleague).await, Role::Investor, "and a refusal seats nobody at all");
+}
+
+/// The other half of the same rule: filtering happens BEFORE ambiguity is decided, so an
+/// impostor's unverified copy of a founder's address cannot deadlock genesis. If it
+/// could, the registry would stay empty — and emergency access, gated on that same
+/// emptiness, would stay open indefinitely.
+#[tokio::test]
+async fn an_unverified_duplicate_does_not_deadlock_a_verified_founder() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let (founder, founder_address) = fx.user().await;
+	let impostor = fx.unverified_user(&founder_address).await;
+	let (colleague, colleague_mail) = fx.user().await;
+
+	let outcome = fx.seed(&[founder_address, colleague_mail]).await;
+
+	let GenesisOutcome::Seated(resolution) = outcome else {
+		panic!("the verified founder must win outright, got {outcome:?}");
+	};
+	assert_eq!(resolution.found.len(), 2);
+	assert_eq!(fx.role_of(founder).await, Role::Owner);
+	assert_eq!(fx.role_of(colleague).await, Role::Owner);
+	assert_eq!(fx.role_of(impostor).await, Role::Investor, "the unverified row is not a candidate for anything");
+}
+
+/// A disabled founder seated here is an owner who can neither act — every RPC is refused
+/// at the gate — nor be removed, because the floor refuses to drop below MIN_OWNERS. With
+/// the registry non-empty, emergency access is latched shut too. Nothing but production
+/// SQL repairs that fund, so both entry forms refuse a disabled account.
+#[tokio::test]
+async fn a_disabled_account_is_never_seated_by_either_entry_form() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let (by_mailbox, mailbox) = fx.user().await;
+	let (by_id, _) = fx.user().await;
+	let (healthy, healthy_mail) = fx.user().await;
+	fx.disable(by_mailbox).await;
+	fx.disable(by_id).await;
+
+	let outcome = fx.seed(&[mailbox.clone(), by_id.to_string(), healthy_mail]).await;
+
+	let GenesisOutcome::TooFew(resolution) = outcome else {
+		panic!("expected a refusal, got {outcome:?}");
+	};
+	assert_eq!(resolution.found, vec![healthy], "only the active account resolved");
+	assert!(resolution.missing_ids.is_empty(), "the id exists — it is refused, not missing");
+	assert!(resolution.missing_mailboxes.is_empty(), "the address exists too");
+	assert_eq!(
+		resolution.unseatable,
+		vec![
+			Unseatable {
+				named: mailbox,
+				reason: UnseatableReason::Disabled,
+			},
+			Unseatable {
+				named: by_id.to_string(),
+				reason: UnseatableReason::Disabled,
+			},
+		],
+		"both forms refuse, and both name the account so the operator fixes the account rather than the list"
+	);
+	for id in [by_mailbox, by_id, healthy] {
+		assert_eq!(fx.role_of(id).await, Role::Investor);
+	}
 }
 
 #[tokio::test]

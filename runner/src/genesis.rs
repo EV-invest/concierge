@@ -12,7 +12,7 @@
 //! 1. If the persisted registry already holds anyone, do nothing, ever again. Genesis
 //!    is closed and `OWNER_SUBJECTS` is inert from then on.
 //! 2. Otherwise resolve every entry against `users`. An entry is either a canonical
-//!    user id (a UUID) or an e-mail address.
+//!    user id (a UUID) or an e-mail address. Only a SEATABLE row counts — see below.
 //! 3. If fewer than [`MIN_OWNERS`] resolve, seat NOBODY. A fund of one cannot admit a
 //!    second owner — admission needs a non-empty "every owner but the initiator" — so
 //!    seating one person would build a dead end, not a start.
@@ -30,6 +30,28 @@
 //! at which at least two of them resolve. An address with no row yet is therefore the
 //! EXPECTED state, logged at `info`; a UUID with no row is a typo, because an id can
 //! only have been copied from a row that exists.
+//!
+//! # What "seatable" means, and why the two forms differ
+//!
+//! An ADDRESS IS NOT AN IDENTITY. The directory stores whatever the identity provider
+//! claimed, verified or not — an unverified Google sign-in works on purpose, so that
+//! nothing downstream trusts the address silently. Genesis is downstream, and it is the
+//! one path that turns a string from the environment into a seat, so it must not be the
+//! place that trusts it: a mailbox resolves only through rows with `email_verified`.
+//! Without that, anyone who can present an unverified claim for a founder's address —
+//! before that founder's own first sign-in — is seated in their place, permanently,
+//! because the owner floor forbids taking a seat back. Naming someone by canonical id
+//! needs no such guard: the id IS the identity, and it can only have been read off the
+//! row it names.
+//!
+//! BOTH forms require an ACTIVE account. A disabled founder seated here is an owner who
+//! can neither act (every RPC is refused at the gate) nor be removed (the floor refuses
+//! to drop below [`MIN_OWNERS`]) — and with the registry non-empty, emergency access is
+//! already latched shut. That is a fund nothing but production SQL can repair.
+//!
+//! A row that exists but is not seatable is reported BY NAME ([`Unseatable`]) rather
+//! than silently skipped, because the operator's list is right and the account is what
+//! needs fixing.
 //!
 //! # Why this can only ever happen once
 //!
@@ -78,12 +100,43 @@ pub fn classify(raw: &[String]) -> Result<Vec<GenesisSubject>, String> {
 /// naming the same person by both id and mailbox counts once.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Resolution {
-	/// Entries that named an existing user.
+	/// Entries that named a SEATABLE user.
 	pub found: Vec<UserId>,
 	/// Configured ids with no `users` row — a wrong UUID.
 	pub missing_ids: Vec<UserId>,
-	/// Configured mailboxes nobody has signed in with yet. The ordinary waiting state.
+	/// Configured mailboxes no seatable row answers to. The ordinary waiting state.
 	pub missing_mailboxes: Vec<Email>,
+	/// Entries that DID name a real row the fund must not be seated with.
+	pub unseatable: Vec<Unseatable>,
+}
+
+/// A name the list carried that resolves to a row genesis refuses to seat, and why.
+/// Reported individually so the operator can see which account to fix rather than
+/// guessing why the roster came up short.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Unseatable {
+	/// The entry as the operator wrote it — an id or an address.
+	pub named: String,
+	pub reason: UnseatableReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnseatableReason {
+	/// The account is disabled. Seating it produces an owner who can neither act nor be
+	/// removed, and by then emergency access is already latched shut.
+	Disabled,
+	/// The address answers only to rows the identity provider never verified. An address
+	/// is not an identity; see the module docs.
+	AddressUnverified,
+}
+
+impl UnseatableReason {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Disabled => "the account is disabled",
+			Self::AddressUnverified => "no VERIFIED account holds that address",
+		}
+	}
 }
 
 /// The branch genesis took. Returned rather than only logged, so each one is
@@ -97,7 +150,11 @@ pub enum GenesisOutcome {
 	Malformed { entry: String },
 	/// The registry already holds owners. The permanent end state.
 	Closed { owners: i64 },
-	/// A configured mailbox matches more than one user. Refuse to guess which.
+	/// A configured mailbox matches more than one SEATABLE user. Refuse to guess which.
+	/// Unverified and disabled rows are filtered out before this is decided, so an
+	/// impostor holding an unverified copy of a founder's address cannot deadlock
+	/// genesis — which, with the registry left empty, would keep emergency access open
+	/// indefinitely.
 	Ambiguous { mailbox: Email, matches: i64 },
 	/// Fewer than [`MIN_OWNERS`] resolved — nobody seated, retried next boot.
 	TooFew(Resolution),
@@ -158,6 +215,13 @@ fn report_unresolved(resolution: &Resolution) {
 	}
 	for mailbox in &resolution.missing_mailboxes {
 		tracing::info!(%mailbox, "OWNER_SUBJECTS names an address that has never signed in — genesis waits for them");
+	}
+	for entry in &resolution.unseatable {
+		tracing::warn!(
+			named = %entry.named,
+			reason = entry.reason.as_str(),
+			"OWNER_SUBJECTS names an account genesis refuses to seat — fix the account, not the list"
+		);
 	}
 }
 

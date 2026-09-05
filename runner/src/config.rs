@@ -18,11 +18,15 @@ ev::settings! {
 		/// long before the person's first sign-in mints their id, so the list can be filled
 		/// in ahead of time and resolves itself once they log in.
 		///
-		/// It does TWO things, both of which switch themselves off for good the moment the
+		/// It feeds two things, and both switch themselves off for good the moment the
 		/// persisted owner registry stops being empty:
-		///   * the genesis seed writes these people into `users.role` (see `crate::genesis`);
-		///   * until that lands, a listed subject authorizes as `Role::Owner` so the console
-		///     is not locked out of a fund that has no owners yet (`crate::authz`).
+		///   * the genesis seed writes these people into `users.role` (see `crate::genesis`).
+		///     It reads BOTH forms, and a mailbox resolves only through a VERIFIED, active
+		///     account — an address is not an identity;
+		///   * until that lands, a listed USER ID authorizes as `Role::Owner`, so the console
+		///     is not locked out of a fund that has no owners yet (`crate::authz`). An
+		///     address cannot do this: a token's `sub` is always a canonical user id, so
+		///     there is nothing for an address to match.
 		///
 		/// Empty ⇒ neither happens. After genesis it is inert forever: the roster can never
 		/// return to zero, because both expulsion and `ResignOwnership` stop at
