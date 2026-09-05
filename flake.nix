@@ -336,6 +336,12 @@
             env.PROTOC = "${pkgs.protobuf}/bin/protoc";
             env.DYLD_FALLBACK_LIBRARY_PATH = "${rust}/lib";
             env.RUSTC_WRAPPER = "sccache";
+            # The governance/authz/genesis suites CLEAR the owner registry of whatever
+            # DATABASE_URL points at, and no API can put it back (the owner floor forbids
+            # dropping below MIN_OWNERS). They refuse to run without this marker, so a
+            # `cargo test` typed in a shell whose DATABASE_URL happens to reach production
+            # aborts instead of emptying the roster. Set for the dev shell and nowhere else.
+            env.CONCIERGE_TEST_DB = "1";
           };
       }
     );

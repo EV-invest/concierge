@@ -19,6 +19,8 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use concierge::{
 	authz::{BreakGlass, require_permission},
 	directory::{self, Directory},
@@ -48,6 +50,9 @@ struct Fixture {
 
 async fn setup() -> Option<Fixture> {
 	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+	// This suite clears the owner registry — a state no API can restore. Never on a
+	// database nobody has declared disposable.
+	common::assert_disposable_database();
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 
