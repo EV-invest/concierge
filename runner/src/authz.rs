@@ -23,6 +23,11 @@
 //! otherwise                   →  only users.role counts; the list means nothing
 //! ```
 //!
+//! Only the ids in that list elevate. `OWNER_SUBJECTS` also accepts e-mail addresses so
+//! the roster can be written down before anyone's first sign-in mints their id, but a
+//! token `sub` is always a canonical user id — so an address SEEDS ([`crate::genesis`])
+//! and never opens a console.
+//!
 //! This is a one-way door, and it is safe for a reason the domain already enforces
 //! rather than one this module asserts: the registry can never fall back to zero. Both
 //! expulsion and `ResignOwnership` refuse below `MIN_OWNERS`
@@ -128,7 +133,15 @@ impl EffectiveRole {
 /// Shared by every surface that resolves or reports a role, so the rule is stated once
 /// and cannot drift between the gate and what the console draws.
 pub struct BreakGlass {
+	/// The list exactly as configured — what [`crate::genesis`] resolves.
 	subjects: Vec<String>,
+	/// The subset that can ever match a token `sub`, canonicalized.
+	///
+	/// `OWNER_SUBJECTS` accepts an e-mail so the roster can be written down before anyone
+	/// has signed in, but a `sub` is always a canonical user id — so an address can only
+	/// ever SEED, never elevate. Deriving that subset once, here, keeps the two behaviours
+	/// from disagreeing about what an entry does.
+	elevates: Vec<String>,
 	/// Latched `true` the first time a persisted owner is observed, and never cleared.
 	///
 	/// Caching a mutable fact is normally a bug; this one is sound because the fact is
@@ -141,15 +154,24 @@ pub struct BreakGlass {
 }
 
 impl BreakGlass {
-	/// An empty list elevates nobody, which is the right posture for every deployment
-	/// that has already been through genesis.
+	/// Ids are canonicalized exactly the way [`crate::genesis::classify`] canonicalizes
+	/// them — trimmed, then re-rendered from the parsed UUID, so case and padding stop
+	/// mattering. Matching raw strings instead meant an entry like `" 550E8400-…"` seated
+	/// a founder but never opened their console: a failure in the safe direction, but a
+	/// disagreement all the same.
+	///
+	/// An empty list elevates nobody, which is the right posture for every deployment that
+	/// has already been through genesis.
 	pub fn new(subjects: Vec<String>) -> Self {
+		let elevates = subjects.iter().filter_map(|entry| Uuid::parse_str(entry.trim()).ok()).map(|id| id.to_string()).collect();
 		Self {
 			subjects,
+			elevates,
 			sealed: AtomicBool::new(false),
 		}
 	}
 
+	/// The list exactly as configured — what the genesis seed resolves.
 	pub fn subjects(&self) -> &[String] {
 		&self.subjects
 	}
@@ -161,11 +183,11 @@ impl BreakGlass {
 	/// A control-plane read failure resolves to "sealed": a database blip must not be
 	/// able to hand [`Role::Owner`] to an environment-listed subject.
 	pub async fn snapshot<'a>(&'a self, users: &dyn UserDirectoryRepository) -> Elevation<'a> {
-		if self.subjects.is_empty() || self.sealed.load(Ordering::Relaxed) {
+		if self.elevates.is_empty() || self.sealed.load(Ordering::Relaxed) {
 			return Elevation { subjects: None };
 		}
 		match users.owner_count().await {
-			Ok(0) => Elevation { subjects: Some(&self.subjects) },
+			Ok(0) => Elevation { subjects: Some(&self.elevates) },
 			Ok(_) => {
 				self.sealed.store(true, Ordering::Relaxed);
 				Elevation { subjects: None }
