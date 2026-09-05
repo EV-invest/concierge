@@ -74,6 +74,11 @@ message UserProfile {
   // The user's platform access role (snake_case: investor/operator/admin/owner).
   // Admin-managed via SetRole; read-only here.
   string role = 17;
+  // True when `role` above came from the OWNER_SUBJECTS emergency allowlist rather than
+  // from `users.role`. See UserSummary.role_is_break_glass in auth.proto — same flag,
+  // same meaning: real authority, granted by the environment while the fund has no
+  // persisted owner, seating nobody. Render it as a warning, never as ownership.
+  bool role_is_break_glass = 18;
 }
 
 // The caller's editable profile, full-replace. Same 10 fields as the editable part of
@@ -132,6 +137,10 @@ message AdminUserSummary {
   uint64 token_version = 6;
   // Unix SECONDS the user was provisioned (joined).
   int64 created_at = 7;
+  // True when `role` above came from the OWNER_SUBJECTS emergency allowlist rather than
+  // from `users.role` — see UserProfile.role_is_break_glass. This is the field that
+  // stops the console listing an "owner" the consilium has never heard of.
+  bool role_is_break_glass = 8;
 }
 
 message ListUsersRequest {

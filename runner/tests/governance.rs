@@ -19,7 +19,10 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use concierge::{
+	authz::BreakGlass,
 	directory::Directory,
 	governance::Governance,
 	infrastructure::{
@@ -59,6 +62,9 @@ struct Fixture {
 
 async fn setup() -> Option<Fixture> {
 	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+	// This suite clears the owner registry — a state no API can restore. Never on a
+	// database nobody has declared disposable.
+	common::assert_disposable_database();
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 
@@ -102,15 +108,20 @@ impl Fixture {
 		self.users.provision(subject, email, true).await.expect("provision").id()
 	}
 
-	/// The directory service over the same adapter, with no break-glass allowlist.
+	/// The directory service over the same adapter, with no emergency allowlist.
 	fn directory(&self) -> Directory {
-		Directory::new(self.users.clone(), Arc::new(Vec::new()))
+		Directory::new(self.users.clone(), Arc::new(BreakGlass::new(Vec::new())))
 	}
 
-	/// The consilium service as an `ADMIN_SUBJECTS`-listed operator sees it.
-	fn service_with_admin(&self, admin: UserId) -> Governance {
+	/// The directory service as an `OWNER_SUBJECTS`-listed operator sees it.
+	fn directory_with_break_glass(&self, subject: UserId) -> Directory {
+		Directory::new(self.users.clone(), Arc::new(BreakGlass::new(vec![subject.to_string()])))
+	}
+
+	/// The consilium service as an `OWNER_SUBJECTS`-listed operator sees it.
+	fn service_with_break_glass(&self, subject: UserId) -> Governance {
 		let (revisions, _) = tokio::sync::broadcast::channel(8);
-		Governance::new(self.users.clone(), Arc::new(vec![admin.to_string()]), self.governance.clone(), revisions)
+		Governance::new(self.users.clone(), Arc::new(BreakGlass::new(vec![subject.to_string()])), self.governance.clone(), revisions)
 	}
 
 	/// A roster of `n` owners, returned in a stable order.
@@ -122,11 +133,11 @@ impl Fixture {
 		owners
 	}
 
-	/// The gRPC service over the same adapters, with no break-glass allowlist — so the
+	/// The gRPC service over the same adapters, with no emergency allowlist — so the
 	/// gate has only the PERSISTED role to decide on.
 	fn service(&self) -> Governance {
 		let (revisions, _) = tokio::sync::broadcast::channel(8);
-		Governance::new(self.users.clone(), Arc::new(Vec::new()), self.governance.clone(), revisions)
+		Governance::new(self.users.clone(), Arc::new(BreakGlass::new(Vec::new())), self.governance.clone(), revisions)
 	}
 
 	async fn role_of(&self, id: UserId) -> Role {
@@ -820,51 +831,94 @@ async fn set_role_refuses_to_mint_or_to_strip_an_owner() {
 	assert_eq!(fx.role_of(candidate).await, Role::Admin);
 }
 
-/// The bootstrap carve-out, stated as a test so its narrowness is checked rather than
-/// asserted in a comment. An admission needs a non-empty `owners \ {initiator}`, so it
-/// cannot produce the SECOND owner; without this a fund could never start.
+/// The bootstrap carve-out that used to live in `guard_ownership` is GONE, and this is
+/// the test that keeps it gone. It seated the second owner directly while the roster was
+/// smaller than two — precisely the window in which emergency access is live, so it
+/// handed an `OWNER_SUBJECTS`-listed operator a way to build a roster of their own. The
+/// first seats now come from the genesis seed, which runs at boot with no request behind
+/// it, and `SetRole` refuses `owner` at every roster size including zero.
 #[tokio::test]
-async fn the_second_owner_may_be_seated_directly_and_the_third_may_not() {
+async fn set_role_refuses_to_seat_an_owner_even_on_an_empty_registry() {
 	let Some(fx) = setup().await else {
 		return;
 	};
-	let founder = fx.owner().await;
-	let second = fx.user().await;
-	let third = fx.user().await;
-	let directory = fx.directory();
+	// `setup` leaves the registry empty — the one state the carve-out used to fire in.
+	let operator = fx.user().await;
+	let candidate = fx.user().await;
+	// The caller is authorized by emergency access itself (there is no persisted owner to
+	// authorize them), so this is the most permissive caller the plane can ever produce.
+	let directory = fx.directory_with_break_glass(operator);
 
-	directory
-		.set_role(as_user(
-			founder,
-			SetRoleRequest {
-				user_id: second.to_string(),
-				role: "owner".into(),
-			},
-		))
-		.await
-		.expect("one owner may seat the second, or no fund could ever start");
-	assert_eq!(fx.role_of(second).await, Role::Owner);
-
-	// From two on, the consilium is the only way in — which is exactly where a
-	// sock-puppet attack would have to begin.
 	let err = directory
 		.set_role(as_user(
-			founder,
+			operator,
 			SetRoleRequest {
-				user_id: third.to_string(),
+				user_id: candidate.to_string(),
 				role: "owner".into(),
 			},
 		))
 		.await
 		.unwrap_err();
 	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-	assert_eq!(fx.role_of(third).await, Role::Investor);
+	assert!(err.message().contains("OpenOwnerAdmission"), "the refusal points at the consilium: {err}");
+	assert_eq!(fx.role_of(candidate).await, Role::Investor, "an empty registry is not a licence to seat anyone");
+
+	// The rest of the console still works on that same authority — emergency access
+	// grants `operator`/`admin`, it just never grants a seat.
+	directory
+		.set_role(as_user(
+			operator,
+			SetRoleRequest {
+				user_id: candidate.to_string(),
+				role: "admin".into(),
+			},
+		))
+		.await
+		.expect("an ordinary role change is exactly what emergency access is for");
+	assert_eq!(fx.role_of(candidate).await, Role::Admin);
 }
 
-/// Break-glass authorizes; it does not seat. An `ADMIN_SUBJECTS`-listed operator holds
-/// `Role::Owner` for the RBAC gate WITHOUT it being persisted, so if the roster were
-/// read through `effective_role` they would silently hold a vote in every consilium —
-/// and on a quiet fund of two, a majority.
+/// Emergency access is self-extinguishing: the moment the registry holds one owner, an
+/// `OWNER_SUBJECTS`-listed subject is nobody again. Before that it authorizes, and this
+/// test pins both halves — including the fact that an authorized operator is still not a
+/// SEAT, so they hold no vote in any consilium.
+#[tokio::test]
+async fn break_glass_authorizes_on_an_empty_registry_and_nothing_once_it_fills() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let operator = fx.user().await;
+	let service = fx.service_with_break_glass(operator);
+
+	// Empty registry: the gate lets them in.
+	let roster = service
+		.list_owners(as_user(operator, ListOwnersRequest {}))
+		.await
+		.expect("emergency access authorizes while the fund has no owners")
+		.into_inner();
+	assert!(roster.items.is_empty(), "authorized, but there is no roster to be on");
+
+	// Seat two owners the only way a fixture can, and emergency access is over — for a
+	// service that had already observed the empty state, which is what makes the latch
+	// worth testing rather than assuming.
+	let owners = fx.roster(2).await;
+	let err = service.list_owners(as_user(operator, ListOwnersRequest {})).await.unwrap_err();
+	assert_eq!(err.code(), Code::PermissionDenied, "the first owner closes emergency access: {err}");
+
+	// And it stays closed: the latch is one-way, so even a fresh service instance — which
+	// has to read the registry rather than remember it — refuses.
+	let fresh = fx.service_with_break_glass(operator);
+	let err = fresh.list_owners(as_user(operator, ListOwnersRequest {})).await.unwrap_err();
+	assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+	assert_eq!(owners.len(), 2);
+}
+
+/// Emergency access never becomes a seat. On a populated fund an `OWNER_SUBJECTS`-listed
+/// operator holds nothing at all — but the assertions below go further than the gate and
+/// pin the consilium itself: they are not on the roster, they cannot open either
+/// proposal, and they are not snapshotted as a voter. That last one is what would
+/// otherwise have handed them a vote in every consilium, and on a quiet fund of two, a
+/// majority.
 #[tokio::test]
 async fn a_break_glass_operator_holds_no_seat_in_any_consilium() {
 	let Some(fx) = setup().await else {
@@ -872,16 +926,17 @@ async fn a_break_glass_operator_holds_no_seat_in_any_consilium() {
 	};
 	let owners = fx.roster(3).await;
 	let operator = fx.user().await;
-	let service = fx.service_with_admin(operator);
+	// A real owner reads the roster, so the assertion below is about who is ON it rather
+	// than about who may look.
+	let service = fx.service_with_break_glass(operator);
 
-	// The gate lets them in: this is a real break-glass principal, not a stranger.
 	let roster = service
-		.list_owners(as_user(operator, ListOwnersRequest {}))
+		.list_owners(as_user(owners[0], ListOwnersRequest {}))
 		.await
-		.expect("the allowlist authorizes them")
+		.expect("an owner reads the roster")
 		.into_inner();
-	assert_eq!(roster.items.len(), 3, "but the roster counts persisted seats only");
-	assert!(!roster.items.iter().any(|o| o.user_id == operator.to_string()), "they are not on it");
+	assert_eq!(roster.items.len(), 3, "the roster counts persisted seats only");
+	assert!(!roster.items.iter().any(|o| o.user_id == operator.to_string()), "the env-listed operator is not on it");
 
 	// They cannot be the initiator of either consilium: both read the persisted roster.
 	let err = service
@@ -969,6 +1024,61 @@ fn as_user<T>(id: UserId, inner: T) -> Request<T> {
 		token_version: 0,
 	});
 	request
+}
+
+/// The TOCTOU window `SetRole` used to leave open, closed and pinned.
+///
+/// The guard used to read the target's role on its own connection and only then open the
+/// write transaction. An admission committing in between was invisible to it, so a
+/// demotion aimed at the candidate saw `holds_seat = false`, passed both refusals, and
+/// then blocked on the row until the consilium committed — stripping the seat it had just
+/// granted, with no consilium, no floor check and no `governance_event` row. This plane's
+/// "exactly two writers of `owner`" invariant was false for the width of that window.
+///
+/// The race is constructed rather than raced for: a transaction that has already seated
+/// the candidate holds their row, the demotion is issued while that lock is held, and the
+/// seat is committed underneath it. The demotion cannot answer before the commit lands,
+/// so a pass here means the decision was taken from the post-commit row.
+#[tokio::test]
+async fn set_role_cannot_strip_a_seat_granted_while_it_was_deciding() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owners = fx.roster(2).await;
+	let candidate = fx.user().await;
+	let directory = fx.directory();
+
+	// Stand in for an admission carrying its verdict: the seat is written and the
+	// candidate's row held, exactly as `grant_seat` leaves it mid-transaction.
+	let url = std::env::var("DATABASE_URL").expect("setup already required it");
+	let mut seating = PgConnection::connect(&url).await.expect("a connection for the seating transaction");
+	sqlx::query("BEGIN").execute(&mut seating).await.expect("begin");
+	sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1")
+		.bind(candidate.raw())
+		.execute(&mut seating)
+		.await
+		.expect("seat the candidate, uncommitted");
+
+	let demotion = directory.set_role(as_user(
+		owners[0],
+		SetRoleRequest {
+			user_id: candidate.to_string(),
+			role: "investor".into(),
+		},
+	));
+	let commit = async {
+		// Long enough for the demotion to reach the row lock it has to wait on. If it has
+		// not got there yet the test still passes — it merely stops being able to catch the
+		// old bug — so this can never become a false failure.
+		tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+		sqlx::query("COMMIT").execute(&mut seating).await.expect("commit the seat");
+	};
+	let (result, ()) = tokio::join!(demotion, commit);
+
+	let err = result.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "the demotion must see the committed seat: {err}");
+	assert!(err.message().contains("OpenOwnerRemoval"), "and be pointed at the consilium: {err}");
+	assert_eq!(fx.role_of(candidate).await, Role::Owner, "the seat the consilium granted survives");
 }
 
 /// Every RPC on the consilium is Owner-only, through the SHARED RBAC gate. An admin —

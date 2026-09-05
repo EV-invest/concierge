@@ -24,12 +24,29 @@ use domain::{
 };
 use uuid::Uuid;
 
-use crate::infrastructure::{
-	governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision},
-	notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
-	platform::{FeatureFlagRow, PlatformConfigRow},
-	users::{AdminUserRow, AuthzRecord},
+use crate::{
+	genesis::{GenesisOutcome, GenesisSubject},
+	infrastructure::{
+		governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision},
+		notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
+		platform::{FeatureFlagRow, PlatformConfigRow},
+		users::{AdminUserRow, AuthzRecord},
+	},
 };
+
+/// The verdict of [`UserDirectoryRepository::set_role_outside_ownership`]. A refusal is
+/// an ordinary answer rather than an error, so the caller keeps the wording of the two
+/// refusals — each names the RPC that DOES do the job — next to the RPC that issues them,
+/// instead of threading gRPC vocabulary through the adapter.
+pub enum RoleChange {
+	/// Boxed only to keep the enum small: the aggregate dwarfs the two refusals, which
+	/// carry nothing.
+	Applied(Box<User>),
+	/// The target holds no seat and `Owner` was asked for.
+	WouldGrantOwnership,
+	/// The target holds a seat and something other than `Owner` was asked for.
+	WouldTakeOwnership,
+}
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
 #[async_trait]
@@ -56,12 +73,38 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// Set a user's KYC level; emits KYC_CHANGED.
 	async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError>;
 
-	/// Set a user's platform access role; emits ROLE_CHANGED across the bridge.
+	/// Set a user's platform access role UNCONDITIONALLY; emits ROLE_CHANGED across the
+	/// bridge.
+	///
+	/// ⚠️ THIS WRITES `owner` IF ASKED TO. It is the raw writer the genesis seed and the
+	/// consilium are built on, not a handler's tool — a request-driven path must call
+	/// [`Self::set_role_outside_ownership`] instead, or the "exactly two writers of
+	/// `owner`" invariant this plane rests on is simply untrue.
 	async fn set_role(&self, id: UserId, role: Role) -> Result<User, DomainError>;
+
+	/// Set a role, refusing BOTH directions of ownership, with the decision taken inside
+	/// the write transaction from the target row held `FOR UPDATE`.
+	///
+	/// The atomicity is the point, not a detail. Read on a separate connection, the check
+	/// is a TOCTOU window: an admission committing in between is invisible to it, so a
+	/// concurrent `SetRole(candidate, "investor")` sees `holds_seat = false`, sails past
+	/// both refusals, and then blocks on the row until the consilium commits — stripping
+	/// the seat it had just granted, with no consilium, no floor check and no audit row.
+	/// Holding the row across the decision makes the two paths serialize instead.
+	///
+	/// Taking only the target's row cannot deadlock against the consilium: that path
+	/// acquires the governance revision row, then the owner rows, then the target's, then
+	/// the outbox advisory lock — this one acquires a suffix of the same order.
+	async fn set_role_outside_ownership(&self, id: UserId, role: Role) -> Result<RoleChange, DomainError>;
 
 	/// The role + status + authoritative `token_version` the authz gates decide on.
 	/// `None` when the user does not exist.
 	async fn authz_record(&self, id: UserId) -> Result<Option<AuthzRecord>, DomainError>;
+
+	/// How many people HOLD a seat, counted straight from `users.role`. This is the
+	/// number emergency access latches on ([`crate::authz::BreakGlass`]) — never a
+	/// count that could include someone merely authorizing as an owner.
+	async fn owner_count(&self) -> Result<i64, DomainError>;
 
 	/// The operator console's user list: filtered + paginated summaries plus the total
 	/// matching the filters.
@@ -201,4 +244,20 @@ pub trait GovernanceRepository: Send + Sync {
 	/// Queue one governance mail to a resolved recipient, bypassing notification
 	/// preferences. False when `dedupe_key` had already been accepted.
 	async fn enqueue_mail(&self, user_id: Uuid, recipient: &str, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<bool, DomainError>;
+}
+
+/// Port for the one-shot genesis seeding of the owner registry.
+///
+/// Split from [`GovernanceRepository`] because it is not a consilium use case and has
+/// exactly one caller — the composition root, once per boot. Like every method there,
+/// it is internally atomic: the roster check, the resolution and every seat it grants
+/// are ONE transaction under the governance lock, so two replicas booting together
+/// cannot seat the fund twice.
+#[async_trait]
+pub trait OwnerGenesisRepository: Send + Sync {
+	/// Seat `subjects` iff the registry is still empty and at least
+	/// [`domain::governance::MIN_OWNERS`] of them resolve to an existing user. Returns
+	/// what happened; the caller does the logging, so the branches stay assertable in a
+	/// test rather than only readable in a log.
+	async fn seed_owners(&self, subjects: &[GenesisSubject]) -> Result<GenesisOutcome, DomainError>;
 }

@@ -15,16 +15,22 @@
 //!   so `domain` never depends on `evconcierge_auth` and vice-versa.
 //!
 //! Every role this module RETURNS — provisioner summaries (the issued session's
-//! `UserSummary`), `GetMe`/`GetUser`, `ListUsers` — is the caller's/target's
-//! *effective* role ([`crate::authz::effective_role`]), so `ADMIN_SUBJECTS` break-glass
-//! elevation is visible to the session and the operator console, while the persisted
-//! `users.role` is only ever written by `SetRole` (and is what the bridge mirrors).
+//! `UserSummary`), `GetMe`/`GetUser`, `ListUsers` — is the caller's/target's role as
+//! [`crate::authz::BreakGlass`] resolves it, and every one of them is returned WITH the
+//! `role_is_break_glass` flag naming which of the two sources it came from. That
+//! pairing is the point: an elevated role that did not announce itself is what let the
+//! console draw three owners while the consilium counted zero.
 //!
-//! OWNERSHIP IS NOT A ROLE EDIT. [`Directory::guard_ownership`] makes `SetRole` refuse
-//! to grant or strip `Role::Owner`; both directions go through the consilium in
-//! [`crate::governance`] instead. Without that refusal every control there is
+//! OWNERSHIP IS NOT A ROLE EDIT. `SetRole` refuses to grant or strip `Role::Owner` —
+//! unconditionally, including on a fund with no owners at all — and it refuses from
+//! INSIDE the write transaction, so no consilium can commit between the check and the
+//! write. Both directions go through the consilium in [`crate::governance`], and the
+//! very first seats through the genesis seed ([`crate::genesis`]); those two are the
+//! only writers of `owner` there are. Without that refusal every control there is
 //! decorative: one owner could mint four sock puppets and then carry a payout quorum
-//! legitimately, with every snapshot and re-validation working exactly as designed.
+//! legitimately, with every snapshot and re-validation working exactly as designed —
+//! and while the registry is empty an emergency-elevated operator could do it before
+//! the fund had even started.
 //!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.
@@ -47,26 +53,24 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::{infrastructure::users::AdminUserRow, ports::UserDirectoryRepository, support::domain_to_status};
+use crate::{
+	authz::{BreakGlass, EffectiveRole, Elevation},
+	infrastructure::users::AdminUserRow,
+	ports::{RoleChange, UserDirectoryRepository},
+	support::domain_to_status,
+};
 
 /// The user directory/profile service, backed by the [`UserDirectoryRepository`]
-/// port. Cheaply cloneable (the repo and allowlist are behind `Arc`s). `admins` is
-/// the boot-loaded admin allowlist (env-only — no hot reload).
+/// port. Cheaply cloneable (the repo and the emergency-access rule are behind `Arc`s).
 #[derive(Clone)]
 pub struct Directory {
 	users: Arc<dyn UserDirectoryRepository>,
-	admins: Arc<Vec<String>>,
+	break_glass: Arc<BreakGlass>,
 }
 
 impl Directory {
-	pub fn new(users: Arc<dyn UserDirectoryRepository>, admins: Arc<Vec<String>>) -> Self {
-		Self { users, admins }
-	}
-
-	/// The break-glass allowlist, loaded once at boot. An empty list grants no
-	/// elevation (fail closed).
-	fn admins(&self) -> &[String] {
-		&self.admins
+	pub fn new(users: Arc<dyn UserDirectoryRepository>, break_glass: Arc<BreakGlass>) -> Self {
+		Self { users, break_glass }
 	}
 
 	/// The authenticated caller's own user id (from the access-token `sub`), gated on live
@@ -81,46 +85,42 @@ impl Directory {
 		Ok(id)
 	}
 
-	/// The role the plane reports for `user`: the persisted role with the
-	/// `ADMIN_SUBJECTS` break-glass elevation applied, so profile/admin reads show the
-	/// same authority the RBAC gate grants.
-	fn effective_role_of(&self, user: &User) -> Role {
-		crate::authz::effective_role(user.role(), &user.id().to_string(), self.admins())
+	/// The role the plane reports for `user`, together with whether it came from
+	/// emergency access — so a profile/admin read shows the same authority the RBAC gate
+	/// grants AND says where it came from.
+	async fn effective_role_of(&self, user: &User) -> EffectiveRole {
+		self.elevation().await.role_of(user.role(), &user.id().to_string())
+	}
+
+	/// The break-glass rule frozen for this request. Taken once and applied to every row
+	/// a handler reports, never once per row.
+	async fn elevation(&self) -> Elevation<'_> {
+		self.break_glass.snapshot(self.users.as_ref()).await
 	}
 }
 
 /// Drain provisioning requests from the auth task until the channel closes — the
 /// receiving end of the [`Provisioner`](evconcierge_auth::Provisioner) channel.
-/// `admins` is the break-glass allowlist: the summaries returned here become the
-/// issued session's `UserSummary` (Exchange AND Refresh), so they carry the
-/// effective role and the BFF gates the admin console on the same authority the
-/// RBAC gate grants.
-pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<dyn UserDirectoryRepository>, admins: Arc<Vec<String>>) {
+/// The summaries returned here become the issued session's `UserSummary` (Exchange AND
+/// Refresh), so they carry the same authority the RBAC gate grants and the same flag
+/// saying whether it is the register's or the environment's.
+pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Arc<dyn UserDirectoryRepository>, break_glass: Arc<BreakGlass>) {
 	while let Some(request) = rx.recv().await {
-		let result = handle(users.as_ref(), request.command, admins.as_ref()).await;
+		let result = handle(users.as_ref(), request.command, break_glass.as_ref()).await;
 		// The auth task may have given up; a dropped responder is not our problem.
 		let _ = request.respond_to.send(result);
 	}
 }
-/// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix,
-/// resolved from the caller's persisted role (with the `ADMIN_SUBJECTS` break-glass).
+
+/// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix.
 async fn require_permission<T>(directory: &Directory, request: &Request<T>, permission: Permission) -> Result<(), Status> {
-	crate::authz::require_permission(directory.users.as_ref(), directory.admins(), request, permission).await
+	crate::authz::require_permission(directory.users.as_ref(), &directory.break_glass, request, permission).await
 }
 
 /// Parse an admin-supplied target `user_id` request field. The caller is already
 /// authorized (`require_permission`), so a malformed value is bad input —
 /// `INVALID_ARGUMENT` — never an auth failure; `UNAUTHENTICATED` is reserved for
 /// the caller's own `sub` in [`Directory::active_caller_id`].
-/// Persisted owners below which `SetRole` will still seat one directly.
-///
-/// An admission needs `owners \ {initiator}` to be non-empty, so it cannot produce the
-/// SECOND owner — a fund of one could never grow, and a fund of zero could never start.
-/// That is a bootstrap deadlock, not a policy, so seating is allowed only while the
-/// persisted roster is smaller than this. From two owners on, the consilium is the only
-/// way in, which is exactly where the sock-puppet attack would have to start.
-const GENESIS_OWNERS: i64 = 2;
-
 fn parse_target_id(raw: &str) -> Result<UserId, Status> {
 	Uuid::parse_str(raw).map(UserId::from_raw).map_err(|_| Status::invalid_argument("user_id is not a valid UUID"))
 }
@@ -134,7 +134,7 @@ impl UserDirectory for Directory {
 	async fn get_me(&self, request: Request<GetMeRequest>) -> Result<Response<UserProfile>, Status> {
 		let id = self.active_caller_id(&request).await?;
 		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
-		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user))))
+		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user).await)))
 	}
 
 	async fn update_profile(&self, request: Request<UpdateProfileRequest>) -> Result<Response<UserProfile>, Status> {
@@ -156,7 +156,7 @@ impl UserDirectory for Directory {
 		})
 		.map_err(domain_to_status)?;
 		let user = self.users.update_profile(id, fields).await.map_err(domain_to_status)?;
-		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user))))
+		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user).await)))
 	}
 
 	async fn revoke_tokens(&self, request: Request<RevokeTokensRequest>) -> Result<Response<RevokeTokensResponse>, Status> {
@@ -210,17 +210,23 @@ impl UserDirectory for Directory {
 			UserStatus::parse(&req.status).map_err(domain_to_status)?;
 		}
 		let (rows, total) = self.users.list(&query, &req.role, &req.status, limit, req.offset as i64).await.map_err(domain_to_status)?;
-		let admins = self.admins();
+		// One snapshot for the whole page: the rule is the same for every row, and asking
+		// per row would be a control-plane read per user listed.
+		let elevation = self.elevation().await;
 		Ok(Response::new(ListUsersResponse {
 			users: rows
 				.into_iter()
 				.map(|row| {
-					let role = match Role::parse(&row.role) {
-						Ok(persisted) => crate::authz::effective_role(persisted, &row.id.to_string(), admins).as_str().to_owned(),
-						// A corrupt stored role must not fail the whole list — surface it verbatim.
-						Err(_) => row.role.clone(),
+					let (role, break_glass) = match Role::parse(&row.role) {
+						Ok(persisted) => {
+							let resolved = elevation.role_of(persisted, &row.id.to_string());
+							(resolved.role.as_str().to_owned(), resolved.break_glass)
+						}
+						// A corrupt stored role must not fail the whole list — surface it verbatim, and
+						// never elevate a value we could not parse.
+						Err(_) => (row.role.clone(), false),
 					};
-					summary_to_proto(row, role)
+					summary_to_proto(row, role, break_glass)
 				})
 				.collect(),
 			total: total as u64,
@@ -231,68 +237,54 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Permission::UserRead).await?;
 		let id = parse_target_id(&request.get_ref().user_id)?;
 		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
-		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user))))
+		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user).await)))
 	}
 
-	async fn set_role(&self, request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
-		require_permission(self, &request, Permission::RoleGrant).await?;
-		let req = request.into_inner();
-		let target = parse_target_id(&req.user_id)?;
-		let role = Role::parse(&req.role).map_err(domain_to_status)?;
-		self.guard_ownership(target, role).await?;
-		let user = self.users.set_role(target, role).await.map_err(domain_to_status)?;
-		Ok(Response::new(SetRoleResponse {
-			role: user.role().as_str().to_owned(),
-		}))
-	}
-}
-
-impl Directory {
-	/// Refuse to grant or strip `Role::Owner` here. A seat is the consilium's to give and
-	/// to take, and this is the check that makes that true rather than merely intended.
+	/// OWNERSHIP IS NOT A ROLE EDIT — refused in both directions, UNCONDITIONALLY, with
+	/// no carve-out for an empty registry.
 	///
 	/// Granting is the dangerous direction. If one owner can mint another they can mint
 	/// four, and a payout consilium of seven with a threshold of four is then carried by
 	/// the puppets alone — legitimately, with the roster snapshot and every re-validation
 	/// behaving exactly as designed. Snapshotting cannot close it, because the stuffing
-	/// happens before the proposal is opened.
+	/// happens before the proposal is opened. Stripping is refused for the mirror reason:
+	/// a bare demotion would be an expulsion with no consilium, no floor check and no
+	/// audit trail. Re-setting the role someone already holds stays a no-op, so a console
+	/// re-submitting an unchanged form does not trip over this.
 	///
-	/// Stripping is refused for the mirror reason: a bare demotion would be an expulsion
-	/// with no consilium, no floor check and no audit trail.
+	/// There used to be a bootstrap carve-out seating the second owner directly while the
+	/// roster was smaller than two. It is gone, and deliberately: emergency access
+	/// ([`crate::authz::BreakGlass`]) is live in exactly that state, so the carve-out
+	/// would have handed an environment-listed operator the power to build a whole roster
+	/// of their own. The first seats come from [`crate::genesis`], at boot, with no
+	/// request behind them.
 	///
-	/// Re-setting the role someone already holds stays a no-op, so a console that
-	/// re-submits an unchanged form does not trip over this.
-	async fn guard_ownership(&self, target: UserId, role: Role) -> Result<(), Status> {
-		// The PERSISTED role, never `effective_role`: break-glass elevation authorizes an
-		// operator, it does not seat them, so it must not decide either branch below.
-		let holds_seat = self.users.find_by_id(target).await.map_err(domain_to_status)?.is_some_and(|user| user.role() == Role::Owner);
-
-		if role == Role::Owner && !holds_seat {
-			if self.persisted_owner_count().await? >= GENESIS_OWNERS {
-				return Err(Status::failed_precondition(
-					"granting ownership goes through GovernanceService.OpenOwnerAdmission, which every other owner must agree to — one owner may not mint another",
-				));
-			}
-			return Ok(());
-		}
-		if holds_seat && role != Role::Owner {
-			return Err(Status::failed_precondition(
+	/// The decision itself lives INSIDE the write transaction
+	/// ([`UserDirectoryRepository::set_role_outside_ownership`]) rather than here. Read
+	/// separately it was a TOCTOU window: an admission committing between the check and
+	/// the write would let a demotion sail past both branches and then strip the seat the
+	/// consilium had just granted — no floor, no audit, and this module's "exactly two
+	/// writers of `owner`" invariant briefly false.
+	async fn set_role(&self, request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
+		require_permission(self, &request, Permission::RoleGrant).await?;
+		let req = request.into_inner();
+		let target = parse_target_id(&req.user_id)?;
+		let role = Role::parse(&req.role).map_err(domain_to_status)?;
+		match self.users.set_role_outside_ownership(target, role).await.map_err(domain_to_status)? {
+			RoleChange::Applied(user) => Ok(Response::new(SetRoleResponse {
+				role: user.role().as_str().to_owned(),
+			})),
+			RoleChange::WouldGrantOwnership => Err(Status::failed_precondition(
+				"granting ownership goes through GovernanceService.OpenOwnerAdmission, which every other owner must agree to — one owner may not mint another",
+			)),
+			RoleChange::WouldTakeOwnership => Err(Status::failed_precondition(
 				"taking ownership away goes through GovernanceService.OpenOwnerRemoval, or ResignOwnership for your own seat",
-			));
+			)),
 		}
-		Ok(())
-	}
-
-	/// How many people actually HOLD a seat. Counted from `users.role` through the same
-	/// filtered list the console uses, so it can never include an `ADMIN_SUBJECTS`
-	/// operator who merely authorizes as one.
-	async fn persisted_owner_count(&self) -> Result<i64, Status> {
-		let (_, total) = self.users.list("", Role::Owner.as_str(), "", 1, 0).await.map_err(domain_to_status)?;
-		Ok(total)
 	}
 }
 
-fn user_to_proto(user: &User, role: Role) -> UserProfile {
+fn user_to_proto(user: &User, resolved: EffectiveRole) -> UserProfile {
 	UserProfile {
 		user_id: user.id().to_string(),
 		email: user.email().as_str().to_owned(),
@@ -310,13 +302,14 @@ fn user_to_proto(user: &User, role: Role) -> UserProfile {
 		base_currency: user.base_currency().unwrap_or_default().to_owned(),
 		timezone: user.timezone().unwrap_or_default().to_owned(),
 		kyc_level: user.kyc_level(),
-		role: role.as_str().to_owned(),
+		role: resolved.role.as_str().to_owned(),
+		role_is_break_glass: resolved.break_glass,
 	}
 }
 
 /// Map an operator-console list row (a lightweight SQL projection) to its wire shape;
-/// `role` is the pre-resolved effective role (or the raw stored string on a corrupt row).
-fn summary_to_proto(row: AdminUserRow, role: String) -> AdminUserSummary {
+/// `role` is the pre-resolved role (or the raw stored string on a corrupt row).
+fn summary_to_proto(row: AdminUserRow, role: String, role_is_break_glass: bool) -> AdminUserSummary {
 	AdminUserSummary {
 		user_id: row.id.to_string(),
 		email: row.email.unwrap_or_default(),
@@ -325,11 +318,12 @@ fn summary_to_proto(row: AdminUserRow, role: String) -> AdminUserSummary {
 		role,
 		token_version: row.token_version as u64,
 		created_at: row.created_at,
+		role_is_break_glass,
 	}
 }
 
-async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand, admins: &[String]) -> Result<ProvisionedUser, AuthError> {
-	match command {
+async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand, break_glass: &BreakGlass) -> Result<ProvisionedUser, AuthError> {
+	let user = match command {
 		ProvisionCommand::Provision {
 			auth_subject,
 			email,
@@ -337,29 +331,29 @@ async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand, 
 		} => {
 			let subject = AuthSubject::parse(&auth_subject).map_err(invalid_identity)?;
 			let email = Email::parse(&email).map_err(invalid_identity)?;
-			let user = users.provision(subject, email, email_verified).await.map_err(to_auth)?;
-			Ok(summary(&user, admins))
+			users.provision(subject, email, email_verified).await.map_err(to_auth)?
 		}
 		ProvisionCommand::Lookup { user_id } => {
 			let id = parse_id(&user_id)?;
-			let user = users.find_by_id(id).await.map_err(to_auth)?.ok_or_else(|| AuthError::Directory("unknown user".into()))?;
-			Ok(summary(&user, admins))
+			users.find_by_id(id).await.map_err(to_auth)?.ok_or_else(|| AuthError::Directory("unknown user".into()))?
 		}
 		ProvisionCommand::RevokeAll { user_id } => {
 			let id = parse_id(&user_id)?;
-			let user = users.revoke_tokens(id).await.map_err(to_auth)?;
-			Ok(summary(&user, admins))
+			users.revoke_tokens(id).await.map_err(to_auth)?
 		}
-	}
+	};
+	let resolved = break_glass.snapshot(users).await.role_of(user.role(), &user.id().to_string());
+	Ok(summary(&user, resolved))
 }
 
-fn summary(user: &User, admins: &[String]) -> ProvisionedUser {
+fn summary(user: &User, resolved: EffectiveRole) -> ProvisionedUser {
 	ProvisionedUser {
 		user_id: user.id().to_string(),
 		email: user.email().as_str().to_owned(),
 		status: user.status().as_str().to_owned(),
 		token_version: user.token_version(),
-		role: crate::authz::effective_role(user.role(), &user.id().to_string(), admins).as_str().to_owned(),
+		role: resolved.role.as_str().to_owned(),
+		role_is_break_glass: resolved.break_glass,
 	}
 }
 

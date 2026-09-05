@@ -1,23 +1,59 @@
-//! The identity plane's shared authorization gate for admin RPCs.
+//! The identity plane's shared authorization gate for admin RPCs, and the
+//! self-extinguishing emergency access that keeps a brand-new fund reachable.
 //!
 //! Resolves the caller's persisted [`Role`] from the verified access-token `sub` and
-//! checks it against the RBAC matrix ([`grants`]). An `ADMIN_SUBJECTS`-listed subject
-//! is treated as [`Role::Owner`] (break-glass bootstrap, so the first operator can
-//! grant roles before any role is persisted) — [`effective_role`] is that one rule,
-//! shared by the gate AND every surface where the plane reports a role (the issued
-//! session's `UserSummary`, `GetMe`/`GetUser`, `ListUsers`), so elevation is visible
-//! wherever it acts. The allowlist is only a ROLE override: a persisted record's
-//! status and `token_version` floor are enforced for everyone, so disabling or
-//! revoking an allowlisted operator still takes effect, and it never writes the
-//! persisted `users.role` (`SetRole` remains the only writer). A service token, or a
-//! missing/unknown user, holds nothing — the gate fails closed.
-//! Shared by the `directory` and `platform` services so the matrix is enforced in
-//! exactly one place; [`caller_gate`] is the same live-record enforcement the
-//! self-service surface (`directory::active_caller_id`) reuses.
+//! checks it against the RBAC matrix ([`grants`]).
+//!
+//! # Break-glass, and why it switches itself off
+//!
+//! `users.role` is the ONE source of truth about ownership: the consilium
+//! ([`crate::governance`]) counts it, the quorum is taken from it, and the money plane
+//! mirrors it. A config allowlist that silently outranked it produced the bug this
+//! module exists to close — the operator console showed three owners while the
+//! consilium saw zero.
+//!
+//! But a fund with an empty registry has nobody who can act, and the genesis seed
+//! ([`crate::genesis`]) can fail to land for perfectly ordinary reasons (a founder has
+//! not signed in yet, a typo in the list). Removing elevation outright would turn that
+//! into an unreachable console recoverable only by hand-editing production SQL. So
+//! [`BreakGlass`] keeps it, under exactly one condition:
+//!
+//! ```text
+//! persisted owner count == 0  →  an OWNER_SUBJECTS-listed subject acts as Role::Owner
+//! otherwise                   →  only users.role counts; the list means nothing
+//! ```
+//!
+//! Only the ids in that list elevate. `OWNER_SUBJECTS` also accepts e-mail addresses so
+//! the roster can be written down before anyone's first sign-in mints their id, but a
+//! token `sub` is always a canonical user id — so an address SEEDS ([`crate::genesis`])
+//! and never opens a console.
+//!
+//! This is a one-way door, and it is safe for a reason the domain already enforces
+//! rather than one this module asserts: the registry can never fall back to zero. Both
+//! expulsion and `ResignOwnership` refuse below `MIN_OWNERS`
+//! (`domain::governance::check_floor`), so the first owner to exist closes emergency
+//! access permanently and no API call can reopen it. Quorum stuffing is unreachable for
+//! the same reason — the instant one owner exists, elevation is already off.
+//!
+//! Two guardrails keep it honest while it IS on:
+//!
+//! * it is a ROLE override, never an exemption — [`caller_gate`] enforces the live
+//!   record's status and `token_version` floor first, so disabling or revoking a listed
+//!   operator still bites;
+//! * it never seats anyone. `SetRole` refuses [`Role::Owner`] unconditionally
+//!   ([`crate::directory`]), so emergency access can hand out `operator`/`admin` and
+//!   nothing more. A seat is born only of the genesis seed or the consilium.
+//!
+//! Elevation is also VISIBLE: every surface that reports a role reports
+//! [`EffectiveRole::break_glass`] beside it, so a console can say the authority came
+//! from the environment rather than from the register. The original bug was not that
+//! elevation existed — it was that it was invisible.
 //!
 //! `Result<_, Status>` is tonic's mandated handler signature; `Status` is a large type
 //! we don't control, so the large-err lint does not apply in this module.
 #![allow(clippy::result_large_err)]
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use domain::{
 	authz::{Permission, Role, grants},
@@ -33,7 +69,7 @@ use crate::{infrastructure::users::AuthzRecord, ports::UserDirectoryRepository};
 /// The verified caller after the live-record gate: the raw token `sub`, its parse as
 /// a canonical user id, and the persisted record — already enforced for status and
 /// the `token_version` floor — when one exists. How a missing id/record fails is the
-/// consumer's policy (allowlist bootstrap vs. `NOT_FOUND` vs. denial).
+/// consumer's policy (emergency access vs. `NOT_FOUND` vs. denial).
 pub struct CallerGate {
 	pub sub: String,
 	pub id: Option<UserId>,
@@ -76,25 +112,134 @@ pub async fn caller_gate<T>(users: &dyn UserDirectoryRepository, request: &Reque
 	Ok(CallerGate { sub, id, record })
 }
 
-/// The role a subject effectively holds — and the one the plane surfaces: the
-/// persisted role, elevated to [`Role::Owner`] when the subject is
-/// `ADMIN_SUBJECTS`-listed. The single source of truth for the break-glass rule.
-pub fn effective_role(persisted: Role, sub: &str, admins: &[String]) -> Role {
-	if admins.iter().any(|s| s == sub) { Role::Owner } else { persisted }
+/// A resolved role together with where it came from. `break_glass` is what a client
+/// renders its warning from: the authority is real, but it is the environment's rather
+/// than the register's, and it disappears the moment the fund has an owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EffectiveRole {
+	pub role: Role,
+	pub break_glass: bool,
+}
+
+impl EffectiveRole {
+	/// The role exactly as `users.role` holds it.
+	pub fn persisted(role: Role) -> Self {
+		Self { role, break_glass: false }
+	}
+}
+
+/// The boot-loaded `OWNER_SUBJECTS` list plus the latch that retires it.
+///
+/// Shared by every surface that resolves or reports a role, so the rule is stated once
+/// and cannot drift between the gate and what the console draws.
+pub struct BreakGlass {
+	/// The list exactly as configured — what [`crate::genesis`] resolves.
+	subjects: Vec<String>,
+	/// The subset that can ever match a token `sub`, canonicalized.
+	///
+	/// `OWNER_SUBJECTS` accepts an e-mail so the roster can be written down before anyone
+	/// has signed in, but a `sub` is always a canonical user id — so an address can only
+	/// ever SEED, never elevate. Deriving that subset once, here, keeps the two behaviours
+	/// from disagreeing about what an entry does.
+	elevates: Vec<String>,
+	/// Latched `true` the first time a persisted owner is observed, and never cleared.
+	///
+	/// Caching a mutable fact is normally a bug; this one is sound because the fact is
+	/// IRREVERSIBLE. The count of `users.role = 'owner'` can go 0 → n, and from n it can
+	/// only ever be pushed down to `MIN_OWNERS` (`domain::governance::check_floor`
+	/// refuses to leave fewer). Nothing in the plane can return it to zero, so a latch
+	/// that only moves false → true can never be stale in the dangerous direction — the
+	/// worst it can do is close emergency access, which is the fail-closed side.
+	sealed: AtomicBool,
+}
+
+impl BreakGlass {
+	/// Ids are canonicalized exactly the way [`crate::genesis::classify`] canonicalizes
+	/// them — trimmed, then re-rendered from the parsed UUID, so case and padding stop
+	/// mattering. Matching raw strings instead meant an entry like `" 550E8400-…"` seated
+	/// a founder but never opened their console: a failure in the safe direction, but a
+	/// disagreement all the same.
+	///
+	/// An empty list elevates nobody, which is the right posture for every deployment that
+	/// has already been through genesis.
+	pub fn new(subjects: Vec<String>) -> Self {
+		let elevates = subjects.iter().filter_map(|entry| Uuid::parse_str(entry.trim()).ok()).map(|id| id.to_string()).collect();
+		Self {
+			subjects,
+			elevates,
+			sealed: AtomicBool::new(false),
+		}
+	}
+
+	/// The list exactly as configured — what the genesis seed resolves.
+	pub fn subjects(&self) -> &[String] {
+		&self.subjects
+	}
+
+	/// Resolve the rule once for the current request. A caller that reports a role for
+	/// many users (`ListUsers`) MUST take one snapshot and apply it per row rather than
+	/// asking per row.
+	///
+	/// A control-plane read failure resolves to "sealed": a database blip must not be
+	/// able to hand [`Role::Owner`] to an environment-listed subject.
+	pub async fn snapshot<'a>(&'a self, users: &dyn UserDirectoryRepository) -> Elevation<'a> {
+		if self.elevates.is_empty() || self.sealed.load(Ordering::Relaxed) {
+			return Elevation { subjects: None };
+		}
+		match users.owner_count().await {
+			Ok(0) => Elevation { subjects: Some(&self.elevates) },
+			Ok(_) => {
+				self.sealed.store(true, Ordering::Relaxed);
+				Elevation { subjects: None }
+			}
+			Err(err) => {
+				tracing::warn!(%err, "owner registry unreadable — treating emergency access as closed");
+				Elevation { subjects: None }
+			}
+		}
+	}
+}
+
+/// The break-glass rule frozen for one request: `Some` while the fund has no persisted
+/// owner, `None` once it has one (or when the list is empty).
+pub struct Elevation<'a> {
+	subjects: Option<&'a [String]>,
+}
+
+impl Elevation<'_> {
+	/// The role the plane acts on and reports for `sub`.
+	pub fn role_of(&self, persisted: Role, sub: &str) -> EffectiveRole {
+		if self.elevates(sub) {
+			EffectiveRole {
+				role: Role::Owner,
+				break_glass: true,
+			}
+		} else {
+			EffectiveRole::persisted(persisted)
+		}
+	}
+
+	/// Whether `sub` is elevated at all — the one case where authority can exist with no
+	/// persisted row to read it from.
+	pub fn elevates(&self, sub: &str) -> bool {
+		self.subjects.is_some_and(|subjects| subjects.iter().any(|s| s == sub))
+	}
 }
 
 /// Authorize `request` for `permission`, or return a gRPC `PermissionDenied`/
 /// `Unauthenticated`.
-pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, admins: &[String], request: &Request<T>, permission: Permission) -> Result<(), Status> {
+pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, break_glass: &BreakGlass, request: &Request<T>, permission: Permission) -> Result<(), Status> {
 	let caller = caller_gate(users, request).await?;
-	// The allowlist is applied AFTER the live-record gate, so DisableUser and
-	// RevokeTokens bite the most privileged principals too — it grants a role, never
-	// an exemption from status/revocation.
+	// Elevation is applied AFTER the live-record gate, so DisableUser and RevokeTokens
+	// bite an environment-listed principal too — it grants a role, never an exemption
+	// from status/revocation.
+	let elevation = break_glass.snapshot(users).await;
 	let role = if let Some(record) = caller.record {
-		effective_role(record.role, &caller.sub, admins)
-	} else if admins.iter().any(|s| s == &caller.sub) {
-		// Break-glass superadmin bootstrap: config-listed subjects hold Owner even with no
-		// persisted record, so the first operator can grant roles before any role exists.
+		elevation.role_of(record.role, &caller.sub).role
+	} else if elevation.elevates(&caller.sub) {
+		// Emergency bootstrap: while the registry is empty a listed subject holds Owner
+		// even with no persisted record, so the console stays reachable before anyone's
+		// first sign-in has minted a row.
 		Role::Owner
 	} else if caller.id.is_none() {
 		return Err(Status::unauthenticated("subject is not a user id"));

@@ -21,7 +21,7 @@ use domain::{
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::ports::UserDirectoryRepository;
+use crate::ports::{RoleChange, UserDirectoryRepository};
 
 /// The full column projection for the [`UserRow`] reads. sqlx 0.9 requires a
 /// `&'static str` query, so each `SELECT` splices this literal in via `concat!` rather
@@ -264,6 +264,39 @@ impl UserDirectoryRepository for PgUsers {
 			Ok(())
 		})
 		.await
+	}
+
+	/// One transaction: read the target `FOR UPDATE`, decide from THAT read, and either
+	/// write or roll back. A refusal returns before the commit, so it leaves nothing —
+	/// not even the row lock, once the transaction drops.
+	async fn set_role_outside_ownership(&self, id: UserId, role: Role) -> Result<RoleChange, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let mut user = load_for_update(&mut tx, id).await?;
+		// The PERSISTED role, never an elevated one: emergency access authorizes an
+		// operator, it does not seat them, so it must not decide either branch.
+		let holds_seat = user.role() == Role::Owner;
+		if role == Role::Owner && !holds_seat {
+			return Ok(RoleChange::WouldGrantOwnership);
+		}
+		if holds_seat && role != Role::Owner {
+			return Ok(RoleChange::WouldTakeOwnership);
+		}
+		user.set_role(role);
+		update_row(&mut tx, &user).await?;
+		drain_outbox(&mut tx, &mut user).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(RoleChange::Applied(Box::new(user)))
+	}
+
+	/// Seats held, straight from the column the consilium decides on. Suspended owners
+	/// count: ownership is the role, and excluding them would let an admin shrink the
+	/// roster (and reopen emergency access) by suspending people.
+	async fn owner_count(&self) -> Result<i64, DomainError> {
+		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE role = $1")
+			.bind(Role::Owner.as_str())
+			.fetch_one(&self.pool)
+			.await
+			.map_err(repo_err)
 	}
 
 	/// The role + status + authoritative `token_version` for a user id, read together so

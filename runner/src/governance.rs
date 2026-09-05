@@ -53,6 +53,7 @@ use tonic::{Request, Response, Status, codegen::tokio_stream::Stream};
 use uuid::Uuid;
 
 use crate::{
+	authz::BreakGlass,
 	infrastructure::governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision},
 	notification::now_secs,
 	ports::{GovernanceRepository, UserDirectoryRepository},
@@ -77,16 +78,16 @@ const MAX_REMOVAL_PAGE: u32 = 200;
 #[derive(Clone)]
 pub struct Governance {
 	users: Arc<dyn UserDirectoryRepository>,
-	admins: Arc<Vec<String>>,
+	break_glass: Arc<BreakGlass>,
 	governance: Arc<dyn GovernanceRepository>,
 	revisions: broadcast::Sender<u64>,
 }
 
 impl Governance {
-	pub fn new(users: Arc<dyn UserDirectoryRepository>, admins: Arc<Vec<String>>, governance: Arc<dyn GovernanceRepository>, revisions: broadcast::Sender<u64>) -> Self {
+	pub fn new(users: Arc<dyn UserDirectoryRepository>, break_glass: Arc<BreakGlass>, governance: Arc<dyn GovernanceRepository>, revisions: broadcast::Sender<u64>) -> Self {
 		Self {
 			users,
-			admins,
+			break_glass,
 			governance,
 			revisions,
 		}
@@ -96,7 +97,7 @@ impl Governance {
 	/// a suspended or token-revoked principal even while their access token still
 	/// verifies.
 	async fn require_owner<T>(&self, request: &Request<T>) -> Result<(), Status> {
-		crate::authz::require_permission(self.users.as_ref(), &self.admins, request, Permission::RoleGrant).await
+		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, request, Permission::RoleGrant).await
 	}
 
 	/// The roster as the wire shows it. Deliberately NOT reached by re-entering
@@ -691,9 +692,9 @@ impl MailRelayService for MailRelay {
 		// A governance mail goes to a FUND OWNER and nobody else. Every kind this relay
 		// renders is addressed to the consilium — an approval to cast, or the outcome of
 		// one — so any other recipient means the money plane asked for a security mail to
-		// be sent to someone with no standing in it. The PERSISTED role, never
-		// `effective_role`: break-glass elevation authorizes an operator, it does not
-		// seat them, and it must not turn them into a governance correspondent either.
+		// be sent to someone with no standing in it. The PERSISTED role, never the elevated
+		// one: emergency access authorizes an operator, it does not seat them, and it must
+		// not turn them into a governance correspondent either.
 		if recipient.role() != Role::Owner {
 			return Err(Status::failed_precondition("a governance mail may only be addressed to a fund owner"));
 		}

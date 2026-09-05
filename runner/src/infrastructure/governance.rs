@@ -28,10 +28,10 @@ use domain::{
 	authz::Role,
 	error::DomainError,
 	governance::{
-		AdmissionId, AdmissionPeer, AdmissionVote, GovernanceEvent, MAX_CODE_ATTEMPTS, Outcome, OwnerAdmission, OwnerRemoval, Peer, ProposalState, REMOVAL_TTL_SECS, RemovalId, RemovalState,
-		Vote, check_floor,
+		AdmissionId, AdmissionPeer, AdmissionVote, GovernanceEvent, MAX_CODE_ATTEMPTS, MIN_OWNERS, Outcome, OwnerAdmission, OwnerRemoval, Peer, ProposalState, REMOVAL_TTL_SECS, RemovalId,
+		RemovalState, Vote, check_floor,
 	},
-	users::UserId,
+	users::{UserId, UserStatus},
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Row};
@@ -39,8 +39,9 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
+	genesis::{GenesisOutcome, GenesisSubject, Resolution, Unseatable, UnseatableReason},
 	infrastructure::{notifications, users},
-	ports::GovernanceRepository,
+	ports::{GovernanceRepository, OwnerGenesisRepository},
 };
 
 /// Crockford base32 with `I`, `L`, `O` and `U` removed — the four a person mistypes or
@@ -545,6 +546,135 @@ async fn record_of(conn: &mut PgConnection, row: &sqlx::postgres::PgRow, now: i6
 		initiator_email: row.try_get("initiator_email").map_err(repo_err)?,
 		peer_emails,
 	})
+}
+
+#[async_trait]
+impl OwnerGenesisRepository for PgGovernance {
+	/// Genesis: the ONE writer that can turn an empty registry into a fund.
+	///
+	/// It lives beside the consilium rather than beside `PgUsers` because it is a
+	/// governance write. It takes [`lock_governance`] and then [`owner_ids_for_update`],
+	/// the same two locks in the same order as every consilium path, so a genesis racing
+	/// a consilium — or another replica's genesis — is serialized rather than
+	/// interleaved. Reading the roster BEFORE that lock would let two pods each see an
+	/// empty registry and seat it twice.
+	///
+	/// The seats go through [`grant_seat`], the same helper an executed admission uses,
+	/// so every founder gets the `ROLE_CHANGED` outbox row the money plane pulls.
+	///
+	/// Every refusal returns early WITHOUT committing, so the revision bump
+	/// [`lock_governance`] performs rolls back with it: a boot that seats nobody leaves
+	/// the live feed alone.
+	async fn seed_owners(&self, subjects: &[GenesisSubject]) -> Result<GenesisOutcome, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		lock_governance(&mut tx).await?;
+
+		let owners = owner_ids_for_update(&mut tx).await?;
+		if !owners.is_empty() {
+			return Ok(GenesisOutcome::Closed { owners: owners.len() as i64 });
+		}
+
+		let mut resolution = Resolution::default();
+		for subject in subjects {
+			match subject {
+				GenesisSubject::Id(id) => {
+					// A canonical id IS the identity, so `email_verified` is irrelevant here — the
+					// id can only have been read off the very row it names. `status` is not
+					// irrelevant: a disabled owner can neither act nor be removed.
+					let status = sqlx::query_scalar::<_, String>("SELECT status FROM users WHERE id = $1")
+						.bind(id.raw())
+						.fetch_optional(&mut *tx)
+						.await
+						.map_err(repo_err)?;
+					match status.as_deref() {
+						None => remember(&mut resolution.missing_ids, *id),
+						Some(status) if status == UserStatus::Active.as_str() => remember(&mut resolution.found, *id),
+						Some(_) => resolution.unseatable.push(Unseatable {
+							named: id.to_string(),
+							reason: UnseatableReason::Disabled,
+						}),
+					}
+				}
+				GenesisSubject::Mailbox(mailbox) => {
+					// `lower(email)` rather than a bare `=`: both sides are already normalized by
+					// `Email::parse`, but a row written before that normalization existed would
+					// otherwise be invisible to a list the operator can see is correct. The table
+					// is tiny and this runs once per boot, so the unindexed scan costs nothing.
+					//
+					// The flags come back WITH the rows rather than being filtered in SQL, so a
+					// refusal can name which problem the address has instead of looking identical
+					// to "nobody has signed in yet".
+					let rows = sqlx::query("SELECT id, email_verified, status FROM users WHERE lower(email) = $1 ORDER BY id")
+						.bind(mailbox.as_str())
+						.fetch_all(&mut *tx)
+						.await
+						.map_err(repo_err)?;
+					let mut seatable: Vec<Uuid> = Vec::new();
+					let mut blocked: Option<UnseatableReason> = None;
+					for row in &rows {
+						let id: Uuid = row.try_get("id").map_err(repo_err)?;
+						let verified: bool = row.try_get("email_verified").map_err(repo_err)?;
+						let status: String = row.try_get("status").map_err(repo_err)?;
+						// AN ADDRESS IS NOT AN IDENTITY. The directory stores whatever the IdP
+						// claimed, and an unverified sign-in works on purpose so that nothing
+						// downstream trusts the address silently. This is the one path that turns a
+						// configured string into a seat, and a seat cannot be taken back, so it
+						// resolves only through verified rows.
+						if !verified {
+							blocked.get_or_insert(UnseatableReason::AddressUnverified);
+						} else if status != UserStatus::Active.as_str() {
+							blocked = Some(UnseatableReason::Disabled);
+						} else {
+							seatable.push(id);
+						}
+					}
+					match seatable.as_slice() {
+						[] => match blocked {
+							Some(reason) => resolution.unseatable.push(Unseatable {
+								named: mailbox.as_str().to_owned(),
+								reason,
+							}),
+							None => resolution.missing_mailboxes.push(mailbox.clone()),
+						},
+						[only] => remember(&mut resolution.found, UserId::from_raw(*only)),
+						// `users.email` is deliberately NOT unique (a person may change it behind a
+						// stable auth subject, and a recreated account gets a new one), so two
+						// VERIFIED rows can still answer to one address — and a seat handed to the
+						// wrong person is one the owner floor will not let anyone take back. Refuse
+						// the whole roster rather than guess.
+						//
+						// Filtering to seatable rows BEFORE deciding this is what stops an
+						// impostor's unverified copy of a founder's address from deadlocking genesis
+						// permanently — which, leaving the registry empty, would hold emergency
+						// access open indefinitely.
+						many => {
+							return Ok(GenesisOutcome::Ambiguous {
+								mailbox: mailbox.clone(),
+								matches: many.len() as i64,
+							});
+						}
+					}
+				}
+			}
+		}
+
+		if resolution.found.len() < MIN_OWNERS {
+			return Ok(GenesisOutcome::TooFew(resolution));
+		}
+		for id in &resolution.found {
+			grant_seat(&mut tx, *id).await?;
+		}
+		tx.commit().await.map_err(repo_err)?;
+		Ok(GenesisOutcome::Seated(resolution))
+	}
+}
+
+/// Append `id` unless it is already there: the same person may be named twice, once by
+/// id and once by mailbox, and they hold one seat either way.
+fn remember(ids: &mut Vec<UserId>, id: UserId) {
+	if !ids.contains(&id) {
+		ids.push(id);
+	}
 }
 
 #[async_trait]
