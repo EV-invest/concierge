@@ -48,6 +48,10 @@ pub struct ProvisionedUser {
 	/// carries a complete principal snapshot and the BFF can gate the admin console
 	/// without a second round trip.
 	pub role: String,
+	/// Whether `role` was granted by the directory's emergency allowlist rather than
+	/// read from its `users.role` column. Carried all the way to the session so a
+	/// console can say which of the two it is drawing.
+	pub role_is_break_glass: bool,
 }
 
 impl ProvisionedUser {

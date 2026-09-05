@@ -11,7 +11,9 @@
 //!   platform        — the platform/cabinet config service (maintenance · announcement · flags)
 //!   governance      — the ownership consilium: the owner roster, owner-removal proposals,
 //!                     the target's emailed approval surface, and the money plane's mail relay
-//!   authz           — the shared RBAC gate (persisted role + status/revocation enforcement)
+//!   authz           — the shared RBAC gate (persisted role + status/revocation enforcement),
+//!                     plus the emergency access that retires itself at the first owner
+//!   genesis         — the boot-time seeding of the fund's first owner registry
 //!   ports           — the driven-port traits (`UserDirectoryRepository`, `PlatformConfigRepository`,
 //!                     `NotificationRepository`, `NotificationDispatchRepository`)
 //!   infrastructure  — driven adapters (Postgres control plane + the port implementations)
@@ -26,6 +28,7 @@ pub mod bridge;
 pub mod config;
 pub mod directory;
 pub mod dispatch;
+pub mod genesis;
 pub mod governance;
 pub mod infrastructure;
 pub mod log;

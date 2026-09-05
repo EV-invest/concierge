@@ -24,11 +24,14 @@ use domain::{
 };
 use uuid::Uuid;
 
-use crate::infrastructure::{
-	governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision},
-	notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
-	platform::{FeatureFlagRow, PlatformConfigRow},
-	users::{AdminUserRow, AuthzRecord},
+use crate::{
+	genesis::{GenesisOutcome, GenesisSubject},
+	infrastructure::{
+		governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision},
+		notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
+		platform::{FeatureFlagRow, PlatformConfigRow},
+		users::{AdminUserRow, AuthzRecord},
+	},
 };
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
@@ -62,6 +65,11 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// The role + status + authoritative `token_version` the authz gates decide on.
 	/// `None` when the user does not exist.
 	async fn authz_record(&self, id: UserId) -> Result<Option<AuthzRecord>, DomainError>;
+
+	/// How many people HOLD a seat, counted straight from `users.role`. This is the
+	/// number emergency access latches on ([`crate::authz::BreakGlass`]) — never a
+	/// count that could include someone merely authorizing as an owner.
+	async fn owner_count(&self) -> Result<i64, DomainError>;
 
 	/// The operator console's user list: filtered + paginated summaries plus the total
 	/// matching the filters.
@@ -201,4 +209,20 @@ pub trait GovernanceRepository: Send + Sync {
 	/// Queue one governance mail to a resolved recipient, bypassing notification
 	/// preferences. False when `dedupe_key` had already been accepted.
 	async fn enqueue_mail(&self, user_id: Uuid, recipient: &str, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<bool, DomainError>;
+}
+
+/// Port for the one-shot genesis seeding of the owner registry.
+///
+/// Split from [`GovernanceRepository`] because it is not a consilium use case and has
+/// exactly one caller — the composition root, once per boot. Like every method there,
+/// it is internally atomic: the roster check, the resolution and every seat it grants
+/// are ONE transaction under the governance lock, so two replicas booting together
+/// cannot seat the fund twice.
+#[async_trait]
+pub trait OwnerGenesisRepository: Send + Sync {
+	/// Seat `subjects` iff the registry is still empty and at least
+	/// [`domain::governance::MIN_OWNERS`] of them resolve to an existing user. Returns
+	/// what happened; the caller does the logging, so the branches stay assertable in a
+	/// test rather than only readable in a log.
+	async fn seed_owners(&self, subjects: &[GenesisSubject]) -> Result<GenesisOutcome, DomainError>;
 }

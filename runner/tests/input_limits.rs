@@ -9,12 +9,16 @@
 use std::sync::Arc;
 
 use concierge::{
+	authz::BreakGlass,
 	directory::Directory,
 	infrastructure::{db, platform::PgPlatform, users::PgUsers},
 	platform::Platform,
 	ports::{PlatformConfigRepository, UserDirectoryRepository},
 };
-use domain::users::{AuthSubject, Email};
+use domain::{
+	authz::Role,
+	users::{AuthSubject, Email},
+};
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
 	ListUsersRequest, SetAnnouncementRequest, SetFeatureFlagRequest, SetKycLevelRequest, UpdateProfileRequest, platform_service_server::PlatformService, user_directory_server::UserDirectory,
@@ -48,14 +52,16 @@ fn request_with<T>(sub: &str, inner: T) -> Request<T> {
 	req
 }
 
-/// An allowlisted (break-glass Owner) caller so one principal exercises both the
-/// self-service and the admin surfaces.
-async fn owner(users: &Arc<dyn UserDirectoryRepository>) -> (String, Arc<Vec<String>>) {
+/// A PERSISTED admin, so one principal exercises both the self-service and the admin
+/// surfaces. Deliberately NOT an `OWNER_SUBJECTS` caller: emergency elevation is live
+/// only while the owner registry is empty, and this suite shares a database with the
+/// consilium suite — one leftover owner there would silently turn every assertion here
+/// into a `PermissionDenied`. `Admin` grants everything these handlers ask for.
+async fn admin(users: &Arc<dyn UserDirectoryRepository>) -> (String, Arc<BreakGlass>) {
 	let subject = AuthSubject::parse(&format!("limits-{}", Uuid::new_v4())).unwrap();
 	let user = users.provision(subject, Email::parse("limits@example.com").unwrap(), true).await.unwrap();
-	let sub = user.id().to_string();
-	let admins: Arc<Vec<String>> = vec![sub.clone()].into();
-	(sub, admins)
+	users.set_role(user.id(), Role::Admin).await.unwrap();
+	(user.id().to_string(), Arc::new(BreakGlass::new(Vec::new())))
 }
 
 fn profile(phone: &str, base_currency: &str) -> UpdateProfileRequest {
@@ -72,8 +78,8 @@ async fn update_profile_rejects_junk_with_invalid_argument() {
 		eprintln!("DATABASE_URL unset — skipping real-DB test");
 		return;
 	};
-	let (sub, admins) = owner(&users).await;
-	let directory = Directory::new(users, admins);
+	let (sub, break_glass) = admin(&users).await;
+	let directory = Directory::new(users, break_glass);
 
 	let err = directory.update_profile(request_with(&sub, profile("https://t.me/junk", ""))).await.unwrap_err();
 	assert_eq!(err.code(), Code::InvalidArgument);
@@ -97,8 +103,8 @@ async fn set_kyc_level_is_bounded() {
 	let Some((users, _)) = setup().await else {
 		return;
 	};
-	let (sub, admins) = owner(&users).await;
-	let directory = Directory::new(users, admins);
+	let (sub, break_glass) = admin(&users).await;
+	let directory = Directory::new(users, break_glass);
 
 	let err = directory
 		.set_kyc_level(request_with(&sub, SetKycLevelRequest { user_id: sub.clone(), kyc_level: 4 }))
@@ -119,8 +125,8 @@ async fn list_users_validates_filters_and_truncates_query() {
 	let Some((users, _)) = setup().await else {
 		return;
 	};
-	let (sub, admins) = owner(&users).await;
-	let directory = Directory::new(users, admins);
+	let (sub, break_glass) = admin(&users).await;
+	let directory = Directory::new(users, break_glass);
 	let list = |query: &str, role: &str, status: &str| ListUsersRequest {
 		query: query.into(),
 		role: role.into(),
@@ -144,8 +150,8 @@ async fn announcement_and_flag_writes_enforce_caps() {
 	let Some((users, config)) = setup().await else {
 		return;
 	};
-	let (sub, admins) = owner(&users).await;
-	let platform = Platform::new(users, admins, config);
+	let (sub, break_glass) = admin(&users).await;
+	let platform = Platform::new(users, break_glass, config);
 
 	let announce = |title: String, body: String| SetAnnouncementRequest { title, body, active: true };
 	let long_title = platform.set_announcement(request_with(&sub, announce("t".repeat(201), String::new()))).await.unwrap_err();

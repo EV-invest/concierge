@@ -48,6 +48,7 @@ impl SessionInfo {
 				status: user.status,
 				role: user.role,
 				is_admin,
+				role_is_break_glass: user.role_is_break_glass,
 			}),
 		}
 	}
@@ -222,6 +223,10 @@ struct SessionUser {
 	status: String,
 	role: String,
 	is_admin: bool,
+	/// `role` came from the `OWNER_SUBJECTS` emergency allowlist, not from `users.role`.
+	/// A zone showing an admin surface on that authority must say so — it is temporary
+	/// by construction and it seats nobody.
+	role_is_break_glass: bool,
 }
 
 #[derive(Serialize)]

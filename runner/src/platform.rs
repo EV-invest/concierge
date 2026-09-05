@@ -24,28 +24,23 @@ use evconcierge_contracts::concierge::v1::{
 use tonic::{Request, Response, Status};
 
 use crate::{
+	authz::BreakGlass,
 	ports::{PlatformConfigRepository, UserDirectoryRepository},
 	support::domain_to_status,
 };
 
-/// The platform-config service. Cheaply cloneable (repos + allowlist behind `Arc`s).
-/// Holds the user repo + admin allowlist only to reuse the shared authz gate.
+/// The platform-config service. Cheaply cloneable (everything behind `Arc`s).
+/// Holds the user repo + emergency-access rule only to reuse the shared authz gate.
 #[derive(Clone)]
 pub struct Platform {
 	users: Arc<dyn UserDirectoryRepository>,
-	admins: Arc<Vec<String>>,
+	break_glass: Arc<BreakGlass>,
 	config: Arc<dyn PlatformConfigRepository>,
 }
 
 impl Platform {
-	pub fn new(users: Arc<dyn UserDirectoryRepository>, admins: Arc<Vec<String>>, config: Arc<dyn PlatformConfigRepository>) -> Self {
-		Self { users, admins, config }
-	}
-
-	/// The break-glass allowlist, loaded once at boot. An empty list grants no
-	/// elevation (fail closed).
-	fn admins(&self) -> &[String] {
-		&self.admins
+	pub fn new(users: Arc<dyn UserDirectoryRepository>, break_glass: Arc<BreakGlass>, config: Arc<dyn PlatformConfigRepository>) -> Self {
+		Self { users, break_glass, config }
 	}
 
 	/// Read the whole config into its wire shape (one authoritative snapshot).
@@ -81,13 +76,13 @@ impl PlatformServiceRpc for Platform {
 	}
 
 	async fn set_maintenance_mode(&self, request: Request<SetMaintenanceModeRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), self.admins(), &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, &request, Permission::PlatformManage).await?;
 		self.config.set_maintenance(request.get_ref().enabled).await.map_err(domain_to_status)?;
 		Ok(Response::new(self.snapshot().await?))
 	}
 
 	async fn set_announcement(&self, request: Request<SetAnnouncementRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), self.admins(), &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, &request, Permission::PlatformManage).await?;
 		let req = request.into_inner();
 		// Empty title/body stays legal — that is how the banner is cleared; only the
 		// caps apply (the banner renders to every signed-in user).
@@ -102,7 +97,7 @@ impl PlatformServiceRpc for Platform {
 	}
 
 	async fn set_feature_flag(&self, request: Request<SetFeatureFlagRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), self.admins(), &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, &request, Permission::PlatformManage).await?;
 		let req = request.into_inner();
 		if !is_flag_key(&req.key) {
 			return Err(Status::invalid_argument("flag key must be 1-64 characters of [a-z0-9_-] and start with a letter or digit"));

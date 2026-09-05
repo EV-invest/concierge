@@ -110,6 +110,7 @@ fn token_response(access_token: String, access_exp: u64, refresh: IssuedRefresh,
 			status: summary.status.clone(),
 			token_version: summary.token_version,
 			role: summary.role.clone(),
+			role_is_break_glass: summary.role_is_break_glass,
 		}),
 	}
 }
@@ -321,6 +322,7 @@ mod tests {
 			status: "active".into(),
 			token_version,
 			role: "investor".into(),
+			role_is_break_glass: false,
 		}
 	}
 

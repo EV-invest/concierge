@@ -128,6 +128,11 @@ message UserSummary {
   // The user's platform access role (snake_case: investor/operator/admin/owner), so the
   // BFF can gate the admin console at sign-in without a second round trip. Read-only.
   string role = 5;
+  // True when `role` above came from the OWNER_SUBJECTS emergency allowlist rather than
+  // from `users.role`. It is real authority, but it is the environment's and not the
+  // register's: it disappears the moment the fund has its first persisted owner, and it
+  // seats nobody. A client MUST render it as a warning, never as ownership.
+  bool role_is_break_glass = 6;
 }
 
 message JwksRequest {}

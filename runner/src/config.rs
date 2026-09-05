@@ -13,9 +13,21 @@ ev::settings! {
 		bind: std::net::SocketAddr = "127.0.0.1:50061",
 		/// Max connections for the request-serving Postgres pool.
 		db_max_connections: u32 = "10",
-		/// Break-glass superadmin allowlist (comma-separated canonical user ids).
-		/// Empty ⇒ no bootstrap admins. NOTE: these are CONCIERGE canonical user ids.
-		admin_subjects: Vec<String> = "",
+		/// The fund's genesis owners (comma-separated). Each entry is either a CONCIERGE
+		/// canonical user id (a UUID) or an e-mail address — an operator knows the mailbox
+		/// long before the person's first sign-in mints their id, so the list can be filled
+		/// in ahead of time and resolves itself once they log in.
+		///
+		/// It does TWO things, both of which switch themselves off for good the moment the
+		/// persisted owner registry stops being empty:
+		///   * the genesis seed writes these people into `users.role` (see `crate::genesis`);
+		///   * until that lands, a listed subject authorizes as `Role::Owner` so the console
+		///     is not locked out of a fund that has no owners yet (`crate::authz`).
+		///
+		/// Empty ⇒ neither happens. After genesis it is inert forever: the roster can never
+		/// return to zero, because both expulsion and `ResignOwnership` stop at
+		/// `MIN_OWNERS`.
+		owner_subjects: Vec<String> = "",
 		/// Shared bearer token for the cross-plane bridge (`UserEvents.PullUserLifecycle`).
 		#[secret]
 		bridge_service_token: String,

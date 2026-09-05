@@ -10,11 +10,15 @@
 use std::sync::Arc;
 
 use concierge::{
+	authz::BreakGlass,
 	infrastructure::{db, platform::PgPlatform, users::PgUsers},
 	platform::Platform,
 	ports::{PlatformConfigRepository, UserDirectoryRepository},
 };
-use domain::users::{AuthSubject, Email};
+use domain::{
+	authz::Role,
+	users::{AuthSubject, Email},
+};
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{GetPlatformConfigRequest, SetAnnouncementRequest, SetFeatureFlagRequest, SetMaintenanceModeRequest, platform_service_server::PlatformService};
 use tonic::{Code, Request};
@@ -56,8 +60,8 @@ async fn any_authenticated_principal_reads_config_but_cannot_write() {
 	let subject = AuthSubject::parse(&format!("platform-{}", Uuid::new_v4())).unwrap();
 	let user = users.provision(subject, Email::parse("platform@example.com").unwrap(), true).await.unwrap();
 	let sub = user.id().to_string();
-	let no_admins: Arc<Vec<String>> = Vec::new().into();
-	let platform = Platform::new(users, no_admins, config);
+	let break_glass = Arc::new(BreakGlass::new(Vec::new()));
+	let platform = Platform::new(users, break_glass, config);
 
 	platform
 		.get_platform_config(request_with(access_claims(&sub), GetPlatformConfigRequest {}))
@@ -88,10 +92,12 @@ async fn operator_config_writes_validate_and_round_trip() {
 	let subject = AuthSubject::parse(&format!("platform-op-{}", Uuid::new_v4())).unwrap();
 	let user = users.provision(subject, Email::parse("platform-op@example.com").unwrap(), true).await.unwrap();
 	let sub = user.id().to_string();
-	// Break-glass allowlist: the caller holds Owner, so these assertions are about the
-	// validation past the gate, not the gate itself.
-	let admins: Arc<Vec<String>> = vec![sub.clone()].into();
-	let platform = Platform::new(users, admins, config);
+	// A PERSISTED admin, so these assertions are about the validation past the gate and
+	// not about the gate itself. Deliberately NOT an `OWNER_SUBJECTS` caller: emergency
+	// elevation applies only while the owner registry is empty, and this suite shares a
+	// database with the consilium suite.
+	users.set_role(user.id(), Role::Admin).await.unwrap();
+	let platform = Platform::new(users, Arc::new(BreakGlass::new(Vec::new())), config);
 
 	let flag = |key: &str, rollout: u32| SetFeatureFlagRequest {
 		key: key.to_string(),

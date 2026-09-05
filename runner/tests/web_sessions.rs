@@ -19,6 +19,7 @@ fn tokens(user_id: &str) -> TokenResponse {
 			status: "active".into(),
 			token_version: 1,
 			role: "investor".into(),
+			role_is_break_glass: false,
 		}),
 	}
 }

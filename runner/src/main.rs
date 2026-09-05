@@ -89,9 +89,11 @@ fn main() -> Result<()> {
 async fn run(config: config::AppConfig) -> Result<()> {
 	infrastructure::config_drift::spawn(config::AppConfig::var_names());
 
-	// The admin allowlist (pre-loaded from env) is shared by the directory and platform
-	// services and by the provisioner loop, so issued sessions carry the effective role.
-	let admin_subjects: Arc<Vec<String>> = Arc::new(config.admin_subjects.clone());
+	// `OWNER_SUBJECTS`, pre-loaded from env. It does two things and then retires: it seeds
+	// the genesis roster below, and until the registry is populated it lets a listed
+	// subject authorize as an owner. Shared by every service that resolves or reports a
+	// role, so the rule is stated once.
+	let break_glass = Arc::new(concierge::authz::BreakGlass::new(config.owner_subjects.clone()));
 	// The plane applies pending control-plane migrations on boot (idempotent). New
 	// migration FILES are authored with the sqlx CLI (`sqlx migrate add …`), never
 	// hand-written.
@@ -99,6 +101,18 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.await
 		.context("failed to connect to the database")?;
 	infrastructure::db::migrate(&pool).await.context("failed to apply database migrations")?;
+
+	// The ownership consilium's adapter, built here rather than beside the other services
+	// because genesis runs off it — before anything is served.
+	let pg_governance = Arc::new(infrastructure::governance::PgGovernance::new(pool.clone(), config.governance_approval_url.clone()));
+
+	// Genesis: the fund's first owner registry, written before the surface is up. A no-op
+	// on every boot after the first one — see `concierge::genesis` for why that is a
+	// property of the data rather than a flag. Only a control-plane failure stops the
+	// boot; a refusal is logged and retried on the next start.
+	concierge::genesis::seed(pg_governance.as_ref(), break_glass.subjects())
+		.await
+		.context("failed to seed the genesis owner registry")?;
 
 	// Product-analytics capture (native PostHog). A `None` key makes capture a
 	// silent no-op, so this is safe to construct unconfigured.
@@ -136,12 +150,11 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// before it moves into the service — never re-read the env with copied defaults.
 	let issuer = auth_config.issuer.clone();
 	let audiences = auth_config.client_audience.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
-	// The admin allowlist is shared by the directory and platform services (the
-	// break-glass superadmin bootstrap for the RBAC gate) and by the provisioner loop,
-	// so issued sessions carry the effective role. Each reads it LIVE through the
-	// `settings` handle, so editing the mounted allowlist applies without a restart.
+	// The provisioner loop resolves roles through the same `BreakGlass` the RBAC gate
+	// uses, so an issued session carries exactly the authority the gate will grant it —
+	// and the flag saying whether that authority is the register's or the environment's.
 	let (provisioner, provision_rx) = provisioner_channel();
-	tokio::spawn(directory::run_provisioner(provision_rx, users.clone(), admin_subjects.clone()));
+	tokio::spawn(directory::run_provisioner(provision_rx, users.clone(), break_glass.clone()));
 	let auth_service = AuthService::try_new(auth_config, provisioner).await.context("failed to build the auth service")?;
 
 	// Inbound verification choke point: a `Verifier` over this plane's own `Jwks` RPC.
@@ -188,7 +201,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// The ownership consilium. The broadcast channel is only an immediacy optimisation
 	// for the live feed — each stream ALSO re-reads the revision from Postgres on an
 	// interval, so a second replica that never sees these sends still converges.
-	let governance_repo: Arc<dyn concierge::ports::GovernanceRepository> = Arc::new(infrastructure::governance::PgGovernance::new(pool.clone(), config.governance_approval_url.clone()));
+	let governance_repo: Arc<dyn concierge::ports::GovernanceRepository> = pg_governance;
 	let (governance_revisions, _) = tokio::sync::broadcast::channel(64);
 
 	// Real SMTP when configured, else a logging no-op — the same "unconfigured ⇒
@@ -262,12 +275,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			)))
 			.add_service(auth.layer(GovernanceServiceServer::new(governance::Governance::new(
 				users.clone(),
-				admin_subjects.clone(),
+				break_glass.clone(),
 				governance_repo,
 				governance_revisions,
 			))))
-			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), admin_subjects.clone()))))
-			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), admin_subjects.clone(), platform_repo))))
+			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), break_glass.clone()))))
+			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))
 			.serve_with_shutdown(config.bind, await_signal())

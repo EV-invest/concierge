@@ -266,6 +266,17 @@ impl UserDirectoryRepository for PgUsers {
 		.await
 	}
 
+	/// Seats held, straight from the column the consilium decides on. Suspended owners
+	/// count: ownership is the role, and excluding them would let an admin shrink the
+	/// roster (and reopen emergency access) by suspending people.
+	async fn owner_count(&self) -> Result<i64, DomainError> {
+		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE role = $1")
+			.bind(Role::Owner.as_str())
+			.fetch_one(&self.pool)
+			.await
+			.map_err(repo_err)
+	}
+
 	/// The role + status + authoritative `token_version` for a user id, read together so
 	/// the admin authz gate can deny a suspended or revoked principal at request time —
 	/// the stateless token verifier can't see either (it validates only the signed
