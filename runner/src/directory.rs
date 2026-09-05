@@ -21,12 +21,13 @@
 //! pairing is the point: an elevated role that did not announce itself is what let the
 //! console draw three owners while the consilium counted zero.
 //!
-//! OWNERSHIP IS NOT A ROLE EDIT. [`Directory::guard_ownership`] makes `SetRole` refuse
-//! to grant or strip `Role::Owner` — unconditionally, including on a fund with no
-//! owners at all. Both directions go through the consilium in [`crate::governance`],
-//! and the very first seats through the genesis seed ([`crate::genesis`]); those two
-//! are the only writers of `owner` there are. Without that refusal every control there
-//! is decorative: one owner could mint four sock puppets and then carry a payout quorum
+//! OWNERSHIP IS NOT A ROLE EDIT. `SetRole` refuses to grant or strip `Role::Owner` —
+//! unconditionally, including on a fund with no owners at all — and it refuses from
+//! INSIDE the write transaction, so no consilium can commit between the check and the
+//! write. Both directions go through the consilium in [`crate::governance`], and the
+//! very first seats through the genesis seed ([`crate::genesis`]); those two are the
+//! only writers of `owner` there are. Without that refusal every control there is
+//! decorative: one owner could mint four sock puppets and then carry a payout quorum
 //! legitimately, with every snapshot and re-validation working exactly as designed —
 //! and while the registry is empty an emergency-elevated operator could do it before
 //! the fund had even started.
@@ -55,7 +56,7 @@ use uuid::Uuid;
 use crate::{
 	authz::{BreakGlass, EffectiveRole, Elevation},
 	infrastructure::users::AdminUserRow,
-	ports::UserDirectoryRepository,
+	ports::{RoleChange, UserDirectoryRepository},
 	support::domain_to_status,
 };
 
@@ -239,59 +240,47 @@ impl UserDirectory for Directory {
 		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user).await)))
 	}
 
-	async fn set_role(&self, request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
-		require_permission(self, &request, Permission::RoleGrant).await?;
-		let req = request.into_inner();
-		let target = parse_target_id(&req.user_id)?;
-		let role = Role::parse(&req.role).map_err(domain_to_status)?;
-		self.guard_ownership(target, role).await?;
-		let user = self.users.set_role(target, role).await.map_err(domain_to_status)?;
-		Ok(Response::new(SetRoleResponse {
-			role: user.role().as_str().to_owned(),
-		}))
-	}
-}
-
-impl Directory {
-	/// Refuse to grant or strip `Role::Owner` here — UNCONDITIONALLY, with no carve-out
-	/// for an empty registry. A seat is the consilium's to give and to take (and the
-	/// genesis seed's to create), and this is the check that makes that true rather than
-	/// merely intended.
+	/// OWNERSHIP IS NOT A ROLE EDIT — refused in both directions, UNCONDITIONALLY, with
+	/// no carve-out for an empty registry.
 	///
 	/// Granting is the dangerous direction. If one owner can mint another they can mint
 	/// four, and a payout consilium of seven with a threshold of four is then carried by
 	/// the puppets alone — legitimately, with the roster snapshot and every re-validation
 	/// behaving exactly as designed. Snapshotting cannot close it, because the stuffing
-	/// happens before the proposal is opened.
+	/// happens before the proposal is opened. Stripping is refused for the mirror reason:
+	/// a bare demotion would be an expulsion with no consilium, no floor check and no
+	/// audit trail. Re-setting the role someone already holds stays a no-op, so a console
+	/// re-submitting an unchanged form does not trip over this.
 	///
-	/// There used to be a bootstrap carve-out here, seating the second owner directly
-	/// while the roster was smaller than two. It is gone, and deliberately: emergency
-	/// access ([`crate::authz::BreakGlass`]) is live in exactly that state, so the
-	/// carve-out would have handed an environment-listed operator the power to build a
-	/// whole roster of their own. The first seats come from [`crate::genesis`], which
-	/// writes them at boot with no request behind it, and never from an RPC.
+	/// There used to be a bootstrap carve-out seating the second owner directly while the
+	/// roster was smaller than two. It is gone, and deliberately: emergency access
+	/// ([`crate::authz::BreakGlass`]) is live in exactly that state, so the carve-out
+	/// would have handed an environment-listed operator the power to build a whole roster
+	/// of their own. The first seats come from [`crate::genesis`], at boot, with no
+	/// request behind them.
 	///
-	/// Stripping is refused for the mirror reason: a bare demotion would be an expulsion
-	/// with no consilium, no floor check and no audit trail.
-	///
-	/// Re-setting the role someone already holds stays a no-op, so a console that
-	/// re-submits an unchanged form does not trip over this.
-	async fn guard_ownership(&self, target: UserId, role: Role) -> Result<(), Status> {
-		// The PERSISTED role, never the elevated one: emergency access authorizes an
-		// operator, it does not seat them, so it must not decide either branch below.
-		let holds_seat = self.users.find_by_id(target).await.map_err(domain_to_status)?.is_some_and(|user| user.role() == Role::Owner);
-
-		if role == Role::Owner && !holds_seat {
-			return Err(Status::failed_precondition(
+	/// The decision itself lives INSIDE the write transaction
+	/// ([`UserDirectoryRepository::set_role_outside_ownership`]) rather than here. Read
+	/// separately it was a TOCTOU window: an admission committing between the check and
+	/// the write would let a demotion sail past both branches and then strip the seat the
+	/// consilium had just granted — no floor, no audit, and this module's "exactly two
+	/// writers of `owner`" invariant briefly false.
+	async fn set_role(&self, request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
+		require_permission(self, &request, Permission::RoleGrant).await?;
+		let req = request.into_inner();
+		let target = parse_target_id(&req.user_id)?;
+		let role = Role::parse(&req.role).map_err(domain_to_status)?;
+		match self.users.set_role_outside_ownership(target, role).await.map_err(domain_to_status)? {
+			RoleChange::Applied(user) => Ok(Response::new(SetRoleResponse {
+				role: user.role().as_str().to_owned(),
+			})),
+			RoleChange::WouldGrantOwnership => Err(Status::failed_precondition(
 				"granting ownership goes through GovernanceService.OpenOwnerAdmission, which every other owner must agree to — one owner may not mint another",
-			));
-		}
-		if holds_seat && role != Role::Owner {
-			return Err(Status::failed_precondition(
+			)),
+			RoleChange::WouldTakeOwnership => Err(Status::failed_precondition(
 				"taking ownership away goes through GovernanceService.OpenOwnerRemoval, or ResignOwnership for your own seat",
-			));
+			)),
 		}
-		Ok(())
 	}
 }
 

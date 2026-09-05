@@ -19,6 +19,8 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
@@ -60,6 +62,9 @@ struct Fixture {
 
 async fn setup() -> Option<Fixture> {
 	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+	// This suite clears the owner registry — a state no API can restore. Never on a
+	// database nobody has declared disposable.
+	common::assert_disposable_database();
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 
@@ -1019,6 +1024,61 @@ fn as_user<T>(id: UserId, inner: T) -> Request<T> {
 		token_version: 0,
 	});
 	request
+}
+
+/// The TOCTOU window `SetRole` used to leave open, closed and pinned.
+///
+/// The guard used to read the target's role on its own connection and only then open the
+/// write transaction. An admission committing in between was invisible to it, so a
+/// demotion aimed at the candidate saw `holds_seat = false`, passed both refusals, and
+/// then blocked on the row until the consilium committed — stripping the seat it had just
+/// granted, with no consilium, no floor check and no `governance_event` row. This plane's
+/// "exactly two writers of `owner`" invariant was false for the width of that window.
+///
+/// The race is constructed rather than raced for: a transaction that has already seated
+/// the candidate holds their row, the demotion is issued while that lock is held, and the
+/// seat is committed underneath it. The demotion cannot answer before the commit lands,
+/// so a pass here means the decision was taken from the post-commit row.
+#[tokio::test]
+async fn set_role_cannot_strip_a_seat_granted_while_it_was_deciding() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owners = fx.roster(2).await;
+	let candidate = fx.user().await;
+	let directory = fx.directory();
+
+	// Stand in for an admission carrying its verdict: the seat is written and the
+	// candidate's row held, exactly as `grant_seat` leaves it mid-transaction.
+	let url = std::env::var("DATABASE_URL").expect("setup already required it");
+	let mut seating = PgConnection::connect(&url).await.expect("a connection for the seating transaction");
+	sqlx::query("BEGIN").execute(&mut seating).await.expect("begin");
+	sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1")
+		.bind(candidate.raw())
+		.execute(&mut seating)
+		.await
+		.expect("seat the candidate, uncommitted");
+
+	let demotion = directory.set_role(as_user(
+		owners[0],
+		SetRoleRequest {
+			user_id: candidate.to_string(),
+			role: "investor".into(),
+		},
+	));
+	let commit = async {
+		// Long enough for the demotion to reach the row lock it has to wait on. If it has
+		// not got there yet the test still passes — it merely stops being able to catch the
+		// old bug — so this can never become a false failure.
+		tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+		sqlx::query("COMMIT").execute(&mut seating).await.expect("commit the seat");
+	};
+	let (result, ()) = tokio::join!(demotion, commit);
+
+	let err = result.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "the demotion must see the committed seat: {err}");
+	assert!(err.message().contains("OpenOwnerRemoval"), "and be pointed at the consilium: {err}");
+	assert_eq!(fx.role_of(candidate).await, Role::Owner, "the seat the consilium granted survives");
 }
 
 /// Every RPC on the consilium is Owner-only, through the SHARED RBAC gate. An admin —
