@@ -162,6 +162,11 @@ enum Store {
 	Redis(redis::aio::ConnectionManager),
 }
 
+/// One `HMGET` reply over [`FIELDS`], in that order. Redis answers a miss with a NIL
+/// per field rather than an error, so every element is optional and "all NIL" is the
+/// only legitimate absence — anything between that and "all present" is a torn hash.
+type SessionFields = (Option<String>, Option<i64>, Option<String>, Option<i64>, Option<String>, Option<Vec<u8>>);
+
 impl Store {
 	fn key(id: &str) -> String {
 		format!("websess:{id}")
@@ -172,15 +177,7 @@ impl Store {
 			Self::InProcess(map) => Ok(map.lock().await.get(id).cloned()),
 			Self::Redis(conn) => {
 				let mut conn = conn.clone();
-				let (access_token, access_expires_at, refresh_token, refresh_expires_at, csrf, user): (
-					Option<String>,
-					Option<i64>,
-					Option<String>,
-					Option<i64>,
-					Option<String>,
-					Option<Vec<u8>>,
-				) = redis::cmd("HMGET").arg(Self::key(id)).arg(&FIELDS).query_async(&mut conn).await.context("web session load")?;
-				let fields = (access_token, access_expires_at, refresh_token, refresh_expires_at, csrf, user);
+				let fields: SessionFields = redis::cmd("HMGET").arg(Self::key(id)).arg(&FIELDS).query_async(&mut conn).await.context("web session load")?;
 				match fields {
 					(None, None, None, None, None, None) => Ok(None),
 					(Some(access_token), Some(access_expires_at), Some(refresh_token), Some(refresh_expires_at), Some(csrf), Some(user)) => Ok(Some(WebSession {
