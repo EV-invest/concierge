@@ -29,6 +29,10 @@ evconcierge_contracts = { path = "contracts" }
 form_urlencoded = "1"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 http = "1"
+# HMAC-SHA256 for the identity provider's webhook signature. Already in the
+# dependency graph (sqlx-postgres uses it for SCRAM), so this adds a manifest line
+# rather than a crate.
+hmac = "0.13"
 # `rust_crypto` selects the pure-Rust provider — no C/aws-lc-rs toolchain, matching
 # the rustls-only stance.
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
