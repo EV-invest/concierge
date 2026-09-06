@@ -65,6 +65,12 @@ ev::settings! {
 		mail_from: String = "EV Investment <notifications@evinvest.ltd>",
 		/// Origin the cabinet is served from; builds the links inside emails.
 		cabinet_url: String = "https://evinvest.ltd/cabinet",
+		/// The HUMAN mailbox handed to a user whose verification cannot run right now.
+		///
+		/// Deliberately not `mail_from`: that address is a SENDER nobody reads, so
+		/// printing it on an error screen would invite replies into a void. This one is
+		/// answered by a person.
+		support_email: String = "admin@evinvest.ltd",
 		/// Trailing-24h send ceiling. Gmail's relay caps daily volume and throttles the
 		/// account past it, so the dispatcher stops SENDING (never queueing) at this
 		/// number. Raise it in step with whatever provider is actually behind the port.

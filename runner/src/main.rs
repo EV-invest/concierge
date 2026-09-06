@@ -251,6 +251,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			cases: kyc_cases,
 			notifications: notification_repo.clone(),
 			provider: kyc_provider,
+			support_email: config.support_email.clone(),
 		},
 	)
 	.await
@@ -311,7 +312,9 @@ async fn run(config: config::AppConfig) -> Result<()> {
 /// The identity-verification vendor, or `None` when it is not configured.
 ///
 /// Unconfigured is a supported state, not a broken one: `/kyc/start` and the webhook
-/// answer 503 and the console's manual `SetKycLevel` keeps working. It is deliberately
+/// answer 503 and the console's manual `SetKycLevel` keeps working. A user meets that
+/// state as the SAME "temporarily unavailable, write to us" answer a vendor outage
+/// produces — the difference between the two is an operator's problem, not theirs. It is deliberately
 /// NOT wired the way the mailer is — an absent mailer silently logs, whereas an absent
 /// webhook secret would mean accepting a verdict nobody signed, so this seam has no
 /// degraded arm at all.

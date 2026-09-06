@@ -16,12 +16,18 @@
 //!     into "POST yourself tier 2";
 //!   * no cookie is read and no CSRF token is expected: there is no browser here, and a
 //!     CSRF check on a server-to-server call is a check that can only ever be wrong.
+//!
+//! When verification cannot be run at all — no vendor configured, or a vendor that will
+//! not open a session — `/kyc/start` DEGRADES rather than errors: one 503, one stable
+//! body, one support address (see [`StartError`]). The user is never shown a technical
+//! failure and never given the impression they did something wrong.
 
 use axum::{
 	Json,
 	body::Bytes,
 	extract::State,
 	http::{HeaderMap, StatusCode},
+	response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::CookieJar;
 use domain::users::UserId;
@@ -41,6 +47,61 @@ use crate::{
 /// has not subscribed, so this never becomes unsolicited mail.
 const TOPIC: &str = "account:verification";
 
+/// The one error code `/kyc/start` publishes. The cabinet switches on THIS, never on the
+/// prose beside it, so the wording can change without breaking a screen.
+const KYC_UNAVAILABLE: &str = "kyc_unavailable";
+
+/// What `/kyc/start` can answer with.
+///
+/// Everything except [`StartError::Unavailable`] keeps the plain-text
+/// `(StatusCode, &'static str)` shape the rest of this surface answers in — a `From`
+/// impl lets `?` carry those through untouched, so `/kyc/start` refuses a bad CSRF token
+/// or an absent session exactly the way `/auth/logout` does.
+pub(super) enum StartError {
+	/// Verification cannot be run right now — and the caller is told no more than that.
+	///
+	/// BOTH causes collapse here: no vendor configured, and a configured vendor that
+	/// would not open a session (out of balance, over quota, down, timing out, answering
+	/// nonsense). Which of the two it is, is ours to fix and not the user's to read
+	/// about, so on the wire they are indistinguishable and the cabinet needs one screen
+	/// rather than two.
+	///
+	/// Deliberately NOT a taxonomy of vendor status codes. We do not know what Didit
+	/// returns for an exhausted balance and the documentation does not say, so a `match`
+	/// on 402/403/429 would be at its most brittle exactly where being wrong costs the
+	/// most: the arm that decides whether a user sees a support address or a stack of
+	/// technical noise.
+	Unavailable {
+		contact: String,
+	},
+	Plain(StatusCode, &'static str),
+}
+
+impl StartError {
+	fn unavailable(st: &super::Inner) -> Self {
+		Self::Unavailable { contact: st.support_email.clone() }
+	}
+}
+
+impl From<(StatusCode, &'static str)> for StartError {
+	fn from((status, message): (StatusCode, &'static str)) -> Self {
+		Self::Plain(status, message)
+	}
+}
+
+impl IntoResponse for StartError {
+	fn into_response(self) -> Response {
+		match self {
+			// 503 because the condition is TEMPORARY, and a stable machine-readable body
+			// so the cabinet never has to parse prose. The vendor's own words never
+			// reach it: "insufficient balance on the Didit account" is a fact about our
+			// business, and it belongs in the log line, not in a browser.
+			Self::Unavailable { contact } => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": KYC_UNAVAILABLE, "contact": contact }))).into_response(),
+			Self::Plain(status, message) => (status, message).into_response(),
+		}
+	}
+}
+
 #[derive(Deserialize, Default)]
 pub struct StartRequest {
 	/// The tier being applied for. 0/absent ⇒ 1, the entry tier.
@@ -57,22 +118,26 @@ pub struct StartResponse {
 
 /// `POST /kyc/start` — open a verification case for the signed-in caller and hand back
 /// the provider's URL.
-pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, body: Option<Json<StartRequest>>) -> Result<Json<StartResponse>, (StatusCode, &'static str)> {
+pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, body: Option<Json<StartRequest>>) -> Result<Json<StartResponse>, StartError> {
 	let st = &st.inner;
 	let Some(provider) = st.kyc.as_ref() else {
-		return Err((StatusCode::SERVICE_UNAVAILABLE, "kyc not configured"));
+		// `debug!`, not `error!`: an unconfigured vendor is a SUPPORTED state that the
+		// boot already announced once, and paging on every request would bury the real
+		// incident below in noise.
+		tracing::debug!("kyc: start refused — no provider is configured");
+		return Err(StartError::unavailable(st));
 	};
 	// State-changing POST behind a cookie ⇒ the same double-submit check `/auth/logout`
 	// and `DELETE /auth/sessions` run.
 	if !verify_csrf(st, &jar, &headers).await? {
-		return Err((StatusCode::FORBIDDEN, "csrf check failed"));
+		return Err((StatusCode::FORBIDDEN, "csrf check failed").into());
 	}
 
 	let Some(session_id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) else {
-		return Err((StatusCode::UNAUTHORIZED, "unauthenticated"));
+		return Err((StatusCode::UNAUTHORIZED, "unauthenticated").into());
 	};
 	let Some(fresh) = st.sessions.fresh(&session_id, &st.auth).await.map_err(store_err)? else {
-		return Err((StatusCode::UNAUTHORIZED, "unauthenticated"));
+		return Err((StatusCode::UNAUTHORIZED, "unauthenticated").into());
 	};
 	let user_id = Uuid::parse_str(&fresh.user.user_id)
 		.map(UserId::from_raw)
@@ -83,7 +148,7 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	if tier > PROVIDER_MAX_TIER {
 		// Refused rather than clamped: silently applying for a lower tier than the caller
 		// asked for would look like an approval for the one they wanted.
-		return Err((StatusCode::BAD_REQUEST, "requested tier is above what a provider may grant"));
+		return Err((StatusCode::BAD_REQUEST, "requested tier is above what a provider may grant").into());
 	}
 
 	// The vendor is called BEFORE the row is written, because the row's identity key is
@@ -92,14 +157,27 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	// and is refused, which is the safe direction. The reverse order would need either a
 	// placeholder `provider_ref` (colliding on the uniqueness that IS the idempotency
 	// key) or an open transaction held across a network call.
+	//
+	// This ordering is also what keeps a failed vendor call from leaving a `pending` row
+	// behind. A dangling `pending` would later read as "the user started and walked
+	// away", which is a lie about a person who never got the chance, and it would poison
+	// every funnel number computed off these rows.
 	let case_id = Uuid::new_v4();
 	let session = provider.start_session(case_id, tier).await.map_err(|e| {
-		tracing::error!(error = %e, provider = provider.name(), "kyc: provider refused to open a session");
-		(StatusCode::BAD_GATEWAY, "kyc provider unavailable")
+		// `error!` — NOT `warn!` — and the reason is the whole point of this arm. From
+		// the user's side an exhausted vendor balance looks like silence: they simply
+		// cannot verify, and nobody files a ticket about a screen that politely says to
+		// try later. `error!` is what `error_monitoring::tracing_layer()` (wired in
+		// `main::init_tracing`) forwards to Sentry, so this line is the only thing that
+		// will wake a human. The vendor's own text goes here and nowhere else.
+		tracing::error!(error = %e, provider = provider.name(), %case_id, tier, "kyc: the provider would not open a session — verification is unavailable to users");
+		StartError::unavailable(st)
 	})?;
 	st.kyc_cases.open_case(case_id, user_id, provider.name(), &session.provider_ref, tier).await.map_err(|e| {
+		// Same screen as a vendor outage: our store being unreachable is no more the
+		// user's business than the vendor's balance, and it is just as temporary.
 		tracing::error!(error = %e, %case_id, "kyc: failed to record the opened case");
-		(StatusCode::INTERNAL_SERVER_ERROR, "could not open a verification case")
+		StartError::unavailable(st)
 	})?;
 
 	tracing::info!(%case_id, tier, provider = provider.name(), "kyc: case opened");

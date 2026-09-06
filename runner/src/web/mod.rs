@@ -104,6 +104,7 @@ impl WebState {
 				kyc_cases: kyc.cases,
 				notifications: kyc.notifications,
 				kyc: kyc.provider,
+				support_email: kyc.support_email,
 			}),
 		})
 	}
@@ -119,6 +120,9 @@ pub struct KycDeps {
 	/// `None` ⇒ the vendor is unconfigured and both KYC routes answer 503. There is no
 	/// arm here that verifies nothing: a webhook we cannot authenticate is dropped.
 	pub provider: Option<Arc<dyn KycProvider>>,
+	/// Printed on the "verification is unavailable" answer, so a user who cannot get
+	/// verified has somewhere to go instead of a dead end.
+	pub support_email: String,
 }
 
 /// The auth surface, mounted behind the conductor's `/api` prefix rewrites:
@@ -172,4 +176,6 @@ struct Inner {
 	notifications: Arc<dyn NotificationRepository>,
 	/// `None` ⇒ unconfigured; both KYC routes answer 503.
 	kyc: Option<Arc<dyn KycProvider>>,
+	/// Human contact handed to a user whose verification cannot run right now.
+	support_email: String,
 }
