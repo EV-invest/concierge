@@ -115,6 +115,14 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   banner, feature flags) behind the shared RBAC gate (`authz`). `notification` and
   `log` stay DEFERRED stubs (`tonic::Status::unimplemented`); their application
   layers are placeholders to grow into. Health returns `"ok"`.
+- **KYC has exactly one writer**: `users.set_kyc_level` (→ `KYC_CHANGED` → outbox →
+  banking's mirror). The verification vendor sits behind the `KycProvider` port and
+  its webhook (`web/kyc.rs`, `POST /kyc/callback/didit` — public, HMAC over the raw
+  body, 300s replay window) lands in that same call, so banking never learns a vendor
+  exists. A provider may only RAISE a level and never past tier 2; tier 3 and every
+  downgrade are human decisions under `Permission::KycManage`. The identity a callback
+  acts on comes from the stored `kyc_cases` row, NEVER from the request body. Absent
+  `DIDIT_*` config, both routes answer 503 — there is no arm that skips the signature.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
