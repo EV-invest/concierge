@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::{
 	Router,
 	body::Body,
@@ -25,10 +26,13 @@ use concierge::{
 		notifications::PgNotifications,
 		users::PgUsers,
 	},
-	ports::{KYC_CALLBACK_WINDOW_SECS, KycCaseRepository, UserDirectoryRepository},
+	ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, UserDirectoryRepository},
 	web::{self, KycDeps},
 };
-use domain::users::{AuthSubject, Email, UserId};
+use domain::{
+	error::DomainError,
+	users::{AuthSubject, Email, UserId},
+};
 use evconcierge_auth::AuthService;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -37,6 +41,39 @@ use uuid::Uuid;
 
 const SECRET: &str = "kyc-integration-secret";
 const PROVIDER: &str = "stub";
+const SUPPORT: &str = "support@evinvest.test";
+
+/// The vendor's own words for an exhausted account. It must never reach a browser, so
+/// the tests below grep the response body for this exact string.
+const VENDOR_DETAIL: &str = "insufficient balance on the didit account";
+
+/// A provider that is configured, reachable and simply will not open a session — the
+/// out-of-balance / over-quota / vendor-is-down case.
+///
+/// It fails the way the live adapter fails: `start_session` collapses every non-success
+/// into one `DomainError`, so this double does not need to imitate any particular vendor
+/// status code (and deliberately does not — we do not know which one Didit sends).
+struct RefusingKyc;
+
+#[async_trait]
+impl KycProvider for RefusingKyc {
+	fn name(&self) -> &'static str {
+		PROVIDER
+	}
+
+	async fn start_session(&self, _case_id: Uuid, _requested_tier: u32) -> Result<KycSession, DomainError> {
+		Err(DomainError::Repository(format!("didit: session rejected with 402 Payment Required: {VENDOR_DETAIL}")))
+	}
+
+	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
+		StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()).parse_callback(headers, body, now)
+	}
+}
+
+/// The body BOTH unavailable causes must produce, byte for byte.
+fn unavailable_body() -> Value {
+	json!({ "error": "kyc_unavailable", "contact": SUPPORT })
+}
 
 struct Harness {
 	router: Router,
@@ -46,6 +83,12 @@ struct Harness {
 }
 
 async fn setup() -> Option<Harness> {
+	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string())))).await
+}
+
+/// The same router with the vendor swapped out, so a test can drive the two ways
+/// verification becomes unavailable — absent, and present but refusing.
+async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
@@ -60,7 +103,8 @@ async fn setup() -> Option<Harness> {
 			users: users.clone(),
 			cases: cases.clone(),
 			notifications: Arc::new(PgNotifications::new(pool.clone())),
-			provider: Some(Arc::new(StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()))),
+			provider,
+			support_email: SUPPORT.to_string(),
 		},
 	)
 	.await
@@ -117,6 +161,16 @@ impl Harness {
 			.fetch_one(&self.pool)
 			.await
 			.expect("count outbox rows")
+	}
+
+	/// Attempt rows this user owns. A vendor call that failed must leave this at zero:
+	/// a `pending` row nobody can act on later reads as an abandoned attempt.
+	async fn case_count(&self, user: UserId) -> i64 {
+		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM kyc_cases WHERE user_id = $1")
+			.bind(user.raw())
+			.fetch_one(&self.pool)
+			.await
+			.expect("count cases")
 	}
 
 	async fn case_row(&self, id: Uuid) -> (String, bool, Value) {
@@ -382,17 +436,13 @@ async fn the_webhook_needs_no_cookie_and_no_csrf_token() {
 	assert_eq!(h.kyc_level(user).await, 1);
 }
 
-/// The signed-in half. It needs the session locker to be SHARED with the router's own
-/// instance, which only Redis gives us — the in-process fallback is per-instance by
-/// design (see `web_sessions.rs`).
-#[tokio::test]
-async fn start_opens_a_case_and_hands_back_a_redirect() {
-	let h = harness!();
-	if std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty()).is_none() {
-		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
-		return;
-	}
-	let user = h.user().await;
+/// Opens a REAL session in the locker the router reads, and returns the cookie header
+/// plus the CSRF token to pair with it.
+///
+/// `None` when Redis is absent: the in-process fallback is per-instance by design (see
+/// `web_sessions.rs`), so a session opened here would be invisible to the router.
+async fn signed_in(user: UserId) -> Option<(String, String)> {
+	std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
 	let sessions = web::WebSessions::from_env().await.expect("session store");
 	let now_s = now();
 	let (session_id, csrf, _) = sessions
@@ -413,6 +463,20 @@ async fn start_opens_a_case_and_hands_back_a_redirect() {
 		.await
 		.expect("open session")
 		.expect("token pair carries a user");
+	Some((format!("ev_session={session_id}; ev_csrf={csrf}"), csrf))
+}
+
+/// The signed-in half. It needs the session locker to be SHARED with the router's own
+/// instance, which only Redis gives us — the in-process fallback is per-instance by
+/// design (see `web_sessions.rs`).
+#[tokio::test]
+async fn start_opens_a_case_and_hands_back_a_redirect() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
 
 	let start = |cookie: String, header: Option<String>, body: &'static str| {
 		let mut request = Request::builder()
@@ -426,7 +490,6 @@ async fn start_opens_a_case_and_hands_back_a_redirect() {
 		h.router.clone().oneshot(request.body(Body::from(body)).unwrap())
 	};
 
-	let cookie = format!("ev_session={session_id}; ev_csrf={csrf}");
 	// Without the double-submit header this is an ordinary cookie-authenticated POST and
 	// must be refused, exactly as /auth/logout is.
 	let refused = start(cookie.clone(), None, r#"{"tier":2}"#).await.unwrap();
@@ -448,4 +511,77 @@ async fn start_opens_a_case_and_hands_back_a_redirect() {
 	assert!(!decided);
 	let owner: Uuid = sqlx::query_scalar("SELECT user_id FROM kyc_cases WHERE id = $1").bind(case_id).fetch_one(&h.pool).await.unwrap();
 	assert_eq!(owner, user.raw(), "the case belongs to the session's user");
+}
+
+/// A user must never be told "you did something wrong" or shown a stack of vendor noise
+/// when the fault is entirely on our side of the fence.
+///
+/// This is the arm reached when the vendor is not configured at all. Note that no cookie
+/// and no CSRF token are sent: the check runs FIRST, so a caller who cannot verify learns
+/// that before being asked to prove anything.
+#[tokio::test]
+async fn an_unconfigured_vendor_answers_the_unavailable_contract() {
+	let Some(h) = setup_with(None).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+
+	let request = Request::builder()
+		.method("POST")
+		.uri("/kyc/start")
+		.header("content-type", "application/json")
+		.body(Body::from(r#"{"tier":1}"#))
+		.unwrap();
+	let response = h.router.clone().oneshot(request).await.expect("router answered");
+
+	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "temporary, not a client mistake");
+	let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+	let answer: Value = serde_json::from_slice(&bytes).expect("a json body the cabinet can switch on");
+	assert_eq!(answer, unavailable_body());
+}
+
+/// The out-of-balance case, which is the one that actually motivated this arm: the keys
+/// are present and correct, and the vendor still will not open a session.
+///
+/// Three things are asserted, and the first is the point of the whole exercise — the user
+/// sees EXACTLY what they see when the feature was never configured. One screen in the
+/// cabinet, not two, and no way to tell from outside which of our problems it is.
+#[tokio::test]
+async fn a_vendor_that_refuses_a_session_degrades_exactly_like_an_unconfigured_one() {
+	let Some(h) = setup_with(Some(Arc::new(RefusingKyc))).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	let request = Request::builder()
+		.method("POST")
+		.uri("/kyc/start")
+		.header("content-type", "application/json")
+		.header("cookie", cookie)
+		.header("x-ev-csrf", csrf)
+		.body(Body::from(r#"{"tier":1}"#))
+		.unwrap();
+	let response = h.router.clone().oneshot(request).await.expect("router answered");
+
+	assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+	let answer: Value = serde_json::from_slice(&bytes).expect("a json body");
+	assert_eq!(answer, unavailable_body(), "the same answer an unconfigured vendor gives");
+
+	// Nothing the vendor said about OUR account may cross the boundary: not the status
+	// code it chose, not its prose, not even its name. A user learning that a payment is
+	// overdue at a supplier is a leak of a business fact, dressed up as an error message.
+	let raw = String::from_utf8_lossy(&bytes).to_lowercase();
+	for leak in ["402", "balance", "payment", "didit", "insufficient"] {
+		assert!(!raw.contains(leak), "vendor detail {leak:?} leaked into the response: {raw}");
+	}
+
+	// And no half-open attempt is left behind. A `pending` row here would later be read
+	// as a user who started verifying and gave up, which is the opposite of what happened.
+	assert_eq!(h.case_count(user).await, 0, "a failed vendor call must not leave a case row");
 }
