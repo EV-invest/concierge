@@ -69,6 +69,11 @@ pub const TOPICS: &[Topic] = &[
 		description: "Deposits, withdrawals, redemptions",
 	},
 	Topic {
+		key: "account:verification",
+		label: "Identity verification",
+		description: "Decisions on your KYC submissions",
+	},
+	Topic {
 		key: "platform:announcements",
 		label: "Platform & product",
 		description: "Maintenance windows, new features",

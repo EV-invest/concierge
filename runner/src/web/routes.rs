@@ -248,7 +248,7 @@ impl super::Inner {
 
 /// A session-store failure is a 500, never an auth verdict: the session may well
 /// still exist, so neither cookies nor upstream state may be touched off it.
-fn store_err(e: color_eyre::Report) -> (StatusCode, &'static str) {
+pub(super) fn store_err(e: color_eyre::Report) -> (StatusCode, &'static str) {
 	tracing::error!(error = ?e, "web session store failed");
 	(StatusCode::INTERNAL_SERVER_ERROR, "session store unavailable")
 }
@@ -262,7 +262,7 @@ async fn refresh_of(st: &super::Inner, jar: &CookieJar) -> Result<Option<String>
 
 /// CSRF double-submit, hardened with the server-side session copy: the `x-ev-csrf`
 /// header must equal the readable csrf cookie AND the value stored on the session.
-async fn verify_csrf(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<bool, (StatusCode, &'static str)> {
+pub(super) async fn verify_csrf(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<bool, (StatusCode, &'static str)> {
 	let Some(cookie) = jar.get(&st.cookies.csrf).map(|c| c.value().to_string()) else {
 		return Ok(false);
 	};

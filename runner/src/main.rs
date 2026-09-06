@@ -236,9 +236,25 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// The site-level auth HTTP surface: the conductor rewrites the shared origin's
 	// `/api/auth/*` + `/api/callback/auth/*` here, so login/session cookies land
 	// first-party for every zone. Calls the SAME issuance service in-process.
-	let web_state = web::WebState::try_new(auth_service.clone(), config.public_origin.clone(), config.app_env == "production")
-		.await
-		.context("failed to build the auth web state")?;
+	// Identity verification. The vendor sits behind `ports::KycProvider`, so its verdict
+	// lands in the SAME `set_kyc_level` the operator console writes through — the event,
+	// the outbox row and the money plane's mirror are identical either way, and banking
+	// never learns a vendor exists.
+	let kyc_cases: Arc<dyn concierge::ports::KycCaseRepository> = Arc::new(infrastructure::kyc::cases::PgKycCases::new(pool.clone()));
+	let kyc_provider = build_kyc_provider(&config)?;
+	let web_state = web::WebState::try_new(
+		auth_service.clone(),
+		config.public_origin.clone(),
+		config.app_env == "production",
+		web::KycDeps {
+			users: users.clone(),
+			cases: kyc_cases,
+			notifications: notification_repo.clone(),
+			provider: kyc_provider,
+		},
+	)
+	.await
+	.context("failed to build the auth web state")?;
 	let web_listener = tokio::net::TcpListener::bind(config.web_bind).await.context("failed to bind the auth web listener")?;
 	tracing::info!(bind = %config.web_bind, "auth web surface listening");
 	let web_server = async {
@@ -290,6 +306,50 @@ async fn run(config: config::AppConfig) -> Result<()> {
 
 	tokio::try_join!(grpc_server, web_server)?;
 	Ok(())
+}
+
+/// The identity-verification vendor, or `None` when it is not configured.
+///
+/// Unconfigured is a supported state, not a broken one: `/kyc/start` and the webhook
+/// answer 503 and the console's manual `SetKycLevel` keeps working. It is deliberately
+/// NOT wired the way the mailer is — an absent mailer silently logs, whereas an absent
+/// webhook secret would mean accepting a verdict nobody signed, so this seam has no
+/// degraded arm at all.
+///
+/// `KYC_STUB` swaps in the no-network provider so the whole flow runs on a laptop. It is
+/// refused in production, where it would be a way to hand out KYC levels.
+fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn concierge::ports::KycProvider>>> {
+	use infrastructure::kyc::{didit, stub};
+
+	// Built from the PUBLIC origin, never from `bind`: what an operator registers in the
+	// vendor console must be the address the conductor serves, which reaches this surface
+	// under an `/api` prefix the conductor adds.
+	let webhook_url = format!("{}/api/kyc/callback/didit", config.public_origin.trim_end_matches('/'));
+
+	if config.kyc_stub {
+		ensure!(
+			config.app_env != "production",
+			"KYC_STUB must never be set in production — it would let anyone sign their own verification verdict"
+		);
+		let secret = config.didit_webhook_secret.clone().unwrap_or_else(|| "kyc-stub-secret".to_string());
+		tracing::warn!(webhook = %webhook_url, "kyc: running the STUB provider — no vendor is contacted and verdicts are locally signed");
+		return Ok(Some(Arc::new(stub::StubKyc::new(secret, config.cabinet_url.clone()))));
+	}
+
+	let (Some(api_key), Some(workflow_id), Some(webhook_secret)) = (config.didit_api_key.clone(), config.didit_workflow_id.clone(), config.didit_webhook_secret.clone()) else {
+		tracing::warn!("kyc: DIDIT_API_KEY/DIDIT_WORKFLOW_ID/DIDIT_WEBHOOK_SECRET incomplete — verification is off; the level stays a manual SetKycLevel decision");
+		return Ok(None);
+	};
+	tracing::info!(webhook = %webhook_url, "kyc: didit provider configured — this is the URL to register in the vendor console");
+	Ok(Some(Arc::new(didit::DiditKyc::new(didit::DiditConfig {
+		base_url: config.didit_base_url.clone(),
+		api_key,
+		workflow_id,
+		webhook_secret,
+		// Where the BROWSER lands when the flow ends — a user-facing page, never the
+		// webhook path, which answers POST only.
+		return_url: config.cabinet_url.clone(),
+	}))))
 }
 
 /// Resolve on SIGTERM or ctrl-c so the server drains in-flight RPCs instead of

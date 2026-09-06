@@ -16,6 +16,7 @@
 //! modules) minus everything banking: the money-plane pair is the cabinet's own
 //! concern, minted zone-side from the verified access token.
 
+mod kyc;
 mod oauth;
 mod routes;
 mod session;
@@ -32,7 +33,10 @@ use evconcierge_auth::AuthService;
 pub use session::WebSessions;
 use time::Duration;
 
-use crate::web::oauth::OAuthTxStore;
+use crate::{
+	ports::{KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
+	web::oauth::OAuthTxStore,
+};
 
 /// Cookie names + shared attributes. `__Host-` prefixed when secure (production);
 /// bare in http dev, since the prefix requires `Secure`.
@@ -87,7 +91,7 @@ pub struct WebState {
 	inner: Arc<Inner>,
 }
 impl WebState {
-	pub async fn try_new(auth: AuthService, public_origin: String, secure_cookies: bool) -> color_eyre::Result<Self> {
+	pub async fn try_new(auth: AuthService, public_origin: String, secure_cookies: bool, kyc: KycDeps) -> color_eyre::Result<Self> {
 		Ok(Self {
 			inner: Arc::new(Inner {
 				auth,
@@ -96,9 +100,25 @@ impl WebState {
 				cookies: CookieNames::new(secure_cookies),
 				google_client_id: std::env::var("GOOGLE_CLIENT_ID").ok().filter(|v| !v.is_empty()),
 				public_origin: public_origin.trim_end_matches('/').to_string(),
+				users: kyc.users,
+				kyc_cases: kyc.cases,
+				notifications: kyc.notifications,
+				kyc: kyc.provider,
 			}),
 		})
 	}
+}
+
+/// What the identity-verification routes need, gathered so the composition root hands
+/// this surface one argument rather than four.
+pub struct KycDeps {
+	/// The SAME directory port the operator RPC writes the level through.
+	pub users: Arc<dyn UserDirectoryRepository>,
+	pub cases: Arc<dyn KycCaseRepository>,
+	pub notifications: Arc<dyn NotificationRepository>,
+	/// `None` ⇒ the vendor is unconfigured and both KYC routes answer 503. There is no
+	/// arm here that verifies nothing: a webhook we cannot authenticate is dropped.
+	pub provider: Option<Arc<dyn KycProvider>>,
 }
 
 /// The auth surface, mounted behind the conductor's `/api` prefix rewrites:
@@ -112,6 +132,11 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/session", get(routes::session))
 		.route("/auth/logout", post(routes::logout))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
+		// Identity verification. `/kyc/callback/didit` is PUBLIC — it is reached by the
+		// vendor, not a browser, and authenticates itself with an HMAC over the body.
+		// Publicly both are seen under the conductor's `/api` prefix.
+		.route("/kyc/start", post(kyc::start))
+		.route("/kyc/callback/didit", post(kyc::callback))
 		.with_state(state)
 }
 /// An opaque identifier: `n` bytes of CSPRNG entropy, base64url-encoded (no padding).
@@ -140,4 +165,11 @@ struct Inner {
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
 	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/google`.
 	public_origin: String,
+	/// The identity control plane — the KYC webhook applies its verdict through the same
+	/// port the operator console's `SetKycLevel` does.
+	users: Arc<dyn UserDirectoryRepository>,
+	kyc_cases: Arc<dyn KycCaseRepository>,
+	notifications: Arc<dyn NotificationRepository>,
+	/// `None` ⇒ unconfigured; both KYC routes answer 503.
+	kyc: Option<Arc<dyn KycProvider>>,
 }
