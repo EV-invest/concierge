@@ -19,6 +19,15 @@ use crate::ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, 
 
 pub const PROVIDER: &str = "didit";
 
+/// Ceiling on the one outbound call this adapter makes.
+///
+/// A vendor that accepts the connection and then never answers is the same outage as one
+/// that refuses it — but without a deadline it would pin the request task open instead of
+/// failing, and `/kyc/start` cannot degrade to "temporarily unavailable" for a call that
+/// never returns. Opening a session is a single round trip, so the window is generous
+/// rather than tight.
+const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Everything the adapter needs from the environment, resolved once at boot.
 pub struct DiditConfig {
 	pub base_url: String,
@@ -38,7 +47,11 @@ pub struct DiditKyc {
 impl DiditKyc {
 	pub fn new(config: DiditConfig) -> Self {
 		Self {
-			http: reqwest::Client::new(),
+			// `expect` on a builder that only fails when the TLS backend cannot be
+			// initialised: that is a broken process, at boot, before any request exists
+			// — the same class of failure as the CSPRNG being unavailable, and the same
+			// treatment it already gets in `web::random_token`.
+			http: reqwest::Client::builder().timeout(SESSION_TIMEOUT).build().expect("reqwest client (TLS backend unavailable)"),
 			config,
 		}
 	}
@@ -72,6 +85,9 @@ impl KycProvider for DiditKyc {
 			}))
 			.send()
 			.await
+			// Covers the refused connection, the DNS failure and the timeout alike. Every
+			// one of them means the same thing to the caller — no session — so none of
+			// them gets its own arm.
 			.map_err(|e| DomainError::Repository(format!("didit: session request failed: {e}")))?;
 
 		let status = response.status();
