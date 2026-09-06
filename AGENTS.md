@@ -123,6 +123,14 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   downgrade are human decisions under `Permission::KycManage`. The identity a callback
   acts on comes from the stored `kyc_cases` row, NEVER from the request body. Absent
   `DIDIT_*` config, both routes answer 503 — there is no arm that skips the signature.
+- **A user never meets a vendor failure.** `/kyc/start` collapses "no vendor configured"
+  and "vendor would not open a session" (balance, quota, outage, timeout, nonsense) into
+  one 503 with one stable body — `{"error":"kyc_unavailable","contact":"<SUPPORT_EMAIL>"}`
+  — so the cabinet needs one screen and the vendor's own words never reach a browser.
+  Vendor codes are deliberately NOT enumerated: we do not know which one means "out of
+  balance" and guessing would be brittle exactly where it costs most. The detail goes to
+  `tracing::error!` (→ Sentry), because from the user's side this failure is SILENT — it
+  looks like a polite "try later" that nobody reports.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
