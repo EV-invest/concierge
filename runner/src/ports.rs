@@ -13,6 +13,11 @@
 //! [`GovernanceRepository`] is the same contract for the ownership consilium: each
 //! method is one use case and is internally atomic, so the verdict, the seat change,
 //! the cross-plane `ROLE_CHANGED` and the audit row can never land apart.
+//!
+//! [`KycProvider`] is the DRIVING side of the same idea for identity verification: the
+//! vendor is behind a port so that swapping Didit for Sumsub costs one adapter and
+//! nothing else, and so that no vendor type is reachable from a handler.
+//! [`KycCaseRepository`] persists the attempts the provider answers about.
 
 use async_trait::async_trait;
 use domain::{
@@ -71,6 +76,11 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	async fn enable_user(&self, id: UserId) -> Result<User, DomainError>;
 
 	/// Set a user's KYC level; emits KYC_CHANGED.
+	///
+	/// The ONE writer of the level, whoever decided it: the operator RPC under
+	/// `Permission::KycManage` and the identity provider's webhook ([`KycProvider`])
+	/// both land here, so the event, the `user_outbox` row and the money plane's mirror
+	/// come out identical — and banking never learns that a KYC vendor exists.
 	async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError>;
 
 	/// Set a user's platform access role UNCONDITIONALLY; emits ROLE_CHANGED across the
@@ -109,6 +119,194 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// The operator console's user list: filtered + paginated summaries plus the total
 	/// matching the filters.
 	async fn list(&self, query: &str, role: &str, status: &str, limit: i64, offset: i64) -> Result<(Vec<AdminUserRow>, i64), DomainError>;
+}
+
+/// The highest level an identity-verification VENDOR may ever cause.
+///
+/// Tier 3 is the ceiling of a human decision (`UserDirectory.SetKycLevel` under
+/// `Permission::KycManage`), and so is every downgrade. Clamping here, in the CHECK on
+/// `kyc_cases.requested_tier`, and again where the webhook applies its verdict means a
+/// compromised vendor account, a forged case row and a bug would each have to line up
+/// before a provider could hand anyone the top tier.
+pub const PROVIDER_MAX_TIER: u32 = 2;
+
+/// How long a signed webhook stays acceptable. Past this, a captured-and-replayed
+/// delivery is refused on age alone rather than on idempotency.
+pub const KYC_CALLBACK_WINDOW_SECS: i64 = 300;
+
+/// A verification session the provider opened: the vendor's handle for it, and the URL
+/// the browser is sent to.
+pub struct KycSession {
+	/// The vendor's own session identifier — stored as `kyc_cases.provider_ref` and the
+	/// ONLY thing a callback may resolve a case by.
+	pub provider_ref: String,
+	/// Where to send the browser to actually perform the verification.
+	pub redirect_url: String,
+}
+
+/// The vendor-neutral state of one verification attempt.
+///
+/// Deliberately a closed enum rather than the provider's string: a new vendor status
+/// must break the compile at the one place a status is turned into a decision
+/// ([`KycStatus::grants_tier`] and its caller), not become a silent no-op in production.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KycStatus {
+	/// The session exists but the user has not begun.
+	Pending,
+	InProgress,
+	/// A human at the vendor is looking at it. The level is untouched until they answer.
+	InReview,
+	Approved,
+	Declined,
+	/// The user walked away mid-flow.
+	Abandoned,
+	Expired,
+	NotFinished,
+	/// A previously-approved verification aged out at the vendor.
+	KycExpired,
+}
+
+impl KycStatus {
+	/// The persisted `kyc_cases.status` vocabulary — kept in step with that column's
+	/// CHECK constraint by [`Self::is_decided`]'s test.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Pending => "pending",
+			Self::InProgress => "in_progress",
+			Self::InReview => "in_review",
+			Self::Approved => "approved",
+			Self::Declined => "declined",
+			Self::Abandoned => "abandoned",
+			Self::Expired => "expired",
+			Self::NotFinished => "not_finished",
+			Self::KycExpired => "kyc_expired",
+		}
+	}
+
+	/// Whether the attempt has stopped moving. Mirrors the `kyc_cases_decision_at`
+	/// CHECK: exactly these statuses carry a `decision_at`.
+	pub fn is_decided(self) -> bool {
+		match self {
+			Self::Pending | Self::InProgress | Self::InReview => false,
+			Self::Approved | Self::Declined | Self::Abandoned | Self::Expired | Self::NotFinished | Self::KycExpired => true,
+		}
+	}
+
+	/// The level this verdict may RAISE a user to, if any.
+	///
+	/// Only an approval moves the level, and only upwards. Every failure mode —
+	/// declined, abandoned, expired, unfinished, aged-out — leaves it exactly where it
+	/// was: someone who holds tier 2 and fails an attempt at a higher one must not be
+	/// dropped to zero by a vendor. Downgrades are a human act under
+	/// `Permission::KycManage`, and there is no other path to one.
+	pub fn grants_tier(self, requested: u32) -> Option<u32> {
+		match self {
+			Self::Approved => Some(requested.min(PROVIDER_MAX_TIER)),
+			Self::Pending | Self::InProgress | Self::InReview | Self::Declined | Self::Abandoned | Self::Expired | Self::NotFinished | Self::KycExpired => None,
+		}
+	}
+}
+
+/// The headers a provider's webhook authenticates itself with, lifted out of the
+/// transport so [`KycProvider::parse_callback`] never sees an `http` type.
+pub struct CallbackHeaders {
+	/// HMAC-SHA256 of the RAW request body, hex-encoded (Didit: `X-Signature`).
+	pub signature: Option<String>,
+	/// Unix seconds the provider claims to have sent at (Didit: `X-Timestamp`).
+	pub timestamp: Option<i64>,
+}
+
+/// One provider verdict, already stripped of everything we refuse to hold.
+pub struct KycDecision {
+	/// The vendor's session id. The case is looked up by THIS and nothing else.
+	pub provider_ref: String,
+	pub status: KycStatus,
+	/// The opaque correlation value we handed the vendor at session start (the case
+	/// id). Usable ONLY as a cross-check against the row found by `provider_ref` — it
+	/// arrives in the request body and is therefore attacker-controlled input, never an
+	/// identity.
+	pub vendor_data: String,
+	/// Allowlisted decision METADATA for `kyc_cases.payload` — document country, document
+	/// type, per-check outcomes. Never documents, images, or document numbers.
+	pub metadata: serde_json::Value,
+}
+
+/// Why a callback was refused. Every variant is a REJECTION: nothing was written and no
+/// level moved.
+#[derive(Debug)]
+pub enum KycCallbackError {
+	/// Missing signature header, or one that does not match the body under the shared
+	/// secret.
+	BadSignature,
+	/// The delivery is outside [`KYC_CALLBACK_WINDOW_SECS`], or carries no usable
+	/// timestamp at all.
+	StaleTimestamp,
+	/// Not the documented body shape, or a status string the closed [`KycStatus`] does
+	/// not know.
+	Malformed(String),
+}
+
+/// Driving port for an identity-verification vendor.
+///
+/// The vendor is young and the platform may well outlive our choice of it, so the whole
+/// integration is two methods: open a session, and turn a signed callback into a
+/// verdict. No vendor type crosses this boundary, and no user identifier crosses it
+/// outbound either — the vendor is handed the CASE id, never a user id, so a breach at
+/// the vendor yields correlation handles rather than our identity space.
+#[async_trait]
+pub trait KycProvider: Send + Sync {
+	/// The `kyc_cases.provider` key this adapter writes and looks cases up by.
+	fn name(&self) -> &'static str;
+
+	/// Open a verification session for an already-opened case.
+	async fn start_session(&self, case_id: Uuid, requested_tier: u32) -> Result<KycSession, DomainError>;
+
+	/// Authenticate and parse one webhook delivery.
+	///
+	/// I/O-FREE by contract — signature check, replay window and parsing only, with the
+	/// clock passed in. It touches no network and no database, so the security-critical
+	/// half of this integration is a pure function a test can hammer without standing
+	/// anything up.
+	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError>;
+}
+
+/// One verification attempt, as much of it as a decision needs.
+pub struct KycCase {
+	pub id: Uuid,
+	/// Read from the STORED row — the reason this table exists. The callback is
+	/// unauthenticated and its body carries no identity we would believe.
+	pub user_id: UserId,
+	pub requested_tier: u32,
+	pub status: KycStatus,
+}
+
+/// What [`KycCaseRepository::record_decision`] did.
+pub enum CaseDecision {
+	/// The case moved to a new status. Only this arm may lead to a level change.
+	Recorded(KycCase),
+	/// The case was already in this status — an at-least-once redelivery. Nothing was
+	/// written and nothing must follow, or a replayed `Approved` would re-emit
+	/// `KYC_CHANGED` onto the cross-plane outbox.
+	Redelivered(KycCase),
+	/// No case for this `(provider, provider_ref)`. Also the shape of the legitimate
+	/// race where a webhook overtakes the transaction that opens the case.
+	Unknown,
+}
+
+/// Persistence port for verification attempts.
+///
+/// [`Self::record_decision`] is internally atomic and single-shot: it takes the case row
+/// `FOR UPDATE`, decides from THAT read whether the status actually transitions, and
+/// writes at most once — so concurrent redeliveries of the same event serialize into one
+/// [`CaseDecision::Recorded`] and any number of [`CaseDecision::Redelivered`].
+#[async_trait]
+pub trait KycCaseRepository: Send + Sync {
+	/// Record a started attempt. `id` is minted by the caller because it is also the
+	/// correlation value handed to the vendor.
+	async fn open_case(&self, id: Uuid, user_id: UserId, provider: &str, provider_ref: &str, requested_tier: u32) -> Result<(), DomainError>;
+
+	/// Apply a verdict to the case it names, if it moves anything.
+	async fn record_decision(&self, provider: &str, decision: &KycDecision) -> Result<CaseDecision, DomainError>;
 }
 
 /// Port for the platform/cabinet control config (maintenance mode, announcement
