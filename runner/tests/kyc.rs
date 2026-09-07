@@ -22,7 +22,11 @@ use axum::{
 use concierge::{
 	infrastructure::{
 		db,
-		kyc::{cases::PgKycCases, didit::sign_body, stub::StubKyc},
+		kyc::{
+			cases::PgKycCases,
+			didit::{sign_body, sign_body_v2},
+			stub::StubKyc,
+		},
 		notifications::PgNotifications,
 		users::PgUsers,
 	},
@@ -134,14 +138,23 @@ impl Harness {
 	}
 
 	async fn post(&self, body: Vec<u8>, signature: String, timestamp: i64) -> (StatusCode, Value) {
-		let request = Request::builder()
+		self.post_with(body, Some(signature), None, timestamp).await
+	}
+
+	/// The webhook with either signature header, both, or neither.
+	async fn post_with(&self, body: Vec<u8>, signature: Option<String>, signature_v2: Option<String>, timestamp: i64) -> (StatusCode, Value) {
+		let mut builder = Request::builder()
 			.method("POST")
 			.uri("/kyc/callback/didit")
 			.header("content-type", "application/json")
-			.header("x-signature", signature)
-			.header("x-timestamp", timestamp.to_string())
-			.body(Body::from(body))
-			.unwrap();
+			.header("x-timestamp", timestamp.to_string());
+		if let Some(v) = signature {
+			builder = builder.header("x-signature", v);
+		}
+		if let Some(v) = signature_v2 {
+			builder = builder.header("x-signature-v2", v);
+		}
+		let request = builder.body(Body::from(body)).unwrap();
 		let response = self.router.clone().oneshot(request).await.expect("router answered");
 		let status = response.status();
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
@@ -589,6 +602,47 @@ async fn a_vendor_that_refuses_a_session_degrades_exactly_like_an_unconfigured_o
 	// And no half-open attempt is left behind. A `pending` row here would later be read
 	// as a user who started verifying and gave up, which is the opposite of what happened.
 	assert_eq!(h.case_count(user).await, 0, "a failed vendor call must not leave a case row");
+}
+
+/// The delivery arrives with a raw signature that cannot match, because something on the
+/// way here re-serialised the JSON — a Cloudflare tunnel, Traefik, and a Next.js rewrite
+/// in the site conductor all sit between Didit and this handler. `X-Signature-V2` is what
+/// survives that, and it must be enough on its own.
+#[tokio::test]
+async fn a_repacked_delivery_is_accepted_on_the_v2_signature_alone() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	let at = now();
+	let raw = body(&session_id, "Approved", &case_id.to_string(), at, json!({}));
+	// What a middlebox leaves behind: a body that means the same thing, byte-for-byte
+	// different, and a raw signature computed over what the vendor originally sent.
+	let repacked = serde_json::to_vec(&serde_json::from_slice::<Value>(&raw).unwrap()).unwrap();
+	let stale_raw_signature = signed(&raw);
+
+	let (status, answer) = h.post_with(repacked.clone(), Some(stale_raw_signature), sign_body_v2(SECRET, &repacked), at).await;
+
+	assert_eq!(status, StatusCode::OK, "V2 alone authenticates it: {answer}");
+	assert_eq!(h.kyc_level(user).await, 2);
+	assert_eq!(h.case_row(case_id).await.0, "approved");
+}
+
+/// Neither signature valid is still a rejection, and it must write nothing. Accepting
+/// either form must not become accepting anything.
+#[tokio::test]
+async fn a_delivery_with_two_wrong_signatures_is_refused() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 1).await;
+
+	let at = now();
+	let raw = body(&session_id, "Approved", &case_id.to_string(), at, json!({}));
+	let (status, _) = h.post_with(raw.clone(), Some(sign_body("wrong-secret", &raw)), sign_body_v2("wrong-secret", &raw), at).await;
+
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(h.kyc_level(user).await, 0, "a forgery moves nothing");
+	assert_eq!(h.case_row(case_id).await.0, "pending", "and writes nothing");
 }
 
 /// Didit will add words to its status vocabulary. The day it does, this endpoint must
