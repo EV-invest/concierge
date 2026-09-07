@@ -191,7 +191,14 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 /// except for the signature over the body.
 ///
 /// `Bytes` must stay the last extractor: it consumes the body, and it gives us the bytes
-/// exactly as they arrived, which is what the signature is computed over.
+/// exactly as they arrived, which is what the raw signature is computed over.
+///
+/// BUDGET: the vendor gives this handler 5 seconds before it calls the delivery failed.
+/// Everything on the path is local Postgres — one short transaction (`SELECT … FOR
+/// UPDATE` plus an `UPDATE`), then the level write and its outbox row, then a
+/// best-effort notification that only ENQUEUES (SMTP lives in the dispatcher loop, never
+/// here). Nothing waits on a network hop. Keep it that way: anything slower added here
+/// turns every verdict into a retry.
 pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, (StatusCode, &'static str)> {
 	let st = &st.inner;
 	let Some(provider) = st.kyc.as_ref() else {
@@ -202,6 +209,7 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 
 	let callback_headers = CallbackHeaders {
 		signature: header_str(&headers, "x-signature"),
+		signature_v2: header_str(&headers, "x-signature-v2"),
 		timestamp: header_str(&headers, "x-timestamp").and_then(|v| v.trim().parse::<i64>().ok()),
 	};
 	// Matched rather than `map_err`-ed because one arm is not a rejection: an unknown
@@ -250,7 +258,12 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 			return Ok(Json(json!({ "ok": true, "duplicate": true })));
 		}
 		// Also the shape of the legitimate race where the webhook overtakes the insert
-		// that opens the case: 404 asks the provider to retry, which resolves it.
+		// that opens the case.
+		//
+		// DO NOT "fix" this to 200. Didit retries on 5xx AND on 404, twice — at roughly
+		// one minute and four minutes — so this 404 IS the recovery path for that race,
+		// not a lost delivery. Answering 200 would tell the vendor the message was
+		// handled and permanently drop a verdict for a case that existed a second later.
 		CaseDecision::Unknown => {
 			tracing::warn!(provider = provider.name(), "kyc callback: no case for this session");
 			return Err((StatusCode::NOT_FOUND, "unknown session"));

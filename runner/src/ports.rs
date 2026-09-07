@@ -217,6 +217,10 @@ impl KycStatus {
 pub struct CallbackHeaders {
 	/// HMAC-SHA256 of the RAW request body, hex-encoded (Didit: `X-Signature`).
 	pub signature: Option<String>,
+	/// HMAC-SHA256 of the CANONICALISED body, hex-encoded (Didit: `X-Signature-V2`).
+	/// Either signature alone authenticates a delivery — see the adapter's
+	/// `verify_signature` for why we accept both rather than picking one.
+	pub signature_v2: Option<String>,
 	/// Unix seconds the provider claims to have sent at (Didit: `X-Timestamp`).
 	pub timestamp: Option<i64>,
 }
