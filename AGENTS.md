@@ -123,6 +123,21 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   downgrade are human decisions under `Permission::KycManage`. The identity a callback
   acts on comes from the stored `kyc_cases` row, NEVER from the request body. Absent
   `DIDIT_*` config, both routes answer 503 — there is no arm that skips the signature.
+- **Either webhook signature authenticates a delivery**: `X-Signature-V2` (over the
+  canonicalised body) is tried first, `X-Signature` (over the raw bytes) second. The
+  delivery crosses a Cloudflare tunnel, Traefik and a Next.js rewrite before reaching us,
+  and any hop re-packing the JSON would break the raw form for EVERY delivery at once —
+  silently, since from a user's seat it just looks like verification stopped working.
+  Accepting both makes the two failure modes cancel out. The webhook's 404 on an unknown
+  session is a RECOVERY path, not a loss: Didit retries 404 and 5xx twice (~1 min, ~4
+  min), which is what resolves the webhook-overtakes-the-insert race. Do not "fix" it to
+  200. The handler must answer inside 5s, so nothing on that path may wait on a network
+  hop.
+- **Vendor status words are copied, never retyped.** The match is case-sensitive, so a
+  near-miss does not fail loudly — the arm just never fires. `"Kyc Expired"` spent a
+  while here as `"KYC Expired"`, silently unclassifiable. An unknown word is answered
+  200-and-ignored (a growing vocabulary must not break the endpoint) with an `error!` so
+  a human adds the arm.
 - **A user never meets a vendor failure.** `/kyc/start` collapses "no vendor configured"
   and "vendor would not open a session" (balance, quota, outage, timeout, nonsense) into
   one 503 with one stable body — `{"error":"kyc_unavailable","contact":"<SUPPORT_EMAIL>"}`
