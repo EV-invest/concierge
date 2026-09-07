@@ -198,21 +198,32 @@ pub fn sign_body(secret: &str, body: &[u8]) -> String {
 
 /// Didit's status vocabulary, verbatim — spacing and capitalisation included.
 ///
-/// An unrecognised value is a REFUSAL, not a shrug: a status we cannot classify might
-/// be an approval, and guessing in either direction is worse than answering 400 and
-/// letting the provider retry while a human reads the log line.
+/// The comparison is case-SENSITIVE and that is not an oversight: a near-miss here is
+/// invisible, because the arm simply never fires and the status falls through to the
+/// catch-all. `"KYC Expired"` sat in this table for exactly that reason and would have
+/// meant every aged-out verification was quietly unclassifiable. Copy the words from the
+/// vendor's document; do not retype them from memory.
+///
+/// An unknown value is [`KycCallbackError::UnknownStatus`], NOT `Malformed`. The vendor
+/// will add words to this list, and an endpoint that answers 400 to a delivery it merely
+/// does not recognise turns a vocabulary change into an outage. Nothing is guessed
+/// either way: an unclassifiable status moves no level (see the handler).
 fn status_from_didit(raw: &str) -> Result<KycStatus, KycCallbackError> {
 	match raw {
 		"Not Started" => Ok(KycStatus::Pending),
 		"In Progress" => Ok(KycStatus::InProgress),
+		// KYB-only, and we run no KYB flow — but a status we can name is better handled
+		// than routed through the unknown-status alarm, so it maps to the running state
+		// it actually describes.
+		"Awaiting User" => Ok(KycStatus::InProgress),
 		"In Review" => Ok(KycStatus::InReview),
+		"Resubmitted" => Ok(KycStatus::Resubmitted),
 		"Approved" => Ok(KycStatus::Approved),
 		"Declined" => Ok(KycStatus::Declined),
 		"Abandoned" => Ok(KycStatus::Abandoned),
 		"Expired" => Ok(KycStatus::Expired),
-		"Not Finished" => Ok(KycStatus::NotFinished),
-		"KYC Expired" => Ok(KycStatus::KycExpired),
-		other => Err(KycCallbackError::Malformed(format!("unknown didit status: {other}"))),
+		"Kyc Expired" => Ok(KycStatus::KycExpired),
+		other => Err(KycCallbackError::UnknownStatus(other.to_string())),
 	}
 }
 
@@ -356,26 +367,49 @@ mod tests {
 	#[test]
 	fn every_documented_status_maps_and_nothing_else_does() {
 		let now = 1_800_000_000;
+		// Didit's documented vocabulary, copied verbatim from the integration guide.
+		// Capitalisation is load-bearing and is the point of this table: `"Kyc Expired"`
+		// was once written `"KYC Expired"` here, and because the match is case-sensitive
+		// the arm simply never fired — every aged-out verification fell through to the
+		// catch-all with no symptom to notice.
 		for (raw_status, expected) in [
 			("Not Started", KycStatus::Pending),
 			("In Progress", KycStatus::InProgress),
+			// KYB-only; we run no KYB flow, but it is handled rather than alarmed on.
+			("Awaiting User", KycStatus::InProgress),
 			("In Review", KycStatus::InReview),
+			("Resubmitted", KycStatus::Resubmitted),
 			("Approved", KycStatus::Approved),
 			("Declined", KycStatus::Declined),
 			("Abandoned", KycStatus::Abandoned),
 			("Expired", KycStatus::Expired),
-			("Not Finished", KycStatus::NotFinished),
-			("KYC Expired", KycStatus::KycExpired),
+			("Kyc Expired", KycStatus::KycExpired),
 		] {
 			let raw = body(raw_status, now);
 			let decision = parse_webhook(SECRET, &headers(&raw, now), &raw, now).expect(raw_status);
 			assert_eq!(decision.status, expected, "{raw_status}");
 		}
-		let raw = body("approved", now);
-		assert!(
-			matches!(parse_webhook(SECRET, &headers(&raw, now), &raw, now), Err(KycCallbackError::Malformed(_))),
-			"the vocabulary is case-sensitive: a status we cannot classify is refused, never guessed"
-		);
+
+		// A word we do not know is `UnknownStatus`, never `Malformed`: the delivery is
+		// genuine and the route answers 200 to it (see `web::kyc::callback`). The
+		// vocabulary is still case-sensitive — `"approved"` is not `"Approved"` — but
+		// getting the case wrong now lands here rather than in a silent no-op.
+		for unknown in ["approved", "Auto Approved", ""] {
+			let raw = body(unknown, now);
+			assert!(
+				matches!(parse_webhook(SECRET, &headers(&raw, now), &raw, now), Err(KycCallbackError::UnknownStatus(_))),
+				"{unknown:?}"
+			);
+		}
+	}
+
+	/// A `Resubmitted` verdict puts the attempt back in the user's hands. It must not
+	/// grant anything and must not close the case, or the row would claim an outcome
+	/// that has not happened.
+	#[test]
+	fn a_resubmission_moves_nothing_and_closes_nothing() {
+		assert_eq!(KycStatus::Resubmitted.grants_tier(2), None);
+		assert!(!KycStatus::Resubmitted.is_decided());
 	}
 
 	#[test]

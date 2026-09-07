@@ -158,10 +158,12 @@ pub enum KycStatus {
 	InReview,
 	Approved,
 	Declined,
+	/// A reviewer sent specific steps back to the user. The attempt is RUNNING again,
+	/// not finished: no level moves and the case stays open.
+	Resubmitted,
 	/// The user walked away mid-flow.
 	Abandoned,
 	Expired,
-	NotFinished,
 	/// A previously-approved verification aged out at the vendor.
 	KycExpired,
 }
@@ -176,9 +178,9 @@ impl KycStatus {
 			Self::InReview => "in_review",
 			Self::Approved => "approved",
 			Self::Declined => "declined",
+			Self::Resubmitted => "resubmitted",
 			Self::Abandoned => "abandoned",
 			Self::Expired => "expired",
-			Self::NotFinished => "not_finished",
 			Self::KycExpired => "kyc_expired",
 		}
 	}
@@ -187,22 +189,25 @@ impl KycStatus {
 	/// CHECK: exactly these statuses carry a `decision_at`.
 	pub fn is_decided(self) -> bool {
 		match self {
-			Self::Pending | Self::InProgress | Self::InReview => false,
-			Self::Approved | Self::Declined | Self::Abandoned | Self::Expired | Self::NotFinished | Self::KycExpired => true,
+			// `Resubmitted` belongs HERE, with the open states: a reviewer asking for
+			// specific steps again puts the attempt back in the user's hands, so a
+			// `decision_at` on it would claim an outcome that has not happened.
+			Self::Pending | Self::InProgress | Self::InReview | Self::Resubmitted => false,
+			Self::Approved | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired => true,
 		}
 	}
 
 	/// The level this verdict may RAISE a user to, if any.
 	///
 	/// Only an approval moves the level, and only upwards. Every failure mode —
-	/// declined, abandoned, expired, unfinished, aged-out — leaves it exactly where it
-	/// was: someone who holds tier 2 and fails an attempt at a higher one must not be
-	/// dropped to zero by a vendor. Downgrades are a human act under
+	/// declined, abandoned, expired, aged-out — and every mid-flight state leaves it
+	/// exactly where it was: someone who holds tier 2 and fails an attempt at a higher
+	/// one must not be dropped to zero by a vendor. Downgrades are a human act under
 	/// `Permission::KycManage`, and there is no other path to one.
 	pub fn grants_tier(self, requested: u32) -> Option<u32> {
 		match self {
 			Self::Approved => Some(requested.min(PROVIDER_MAX_TIER)),
-			Self::Pending | Self::InProgress | Self::InReview | Self::Declined | Self::Abandoned | Self::Expired | Self::NotFinished | Self::KycExpired => None,
+			Self::Pending | Self::InProgress | Self::InReview | Self::Resubmitted | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired => None,
 		}
 	}
 }
@@ -241,9 +246,16 @@ pub enum KycCallbackError {
 	/// The delivery is outside [`KYC_CALLBACK_WINDOW_SECS`], or carries no usable
 	/// timestamp at all.
 	StaleTimestamp,
-	/// Not the documented body shape, or a status string the closed [`KycStatus`] does
-	/// not know.
+	/// Not the documented body shape.
 	Malformed(String),
+	/// A signed, in-window, well-formed delivery carrying a status word this adapter
+	/// does not know.
+	///
+	/// Split out from [`Self::Malformed`] because it is not the caller's fault and not
+	/// a forgery: the vendor's vocabulary grows, and the day it does, an endpoint that
+	/// answers 400 to every delivery is an outage. The route accepts these and changes
+	/// nothing — see the handler, which also explains why the log line is `error!`.
+	UnknownStatus(String),
 }
 
 /// Driving port for an identity-verification vendor.

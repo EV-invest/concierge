@@ -44,11 +44,14 @@ CREATE TABLE kyc_cases (
     CONSTRAINT kyc_cases_provider_len     CHECK (char_length(provider) <= 32),
     CONSTRAINT kyc_cases_provider_ref_len CHECK (char_length(provider_ref) BETWEEN 1 AND 128),
     CONSTRAINT kyc_cases_requested_tier   CHECK (requested_tier BETWEEN 1 AND 2),
+    -- Didit's documented vocabulary, mapped to snake_case. 'resubmitted' is a RUNNING
+    -- state, not an outcome: a reviewer sent specific steps back to the user, so it sits
+    -- with the open statuses below and carries no `decision_at`.
     CONSTRAINT kyc_cases_status CHECK (
-        status IN ('pending', 'in_progress', 'in_review', 'approved', 'declined', 'abandoned', 'expired', 'not_finished', 'kyc_expired')
+        status IN ('pending', 'in_progress', 'in_review', 'resubmitted', 'approved', 'declined', 'abandoned', 'expired', 'kyc_expired')
     ),
     CONSTRAINT kyc_cases_decision_at CHECK (
-        (decision_at IS NULL) = (status IN ('pending', 'in_progress', 'in_review'))
+        (decision_at IS NULL) = (status IN ('pending', 'in_progress', 'in_review', 'resubmitted'))
     )
 );
 

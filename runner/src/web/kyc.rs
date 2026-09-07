@@ -204,22 +204,39 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 		signature: header_str(&headers, "x-signature"),
 		timestamp: header_str(&headers, "x-timestamp").and_then(|v| v.trim().parse::<i64>().ok()),
 	};
-	let decision = provider.parse_callback(&callback_headers, &body, now_secs()).map_err(|err| match err {
+	// Matched rather than `map_err`-ed because one arm is not a rejection: an unknown
+	// status is ACCEPTED and ignored.
+	let decision = match provider.parse_callback(&callback_headers, &body, now_secs()) {
+		Ok(decision) => decision,
 		// Deliberately terse to the caller and detailed to the log: a rejected caller
 		// learns only that it was rejected.
-		KycCallbackError::BadSignature => {
+		Err(KycCallbackError::BadSignature) => {
 			tracing::warn!(provider = provider.name(), "kyc callback: signature rejected");
-			(StatusCode::UNAUTHORIZED, "invalid signature")
+			return Err((StatusCode::UNAUTHORIZED, "invalid signature"));
 		}
-		KycCallbackError::StaleTimestamp => {
+		Err(KycCallbackError::StaleTimestamp) => {
 			tracing::warn!(provider = provider.name(), "kyc callback: outside the replay window");
-			(StatusCode::BAD_REQUEST, "stale delivery")
+			return Err((StatusCode::BAD_REQUEST, "stale delivery"));
 		}
-		KycCallbackError::Malformed(detail) => {
+		Err(KycCallbackError::Malformed(detail)) => {
 			tracing::warn!(provider = provider.name(), %detail, "kyc callback: unusable body");
-			(StatusCode::BAD_REQUEST, "malformed callback")
+			return Err((StatusCode::BAD_REQUEST, "malformed callback"));
 		}
-	})?;
+		// 200, because the delivery is genuine, in-window and well-formed — we simply do
+		// not know the word. The vendor's vocabulary grows; answering 4xx to a status we
+		// merely have not been taught would turn "Didit shipped a new state" into an
+		// endpoint that rejects deliveries, and a 5xx would put it in a retry loop that
+		// can never succeed. Nothing is written and no level moves.
+		//
+		// `error!`, though — NOT `warn!`. If the new word turns out to mean an approval,
+		// every user hitting it is verified at the vendor and stuck at their old level
+		// here, and nobody reports that. This line (via `error_monitoring::tracing_layer`)
+		// is the only thing that will bring a human to add the arm.
+		Err(KycCallbackError::UnknownStatus(word)) => {
+			tracing::error!(provider = provider.name(), status = %word, "kyc callback: the vendor sent a status this build does not know — accepted, but no level was moved");
+			return Ok(Json(json!({ "ok": true, "ignored": "unknown status" })));
+		}
+	};
 
 	let case = match st.kyc_cases.record_decision(provider.name(), &decision).await.map_err(|e| {
 		tracing::error!(error = %e, "kyc callback: could not record the decision");

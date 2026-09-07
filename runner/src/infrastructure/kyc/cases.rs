@@ -34,9 +34,9 @@ fn status_from_column(raw: &str) -> Result<KycStatus, DomainError> {
 		KycStatus::InReview,
 		KycStatus::Approved,
 		KycStatus::Declined,
+		KycStatus::Resubmitted,
 		KycStatus::Abandoned,
 		KycStatus::Expired,
-		KycStatus::NotFinished,
 		KycStatus::KycExpired,
 	];
 	KNOWN

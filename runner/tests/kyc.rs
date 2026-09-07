@@ -308,7 +308,12 @@ async fn a_failed_attempt_never_lowers_an_existing_level() {
 	let manual_events = h.kyc_changed_count(user).await;
 
 	// Every way an attempt can fail, one after another, on cases asking for tier 2.
-	for failure in ["Declined", "Abandoned", "Expired", "Not Finished", "KYC Expired"] {
+	// Spelling copied from Didit's integration guide: `"Kyc Expired"`, not `"KYC
+	// Expired"`. This list used to carry the wrong capitalisation AND a `"Not Finished"`
+	// that the vendor does not send, and it passed — because the adapter carried the
+	// same wrong word. A vocabulary test is only worth something when its words come
+	// from the vendor's document rather than from the code it is checking.
+	for failure in ["Declined", "Abandoned", "Expired", "Kyc Expired"] {
 		let (case_id, session_id) = h.case(user, 2).await;
 		let at = now();
 		let raw = body(&session_id, failure, &case_id.to_string(), at, json!({}));
@@ -584,4 +589,81 @@ async fn a_vendor_that_refuses_a_session_degrades_exactly_like_an_unconfigured_o
 	// And no half-open attempt is left behind. A `pending` row here would later be read
 	// as a user who started verifying and gave up, which is the opposite of what happened.
 	assert_eq!(h.case_count(user).await, 0, "a failed vendor call must not leave a case row");
+}
+
+/// Didit will add words to its status vocabulary. The day it does, this endpoint must
+/// keep answering 2xx: a 4xx would reject a genuine delivery and a 5xx would put the
+/// vendor in a retry loop that can never succeed. Nothing is written either way.
+#[tokio::test]
+async fn a_status_this_build_does_not_know_is_accepted_and_changes_nothing() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	let at = now();
+	let raw = body(&session_id, "Some Status We Have Never Seen", &case_id.to_string(), at, json!({}));
+	let (status, answer) = h.post(raw.clone(), signed(&raw), at).await;
+
+	assert_eq!(status, StatusCode::OK, "a vocabulary change must not break the endpoint");
+	assert_eq!(answer["ignored"], "unknown status");
+	assert_eq!(h.kyc_level(user).await, 0, "an unclassifiable status is never guessed into an approval");
+	let (recorded, decided, _) = h.case_row(case_id).await;
+	assert_eq!(recorded, "pending", "and the case is left exactly as it was");
+	assert!(!decided);
+	assert_eq!(h.kyc_changed_count(user).await, 0);
+}
+
+/// A reviewer asking for specific steps again puts the attempt back in the user's hands.
+/// It is NOT an outcome: no level moves, and the case must stay open — a `decision_at`
+/// here would claim the flow had finished when it has just restarted.
+#[tokio::test]
+async fn a_resubmission_reopens_the_case_rather_than_closing_it() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	let at = now();
+	// The vendor sends `resubmit_info` in place of `decision` here. The parser must not
+	// need `decision` to be present.
+	let raw = body(
+		&session_id,
+		"Resubmitted",
+		&case_id.to_string(),
+		at,
+		json!({ "resubmit_info": { "nodes_to_resubmit": ["id_verification"], "reasons": ["document is blurred"] } }),
+	);
+	let (status, _) = h.post(raw.clone(), signed(&raw), at).await;
+
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 0, "a resubmission grants nothing");
+	let (recorded, decided, _) = h.case_row(case_id).await;
+	assert_eq!(recorded, "resubmitted");
+	assert!(!decided, "the attempt is running again, so it carries no decision_at");
+	assert_eq!(h.kyc_changed_count(user).await, 0);
+}
+
+/// Didit offers `event_id` as a dedupe key. We do not use it — idempotency is the status
+/// comparison under `FOR UPDATE` on `(provider, provider_ref)`, which holds whatever
+/// `event_id` happens to mean — so a body without one must behave exactly like a body
+/// with one, redelivery included.
+#[tokio::test]
+async fn a_body_without_an_event_id_is_handled_and_still_idempotent() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 1).await;
+
+	let at = now();
+	let mut payload: Value = serde_json::from_slice(&body(&session_id, "Approved", &case_id.to_string(), at, json!({}))).unwrap();
+	payload.as_object_mut().unwrap().remove("event_id");
+	let raw = serde_json::to_vec(&payload).unwrap();
+	assert!(!String::from_utf8_lossy(&raw).contains("event_id"));
+
+	let (first, _) = h.post(raw.clone(), signed(&raw), at).await;
+	let (second, again) = h.post(raw.clone(), signed(&raw), at).await;
+
+	assert_eq!(first, StatusCode::OK);
+	assert_eq!(second, StatusCode::OK);
+	assert_eq!(again["duplicate"], true, "the second delivery is recognised without an event_id");
+	assert_eq!(h.kyc_level(user).await, 1);
+	assert_eq!(h.kyc_changed_count(user).await, 1, "exactly one crossing of the bridge");
 }
