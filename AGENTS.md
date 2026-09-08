@@ -115,6 +115,37 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   banner, feature flags) behind the shared RBAC gate (`authz`). `notification` and
   `log` stay DEFERRED stubs (`tonic::Status::unimplemented`); their application
   layers are placeholders to grow into. Health returns `"ok"`.
+- **KYC has exactly one writer**: `users.set_kyc_level` (→ `KYC_CHANGED` → outbox →
+  banking's mirror). The verification vendor sits behind the `KycProvider` port and
+  its webhook (`web/kyc.rs`, `POST /kyc/callback/didit` — public, HMAC over the raw
+  body, 300s replay window) lands in that same call, so banking never learns a vendor
+  exists. A provider may only RAISE a level and never past tier 2; tier 3 and every
+  downgrade are human decisions under `Permission::KycManage`. The identity a callback
+  acts on comes from the stored `kyc_cases` row, NEVER from the request body. Absent
+  `DIDIT_*` config, both routes answer 503 — there is no arm that skips the signature.
+- **Either webhook signature authenticates a delivery**: `X-Signature-V2` (over the
+  canonicalised body) is tried first, `X-Signature` (over the raw bytes) second. The
+  delivery crosses a Cloudflare tunnel, Traefik and a Next.js rewrite before reaching us,
+  and any hop re-packing the JSON would break the raw form for EVERY delivery at once —
+  silently, since from a user's seat it just looks like verification stopped working.
+  Accepting both makes the two failure modes cancel out. The webhook's 404 on an unknown
+  session is a RECOVERY path, not a loss: Didit retries 404 and 5xx twice (~1 min, ~4
+  min), which is what resolves the webhook-overtakes-the-insert race. Do not "fix" it to
+  200. The handler must answer inside 5s, so nothing on that path may wait on a network
+  hop.
+- **Vendor status words are copied, never retyped.** The match is case-sensitive, so a
+  near-miss does not fail loudly — the arm just never fires. `"Kyc Expired"` spent a
+  while here as `"KYC Expired"`, silently unclassifiable. An unknown word is answered
+  200-and-ignored (a growing vocabulary must not break the endpoint) with an `error!` so
+  a human adds the arm.
+- **A user never meets a vendor failure.** `/kyc/start` collapses "no vendor configured"
+  and "vendor would not open a session" (balance, quota, outage, timeout, nonsense) into
+  one 503 with one stable body — `{"error":"kyc_unavailable","contact":"<SUPPORT_EMAIL>"}`
+  — so the cabinet needs one screen and the vendor's own words never reach a browser.
+  Vendor codes are deliberately NOT enumerated: we do not know which one means "out of
+  balance" and guessing would be brittle exactly where it costs most. The detail goes to
+  `tracing::error!` (→ Sentry), because from the user's side this failure is SILENT — it
+  looks like a polite "try later" that nobody reports.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.

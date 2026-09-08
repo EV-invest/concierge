@@ -65,6 +65,12 @@ ev::settings! {
 		mail_from: String = "EV Investment <notifications@evinvest.ltd>",
 		/// Origin the cabinet is served from; builds the links inside emails.
 		cabinet_url: String = "https://evinvest.ltd/cabinet",
+		/// The HUMAN mailbox handed to a user whose verification cannot run right now.
+		///
+		/// Deliberately not `mail_from`: that address is a SENDER nobody reads, so
+		/// printing it on an error screen would invite replies into a void. This one is
+		/// answered by a person.
+		support_email: String = "admin@evinvest.ltd",
 		/// Trailing-24h send ceiling. Gmail's relay caps daily volume and throttles the
 		/// account past it, so the dispatcher stops SENDING (never queueing) at this
 		/// number. Raise it in step with whatever provider is actually behind the port.
@@ -82,6 +88,29 @@ ev::settings! {
 		/// signed in, but there is no `/governance/*` surface on the site and a link into
 		/// one would 404 every removal invitation ever sent.
 		governance_approval_url: String = "https://evinvest.ltd/cabinet/owner-removal",
+		/// Didit (identity verification) credentials. The feature is ON only when all three
+		/// are present; with any of them missing `/kyc/start` and `/kyc/callback/didit` answer
+		/// 503 and no case can be opened.
+		///
+		/// Deliberately NOT `#[required_in("production")]`, unlike the mailer above: that
+		/// marker is for seams whose absence is SILENT (mail nobody receives, errors nobody
+		/// is paged about). An unconfigured provider is loud — every start answers 503 and
+		/// the boot logs say so — and refusing to boot the whole identity plane over a
+		/// missing vendor key would take sign-in down with it.
+		#[secret]
+		didit_api_key: Option<String>,
+		didit_workflow_id: Option<String>,
+		/// Shared secret behind the webhook's `X-Signature`. This is the ONLY thing standing
+		/// between a public, unauthenticated POST and a KYC level, so an absent one fails
+		/// CLOSED rather than skipping the check.
+		#[secret]
+		didit_webhook_secret: Option<String>,
+		didit_base_url: String = "https://verification.didit.me",
+		/// Run the no-network stub provider instead of Didit, so the whole flow (start →
+		/// redirect → signed callback → level change → outbox row) works on a laptop with no
+		/// vendor account. Refused in production by the composition root — a stub that could
+		/// be switched on there would be a way to hand out KYC levels.
+		kyc_stub: bool = "false",
 	}
 }
 
