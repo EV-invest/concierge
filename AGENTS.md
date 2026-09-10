@@ -136,8 +136,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   call, so banking never learns a vendor exists. A provider may only RAISE a level and
   never past `PROVIDER_MAX_TIER`; every tier above it and every downgrade are human
   decisions under `Permission::KycManage`. The identity a callback acts on comes from the
-  stored `kyc_cases` row, NEVER from the request body. Absent `DIDIT_*` config, both
-  routes answer 503 — there is no arm that skips the signature.
+  stored `kyc_cases` row, NEVER from the request body; the body's echoed `vendor_data` is
+  a CROSS-CHECK against that row and is decided inside the recording transaction, because
+  a refusal reached after the commit is not a refusal — it used to answer 400 over a row
+  it had already moved (#54). Absent `DIDIT_*` config, both routes answer 503 — there is
+  no arm that skips the signature.
 - **The vendor ceiling is what the vendor actually CHECKS, and it is 1.** There is one
   Didit workflow (`DIDIT_WORKFLOW_ID`) and it verifies a document and a selfie — tier-1
   evidence. Tier 2 means "plus proof of address and source of funds" (`banking`'s
