@@ -277,6 +277,15 @@ pub struct KycDecision {
 	/// Allowlisted decision METADATA for `kyc_cases.payload` — document country, document
 	/// type, per-check outcomes. Never documents, images, or document numbers.
 	pub metadata: serde_json::Value,
+	/// Unix seconds the vendor stamped INSIDE the signed body — the instant this verdict
+	/// was made, as opposed to the instant this delivery happened to arrive.
+	///
+	/// This is the ordering key [`KycCaseRepository::record_decision`] judges a verdict
+	/// by, which is why it is the signed copy and not the `X-Timestamp` header: the
+	/// header is unauthenticated, so ordering taken from it could be rewritten by anyone
+	/// holding one captured delivery. Non-optional by construction — a body without it is
+	/// refused as [`KycCallbackError::Malformed`] before a decision is ever built.
+	pub signed_at: i64,
 }
 
 /// Why a callback was refused. Every variant is a REJECTION: nothing was written and no
@@ -345,6 +354,18 @@ pub enum CaseDecision {
 	/// written and nothing must follow, or a replayed `Approved` would re-emit
 	/// `KYC_CHANGED` onto the cross-plane outbox.
 	Redelivered(KycCase),
+	/// The delivery is genuine but SUPERSEDED: it describes an older verdict than the one
+	/// the case already holds, or it would reopen a case that has finished. Nothing was
+	/// written and nothing must follow.
+	///
+	/// Distinct from [`Self::Redelivered`] on purpose, and the difference decides whether
+	/// the caller may still act. A redelivery asserts the state the case IS in, so
+	/// re-applying it is idempotent and repairs a first delivery that recorded the status
+	/// and then failed to move the level. An ignored delivery asserts a state the case has
+	/// LEFT — acting on it would apply a verdict the vendor has already replaced.
+	///
+	/// Carries the case as it actually stands, never the superseded verdict.
+	Ignored(KycCase),
 	/// No case for this `(provider, provider_ref)`. Also the shape of the legitimate
 	/// race where a webhook overtakes the transaction that opens the case.
 	Unknown,
@@ -363,6 +384,13 @@ pub trait KycCaseRepository: Send + Sync {
 	async fn open_case(&self, id: Uuid, user_id: UserId, provider: &str, provider_ref: &str, requested_tier: u32) -> Result<(), DomainError>;
 
 	/// Apply a verdict to the case it names, if it moves anything.
+	///
+	/// Ordering is decided here and nowhere else, from [`KycDecision::signed_at`] against
+	/// the instant stored with the current status — because arrival order is not send
+	/// order. Didit retries a delivery at roughly one and four minutes, so a retried
+	/// `in_review` landing after the `approved` that replaced it is routine. A verdict
+	/// strictly older than the stored one, and any delivery that would move a finished
+	/// case back to a running state, answer [`CaseDecision::Ignored`].
 	async fn record_decision(&self, provider: &str, decision: &KycDecision) -> Result<CaseDecision, DomainError>;
 }
 

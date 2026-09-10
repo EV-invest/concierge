@@ -156,6 +156,7 @@ pub(super) fn parse_webhook(secret: &str, headers: &CallbackHeaders, body: &[u8]
 		status,
 		vendor_data: payload.vendor_data.unwrap_or_default(),
 		metadata,
+		signed_at,
 	})
 }
 

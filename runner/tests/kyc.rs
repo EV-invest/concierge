@@ -186,6 +186,16 @@ impl Harness {
 			.expect("count cases")
 	}
 
+	/// The signed instant the stored verdict was made at — the ordering key an
+	/// out-of-order delivery is judged against.
+	async fn case_event_at(&self, id: Uuid) -> Option<i64> {
+		sqlx::query_scalar::<_, Option<i64>>("SELECT event_at FROM kyc_cases WHERE id = $1")
+			.bind(id)
+			.fetch_one(&self.pool)
+			.await
+			.expect("read case")
+	}
+
 	async fn case_row(&self, id: Uuid) -> (String, bool, Value) {
 		sqlx::query_as::<_, (String, bool, Value)>("SELECT status, decision_at IS NOT NULL, payload FROM kyc_cases WHERE id = $1")
 			.bind(id)
@@ -818,4 +828,69 @@ async fn a_vendor_approval_never_overwrites_a_concurrent_human_grant() {
 
 	assert_eq!(webhook_status, StatusCode::OK, "the approval is still handled, whichever order it landed in");
 	assert_eq!(h.kyc_level(user).await, 3, "a vendor approval for tier 2 must never pull a human's tier 3 back down");
+}
+
+/// Arrival order is not send order, and a decided case must not be reopened by a straggler.
+///
+/// Didit retries at roughly one and four minutes, so an `in_review` retry landing after
+/// the `approved` that superseded it is ordinary. Judged only by "the status differs", it
+/// would win: the case would go back to `in_review`, `decision_at` would be cleared, and
+/// the row explaining why this user holds tier 2 would stop claiming any decision at all.
+#[tokio::test]
+async fn a_stale_verdict_never_reopens_a_decided_case() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	// The approval the vendor sent second and we received first.
+	let decided_at = now();
+	let approval = body(&session_id, "Approved", &case_id.to_string(), decided_at, json!({}));
+	let (status, _) = h.post(approval.clone(), signed(&approval), decided_at).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 2);
+
+	// The earlier `in_review`, retried into the window and arriving late. Signed, fresh
+	// enough to pass the replay check, and genuinely older than the verdict on file.
+	let sent_at = decided_at - 60;
+	let straggler = body(&session_id, "In Review", &case_id.to_string(), sent_at, json!({}));
+	let (status, answer) = h.post(straggler.clone(), signed(&straggler), now()).await;
+
+	assert_eq!(status, StatusCode::OK, "the delivery is genuine, so there is nothing for the vendor to retry");
+	assert_eq!(answer["ignored"], "superseded");
+	let (case_status, decided, _) = h.case_row(case_id).await;
+	assert_eq!(case_status, "approved", "the case still holds the verdict it was decided on");
+	assert!(decided, "and it still records WHEN it was decided");
+	assert_eq!(h.case_event_at(case_id).await, Some(decided_at), "the ordering key is the approval's, not the straggler's");
+	assert_eq!(h.kyc_level(user).await, 2);
+	assert_eq!(h.kyc_changed_count(user).await, 1, "an out-of-order delivery emits nothing");
+}
+
+/// The ordering rule must not freeze a case at its first verdict.
+///
+/// `Kyc Expired` after `Approved` is a real Didit transition — a verification that aged
+/// out at the vendor — and it is strictly LATER, so it applies. What it does not do is
+/// move a level: only an approval grants one, and taking one away is a human act under
+/// `KycManage`. A guard that refused this would trade a lost audit trail for the
+/// out-of-order fix.
+#[tokio::test]
+async fn a_later_verdict_still_moves_a_decided_case() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	let approved_at = now() - 120;
+	let approval = body(&session_id, "Approved", &case_id.to_string(), approved_at, json!({}));
+	let (status, _) = h.post(approval.clone(), signed(&approval), now()).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 2);
+
+	let expired_at = now();
+	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
+	let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
+
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(h.case_row(case_id).await.0, "kyc_expired", "a genuinely later verdict is recorded");
+	assert_eq!(h.case_event_at(case_id).await, Some(expired_at));
+	assert_eq!(h.kyc_level(user).await, 2, "but a vendor still never takes a level away");
+	assert_eq!(h.kyc_changed_count(user).await, 1);
 }

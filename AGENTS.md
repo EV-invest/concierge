@@ -133,6 +133,14 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `Permission::KycManage`. The identity a callback acts on comes from the stored
   `kyc_cases` row, NEVER from the request body. Absent `DIDIT_*` config, both routes
   answer 503 — there is no arm that skips the signature.
+- **Verdicts are ordered by the SIGNED timestamp, never by arrival.** Didit retries at
+  ~1 min and ~4 min, so a superseded `in_review` landing after the `approved` that
+  replaced it is routine. `kyc_cases.event_at` holds the signed instant of the stored
+  verdict; a delivery strictly older than it, or one that would move a decided case
+  back to a running state, is answered 200-and-ignored. The body's `timestamp` is
+  REQUIRED for this reason and its absence is a rejection: `X-Timestamp` is not
+  covered by either signature, so ordering taken from the header could be rewritten by
+  anyone holding one captured delivery.
 - **Either webhook signature authenticates a delivery**: `X-Signature-V2` (over the
   canonicalised body) is tried first, `X-Signature` (over the raw bytes) second. The
   delivery crosses a Cloudflare tunnel, Traefik and a Next.js rewrite before reaching us,

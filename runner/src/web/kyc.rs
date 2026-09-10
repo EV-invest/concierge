@@ -259,6 +259,13 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 			tracing::debug!(case_id = %case.id, status = case.status.as_str(), "kyc callback: redelivery ignored");
 			return Ok(Json(json!({ "ok": true, "duplicate": true })));
 		}
+		// Genuine, but describing a verdict the case has already moved past. 200: the
+		// delivery was handled correctly and there is nothing for the vendor to retry.
+		// NOT applied — a superseded verdict must not reach `apply`.
+		CaseDecision::Ignored(case) => {
+			tracing::info!(case_id = %case.id, held = case.status.as_str(), superseded = decision.status.as_str(), "kyc callback: out-of-order delivery ignored");
+			return Ok(Json(json!({ "ok": true, "ignored": "superseded", "status": case.status.as_str() })));
+		}
 		// Also the shape of the legitimate race where the webhook overtakes the insert
 		// that opens the case.
 		//
