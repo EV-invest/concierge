@@ -133,6 +133,16 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `Permission::KycManage`. The identity a callback acts on comes from the stored
   `kyc_cases` row, NEVER from the request body. Absent `DIDIT_*` config, both routes
   answer 503 — there is no arm that skips the signature.
+- **Nothing reaches the vendor before the per-user gate.** Opening a Didit session is
+  BILLED against a balance every user shares, and past that balance `/kyc/start` degrades
+  fail-closed: 503 for everyone, arriving as silence, because a polite "try later" is not
+  something anyone reports. So `/kyc/start` reads `KycCaseRepository::start_gate` FIRST. A
+  caller with a still-running case is handed that case back — `kyc_cases.redirect_url` is
+  stored for exactly this and a second session would only buy them a duplicate row that
+  later reads as an abandoned attempt — and a caller past `START_MAX_PER_WINDOW` in
+  `START_WINDOW_SECS` is refused 429. Both answers happen without a vendor call; that
+  ordering is the entire point, not an optimisation. The gate is a read and not a lock:
+  two simultaneous requests can both pass it, and the window cap is what bounds that.
 - **A verdict is not handled until the level moved.** Recording the decision and
   writing the level are two transactions, so `kyc_cases` saying `approved` beside an
   account still at tier 0 is a reachable state. The webhook answers 5xx when the level

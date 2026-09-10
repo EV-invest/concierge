@@ -23,6 +23,13 @@
 //! not open a session — `/kyc/start` DEGRADES rather than errors: one 503, one stable
 //! body, one support address (see [`StartError`]). The user is never shown a technical
 //! failure and never given the impression they did something wrong.
+//!
+//! `/kyc/start` also decides ALL of that before it dials the vendor, because opening a
+//! session is billed and the balance behind it is shared by every user on the platform.
+//! A caller already mid-flow is handed the case they are in, and a caller past
+//! [`START_MAX_PER_WINDOW`] is refused — both without a vendor call. What sits on the
+//! other side of that balance is not a degraded feature: it is the fail-closed 503 above,
+//! for everyone, which arrives as silence.
 
 use axum::{
 	Json,
@@ -111,6 +118,23 @@ pub struct StartRequest {
 	tier: u32,
 }
 
+/// How far back [`START_MAX_PER_WINDOW`] counts.
+const START_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// How many cases one user may open inside [`START_WINDOW_SECS`].
+///
+/// Five, because honest use is bounded and cheap to picture: a rejected document, a
+/// session left open until it expired, a phone that ran out of battery mid-flow, a
+/// retry. Someone genuinely trying to get verified is not on their sixth attempt in a
+/// day; someone on their fiftieth is spending the platform's Didit balance, and past
+/// zero the route fails closed for EVERY user. A number this side of honest use costs a
+/// rare user one day's wait; a number the other side costs everyone verification.
+///
+/// A constant and not configuration: an env var here is a knob nobody would ever be in a
+/// position to turn correctly at 3am, and one more value to carry through the deploy
+/// chain for no decision it would help anyone make.
+pub const START_MAX_PER_WINDOW: i64 = 5;
+
 #[derive(Serialize)]
 pub struct StartResponse {
 	/// Where to send the browser to perform the verification.
@@ -153,6 +177,48 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		return Err((StatusCode::BAD_REQUEST, "requested tier is above what a provider may grant").into());
 	}
 
+	// EVERYTHING below this line happens before the vendor is dialled, and that ordering is
+	// the whole point: `POST /v3/session/` is billed, and the platform's balance is a shared
+	// resource one signed-in account could otherwise drain in a loop. What is behind that
+	// balance is not a feature degrading — it is a fail-closed 503 on every user's
+	// verification, arriving as silence, because a polite "try later" is not something
+	// anyone files a ticket about.
+	let gate = st.kyc_cases.start_gate(user_id, START_WINDOW_SECS).await.map_err(|e| {
+		// Refusing here rather than proceeding: an unreadable gate is exactly the state in
+		// which we do not know whether spending a session is safe.
+		tracing::error!(error = %e, "kyc: could not read the start gate");
+		StartError::unavailable(st)
+	})?;
+
+	// An attempt already running gets handed back, not replaced. The user is mid-flow —
+	// they refreshed, came back from the vendor, or clicked twice — and buying a second
+	// session would charge us to give them a worse version of what they have: two open
+	// cases, one of which they will abandon and which will then read as a user who gave up.
+	if let Some(live) = &gate.live {
+		if let Some(redirect_url) = &live.redirect_url {
+			tracing::debug!(case_id = %live.id, "kyc: start reused the caller's running case");
+			return Ok(Json(StartResponse {
+				redirect_url: redirect_url.clone(),
+				case_id: live.id.to_string(),
+			}));
+		}
+		// A case opened before `kyc_cases.redirect_url` existed. There is no URL to hand
+		// back and no way to fetch one, so the choice is a new session or a dead end — and
+		// stranding a user who did nothing wrong is the worse of the two. The window cap
+		// below still applies, so this cannot be looped.
+		tracing::info!(case_id = %live.id, "kyc: the caller's running case predates redirect_url — opening a fresh session");
+	}
+
+	if gate.recent >= START_MAX_PER_WINDOW {
+		// 429 and not the `Unavailable` 503: this one IS about the caller, it is not a
+		// failure on our side, and telling them so is honest. Plain text like every other
+		// refusal on this route — the cabinet has no screen keyed to this and adding a
+		// second machine-readable code for a state honest use does not reach would be
+		// contract surface bought for nothing.
+		tracing::warn!(%user_id, opened = gate.recent, "kyc: start refused — the caller is over the per-user window cap");
+		return Err((StatusCode::TOO_MANY_REQUESTS, "too many verification attempts today").into());
+	}
+
 	// The vendor is called BEFORE the row is written, because the row's identity key is
 	// the vendor's session id and there is no meaningful case without one. The cost is a
 	// vendor session nobody claims when the insert fails; its webhook then finds no case
@@ -175,12 +241,15 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		tracing::error!(error = %e, provider = provider.name(), %case_id, tier, "kyc: the provider would not open a session — verification is unavailable to users");
 		StartError::unavailable(st)
 	})?;
-	st.kyc_cases.open_case(case_id, user_id, provider.name(), &session.provider_ref, tier).await.map_err(|e| {
-		// Same screen as a vendor outage: our store being unreachable is no more the
-		// user's business than the vendor's balance, and it is just as temporary.
-		tracing::error!(error = %e, %case_id, "kyc: failed to record the opened case");
-		StartError::unavailable(st)
-	})?;
+	st.kyc_cases
+		.open_case(case_id, user_id, provider.name(), &session.provider_ref, tier, &session.redirect_url)
+		.await
+		.map_err(|e| {
+			// Same screen as a vendor outage: our store being unreachable is no more the
+			// user's business than the vendor's balance, and it is just as temporary.
+			tracing::error!(error = %e, %case_id, "kyc: failed to record the opened case");
+			StartError::unavailable(st)
+		})?;
 
 	tracing::info!(%case_id, tier, provider = provider.name(), "kyc: case opened");
 	Ok(Json(StartResponse {

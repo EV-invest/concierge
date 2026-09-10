@@ -11,7 +11,10 @@
 //! session; callback verification is the same code the live adapter runs, so a test that
 //! passes here is a test of what ships.
 
-use std::sync::Arc;
+use std::sync::{
+	Arc,
+	atomic::{AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -31,7 +34,7 @@ use concierge::{
 		users::PgUsers,
 	},
 	ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, KycStatus, UserDirectoryRepository},
-	web::{self, KycDeps},
+	web::{self, KycDeps, START_MAX_PER_WINDOW},
 };
 use domain::{
 	error::DomainError,
@@ -71,6 +74,41 @@ impl KycProvider for RefusingKyc {
 
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
 		StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()).parse_callback(headers, body, now)
+	}
+}
+
+/// The stub, plus a tally of how many times a session was actually bought.
+///
+/// The gate this counts is in front of a BILLABLE call, and "did we skip the vendor?" is
+/// not visible in the response or in the database — a reused case and a fresh one look
+/// alike from outside. Counting the port call is the only place the difference shows.
+struct CountingKyc {
+	inner: StubKyc,
+	sessions: Arc<AtomicUsize>,
+}
+
+impl CountingKyc {
+	fn new(sessions: Arc<AtomicUsize>) -> Self {
+		Self {
+			inner: StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()),
+			sessions,
+		}
+	}
+}
+
+#[async_trait]
+impl KycProvider for CountingKyc {
+	fn name(&self) -> &'static str {
+		self.inner.name()
+	}
+
+	async fn start_session(&self, case_id: Uuid, requested_tier: u32) -> Result<KycSession, DomainError> {
+		self.sessions.fetch_add(1, Ordering::SeqCst);
+		self.inner.start_session(case_id, requested_tier).await
+	}
+
+	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
+		self.inner.parse_callback(headers, body, now)
 	}
 }
 
@@ -133,8 +171,36 @@ impl Harness {
 	async fn case(&self, user: UserId, tier: u32) -> (Uuid, String) {
 		let id = Uuid::new_v4();
 		let provider_ref = format!("stub-{id}");
-		self.cases.open_case(id, user, PROVIDER, &provider_ref, tier).await.expect("open case");
+		let redirect_url = format!("https://evinvest.test/cabinet?kyc_session={provider_ref}");
+		self.cases.open_case(id, user, PROVIDER, &provider_ref, tier, &redirect_url).await.expect("open case");
 		(id, provider_ref)
+	}
+
+	/// Finish this user's open cases without a verdict, so a test about the WINDOW cap is
+	/// not answered by the reuse rule first. Both are gates on the same route and the
+	/// running-case one runs earlier.
+	async fn close_open_cases(&self, user: UserId) {
+		sqlx::query("UPDATE kyc_cases SET status = 'abandoned', decision_at = now() WHERE user_id = $1 AND decision_at IS NULL")
+			.bind(user.raw())
+			.execute(&self.pool)
+			.await
+			.expect("close cases");
+	}
+
+	/// `POST /kyc/start` as the cabinet reaches it. `body` is passed through verbatim.
+	async fn start(&self, cookie: &str, csrf: Option<&str>, body: &str) -> (StatusCode, Value) {
+		let mut request = Request::builder()
+			.method("POST")
+			.uri("/kyc/start")
+			.header("content-type", "application/json")
+			.header("cookie", cookie);
+		if let Some(token) = csrf {
+			request = request.header("x-ev-csrf", token);
+		}
+		let response = self.router.clone().oneshot(request.body(Body::from(body.to_owned())).unwrap()).await.expect("router answered");
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+		(status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 	}
 
 	async fn post(&self, body: Vec<u8>, signature: String, timestamp: i64) -> (StatusCode, Value) {
@@ -569,6 +635,69 @@ async fn start_opens_a_case_and_hands_back_a_redirect() {
 	assert!(!decided);
 	let owner: Uuid = sqlx::query_scalar("SELECT user_id FROM kyc_cases WHERE id = $1").bind(case_id).fetch_one(&h.pool).await.unwrap();
 	assert_eq!(owner, user.raw(), "the case belongs to the session's user");
+}
+
+/// `/kyc/start` had nothing between the session check and a BILLABLE `POST /v3/session/`.
+/// A user already mid-flow — refreshing, coming back from the vendor, double-clicking —
+/// must get the attempt they are in, not a second one bought at our expense.
+#[tokio::test]
+async fn a_second_start_reuses_the_live_case_and_never_calls_the_vendor() {
+	let counter = Arc::new(AtomicUsize::new(0));
+	let Some(h) = setup_with(Some(Arc::new(CountingKyc::new(counter.clone())))).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	let (status, first) = h.start(&cookie, Some(&csrf), "{}").await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(counter.load(Ordering::SeqCst), 1, "the first start is the one that buys a session");
+
+	let (status, second) = h.start(&cookie, Some(&csrf), "{}").await;
+	assert_eq!(status, StatusCode::OK, "a user mid-flow is not an error");
+	assert_eq!(counter.load(Ordering::SeqCst), 1, "and the second start must not reach the vendor at all");
+	assert_eq!(second["case_id"], first["case_id"], "they are sent back to the attempt they already have");
+	assert_eq!(second["redirect_url"], first["redirect_url"]);
+	assert_eq!(h.case_count(user).await, 1, "one attempt, one row — a second would read as an abandoned try");
+}
+
+/// The loop the issue describes: call it again and again. Once the running case is out of
+/// the way the window cap is what stands between one account and the platform's Didit
+/// balance — and past that balance every user's verification answers 503.
+#[tokio::test]
+async fn the_window_cap_refuses_a_start_without_calling_the_vendor() {
+	let counter = Arc::new(AtomicUsize::new(0));
+	let Some(h) = setup_with(Some(Arc::new(CountingKyc::new(counter.clone())))).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	// Walking away from each attempt is what a determined caller would do to get past the
+	// reuse rule, so the test does exactly that.
+	for attempt in 1..=START_MAX_PER_WINDOW {
+		let (status, answer) = h.start(&cookie, Some(&csrf), "{}").await;
+		assert_eq!(status, StatusCode::OK, "attempt {attempt} is still inside the cap: {answer}");
+		h.close_open_cases(user).await;
+	}
+	assert_eq!(counter.load(Ordering::SeqCst), START_MAX_PER_WINDOW as usize);
+
+	let (status, _) = h.start(&cookie, Some(&csrf), "{}").await;
+	assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the caller is over the cap, and this is their doing — not an outage");
+	assert_eq!(
+		counter.load(Ordering::SeqCst),
+		START_MAX_PER_WINDOW as usize,
+		"the refusal happens BEFORE the vendor is dialled — that is the whole point"
+	);
+	assert_eq!(h.case_count(user).await, START_MAX_PER_WINDOW, "and no row is written for a refused start");
 }
 
 /// A user must never be told "you did something wrong" or shown a stack of vendor noise

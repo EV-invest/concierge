@@ -30,6 +30,10 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use evconcierge_auth::AuthService;
+/// Re-exported so the integration suite asserts against the cap the route actually
+/// enforces. A test that hard-coded the number would keep passing after someone raised
+/// it, and the number is what stands between one account and the vendor balance.
+pub use kyc::START_MAX_PER_WINDOW;
 pub use session::WebSessions;
 use time::Duration;
 

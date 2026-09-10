@@ -208,6 +208,23 @@ pub enum KycStatus {
 }
 
 impl KycStatus {
+	/// Every variant. Two places enumerate this vocabulary against the database — the
+	/// adapter rehydrating `kyc_cases.status`, and the "is this user still mid-flow?"
+	/// lookup that names the running statuses in SQL — and a hand-written list in either
+	/// would fail SILENTLY when a variant is added: an unlisted running status simply
+	/// stops counting as running, and the user buys another vendor session.
+	pub const ALL: [Self; 9] = [
+		Self::Pending,
+		Self::InProgress,
+		Self::InReview,
+		Self::Approved,
+		Self::Declined,
+		Self::Resubmitted,
+		Self::Abandoned,
+		Self::Expired,
+		Self::KycExpired,
+	];
+
 	/// The persisted `kyc_cases.status` vocabulary — kept in step with that column's
 	/// CHECK constraint by [`Self::is_decided`]'s test.
 	pub fn as_str(self) -> &'static str {
@@ -371,6 +388,25 @@ pub enum CaseDecision {
 	Unknown,
 }
 
+/// The caller's still-running attempt, as much of it as `/kyc/start` needs to hand the
+/// browser back where it left off.
+pub struct LiveCase {
+	pub id: Uuid,
+	/// Where the vendor sent the browser when this case was opened.
+	///
+	/// `None` for a row written before `kyc_cases.redirect_url` existed. That case can be
+	/// COUNTED but not resumed: the vendor's session URL is not derivable from anything
+	/// else we keep, and there is no second call that would fetch it back.
+	pub redirect_url: Option<String>,
+}
+
+/// What `/kyc/start` must know BEFORE it is allowed to spend a paid vendor session.
+pub struct StartGate {
+	pub live: Option<LiveCase>,
+	/// Attempts this user opened inside the trailing window.
+	pub recent: i64,
+}
+
 /// Persistence port for verification attempts.
 ///
 /// [`Self::record_decision`] is internally atomic and single-shot: it takes the case row
@@ -381,7 +417,21 @@ pub enum CaseDecision {
 pub trait KycCaseRepository: Send + Sync {
 	/// Record a started attempt. `id` is minted by the caller because it is also the
 	/// correlation value handed to the vendor.
-	async fn open_case(&self, id: Uuid, user_id: UserId, provider: &str, provider_ref: &str, requested_tier: u32) -> Result<(), DomainError>;
+	async fn open_case(&self, id: Uuid, user_id: UserId, provider: &str, provider_ref: &str, requested_tier: u32, redirect_url: &str) -> Result<(), DomainError>;
+
+	/// Read what decides whether this caller may open ANOTHER case: their still-running
+	/// attempt, and how many they have opened in the last `window_secs`.
+	///
+	/// A read, and a deliberately cheap one, because it sits in front of a BILLABLE call.
+	/// `/kyc/start` had nothing between the session check and `POST /v3/session/`, so a
+	/// signed-in account looping the route drained the platform's Didit quota — and the
+	/// degradation past that point is fail-closed, which turns one abusive user into a
+	/// verification outage for everyone. This is the read that has to happen first.
+	///
+	/// NOT a lock and not a reservation: two simultaneous requests can both read "no live
+	/// case" and both open one. Serialising them would mean holding a row across a vendor
+	/// round trip, and the window cap already bounds what that race can cost.
+	async fn start_gate(&self, user_id: UserId, window_secs: i64) -> Result<StartGate, DomainError>;
 
 	/// Apply a verdict to the case it names, if it moves anything.
 	///
