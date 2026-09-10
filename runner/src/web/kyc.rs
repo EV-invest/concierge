@@ -15,7 +15,8 @@
 //!   * the identity acted on comes from the STORED `kyc_cases` row, looked up by the
 //!     provider's session id, and never from the request body. `vendor_data` is a
 //!     cross-check and nothing more — treating it as identity would turn this route
-//!     into "POST yourself tier 2";
+//!     into "POST yourself tier 2" — and it is checked inside the write transaction, so a
+//!     delivery that fails it leaves the case where it was;
 //!   * no cookie is read and no CSRF token is expected: there is no browser here, and a
 //!     CSRF check on a server-to-server call is a check that can only ever be wrong.
 //!
@@ -355,16 +356,15 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 			tracing::warn!(provider = provider.name(), "kyc callback: no case for this session");
 			return Err((StatusCode::NOT_FOUND, "unknown session"));
 		}
+		// The delivery's echoed correlation value names some other case. Refused, and —
+		// unlike before — refused before it wrote anything: the comparison now happens
+		// inside the transaction holding the row, so the 400 the caller reads and the row
+		// they can go and look at finally say the same thing.
+		CaseDecision::Mismatch(case) => {
+			tracing::error!(case_id = %case.id, echoed = %decision.vendor_data, "kyc callback: vendor_data does not match the case it names");
+			return Err((StatusCode::BAD_REQUEST, "callback does not match its case"));
+		}
 	};
-
-	// A cross-check, never a lookup: `vendor_data` is what WE handed the vendor, echoed
-	// back through a body an attacker also controls. It cannot select a case — it can
-	// only disagree with the one `provider_ref` already found, and a disagreement means
-	// the two ends are talking about different things.
-	if !decision.vendor_data.is_empty() && decision.vendor_data != case.id.to_string() {
-		tracing::error!(case_id = %case.id, echoed = %decision.vendor_data, "kyc callback: vendor_data does not match the case it names");
-		return Err((StatusCode::BAD_REQUEST, "callback does not match its case"));
-	}
 
 	apply(st, &case).await?;
 	Ok(Json(json!({ "ok": true, "status": case.status.as_str(), "duplicate": duplicate })))

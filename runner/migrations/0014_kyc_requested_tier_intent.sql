@@ -1,0 +1,56 @@
+-- What `kyc_cases_requested_tier` actually states, written down because the schema and
+-- `PROVIDER_MAX_TIER` say two different numbers and neither said the other was fine (#57).
+--
+-- No DDL beyond a comment. The range stays `BETWEEN 1 AND 2` ON PURPOSE, and this file is
+-- the reason, so the next reader does not have to work out which number is stale.
+--
+-- THE TWO NUMBERS ARE TWO DIFFERENT STATEMENTS. The CHECK bounds the SHAPE OF THE RECORD:
+-- a provider may only ever be ASKED for tier 1 or 2, because tier 3 is the ceiling of a
+-- human decision (`UserDirectory.SetKycLevel` under `Permission::KycManage`) and so is
+-- every downgrade. That is a property of the platform's tier model and it has not moved.
+-- `PROVIDER_MAX_TIER` (`runner/src/ports.rs`) bounds what a vendor approval may GRANT
+-- TODAY, and it is a property of the WORKFLOW CONFIGURATION: it is 1 because the one
+-- Didit workflow we run checks a document and a selfie, and raising it is a second
+-- workflow id selected by tier inside `start_session`, not a constant edit. Rows outlive
+-- that configuration, so a column constraint cannot be the place it is stated — the
+-- ceiling would have to be migrated every time the vendor setup changed, and a row
+-- written under the old setup would then fail to validate under the new one.
+--
+-- WHAT WAS ACTUALLY WRONG. 0010_kyc_cases.sql's `TIER CEILING` note claimed this CHECK was
+-- the guard that "a future adapter, a backfill or a console UPDATE cannot write a case
+-- that would grant more than a vendor may". It is not, and it never could be: what a case
+-- GRANTS is decided when the verdict is applied (`KycStatus::grants_tier`, which clamps to
+-- `PROVIDER_MAX_TIER`), not when the row is written. An applied migration cannot be edited
+-- — sqlx checksums it and every environment that already ran it would refuse to boot — so
+-- the correction is carried here and into the constraint's own comment, where `\d+` and
+-- `pg_dump` will show it to a reader who never opens this directory.
+--
+-- WHY THE EXISTING `requested_tier = 2` ROWS ARE NOT REWRITTEN. They were written by the
+-- validated path, back when `/kyc/start` still took the tier from the request body (#55).
+-- They record a request a real person made under the rules in force at the time. 0013
+-- cleared out-of-range `users.kyc_level` values, and that is not this: an out-of-range
+-- level was a value NO path could legitimately produce, and it was spendable — the money
+-- plane mirrors it and gates money operations on it. A `requested_tier` of 2 is neither.
+-- It is a true record, and it is not spendable: `grants_tier` clamps it to
+-- `PROVIDER_MAX_TIER` at the moment the verdict lands, which is precisely why #55 put the
+-- clamp there rather than at the entry point — it is the only half of that fix that
+-- reaches a case opened yesterday. Rewriting these to 1 would buy a narrower CHECK by
+-- making the table report a question that was never asked.
+--
+-- WHY NOT `NOT VALID`, WHICH IS WHAT 0013 REACHED FOR. Do not copy that shape here; it
+-- breaks this table. `NOT VALID` skips the initial scan but is still enforced against
+-- every subsequent INSERT AND UPDATE, and a CHECK is evaluated over the WHOLE new tuple
+-- regardless of which columns an UPDATE touched. `user_outbox` survives that because it is
+-- append-only. `kyc_cases` rows are updated for their entire life — `record_decision`
+-- writes `status`, `payload`, `decision_at` and `event_at` — so a `requested_tier = 1`
+-- constraint added `NOT VALID` would make the webhook's UPDATE fail on every still-running
+-- case that asked for 2. The handler would answer 5xx, the vendor would retry, and the
+-- retry would fail the same way: a verdict that can never be recorded, for the exact users
+-- #55 was fixing.
+--
+-- REVERSIBILITY. Nothing to reverse — this file changes no data and no structure. Should
+-- the ceiling ever genuinely become a record-shape rule, the change is a new migration
+-- that sanitizes and then adds a VALIDATED constraint, and it must be argued against the
+-- paragraph above rather than around it.
+COMMENT ON CONSTRAINT kyc_cases_requested_tier ON kyc_cases IS
+	'The tier a PROVIDER may be asked for: 1 or 2, because tier 3 and every downgrade are human decisions under Permission::KycManage. NOT the current vendor ceiling — that is PROVIDER_MAX_TIER (runner/src/ports.rs), which follows the configured workflow and is enforced where the verdict is applied (KycStatus::grants_tier). Rows asking for 2 predate #55 and are deliberately left standing; see 0014_kyc_requested_tier_intent.sql.';

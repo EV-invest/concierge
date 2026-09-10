@@ -536,7 +536,7 @@ async fn a_callback_for_an_unknown_session_is_refused() {
 async fn an_echoed_correlation_value_must_match_the_case_it_names() {
 	let h = harness!();
 	let user = h.user().await;
-	let (_case_id, session_id) = h.case(user, 1).await;
+	let (case_id, session_id) = h.case(user, 1).await;
 
 	let at = now();
 	let raw = body(&session_id, "Approved", &Uuid::new_v4().to_string(), at, json!({}));
@@ -544,6 +544,35 @@ async fn an_echoed_correlation_value_must_match_the_case_it_names() {
 
 	assert_eq!(status, StatusCode::BAD_REQUEST, "vendor_data is a cross-check; a mismatch means the two ends disagree");
 	assert_eq!(h.kyc_level(user).await, 0);
+
+	// The point of the refusal, and what it did not do before #54: a 400 that keeps the
+	// write is not a refusal. The row must still be the `pending` one `open_case` wrote —
+	// no status, no `decision_at`, no allowlisted payload out of a body we just rejected.
+	let (status, decided, payload) = h.case_row(case_id).await;
+	assert_eq!(status, "pending", "a refused delivery must not move the case it disagreed about");
+	assert!(!decided);
+	assert_eq!(payload, json!({}));
+	assert_eq!(h.case_event_at(case_id).await, None, "and it must not become the case's ordering key either");
+}
+
+#[tokio::test]
+async fn a_disagreeing_redelivery_is_refused_rather_than_re_asserted() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 1).await;
+
+	let at = now();
+	let raw = body(&session_id, "Approved", &case_id.to_string(), at, json!({}));
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 1);
+
+	// Same verdict, same case, wrong correlation value. Read as a redelivery this would be
+	// re-applied; the cross-check outranks that, because a delivery the two ends disagree
+	// about is not evidence of anything — including of what the case already holds.
+	let raw = body(&session_id, "Approved", &Uuid::new_v4().to_string(), at, json!({}));
+	let (status, _) = h.post(raw.clone(), signed(&raw), at).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST);
+	assert_eq!(h.kyc_changed_count(user).await, 1, "and it emits nothing onto the cross-plane outbox");
 }
 
 #[tokio::test]
@@ -618,6 +647,51 @@ async fn start_opens_a_case_and_hands_back_a_redirect() {
 	assert!(!decided);
 	let owner: Uuid = sqlx::query_scalar("SELECT user_id FROM kyc_cases WHERE id = $1").bind(case_id).fetch_one(&h.pool).await.unwrap();
 	assert_eq!(owner, user.raw(), "the case belongs to the session's user");
+}
+
+/// The CSRF check, driven through the only state-changing route these tests reach.
+///
+/// A near miss is the interesting input: it is what a comparison that stops at the first
+/// differing byte answers fastest, and it is what the constant-time one must answer
+/// exactly like a wild guess. Timing is not assertable from here — what is, is that
+/// narrowing the comparison did not narrow the CHECK: the header must still match the
+/// cookie AND the server-side copy, and a correct token must still get through.
+#[tokio::test]
+async fn a_csrf_token_that_is_merely_close_is_still_refused() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	let mut near = csrf.clone();
+	let last = near.pop().expect("a non-empty token");
+	near.push(if last == 'a' { 'b' } else { 'a' });
+
+	assert_eq!(h.start(&cookie, Some(&near), "").await.0, StatusCode::FORBIDDEN, "one byte out is out");
+	assert_eq!(
+		h.start(&cookie, Some(&format!("{csrf}x")), "").await.0,
+		StatusCode::FORBIDDEN,
+		"a correct prefix is not a correct token"
+	);
+	assert_eq!(h.start(&cookie, Some(""), "").await.0, StatusCode::FORBIDDEN);
+
+	// The half this plane has that the cabinet does not: a caller who controls their own
+	// cookie jar can make the header and the cookie agree, and it still is not enough —
+	// the value held on the session is what decides.
+	let session_cookie = cookie.split(';').next().expect("the session cookie comes first");
+	assert_eq!(
+		h.start(&format!("{session_cookie}; ev_csrf={near}"), Some(&near), "").await.0,
+		StatusCode::FORBIDDEN,
+		"a matching header and cookie the server never issued are still refused"
+	);
+
+	assert_eq!(h.case_count(user).await, 0, "and none of that opened a case");
+
+	// A check nothing gets through is not a check.
+	assert_eq!(h.start(&cookie, Some(&csrf), "").await.0, StatusCode::OK);
+	assert_eq!(h.case_count(user).await, 1);
 }
 
 /// The applicant used to choose the level they would be granted.

@@ -121,6 +121,22 @@ impl KycCaseRepository for PgKycCases {
 			status,
 		};
 
+		// The cross-check, before anything is judged and long before anything is written.
+		// `vendor_data` is the correlation value WE handed the vendor, echoed back through
+		// a body an attacker also controls, so it can never SELECT a case — it can only
+		// disagree with the one `provider_ref` already found, and a disagreement means the
+		// two ends are talking about different things. It used to be compared by the
+		// handler on the case this method returned, which is to say after the commit: the
+		// delivery was refused with a 400 and its status kept (#54).
+		//
+		// An EMPTY value stays exempt, and that is a real exemption rather than a pass: a
+		// vendor that never echoes the field would otherwise have every delivery refused,
+		// and the field is not what authenticates a delivery — the HMAC is, and this row
+		// was found by the vendor's own session id.
+		if !decision.vendor_data.is_empty() && decision.vendor_data != id.to_string() {
+			return Ok(CaseDecision::Mismatch(case(stored)));
+		}
+
 		if stored == decision.status {
 			// Nothing to write: the transaction only ever held a read lock, so dropping it
 			// here is the same as committing it.

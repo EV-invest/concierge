@@ -12,6 +12,7 @@ use axum_extra::extract::cookie::CookieJar;
 use evconcierge_contracts::concierge::v1::{self as cc, auth_service_server::AuthService as AuthRpc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use subtle::ConstantTimeEq;
 
 use crate::web::{
 	WebState,
@@ -262,6 +263,17 @@ async fn refresh_of(st: &super::Inner, jar: &CookieJar) -> Result<Option<String>
 
 /// CSRF double-submit, hardened with the server-side session copy: the `x-ev-csrf`
 /// header must equal the readable csrf cookie AND the value stored on the session.
+///
+/// Both comparisons are constant time. Neither is a plausible oracle on its own — a
+/// `memcmp` would have to be timed across the network and the whole token guessed anyway
+/// — but this plane compares the bridge token (`support::authenticate_service`), the
+/// webhook signature (`infrastructure::kyc::didit`) and the consilium code
+/// (`infrastructure::governance`) that way, and a token check that quietly does not is
+/// the kind of exception a reader takes for the rule.
+///
+/// The order matters more than the timing does and is deliberate: the header is matched
+/// against the cookie and the SERVER-SIDE copy, and the whole check runs BEFORE the
+/// session is read, so a request that fails it never touches session state.
 pub(super) async fn verify_csrf(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<bool, (StatusCode, &'static str)> {
 	let Some(cookie) = jar.get(&st.cookies.csrf).map(|c| c.value().to_string()) else {
 		return Ok(false);
@@ -269,13 +281,27 @@ pub(super) async fn verify_csrf(st: &super::Inner, jar: &CookieJar, headers: &He
 	let Some(header) = headers.get("x-ev-csrf").and_then(|v| v.to_str().ok()) else {
 		return Ok(false);
 	};
-	if cookie != header {
+	if !ct_str_eq(&cookie, header) {
 		return Ok(false);
 	}
 	match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
-		Some(id) => Ok(st.sessions.csrf(&id).await.map_err(store_err)?.as_deref() == Some(header)),
+		Some(id) => Ok(st.sessions.csrf(&id).await.map_err(store_err)?.is_some_and(|stored| ct_str_eq(&stored, header))),
 		None => Ok(false),
 	}
+}
+
+/// Constant-time string equality.
+///
+/// The length guard is what keeps `ct_eq` meaningful: `subtle` answers "not equal"
+/// immediately on a length mismatch, so without it a wrong-length token would be
+/// indistinguishable from a wrong one of the right length. Length is not the secret here
+/// — CSRF tokens are minted at one fixed width — so leaking it costs nothing.
+///
+/// Local rather than shared with the identical helpers in `evconcierge_auth` and the
+/// Didit adapter: it is two lines, and a crate-crossing home for it would be an
+/// abstraction layer bought to avoid typing them.
+fn ct_str_eq(a: &str, b: &str) -> bool {
+	a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
 /// Clear the OAuth transaction cookie.

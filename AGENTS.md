@@ -136,8 +136,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   call, so banking never learns a vendor exists. A provider may only RAISE a level and
   never past `PROVIDER_MAX_TIER`; every tier above it and every downgrade are human
   decisions under `Permission::KycManage`. The identity a callback acts on comes from the
-  stored `kyc_cases` row, NEVER from the request body. Absent `DIDIT_*` config, both
-  routes answer 503 — there is no arm that skips the signature.
+  stored `kyc_cases` row, NEVER from the request body; the body's echoed `vendor_data` is
+  a CROSS-CHECK against that row and is decided inside the recording transaction, because
+  a refusal reached after the commit is not a refusal — it used to answer 400 over a row
+  it had already moved (#54). Absent `DIDIT_*` config, both routes answer 503 — there is
+  no arm that skips the signature.
 - **The vendor ceiling is what the vendor actually CHECKS, and it is 1.** There is one
   Didit workflow (`DIDIT_WORKFLOW_ID`) and it verifies a document and a selfie — tier-1
   evidence. Tier 2 means "plus proof of address and source of funds" (`banking`'s
@@ -149,7 +152,15 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   it: rows asking for 2 are already in the table, and clamping where the VERDICT is
   applied is the only thing that reaches a case opened before the entry point changed.
   Raising the ceiling is not a constant edit — it is a second workflow id selected by tier
-  inside `start_session`, and the constant must not move ahead of it.
+  inside `start_session`, and the constant must not move ahead of it. The
+  `kyc_cases_requested_tier` CHECK still reads `BETWEEN 1 AND 2` and is NOT a stale second
+  copy of this constant: it bounds the tier a provider may be ASKED for, which follows the
+  platform's tier model (3 and every downgrade are human), while `PROVIDER_MAX_TIER` bounds
+  what an approval may GRANT and follows the configured workflow. Rows outlive that
+  configuration, so the ceiling cannot live in a column constraint —
+  `0014_kyc_requested_tier_intent.sql` carries the argument, including why the
+  `requested_tier = 2` rows are left standing and why `NOT VALID`, which is 0013's shape
+  for `user_outbox`, would break this table instead of bounding it.
 - **Nothing reaches the vendor before the per-user gate.** Opening a Didit session is
   BILLED against a balance every user shares, and past that balance `/kyc/start` degrades
   fail-closed: 503 for everyone, arriving as silence, because a polite "try later" is not
@@ -198,6 +209,19 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   balance" and guessing would be brittle exactly where it costs most. The detail goes to
   `tracing::error!` (→ Sentry), because from the user's side this failure is SILENT — it
   looks like a polite "try later" that nobody reports.
+- **Every comparison against a presented secret is constant time**, with an explicit
+  length guard in front of `subtle::ConstantTimeEq` (which short-circuits on a length
+  mismatch, so without the guard a wrong-length candidate is distinguishable from a
+  wrong one of the right length). That is the bridge service token
+  (`support::authenticate_service`), the Didit webhook HMAC (`infrastructure::kyc::didit`),
+  the consilium self-decision code (`infrastructure::governance`), the refresh-token secret
+  (`evconcierge_auth::management`) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
+  Whether any one of them is a practical timing oracle is not the test — a plane that
+  states this discipline and then has one check quietly doing `!=` (#52) is a plane whose
+  next reader takes the exception for the rule. The CSRF check is also the STRICTER of the
+  two planes' and must stay so: the header is matched against the readable cookie AND the
+  server-side copy in the session locker, and the whole check runs BEFORE the session is
+  read, so a request that fails it never touches session state.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.

@@ -184,6 +184,11 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 /// them still running, and refusing the tier at the entry point does nothing for a case
 /// that was opened yesterday. Clamping where the verdict is APPLIED is what makes those
 /// grant a 1 when they land.
+///
+/// NOT the `kyc_cases_requested_tier` CHECK, which still reads `BETWEEN 1 AND 2` and is
+/// meant to: that one bounds the tier a provider may be ASKED for and follows the
+/// platform's tier model, this one bounds what an approval may GRANT and follows the
+/// configured workflow. `0014_kyc_requested_tier_intent.sql` is the argument.
 pub const PROVIDER_MAX_TIER: u32 = 1;
 
 /// How long a signed webhook stays acceptable. Past this, a captured-and-replayed
@@ -400,6 +405,21 @@ pub enum CaseDecision {
 	///
 	/// Carries the case as it actually stands, never the superseded verdict.
 	Ignored(KycCase),
+	/// The delivery's [`KycDecision::vendor_data`] names a different case than the one
+	/// `provider_ref` resolved to. Nothing was written and nothing must follow.
+	///
+	/// The check lives inside the write transaction rather than in the handler because it
+	/// is a REFUSAL, and a refusal decided after the commit is not one: the cross-check
+	/// used to run on the returned case, so a delivery the handler then answered `400` had
+	/// already moved the row's `status`, `decision_at` and `payload` (#54).
+	///
+	/// It outranks [`Self::Redelivered`] and [`Self::Ignored`] deliberately. Those two
+	/// classify a delivery we believe; this one says the two ends disagree about what they
+	/// are talking about, which makes the delivery untrustworthy about this case in every
+	/// reading.
+	///
+	/// Carries the case as it actually stands, which is also what it stood at before.
+	Mismatch(KycCase),
 	/// No case for this `(provider, provider_ref)`. Also the shape of the legitimate
 	/// race where a webhook overtakes the transaction that opens the case.
 	Unknown,
@@ -458,6 +478,12 @@ pub trait KycCaseRepository: Send + Sync {
 	/// `in_review` landing after the `approved` that replaced it is routine. A verdict
 	/// strictly older than the stored one, and any delivery that would move a finished
 	/// case back to a running state, answer [`CaseDecision::Ignored`].
+	///
+	/// The [`KycDecision::vendor_data`] cross-check is decided here too, and for the same
+	/// reason ordering is: it is a REFUSAL, and a refusal has to be reached before the
+	/// write it refuses. Answering [`CaseDecision::Mismatch`] is the contract — the
+	/// implementation must compare inside the transaction that holds the row, so that a
+	/// disagreeing delivery leaves the case exactly where it stood.
 	async fn record_decision(&self, provider: &str, decision: &KycDecision) -> Result<CaseDecision, DomainError>;
 }
 
