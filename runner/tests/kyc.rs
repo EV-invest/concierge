@@ -415,6 +415,36 @@ async fn a_stale_delivery_is_refused() {
 	assert_eq!(h.case_row(case_id).await.0, "pending");
 }
 
+/// The replay window must not rest on a field the body is free to omit.
+///
+/// `X-Timestamp` is not covered by either signature, so an attacker holding one captured
+/// delivery can re-stamp it at will. The only dateable copy is the one INSIDE the signed
+/// body — and if that one may be absent, the window is a formality: the same bytes stay
+/// acceptable a year later. A body with no `timestamp` is therefore malformed, not
+/// "in-window by default".
+#[tokio::test]
+async fn a_body_with_no_signed_timestamp_is_refused_however_fresh_the_header() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	// A genuine, correctly signed approval captured long ago — with the one field that
+	// dates it stripped out, exactly as a vendor that "forgot" to send it would look.
+	let captured = now() - KYC_CALLBACK_WINDOW_SECS * 10;
+	let mut payload: Value = serde_json::from_slice(&body(&session_id, "Approved", &case_id.to_string(), captured, json!({}))).unwrap();
+	payload.as_object_mut().unwrap().remove("timestamp");
+	let raw = serde_json::to_vec(&payload).unwrap();
+	assert!(!String::from_utf8_lossy(&raw).contains("timestamp"));
+
+	// The signature is VALID over these exact bytes, and the transport header says now.
+	let (status, _) = h.post(raw.clone(), signed(&raw), now()).await;
+
+	assert_eq!(status, StatusCode::BAD_REQUEST, "an undateable body cannot be checked against the replay window");
+	assert_eq!(h.kyc_level(user).await, 0);
+	assert_eq!(h.kyc_changed_count(user).await, 0);
+	assert_eq!(h.case_row(case_id).await.0, "pending", "and nothing about the case moved");
+}
+
 #[tokio::test]
 async fn a_callback_for_an_unknown_session_is_refused() {
 	let h = harness!();

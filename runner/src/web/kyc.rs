@@ -9,7 +9,9 @@
 //! `POST /kyc/callback/didit` is the first PUBLIC, non-OAuth entry point in this plane.
 //! Nothing about the caller is known but the shared webhook secret, so:
 //!   * the HMAC is checked in constant time and an unconfigured secret fails CLOSED;
-//!   * deliveries outside a 300-second window are refused;
+//!   * deliveries outside a 300-second window are refused, and a body carrying no
+//!     signed timestamp is refused outright rather than falling back on the unsigned
+//!     `X-Timestamp` header;
 //!   * the identity acted on comes from the STORED `kyc_cases` row, looked up by the
 //!     provider's session id, and never from the request body. `vendor_data` is a
 //!     cross-check and nothing more — treating it as identity would turn this route

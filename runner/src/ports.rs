@@ -247,10 +247,12 @@ pub enum KycCallbackError {
 	/// Missing signature header, or one that does not match the body under the shared
 	/// secret.
 	BadSignature,
-	/// The delivery is outside [`KYC_CALLBACK_WINDOW_SECS`], or carries no usable
-	/// timestamp at all.
+	/// The delivery is outside [`KYC_CALLBACK_WINDOW_SECS`], on the transport header or
+	/// on the SIGNED body timestamp, or carries no `X-Timestamp` at all.
 	StaleTimestamp,
-	/// Not the documented body shape.
+	/// Not the documented body shape — including a body that carries no `timestamp`.
+	/// That one is a REJECTION and not a skipped check: the header copy is unsigned, so
+	/// a delivery whose signed body cannot be dated is replayable at any later time.
 	Malformed(String),
 	/// A signed, in-window, well-formed delivery carrying a status word this adapter
 	/// does not know.
