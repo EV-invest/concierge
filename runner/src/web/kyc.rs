@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycStatus, PROVIDER_MAX_TIER},
+	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus, PROVIDER_MAX_TIER},
 	web::{
 		WebState, now_secs,
 		routes::{store_err, verify_csrf},
@@ -305,30 +305,19 @@ async fn apply(st: &super::Inner, case: &KycCase) {
 		return;
 	};
 
-	// Read the current level rather than writing the requested one blind: an approval for
-	// a tier the user already exceeds must not pull them DOWN to it.
-	let current = match st.users.find_by_id(case.user_id).await {
-		Ok(Some(user)) => user.kyc_level(),
-		Ok(None) => {
-			tracing::error!(case_id = %case.id, "kyc callback: the case names a user that no longer exists");
-			return;
-		}
-		Err(e) => {
-			tracing::error!(error = %e, case_id = %case.id, "kyc callback: could not read the user behind the case");
-			return;
-		}
-	};
-	if target <= current {
-		tracing::info!(case_id = %case.id, current, target, "kyc callback: approval does not raise the level");
-		return;
-	}
-
-	// THE shared point. The operator RPC calls exactly this, so the `KYC_CHANGED` event,
-	// the `user_outbox` row and the money plane's mirror are identical whether a person
-	// or a vendor decided — and banking never learns a vendor exists.
-	match st.users.set_kyc_level(case.user_id, target).await {
-		Ok(_) => {
-			tracing::info!(case_id = %case.id, target, "kyc callback: level raised");
+	// THE shared point, and a MONOTONIC one. The comparison that decides whether this is
+	// a raise happens inside the same transaction as the write, under the user row's
+	// lock — an approval for a tier the user already exceeds must never pull them down to
+	// it, and read on a separate connection that check is a race the operator console can
+	// lose: a human revoking a level under `KycManage` commits between our read and our
+	// write, and the vendor silently restores what they had just taken away.
+	//
+	// The aggregate call underneath is the one the operator RPC uses, so the `KYC_CHANGED`
+	// event, the `user_outbox` row and the money plane's mirror come out identical whether
+	// a person or a vendor decided — banking still never learns a vendor exists.
+	match st.users.raise_kyc_level_to(case.user_id, target).await {
+		Ok(KycLevelChange::Raised { from, to }) => {
+			tracing::info!(case_id = %case.id, from, to, "kyc callback: level raised");
 			notify(
 				st,
 				case,
@@ -338,7 +327,12 @@ async fn apply(st: &super::Inner, case: &KycCase) {
 			)
 			.await;
 		}
-		Err(e) => tracing::error!(error = %e, case_id = %case.id, "kyc callback: could not apply the approved level"),
+		// Not a failure: an approval for a tier already held is a correct delivery whose
+		// correct effect is nothing.
+		Ok(KycLevelChange::AlreadyHolds(current)) => {
+			tracing::info!(case_id = %case.id, current, target, "kyc callback: approval does not raise the level");
+		}
+		Err(e) => tracing::error!(error = %e, case_id = %case.id, target, "kyc callback: could not apply the approved level"),
 	}
 }
 

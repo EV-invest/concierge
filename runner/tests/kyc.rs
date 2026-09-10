@@ -751,3 +751,71 @@ async fn a_body_without_an_event_id_is_handled_and_still_idempotent() {
 	assert_eq!(h.kyc_level(user).await, 1);
 	assert_eq!(h.kyc_changed_count(user).await, 1, "exactly one crossing of the bridge");
 }
+
+/// The vendor path must not undo a human decision it raced with.
+///
+/// The old handler read the level on one connection and wrote it on another. Between the
+/// two, an operator under `Permission::KycManage` can commit anything — including a grant
+/// ABOVE what a vendor may ever give. The webhook then wrote its own stale conclusion on
+/// top, and a tier 3 the consilium had just granted came back as tier 2, decided by a
+/// vendor that is not allowed past 2 in the first place. Nothing logs an error: from the
+/// inside it looks like an approval being applied.
+///
+/// Asserted as an INVARIANT rather than as one interleaving: whichever of the two commits
+/// first, a vendor approval for tier 2 must never leave the user below the 3 a human set.
+/// The row lock is what makes both orders end the same way, so the test also pins that the
+/// comparison really is inside it — the webhook must BLOCK while the row is held.
+#[tokio::test]
+async fn a_vendor_approval_never_overwrites_a_concurrent_human_grant() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	// Hold the user row exactly where `raise_kyc_level_to` needs it, so both writers line
+	// up behind it instead of interleaving by luck.
+	let mut holder = h.pool.begin().await.unwrap();
+	sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+		.bind(user.raw())
+		.fetch_one(&mut *holder)
+		.await
+		.unwrap();
+
+	let at = now();
+	let raw = body(&session_id, "Approved", &case_id.to_string(), at, json!({}));
+	let router = h.router.clone();
+	let webhook = tokio::spawn(async move {
+		let request = Request::builder()
+			.method("POST")
+			.uri("/kyc/callback/didit")
+			.header("content-type", "application/json")
+			.header("x-timestamp", at.to_string())
+			.header("x-signature", sign_body(SECRET, &raw))
+			.body(Body::from(raw))
+			.unwrap();
+		router.oneshot(request).await.expect("router answered").status()
+	});
+
+	tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+	assert!(
+		!webhook.is_finished(),
+		"the approval must block on the user row — a comparison taken outside the lock is the race this guards"
+	);
+
+	// The human decision lands first, granting a tier no vendor may reach.
+	let operator = h.users.clone();
+	let grant = tokio::spawn(async move { operator.set_kyc_level(user, 3).await });
+	holder.rollback().await.unwrap();
+
+	let webhook_status = tokio::time::timeout(std::time::Duration::from_secs(10), webhook)
+		.await
+		.expect("the webhook completes")
+		.expect("join");
+	tokio::time::timeout(std::time::Duration::from_secs(10), grant)
+		.await
+		.expect("the grant completes")
+		.expect("join")
+		.expect("the operator grant succeeds");
+
+	assert_eq!(webhook_status, StatusCode::OK, "the approval is still handled, whichever order it landed in");
+	assert_eq!(h.kyc_level(user).await, 3, "a vendor approval for tier 2 must never pull a human's tier 3 back down");
+}

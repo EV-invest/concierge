@@ -53,6 +53,23 @@ pub enum RoleChange {
 	WouldTakeOwnership,
 }
 
+/// What [`UserDirectoryRepository::raise_kyc_level_to`] did.
+///
+/// "Already holds it" is an ORDINARY answer and not an error: at-least-once webhook
+/// delivery makes a verdict for a level the user already reached a routine event, and an
+/// `Err` there would put a genuine, correctly-handled delivery into the vendor's retry
+/// loop.
+pub enum KycLevelChange {
+	/// The level moved up, and exactly one `KYC_CHANGED` went to the outbox with it.
+	/// `from` is carried for the log line — the decision itself was taken under the row
+	/// lock, so nothing downstream may re-derive it with a second read.
+	Raised { from: u32, to: u32 },
+	/// The user already stood at or above the target, so nothing was written. NOT a
+	/// failure: an approval for tier 1 reaching someone who already holds tier 2 is a
+	/// correct delivery whose only correct effect is nothing.
+	AlreadyHolds(u32),
+}
+
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
 #[async_trait]
 pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggregate = User> {
@@ -82,6 +99,28 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// both land here, so the event, the `user_outbox` row and the money plane's mirror
 	/// come out identical — and banking never learns that a KYC vendor exists.
 	async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError>;
+
+	/// RAISE a user's KYC level to `target`, with the "is this actually a raise?"
+	/// comparison taken inside the write transaction from the row held `FOR UPDATE`.
+	///
+	/// The atomicity is the whole point, exactly as in
+	/// [`Self::set_role_outside_ownership`]. Read on a separate connection, "is the
+	/// target above the current level?" is a TOCTOU window, and the vendor webhook is the
+	/// one caller that cannot avoid racing: an operator revoking a level under
+	/// `Permission::KycManage` commits in between, the webhook's stale read still says
+	/// `0 -> 2`, and it then blocks on the row only to write the level a human had just
+	/// taken away — a DOWNGRADE reversed by a vendor, which is the one thing the whole
+	/// KYC surface promises cannot happen. Holding the row across the comparison makes the
+	/// two paths serialize instead.
+	///
+	/// This does NOT replace [`Self::set_kyc_level`]; it wraps the same aggregate call in
+	/// a monotonic guard. The unconditional writer stays the human path's tool, because a
+	/// human under `KycManage` is precisely who is allowed to move a level DOWN.
+	///
+	/// Taking only the target's row cannot deadlock against the consilium path: that one
+	/// acquires the governance revision row, then the owner rows, then the target's, then
+	/// the outbox advisory lock — this acquires a suffix of the same order.
+	async fn raise_kyc_level_to(&self, id: UserId, target: u32) -> Result<KycLevelChange, DomainError>;
 
 	/// Set a user's platform access role UNCONDITIONALLY; emits ROLE_CHANGED across the
 	/// bridge.
