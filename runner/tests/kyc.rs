@@ -620,6 +620,47 @@ async fn start_opens_a_case_and_hands_back_a_redirect() {
 	assert_eq!(owner, user.raw(), "the case belongs to the session's user");
 }
 
+/// The CSRF check, driven through the only state-changing route these tests reach.
+///
+/// A near miss is the interesting input: it is what a comparison that stops at the first
+/// differing byte answers fastest, and it is what the constant-time one must answer
+/// exactly like a wild guess. Timing is not assertable from here — what is, is that
+/// narrowing the comparison did not narrow the CHECK: the header must still match the
+/// cookie AND the server-side copy, and a correct token must still get through.
+#[tokio::test]
+async fn a_csrf_token_that_is_merely_close_is_still_refused() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	let mut near = csrf.clone();
+	let last = near.pop().expect("a non-empty token");
+	near.push(if last == 'a' { 'b' } else { 'a' });
+
+	assert_eq!(h.start(&cookie, Some(&near), "").await.0, StatusCode::FORBIDDEN, "one byte out is out");
+	assert_eq!(h.start(&cookie, Some(&format!("{csrf}x")), "").await.0, StatusCode::FORBIDDEN, "a correct prefix is not a correct token");
+	assert_eq!(h.start(&cookie, Some(""), "").await.0, StatusCode::FORBIDDEN);
+
+	// The half this plane has that the cabinet does not: a caller who controls their own
+	// cookie jar can make the header and the cookie agree, and it still is not enough —
+	// the value held on the session is what decides.
+	let session_cookie = cookie.split(';').next().expect("the session cookie comes first");
+	assert_eq!(
+		h.start(&format!("{session_cookie}; ev_csrf={near}"), Some(&near), "").await.0,
+		StatusCode::FORBIDDEN,
+		"a matching header and cookie the server never issued are still refused"
+	);
+
+	assert_eq!(h.case_count(user).await, 0, "and none of that opened a case");
+
+	// A check nothing gets through is not a check.
+	assert_eq!(h.start(&cookie, Some(&csrf), "").await.0, StatusCode::OK);
+	assert_eq!(h.case_count(user).await, 1);
+}
+
 /// The applicant used to choose the level they would be granted.
 ///
 /// `POST {"tier":2}` was recorded as the case's `requested_tier`, the vendor was never

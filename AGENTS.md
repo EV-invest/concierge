@@ -198,6 +198,19 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   balance" and guessing would be brittle exactly where it costs most. The detail goes to
   `tracing::error!` (→ Sentry), because from the user's side this failure is SILENT — it
   looks like a polite "try later" that nobody reports.
+- **Every comparison against a presented secret is constant time**, with an explicit
+  length guard in front of `subtle::ConstantTimeEq` (which short-circuits on a length
+  mismatch, so without the guard a wrong-length candidate is distinguishable from a
+  wrong one of the right length). That is the bridge service token
+  (`support::authenticate_service`), the Didit webhook HMAC (`infrastructure::kyc::didit`),
+  the consilium self-decision code (`infrastructure::governance`), the refresh-token secret
+  (`evconcierge_auth::management`) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
+  Whether any one of them is a practical timing oracle is not the test — a plane that
+  states this discipline and then has one check quietly doing `!=` (#52) is a plane whose
+  next reader takes the exception for the rule. The CSRF check is also the STRICTER of the
+  two planes' and must stay so: the header is matched against the readable cookie AND the
+  server-side copy in the session locker, and the whole check runs BEFORE the session is
+  read, so a request that fails it never touches session state.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
