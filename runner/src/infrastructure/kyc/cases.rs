@@ -8,7 +8,7 @@ use domain::{error::DomainError, users::UserId};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::ports::{CaseDecision, KycCase, KycCaseRepository, KycDecision, KycStatus};
+use crate::ports::{CaseDecision, KycCase, KycCaseRepository, KycDecision, KycStatus, LiveCase, StartGate};
 
 pub struct PgKycCases {
 	pool: PgPool,
@@ -28,36 +28,60 @@ fn repo_err(err: sqlx::Error) -> DomainError {
 /// can only come from a hand-written UPDATE — the CHECK constraint and this adapter are
 /// the only writers — so it is a repository error, not a status.
 fn status_from_column(raw: &str) -> Result<KycStatus, DomainError> {
-	const KNOWN: [KycStatus; 9] = [
-		KycStatus::Pending,
-		KycStatus::InProgress,
-		KycStatus::InReview,
-		KycStatus::Approved,
-		KycStatus::Declined,
-		KycStatus::Resubmitted,
-		KycStatus::Abandoned,
-		KycStatus::Expired,
-		KycStatus::KycExpired,
-	];
-	KNOWN
+	KycStatus::ALL
 		.into_iter()
 		.find(|s| s.as_str() == raw)
 		.ok_or_else(|| DomainError::Repository(format!("kyc_cases.status holds an unknown value: {raw}")))
 }
 
+/// The `status` values a case is still MOVING through, derived from the enum rather than
+/// typed out: a running status missing from this list would read as finished, and the
+/// user would be sold a second vendor session for the attempt they are already in.
+fn running_statuses() -> Vec<&'static str> {
+	KycStatus::ALL.into_iter().filter(|s| !s.is_decided()).map(KycStatus::as_str).collect()
+}
+
 #[async_trait]
 impl KycCaseRepository for PgKycCases {
-	async fn open_case(&self, id: Uuid, user_id: UserId, provider: &str, provider_ref: &str, requested_tier: u32) -> Result<(), DomainError> {
-		sqlx::query("INSERT INTO kyc_cases (id, user_id, provider, provider_ref, requested_tier, status) VALUES ($1, $2, $3, $4, $5, 'pending')")
+	async fn open_case(&self, id: Uuid, user_id: UserId, provider: &str, provider_ref: &str, requested_tier: u32, redirect_url: &str) -> Result<(), DomainError> {
+		sqlx::query("INSERT INTO kyc_cases (id, user_id, provider, provider_ref, requested_tier, status, redirect_url) VALUES ($1, $2, $3, $4, $5, 'pending', $6)")
 			.bind(id)
 			.bind(user_id.raw())
 			.bind(provider)
 			.bind(provider_ref)
 			.bind(requested_tier as i32)
+			.bind(redirect_url)
 			.execute(&self.pool)
 			.await
 			.map_err(repo_err)?;
 		Ok(())
+	}
+
+	/// Two reads, both served by `kyc_cases_user_idx (user_id, created_at DESC)`.
+	///
+	/// Not one transaction, and not one statement, because neither would buy anything: the
+	/// answer is stale the moment it is returned either way — the caller acts on it outside
+	/// any lock — and the guarantee this gate offers is a bound on volume, not mutual
+	/// exclusion. Keeping them separate keeps each one a query a reader can check by eye.
+	async fn start_gate(&self, user_id: UserId, window_secs: i64) -> Result<StartGate, DomainError> {
+		let live: Option<(Uuid, Option<String>)> = sqlx::query_as("SELECT id, redirect_url FROM kyc_cases WHERE user_id = $1 AND status = ANY($2) ORDER BY created_at DESC LIMIT 1")
+			.bind(user_id.raw())
+			.bind(running_statuses())
+			.fetch_optional(&self.pool)
+			.await
+			.map_err(repo_err)?;
+
+		let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM kyc_cases WHERE user_id = $1 AND created_at > now() - make_interval(secs => $2)")
+			.bind(user_id.raw())
+			.bind(window_secs as f64)
+			.fetch_one(&self.pool)
+			.await
+			.map_err(repo_err)?;
+
+		Ok(StartGate {
+			live: live.map(|(id, redirect_url)| LiveCase { id, redirect_url }),
+			recent,
+		})
 	}
 
 	/// One transaction: take the case `FOR UPDATE`, judge the incoming verdict against

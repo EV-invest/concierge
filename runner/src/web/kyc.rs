@@ -23,6 +23,13 @@
 //! not open a session — `/kyc/start` DEGRADES rather than errors: one 503, one stable
 //! body, one support address (see [`StartError`]). The user is never shown a technical
 //! failure and never given the impression they did something wrong.
+//!
+//! `/kyc/start` also decides ALL of that before it dials the vendor, because opening a
+//! session is billed and the balance behind it is shared by every user on the platform.
+//! A caller already mid-flow is handed the case they are in, and a caller past
+//! [`START_MAX_PER_WINDOW`] is refused — both without a vendor call. What sits on the
+//! other side of that balance is not a degraded feature: it is the fail-closed 503 above,
+//! for everyone, which arrives as silence.
 
 use axum::{
 	Json,
@@ -33,12 +40,12 @@ use axum::{
 };
 use axum_extra::extract::cookie::CookieJar;
 use domain::users::UserId;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus, PROVIDER_MAX_TIER},
+	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus},
 	web::{
 		WebState, now_secs,
 		routes::{store_err, verify_csrf},
@@ -104,12 +111,34 @@ impl IntoResponse for StartError {
 	}
 }
 
-#[derive(Deserialize, Default)]
-pub struct StartRequest {
-	/// The tier being applied for. 0/absent ⇒ 1, the entry tier.
-	#[serde(default)]
-	tier: u32,
-}
+/// The tier a case is opened for, and the only one this route can produce.
+///
+/// The applicant used to name it in the request body. Nothing downstream ever read it —
+/// `KycProvider::start_session` took the tier and dropped it, and the vendor was asked
+/// for the same single workflow either way — so `{"tier":2}` bought level 2, meaning
+/// "proof of address and source of funds" in `banking`'s `users.proto`, for a document
+/// and a selfie. The field is gone rather than validated: there is nothing here that
+/// could honour it, and the cabinet never sent it (see `kyc-client.ts`, "No body on
+/// purpose"). A body carrying it is accepted and ignored, which is what makes removing it
+/// safe for anything already in flight.
+const ENTRY_TIER: u32 = 1;
+
+/// How far back [`START_MAX_PER_WINDOW`] counts.
+const START_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// How many cases one user may open inside [`START_WINDOW_SECS`].
+///
+/// Five, because honest use is bounded and cheap to picture: a rejected document, a
+/// session left open until it expired, a phone that ran out of battery mid-flow, a
+/// retry. Someone genuinely trying to get verified is not on their sixth attempt in a
+/// day; someone on their fiftieth is spending the platform's Didit balance, and past
+/// zero the route fails closed for EVERY user. A number this side of honest use costs a
+/// rare user one day's wait; a number the other side costs everyone verification.
+///
+/// A constant and not configuration: an env var here is a knob nobody would ever be in a
+/// position to turn correctly at 3am, and one more value to carry through the deploy
+/// chain for no decision it would help anyone make.
+pub const START_MAX_PER_WINDOW: i64 = 5;
 
 #[derive(Serialize)]
 pub struct StartResponse {
@@ -120,7 +149,9 @@ pub struct StartResponse {
 
 /// `POST /kyc/start` — open a verification case for the signed-in caller and hand back
 /// the provider's URL.
-pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, body: Option<Json<StartRequest>>) -> Result<Json<StartResponse>, StartError> {
+///
+/// Takes NO body. It used to take a tier and act on it; see [`ENTRY_TIER`].
+pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Result<Json<StartResponse>, StartError> {
 	let st = &st.inner;
 	let Some(provider) = st.kyc.as_ref() else {
 		// `debug!`, not `error!`: an unconfigured vendor is a SUPPORTED state that the
@@ -145,12 +176,46 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		.map(UserId::from_raw)
 		.map_err(|_| (StatusCode::UNAUTHORIZED, "unauthenticated"))?;
 
-	let requested = body.map(|Json(b)| b.tier).unwrap_or_default();
-	let tier = if requested == 0 { 1 } else { requested };
-	if tier > PROVIDER_MAX_TIER {
-		// Refused rather than clamped: silently applying for a lower tier than the caller
-		// asked for would look like an approval for the one they wanted.
-		return Err((StatusCode::BAD_REQUEST, "requested tier is above what a provider may grant").into());
+	// EVERYTHING below this line happens before the vendor is dialled, and that ordering is
+	// the whole point: `POST /v3/session/` is billed, and the platform's balance is a shared
+	// resource one signed-in account could otherwise drain in a loop. What is behind that
+	// balance is not a feature degrading — it is a fail-closed 503 on every user's
+	// verification, arriving as silence, because a polite "try later" is not something
+	// anyone files a ticket about.
+	let gate = st.kyc_cases.start_gate(user_id, START_WINDOW_SECS).await.map_err(|e| {
+		// Refusing here rather than proceeding: an unreadable gate is exactly the state in
+		// which we do not know whether spending a session is safe.
+		tracing::error!(error = %e, "kyc: could not read the start gate");
+		StartError::unavailable(st)
+	})?;
+
+	// An attempt already running gets handed back, not replaced. The user is mid-flow —
+	// they refreshed, came back from the vendor, or clicked twice — and buying a second
+	// session would charge us to give them a worse version of what they have: two open
+	// cases, one of which they will abandon and which will then read as a user who gave up.
+	if let Some(live) = &gate.live {
+		if let Some(redirect_url) = &live.redirect_url {
+			tracing::debug!(case_id = %live.id, "kyc: start reused the caller's running case");
+			return Ok(Json(StartResponse {
+				redirect_url: redirect_url.clone(),
+				case_id: live.id.to_string(),
+			}));
+		}
+		// A case opened before `kyc_cases.redirect_url` existed. There is no URL to hand
+		// back and no way to fetch one, so the choice is a new session or a dead end — and
+		// stranding a user who did nothing wrong is the worse of the two. The window cap
+		// below still applies, so this cannot be looped.
+		tracing::info!(case_id = %live.id, "kyc: the caller's running case predates redirect_url — opening a fresh session");
+	}
+
+	if gate.recent >= START_MAX_PER_WINDOW {
+		// 429 and not the `Unavailable` 503: this one IS about the caller, it is not a
+		// failure on our side, and telling them so is honest. Plain text like every other
+		// refusal on this route — the cabinet has no screen keyed to this and adding a
+		// second machine-readable code for a state honest use does not reach would be
+		// contract surface bought for nothing.
+		tracing::warn!(%user_id, opened = gate.recent, "kyc: start refused — the caller is over the per-user window cap");
+		return Err((StatusCode::TOO_MANY_REQUESTS, "too many verification attempts today").into());
 	}
 
 	// The vendor is called BEFORE the row is written, because the row's identity key is
@@ -165,24 +230,27 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	// away", which is a lie about a person who never got the chance, and it would poison
 	// every funnel number computed off these rows.
 	let case_id = Uuid::new_v4();
-	let session = provider.start_session(case_id, tier).await.map_err(|e| {
+	let session = provider.start_session(case_id, ENTRY_TIER).await.map_err(|e| {
 		// `error!` — NOT `warn!` — and the reason is the whole point of this arm. From
 		// the user's side an exhausted vendor balance looks like silence: they simply
 		// cannot verify, and nobody files a ticket about a screen that politely says to
 		// try later. `error!` is what `error_monitoring::tracing_layer()` (wired in
 		// `main::init_tracing`) forwards to Sentry, so this line is the only thing that
 		// will wake a human. The vendor's own text goes here and nowhere else.
-		tracing::error!(error = %e, provider = provider.name(), %case_id, tier, "kyc: the provider would not open a session — verification is unavailable to users");
+		tracing::error!(error = %e, provider = provider.name(), %case_id, tier = ENTRY_TIER, "kyc: the provider would not open a session — verification is unavailable to users");
 		StartError::unavailable(st)
 	})?;
-	st.kyc_cases.open_case(case_id, user_id, provider.name(), &session.provider_ref, tier).await.map_err(|e| {
-		// Same screen as a vendor outage: our store being unreachable is no more the
-		// user's business than the vendor's balance, and it is just as temporary.
-		tracing::error!(error = %e, %case_id, "kyc: failed to record the opened case");
-		StartError::unavailable(st)
-	})?;
+	st.kyc_cases
+		.open_case(case_id, user_id, provider.name(), &session.provider_ref, ENTRY_TIER, &session.redirect_url)
+		.await
+		.map_err(|e| {
+			// Same screen as a vendor outage: our store being unreachable is no more the
+			// user's business than the vendor's balance, and it is just as temporary.
+			tracing::error!(error = %e, %case_id, "kyc: failed to record the opened case");
+			StartError::unavailable(st)
+		})?;
 
-	tracing::info!(%case_id, tier, provider = provider.name(), "kyc: case opened");
+	tracing::info!(%case_id, tier = ENTRY_TIER, provider = provider.name(), "kyc: case opened");
 	Ok(Json(StartResponse {
 		redirect_url: session.redirect_url,
 		case_id: case_id.to_string(),

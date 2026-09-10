@@ -129,10 +129,32 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `KycProvider` port and its webhook (`web/kyc.rs`, `POST /kyc/callback/didit` —
   public, HMAC over the raw body, 300s replay window) lands in that same aggregate
   call, so banking never learns a vendor exists. A provider may only RAISE a level and
-  never past tier 2; tier 3 and every downgrade are human decisions under
-  `Permission::KycManage`. The identity a callback acts on comes from the stored
-  `kyc_cases` row, NEVER from the request body. Absent `DIDIT_*` config, both routes
-  answer 503 — there is no arm that skips the signature.
+  never past `PROVIDER_MAX_TIER`; every tier above it and every downgrade are human
+  decisions under `Permission::KycManage`. The identity a callback acts on comes from the
+  stored `kyc_cases` row, NEVER from the request body. Absent `DIDIT_*` config, both
+  routes answer 503 — there is no arm that skips the signature.
+- **The vendor ceiling is what the vendor actually CHECKS, and it is 1.** There is one
+  Didit workflow (`DIDIT_WORKFLOW_ID`) and it verifies a document and a selfie — tier-1
+  evidence. Tier 2 means "plus proof of address and source of funds" (`banking`'s
+  `users.proto`), and no workflow we run asks for either, so an approval is evidence for
+  tier 1 and nothing more. `/kyc/start` used to take the tier from the REQUEST BODY, and
+  `start_session` then dropped it — so `{"tier":2}` bought level 2 for a tier-1 check,
+  chosen by the applicant. The body no longer carries a tier at all and cases open at
+  `ENTRY_TIER`. `PROVIDER_MAX_TIER` is the second half of that fix and not a duplicate of
+  it: rows asking for 2 are already in the table, and clamping where the VERDICT is
+  applied is the only thing that reaches a case opened before the entry point changed.
+  Raising the ceiling is not a constant edit — it is a second workflow id selected by tier
+  inside `start_session`, and the constant must not move ahead of it.
+- **Nothing reaches the vendor before the per-user gate.** Opening a Didit session is
+  BILLED against a balance every user shares, and past that balance `/kyc/start` degrades
+  fail-closed: 503 for everyone, arriving as silence, because a polite "try later" is not
+  something anyone reports. So `/kyc/start` reads `KycCaseRepository::start_gate` FIRST. A
+  caller with a still-running case is handed that case back — `kyc_cases.redirect_url` is
+  stored for exactly this and a second session would only buy them a duplicate row that
+  later reads as an abandoned attempt — and a caller past `START_MAX_PER_WINDOW` in
+  `START_WINDOW_SECS` is refused 429. Both answers happen without a vendor call; that
+  ordering is the entire point, not an optimisation. The gate is a read and not a lock:
+  two simultaneous requests can both pass it, and the window cap is what bounds that.
 - **A verdict is not handled until the level moved.** Recording the decision and
   writing the level are two transactions, so `kyc_cases` saying `approved` beside an
   account still at tier 0 is a reachable state. The webhook answers 5xx when the level
