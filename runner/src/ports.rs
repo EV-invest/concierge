@@ -162,12 +162,24 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 
 /// The highest level an identity-verification VENDOR may ever cause.
 ///
+/// ONE, because one is what the vendor actually checks. There is a single Didit
+/// workflow (`DIDIT_WORKFLOW_ID`) and it verifies a document and a selfie — the tier-1
+/// evidence. Tier 2 means "everything in tier 1 plus proof of address and source of
+/// funds" (`banking`'s `users.proto`), and no workflow we run asks for either, so a
+/// vendor approval is evidence for tier 1 and nothing more. Raising this again is not a
+/// constant edit: it is a second workflow id, selected by tier inside
+/// `KycProvider::start_session`, and this ceiling is what stops the constant and the
+/// vendor drifting apart in the meantime.
+///
 /// Tier 3 is the ceiling of a human decision (`UserDirectory.SetKycLevel` under
-/// `Permission::KycManage`), and so is every downgrade. Clamping here, in the CHECK on
-/// `kyc_cases.requested_tier`, and again where the webhook applies its verdict means a
-/// compromised vendor account, a forged case row and a bug would each have to line up
-/// before a provider could hand anyone the top tier.
-pub const PROVIDER_MAX_TIER: u32 = 2;
+/// `Permission::KycManage`), and so is every downgrade.
+///
+/// This is also the clamp that retires the cases opened while `/kyc/start` still took
+/// the tier from the request body: rows asking for 2 are already in the table, some of
+/// them still running, and refusing the tier at the entry point does nothing for a case
+/// that was opened yesterday. Clamping where the verdict is APPLIED is what makes those
+/// grant a 1 when they land.
+pub const PROVIDER_MAX_TIER: u32 = 1;
 
 /// How long a signed webhook stays acceptable. Past this, a captured-and-replayed
 /// delivery is refused on age alone rather than on idempotency.

@@ -72,6 +72,12 @@ impl KycProvider for DiditKyc {
 	/// `POST /v3/session/`. `vendor_data` carries the CASE id and nothing else: the
 	/// vendor never receives a user id, an email or a name from us, so what it can leak
 	/// about our identity space is a correlation handle.
+	///
+	/// The tier is IGNORED, and that is why `PROVIDER_MAX_TIER` is 1. There is one
+	/// configured workflow, so asking for a higher tier here would change nothing the
+	/// vendor does while changing what we grant for the answer — which is the exact shape
+	/// of the hole this parameter used to open. Honouring it means a second
+	/// `DIDIT_WORKFLOW_ID_*`, selected here, and the ceiling raised in the same change.
 	async fn start_session(&self, case_id: Uuid, _requested_tier: u32) -> Result<KycSession, DomainError> {
 		let url = format!("{}/v3/session/", self.config.base_url.trim_end_matches('/'));
 		let response = self

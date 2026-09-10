@@ -40,12 +40,12 @@ use axum::{
 };
 use axum_extra::extract::cookie::CookieJar;
 use domain::users::UserId;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus, PROVIDER_MAX_TIER},
+	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus},
 	web::{
 		WebState, now_secs,
 		routes::{store_err, verify_csrf},
@@ -111,12 +111,17 @@ impl IntoResponse for StartError {
 	}
 }
 
-#[derive(Deserialize, Default)]
-pub struct StartRequest {
-	/// The tier being applied for. 0/absent ⇒ 1, the entry tier.
-	#[serde(default)]
-	tier: u32,
-}
+/// The tier a case is opened for, and the only one this route can produce.
+///
+/// The applicant used to name it in the request body. Nothing downstream ever read it —
+/// `KycProvider::start_session` took the tier and dropped it, and the vendor was asked
+/// for the same single workflow either way — so `{"tier":2}` bought level 2, meaning
+/// "proof of address and source of funds" in `banking`'s `users.proto`, for a document
+/// and a selfie. The field is gone rather than validated: there is nothing here that
+/// could honour it, and the cabinet never sent it (see `kyc-client.ts`, "No body on
+/// purpose"). A body carrying it is accepted and ignored, which is what makes removing it
+/// safe for anything already in flight.
+const ENTRY_TIER: u32 = 1;
 
 /// How far back [`START_MAX_PER_WINDOW`] counts.
 const START_WINDOW_SECS: i64 = 24 * 60 * 60;
@@ -144,7 +149,9 @@ pub struct StartResponse {
 
 /// `POST /kyc/start` — open a verification case for the signed-in caller and hand back
 /// the provider's URL.
-pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, body: Option<Json<StartRequest>>) -> Result<Json<StartResponse>, StartError> {
+///
+/// Takes NO body. It used to take a tier and act on it; see [`ENTRY_TIER`].
+pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Result<Json<StartResponse>, StartError> {
 	let st = &st.inner;
 	let Some(provider) = st.kyc.as_ref() else {
 		// `debug!`, not `error!`: an unconfigured vendor is a SUPPORTED state that the
@@ -168,14 +175,6 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	let user_id = Uuid::parse_str(&fresh.user.user_id)
 		.map(UserId::from_raw)
 		.map_err(|_| (StatusCode::UNAUTHORIZED, "unauthenticated"))?;
-
-	let requested = body.map(|Json(b)| b.tier).unwrap_or_default();
-	let tier = if requested == 0 { 1 } else { requested };
-	if tier > PROVIDER_MAX_TIER {
-		// Refused rather than clamped: silently applying for a lower tier than the caller
-		// asked for would look like an approval for the one they wanted.
-		return Err((StatusCode::BAD_REQUEST, "requested tier is above what a provider may grant").into());
-	}
 
 	// EVERYTHING below this line happens before the vendor is dialled, and that ordering is
 	// the whole point: `POST /v3/session/` is billed, and the platform's balance is a shared
@@ -231,18 +230,18 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	// away", which is a lie about a person who never got the chance, and it would poison
 	// every funnel number computed off these rows.
 	let case_id = Uuid::new_v4();
-	let session = provider.start_session(case_id, tier).await.map_err(|e| {
+	let session = provider.start_session(case_id, ENTRY_TIER).await.map_err(|e| {
 		// `error!` — NOT `warn!` — and the reason is the whole point of this arm. From
 		// the user's side an exhausted vendor balance looks like silence: they simply
 		// cannot verify, and nobody files a ticket about a screen that politely says to
 		// try later. `error!` is what `error_monitoring::tracing_layer()` (wired in
 		// `main::init_tracing`) forwards to Sentry, so this line is the only thing that
 		// will wake a human. The vendor's own text goes here and nowhere else.
-		tracing::error!(error = %e, provider = provider.name(), %case_id, tier, "kyc: the provider would not open a session — verification is unavailable to users");
+		tracing::error!(error = %e, provider = provider.name(), %case_id, tier = ENTRY_TIER, "kyc: the provider would not open a session — verification is unavailable to users");
 		StartError::unavailable(st)
 	})?;
 	st.kyc_cases
-		.open_case(case_id, user_id, provider.name(), &session.provider_ref, tier, &session.redirect_url)
+		.open_case(case_id, user_id, provider.name(), &session.provider_ref, ENTRY_TIER, &session.redirect_url)
 		.await
 		.map_err(|e| {
 			// Same screen as a vendor outage: our store being unreachable is no more the
@@ -251,7 +250,7 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 			StartError::unavailable(st)
 		})?;
 
-	tracing::info!(%case_id, tier, provider = provider.name(), "kyc: case opened");
+	tracing::info!(%case_id, tier = ENTRY_TIER, provider = provider.name(), "kyc: case opened");
 	Ok(Json(StartResponse {
 		redirect_url: session.redirect_url,
 		case_id: case_id.to_string(),
