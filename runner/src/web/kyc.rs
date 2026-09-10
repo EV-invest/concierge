@@ -248,16 +248,26 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 		}
 	};
 
-	let case = match st.kyc_cases.record_decision(provider.name(), &decision).await.map_err(|e| {
+	let (case, duplicate) = match st.kyc_cases.record_decision(provider.name(), &decision).await.map_err(|e| {
 		tracing::error!(error = %e, "kyc callback: could not record the decision");
 		(StatusCode::INTERNAL_SERVER_ERROR, "could not record the decision")
 	})? {
-		CaseDecision::Recorded(case) => case,
+		CaseDecision::Recorded(case) => (case, false),
 		// At-least-once delivery is normal, not an error — answering anything but 2xx
 		// would make the provider retry a message we have already acted on.
+		//
+		// It still goes through `apply`, and that is the point rather than an oversight.
+		// Recording the status and raising the level are two writes, and only the first is
+		// covered by the row lock: a delivery that stored `approved` and then died — the
+		// pod rolled, the level write lost its connection — leaves a case that says
+		// verified and a user who is not. Skipping the retry, as this handler used to,
+		// made that state PERMANENT, because every later delivery of the same verdict is
+		// a redelivery too. Applying again is safe by construction: `raise_kyc_level_to`
+		// compares under the row lock and writes nothing when the level is already held,
+		// so the second pass emits no second `KYC_CHANGED`.
 		CaseDecision::Redelivered(case) => {
-			tracing::debug!(case_id = %case.id, status = case.status.as_str(), "kyc callback: redelivery ignored");
-			return Ok(Json(json!({ "ok": true, "duplicate": true })));
+			tracing::debug!(case_id = %case.id, status = case.status.as_str(), "kyc callback: redelivery — re-asserting the recorded verdict");
+			(case, true)
 		}
 		// Genuine, but describing a verdict the case has already moved past. 200: the
 		// delivery was handled correctly and there is nothing for the vendor to retry.
@@ -288,12 +298,23 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 		return Err((StatusCode::BAD_REQUEST, "callback does not match its case"));
 	}
 
-	apply(st, &case).await;
-	Ok(Json(json!({ "ok": true, "status": case.status.as_str() })))
+	apply(st, &case).await?;
+	Ok(Json(json!({ "ok": true, "status": case.status.as_str(), "duplicate": duplicate })))
 }
 
 /// Turn a recorded verdict into a level, if it is one that moves the level at all.
-async fn apply(st: &super::Inner, case: &KycCase) {
+///
+/// FALLIBLE ON PURPOSE. This used to swallow every failure and let the caller answer 200,
+/// which told the vendor the verdict was handled and stopped the retries — for a user
+/// whose level had NOT moved. The case row said `approved`, the account said tier 0, and
+/// nothing would ever reconcile the two: the vendor had been told to stop, and no other
+/// path re-reads decided cases. An `Err` here means "the verdict is recorded but not
+/// applied", the caller turns it into a 5xx, and the vendor's retry is what repairs it.
+///
+/// A notification failure is NOT one of those errors and stays best-effort below: the
+/// level is already written by then, and retrying a delivery to re-send an email would
+/// re-run this whole path for a decision that has fully landed.
+async fn apply(st: &super::Inner, case: &KycCase) -> Result<(), (StatusCode, &'static str)> {
 	let Some(target) = case.status.grants_tier(case.requested_tier) else {
 		// Declined, abandoned, expired, unfinished, aged-out, still running: the case row
 		// now says so and the level is untouched. Someone who holds tier 2 and fails an
@@ -309,7 +330,7 @@ async fn apply(st: &super::Inner, case: &KycCase) {
 			)
 			.await;
 		}
-		return;
+		return Ok(());
 	};
 
 	// THE shared point, and a MONOTONIC one. The comparison that decides whether this is
@@ -333,13 +354,23 @@ async fn apply(st: &super::Inner, case: &KycCase) {
 				"Your verification was approved and your account level has been updated.",
 			)
 			.await;
+			Ok(())
 		}
-		// Not a failure: an approval for a tier already held is a correct delivery whose
-		// correct effect is nothing.
+		// Not a failure and not a retry: an approval for a tier already held is a correct
+		// delivery whose correct effect is nothing. Notably this is also the redelivery
+		// path, which is why re-applying costs no second event.
 		Ok(KycLevelChange::AlreadyHolds(current)) => {
 			tracing::info!(case_id = %case.id, current, target, "kyc callback: approval does not raise the level");
+			Ok(())
 		}
-		Err(e) => tracing::error!(error = %e, case_id = %case.id, target, "kyc callback: could not apply the approved level"),
+		// Includes the case naming a user that no longer exists (`DomainError::NotFound`
+		// out of the `FOR UPDATE` load). A retry will not resurrect them, but 200 here
+		// would file the verdict as applied, and it is not — the log line, not a silent
+		// success, is what gets a human to look.
+		Err(e) => {
+			tracing::error!(error = %e, case_id = %case.id, target, "kyc callback: could not apply the approved level");
+			Err((StatusCode::INTERNAL_SERVER_ERROR, "could not apply the decision"))
+		}
 	}
 }
 

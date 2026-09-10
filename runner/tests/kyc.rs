@@ -30,7 +30,7 @@ use concierge::{
 		notifications::PgNotifications,
 		users::PgUsers,
 	},
-	ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, UserDirectoryRepository},
+	ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, KycStatus, UserDirectoryRepository},
 	web::{self, KycDeps},
 };
 use domain::{
@@ -893,4 +893,43 @@ async fn a_later_verdict_still_moves_a_decided_case() {
 	assert_eq!(h.case_event_at(case_id).await, Some(expired_at));
 	assert_eq!(h.kyc_level(user).await, 2, "but a vendor still never takes a level away");
 	assert_eq!(h.kyc_changed_count(user).await, 1);
+}
+
+/// The verdict and the level are two writes, and only the first is under the case lock.
+///
+/// So there is a real window where `kyc_cases` says `approved` and the account is still
+/// at zero: the level write lost its connection, the pod rolled, Postgres dropped the
+/// session. The vendor's retry is the ONLY thing that ever revisits a decided case — and
+/// this handler used to spend it, answering 200 to the redelivery and returning before
+/// the level was touched. That made the split state permanent, because every later
+/// delivery is a redelivery too. The user stays unverified while their case row says
+/// otherwise, and nothing in the system disagrees loudly enough for anyone to notice.
+#[tokio::test]
+async fn a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	// Exactly the halfway state: `record_decision` committed, the level write never ran.
+	let at = now();
+	let decision = KycDecision {
+		provider_ref: session_id.clone(),
+		status: KycStatus::Approved,
+		vendor_data: case_id.to_string(),
+		metadata: json!({}),
+		signed_at: at,
+	};
+	h.cases.record_decision(PROVIDER, &decision).await.expect("record the verdict");
+	assert_eq!(h.case_row(case_id).await.0, "approved", "the case is decided...");
+	assert_eq!(h.kyc_level(user).await, 0, "...and the account has not caught up");
+
+	// The vendor retries, as it does. This delivery is a REDELIVERY — the stored status
+	// already equals the incoming one — and it must still finish the job.
+	let raw = body(&session_id, "Approved", &case_id.to_string(), at, json!({}));
+	let (status, answer) = h.post(raw.clone(), signed(&raw), at).await;
+
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer["duplicate"], true, "it is still a duplicate, and still answered 2xx");
+	assert_eq!(h.kyc_level(user).await, 2, "the retry is what repairs a verdict whose level never landed");
+	assert_eq!(h.kyc_changed_count(user).await, 1, "and it emits the ONE event the original attempt owed the money plane");
 }

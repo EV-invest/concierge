@@ -133,6 +133,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `Permission::KycManage`. The identity a callback acts on comes from the stored
   `kyc_cases` row, NEVER from the request body. Absent `DIDIT_*` config, both routes
   answer 503 — there is no arm that skips the signature.
+- **A verdict is not handled until the level moved.** Recording the decision and
+  writing the level are two transactions, so `kyc_cases` saying `approved` beside an
+  account still at tier 0 is a reachable state. The webhook answers 5xx when the level
+  write fails and re-applies on REDELIVERY rather than short-circuiting it — the
+  vendor's retry is the only thing that ever revisits a decided case, and answering
+  200 to it makes that split state permanent. Re-applying is free: the monotonic
+  writer compares under the row lock and emits nothing when the level is already held.
 - **Verdicts are ordered by the SIGNED timestamp, never by arrival.** Didit retries at
   ~1 min and ~4 min, so a superseded `in_review` landing after the `approved` that
   replaced it is routine. `kyc_cases.event_at` holds the signed instant of the stored
