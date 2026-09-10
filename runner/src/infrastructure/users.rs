@@ -251,11 +251,9 @@ impl UserDirectoryRepository for PgUsers {
 	}
 
 	async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError> {
-		self.mutate(id, |user| {
-			user.set_kyc_level(level);
-			Ok(())
-		})
-		.await
+		// The level reaches here straight from a request, so the aggregate's refusal is
+		// the caller's bad input and travels back as `Validation` -> `INVALID_ARGUMENT`.
+		self.mutate(id, |user| user.set_kyc_level(level)).await
 	}
 
 	/// One transaction: read the target `FOR UPDATE`, compare from THAT read, and either
@@ -272,7 +270,12 @@ impl UserDirectoryRepository for PgUsers {
 			// would not — it would emit a `KYC_CHANGED` carrying a downgrade.
 			return Ok(KycLevelChange::AlreadyHolds(current));
 		}
-		user.set_kyc_level(target);
+		// Unlike `set_kyc_level`, `target` is NOT a caller's number: it comes from the
+		// stored case's tier under this plane's own provider ceiling. A refusal here means
+		// that clamp is broken, which is our invariant and not the vendor's request — so it
+		// must not go back as `INVALID_ARGUMENT` blaming a delivery that asked for nothing.
+		user.set_kyc_level(target)
+			.map_err(|e| DomainError::Repository(format!("kyc level {target} is not writable: {e}")))?;
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
 		tx.commit().await.map_err(repo_err)?;

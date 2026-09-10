@@ -41,7 +41,7 @@ use std::sync::Arc;
 use domain::{
 	authz::{Permission, Role},
 	error::DomainError,
-	users::{AuthSubject, Email, ProfileFields, User, UserId, UserStatus},
+	users::{AuthSubject, Email, MAX_KYC_LEVEL, ProfileFields, User, UserId, UserStatus},
 };
 use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser};
 use evconcierge_contracts::concierge::v1::{
@@ -186,11 +186,11 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Permission::KycManage).await?;
 		let req = request.into_inner();
 		let target = parse_target_id(&req.user_id)?;
-		// No authoritative range exists anywhere in the plane (the proto carries a bare
-		// uint32 and banking mirrors it verbatim), so bound it to the conventional KYC
-		// tiers rather than accept any 32-bit value onto the bridge.
-		if req.kyc_level > 3 {
-			return Err(Status::invalid_argument("kyc_level must be between 0 and 3"));
+		// The aggregate and the `users_kyc_level_range` CHECK both refuse this too — the
+		// range is theirs, not this handler's. Rejecting here as well only saves the
+		// round trip to a row we already know we will not write.
+		if req.kyc_level > MAX_KYC_LEVEL {
+			return Err(Status::invalid_argument(format!("kyc_level must be between 0 and {MAX_KYC_LEVEL}")));
 		}
 		let user = self.users.set_kyc_level(target, req.kyc_level).await.map_err(domain_to_status)?;
 		Ok(Response::new(SetKycLevelResponse { kyc_level: user.kyc_level() }))

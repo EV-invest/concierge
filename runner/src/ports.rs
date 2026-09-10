@@ -94,6 +94,11 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 
 	/// Set a user's KYC level; emits KYC_CHANGED.
 	///
+	/// Unconditional in DIRECTION only. The aggregate refuses anything above
+	/// [`domain::users::MAX_KYC_LEVEL`] and the `users_kyc_level_range` CHECK refuses it
+	/// again at the column, so an out-of-range level is not something a caller here can
+	/// choose — it comes back as [`DomainError::Validation`].
+	///
 	/// The ONE writer of the level, whoever decided it: the operator RPC under
 	/// `Permission::KycManage` and the identity provider's webhook ([`KycProvider`])
 	/// both land here, so the event, the `user_outbox` row and the money plane's mirror
@@ -114,8 +119,8 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// two paths serialize instead.
 	///
 	/// This does NOT replace [`Self::set_kyc_level`]; it wraps the same aggregate call in
-	/// a monotonic guard. The unconditional writer stays the human path's tool, because a
-	/// human under `KycManage` is precisely who is allowed to move a level DOWN.
+	/// a monotonic guard. The direction-unconditional writer stays the human path's tool,
+	/// because a human under `KycManage` is precisely who is allowed to move a level DOWN.
 	///
 	/// Taking only the target's row cannot deadlock against the consilium path: that one
 	/// acquires the governance revision row, then the owner rows, then the target's, then
