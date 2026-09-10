@@ -14,10 +14,11 @@ use concierge::{
 	infrastructure::{db, platform::PgPlatform, users::PgUsers},
 	platform::Platform,
 	ports::{PlatformConfigRepository, UserDirectoryRepository},
+	support::domain_to_status,
 };
 use domain::{
 	authz::Role,
-	users::{AuthSubject, Email},
+	users::{AuthSubject, Email, MAX_KYC_LEVEL},
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
@@ -118,6 +119,65 @@ async fn set_kyc_level_is_bounded() {
 		.unwrap()
 		.into_inner();
 	assert_eq!(ok.kyc_level, 3);
+}
+
+/// #45: the handler guard above is a fast path, not the boundary. Skip it — call the
+/// repository port the way any other writer in this plane would — and the aggregate must
+/// still refuse, mapping to `INVALID_ARGUMENT` because the level came from outside.
+#[tokio::test]
+async fn kyc_level_is_bounded_beneath_the_handler() {
+	let Some((users, _)) = setup().await else {
+		return;
+	};
+	let subject = AuthSubject::parse(&format!("kyc-bound-{}", Uuid::new_v4())).unwrap();
+	let user = users.provision(subject, Email::parse("kyc-bound@example.com").unwrap(), true).await.unwrap();
+
+	for level in [MAX_KYC_LEVEL + 1, 999, u32::MAX] {
+		let err = users.set_kyc_level(user.id(), level).await.unwrap_err();
+		assert_eq!(domain_to_status(err).code(), Code::InvalidArgument, "level {level} must be refused as bad input");
+	}
+
+	let unchanged = users.find_by_id(user.id()).await.unwrap().expect("the user survives a refused write");
+	assert_eq!(unchanged.kyc_level(), 0, "a refused write leaves the record alone");
+}
+
+/// #45, the last line: with the aggregate out of the picture entirely — a backfill, a
+/// console `UPDATE`, the next adapter — the column itself refuses. This is the check that
+/// makes the level unreachable rather than merely well-guarded, and the same bound covers
+/// `user_outbox`, which is the copy the banking money plane actually mirrors.
+#[tokio::test]
+async fn kyc_level_out_of_range_is_refused_by_the_store() {
+	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+		return;
+	};
+	let pool = db::connect_sized(&url, 2).await.expect("connect to Postgres");
+	db::migrate(&pool).await.expect("apply migrations");
+	let users: Arc<dyn UserDirectoryRepository> = Arc::new(PgUsers::new(pool.clone()));
+
+	let subject = AuthSubject::parse(&format!("kyc-store-{}", Uuid::new_v4())).unwrap();
+	let user = users.provision(subject, Email::parse("kyc-store@example.com").unwrap(), true).await.unwrap();
+
+	// A negative value matters as much as 999: the column is signed, the domain reads it
+	// as `u32`, and -1 would rehydrate as 4294967295 — the largest tier imaginable.
+	for level in [-1_i32, 4, 999] {
+		let err = sqlx::query("UPDATE users SET kyc_level = $2 WHERE id = $1")
+			.bind(user.id().raw())
+			.bind(level)
+			.execute(&pool)
+			.await
+			.expect_err("the store must refuse a level no handler would accept");
+		assert!(err.to_string().contains("users_kyc_level_range"), "rejected by the range CHECK, not by accident: {err}");
+	}
+
+	let outbox = sqlx::query("INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject) VALUES ($1, 'KYC_CHANGED', 999, 0, 99, 'bypass')")
+		.bind(user.id().raw())
+		.execute(&pool)
+		.await
+		.expect_err("the mirrored copy is bounded too");
+	assert!(outbox.to_string().contains("user_outbox_kyc_level_range"), "rejected by the range CHECK: {outbox}");
+
+	let unchanged = users.find_by_id(user.id()).await.unwrap().expect("the user survives");
+	assert_eq!(unchanged.kyc_level(), 0);
 }
 
 #[tokio::test]

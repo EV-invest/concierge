@@ -26,6 +26,15 @@ use crate::{authz::Role, error::DomainError};
 /// name may start with. Keeping the list here (vs a tz crate) preserves the no-deps
 /// rule; new areas have not been added to the database in decades.
 const IANA_AREAS: [&str; 11] = ["Africa", "America", "Antarctica", "Arctic", "Asia", "Atlantic", "Australia", "Etc", "Europe", "Indian", "Pacific"];
+/// The inclusive ceiling of the platform's KYC tiers, and the aggregate's only bound on
+/// the level.
+///
+/// The wire contract carries a bare `uint32` and the banking money plane mirrors whatever
+/// arrives, so nothing outside this plane will ever reject a nonsense tier: an account at
+/// level 999 clears every threshold banking gates a money operation on. The range is
+/// therefore an invariant of the identity record itself rather than a guard clause in the
+/// one handler that happens to be validated today.
+pub const MAX_KYC_LEVEL: u32 = 3;
 /// The platform's canonical user id (a UUID). **This** value is the `sub` of the
 /// first-party session JWT — never the IdP's `sub` (see [`AuthSubject`]).
 pub type UserId = Id<UserTag>;
@@ -267,12 +276,20 @@ impl User {
 	}
 
 	/// Set the KYC level and emit [`UserEvent::KycChanged`]. No-op when unchanged.
-	pub fn set_kyc_level(&mut self, level: u32) {
+	///
+	/// Rejects anything above [`MAX_KYC_LEVEL`]. This is the ONE writer of the level, so
+	/// bounding it here bounds every path that reaches it — the operator RPC, the vendor
+	/// webhook, and whatever writer is added next — instead of trusting each to re-check.
+	pub fn set_kyc_level(&mut self, level: u32) -> Result<(), DomainError> {
+		if level > MAX_KYC_LEVEL {
+			return Err(DomainError::Validation(format!("kyc_level must be between 0 and {MAX_KYC_LEVEL}")));
+		}
 		if self.kyc_level == level {
-			return;
+			return Ok(());
 		}
 		self.kyc_level = level;
 		self.bump_and_emit(UserEvent::KycChanged);
+		Ok(())
 	}
 
 	/// Set the platform access role and emit [`UserEvent::RoleChanged`] (the money plane
@@ -620,10 +637,34 @@ mod tests {
 	fn kyc_change_is_idempotent() {
 		let mut user = fixture();
 		user.drain_events();
-		user.set_kyc_level(2);
-		user.set_kyc_level(2);
+		user.set_kyc_level(2).expect("2 is a real tier");
+		user.set_kyc_level(2).expect("2 is a real tier");
 		assert_eq!(user.kyc_level(), 2);
 		assert_eq!(user.drain_events(), [UserEvent::KycChanged]);
+	}
+
+	#[test]
+	fn kyc_level_above_the_ceiling_is_refused() {
+		let mut user = fixture();
+		user.set_kyc_level(MAX_KYC_LEVEL).expect("the ceiling itself is a real tier");
+		user.drain_events();
+
+		for level in [MAX_KYC_LEVEL + 1, 4, 999, u32::MAX] {
+			let err = user.set_kyc_level(level).expect_err("a tier the platform does not define must not be writable");
+			assert!(matches!(err, DomainError::Validation(_)), "an out-of-range level is bad input, not a policy refusal: {err}");
+		}
+
+		assert_eq!(user.kyc_level(), MAX_KYC_LEVEL, "a refused write leaves the level alone");
+		assert_eq!(user.drain_events(), [], "and emits nothing onto the cross-plane outbox");
+	}
+
+	#[test]
+	fn kyc_level_accepts_every_defined_tier() {
+		let mut user = fixture();
+		for level in 0..=MAX_KYC_LEVEL {
+			user.set_kyc_level(level).expect("every defined tier is writable");
+			assert_eq!(user.kyc_level(), level);
+		}
 	}
 
 	#[test]
