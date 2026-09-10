@@ -152,7 +152,15 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   it: rows asking for 2 are already in the table, and clamping where the VERDICT is
   applied is the only thing that reaches a case opened before the entry point changed.
   Raising the ceiling is not a constant edit — it is a second workflow id selected by tier
-  inside `start_session`, and the constant must not move ahead of it.
+  inside `start_session`, and the constant must not move ahead of it. The
+  `kyc_cases_requested_tier` CHECK still reads `BETWEEN 1 AND 2` and is NOT a stale second
+  copy of this constant: it bounds the tier a provider may be ASKED for, which follows the
+  platform's tier model (3 and every downgrade are human), while `PROVIDER_MAX_TIER` bounds
+  what an approval may GRANT and follows the configured workflow. Rows outlive that
+  configuration, so the ceiling cannot live in a column constraint —
+  `0014_kyc_requested_tier_intent.sql` carries the argument, including why the
+  `requested_tier = 2` rows are left standing and why `NOT VALID`, which is 0013's shape
+  for `user_outbox`, would break this table instead of bounding it.
 - **Nothing reaches the vendor before the per-user gate.** Opening a Didit session is
   BILLED against a balance every user shares, and past that balance `/kyc/start` degrades
   fail-closed: 503 for everyone, arriving as silence, because a polite "try later" is not

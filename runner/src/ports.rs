@@ -184,6 +184,11 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 /// them still running, and refusing the tier at the entry point does nothing for a case
 /// that was opened yesterday. Clamping where the verdict is APPLIED is what makes those
 /// grant a 1 when they land.
+///
+/// NOT the `kyc_cases_requested_tier` CHECK, which still reads `BETWEEN 1 AND 2` and is
+/// meant to: that one bounds the tier a provider may be ASKED for and follows the
+/// platform's tier model, this one bounds what an approval may GRANT and follows the
+/// configured workflow. `0014_kyc_requested_tier_intent.sql` is the argument.
 pub const PROVIDER_MAX_TIER: u32 = 1;
 
 /// How long a signed webhook stays acceptable. Past this, a captured-and-replayed
