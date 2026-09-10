@@ -132,9 +132,16 @@ pub(super) fn parse_webhook(secret: &str, headers: &CallbackHeaders, body: &[u8]
 	// the body is covered by the signature, so `X-Timestamp` alone can be re-stamped
 	// freely on a captured delivery. Checking the signed copy is what makes the window
 	// a replay defence rather than a formality.
-	if let Some(signed_at) = payload.timestamp
-		&& (now - signed_at).abs() > KYC_CALLBACK_WINDOW_SECS
-	{
+	//
+	// Which is exactly why its ABSENCE is `Malformed` and never a reason to fall back on
+	// the header: a captured delivery whose body carries no `timestamp` would otherwise
+	// stay replayable forever, since re-stamping the unsigned `X-Timestamp` costs an
+	// attacker nothing. A defence that any of the hops in front of us — the Cloudflare
+	// tunnel, Traefik, the rewrite in site_conductor — could switch off by dropping one
+	// optional field is not a defence. The vendor documents the field, so requiring it
+	// refuses forgeries, not deliveries.
+	let signed_at = payload.timestamp.ok_or_else(|| KycCallbackError::Malformed("body carries no timestamp".to_string()))?;
+	if (now - signed_at).abs() > KYC_CALLBACK_WINDOW_SECS {
 		return Err(KycCallbackError::StaleTimestamp);
 	}
 
@@ -149,6 +156,7 @@ pub(super) fn parse_webhook(secret: &str, headers: &CallbackHeaders, body: &[u8]
 		status,
 		vendor_data: payload.vendor_data.unwrap_or_default(),
 		metadata,
+		signed_at,
 	})
 }
 

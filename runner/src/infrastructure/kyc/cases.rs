@@ -60,8 +60,8 @@ impl KycCaseRepository for PgKycCases {
 		Ok(())
 	}
 
-	/// One transaction: take the case `FOR UPDATE`, compare the stored status with the
-	/// incoming one, and write only if it actually moves.
+	/// One transaction: take the case `FOR UPDATE`, judge the incoming verdict against
+	/// the stored one, and write only if it actually moves the case FORWARD.
 	///
 	/// The lock is the idempotency, not a detail. Two redeliveries of the same event can
 	/// arrive at two replicas at once; read outside a lock they would both see the old
@@ -69,31 +69,64 @@ impl KycCaseRepository for PgKycCases {
 	/// `KYC_CHANGED` rows onto the cross-plane outbox for one decision. Holding the row
 	/// across the comparison makes the second one see the first's write and report
 	/// [`CaseDecision::Redelivered`].
+	///
+	/// "Different status ⇒ write it" is NOT enough, which is what `event_at` is here for.
+	/// Deliveries do not arrive in the order they were sent — Didit retries at roughly one
+	/// and four minutes — so the last packet to land is not the vendor's latest word. The
+	/// stored signed instant is what makes the outcome depend on what was decided rather
+	/// than on which retry won the race.
 	async fn record_decision(&self, provider: &str, decision: &KycDecision) -> Result<CaseDecision, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 
-		let row: Option<(Uuid, Uuid, i32, String)> = sqlx::query_as("SELECT id, user_id, requested_tier, status FROM kyc_cases WHERE provider = $1 AND provider_ref = $2 FOR UPDATE")
-			.bind(provider)
-			.bind(&decision.provider_ref)
-			.fetch_optional(&mut *tx)
-			.await
-			.map_err(repo_err)?;
+		let row: Option<(Uuid, Uuid, i32, String, Option<i64>)> =
+			sqlx::query_as("SELECT id, user_id, requested_tier, status, event_at FROM kyc_cases WHERE provider = $1 AND provider_ref = $2 FOR UPDATE")
+				.bind(provider)
+				.bind(&decision.provider_ref)
+				.fetch_optional(&mut *tx)
+				.await
+				.map_err(repo_err)?;
 
-		let Some((id, user_id, requested_tier, stored_status)) = row else {
+		let Some((id, user_id, requested_tier, stored_status, stored_at)) = row else {
 			return Ok(CaseDecision::Unknown);
 		};
 		let stored = status_from_column(&stored_status)?;
-		let case = KycCase {
+		let case = |status| KycCase {
 			id,
 			user_id: UserId::from_raw(user_id),
 			requested_tier: requested_tier.max(0) as u32,
-			status: decision.status,
+			status,
 		};
 
 		if stored == decision.status {
 			// Nothing to write: the transaction only ever held a read lock, so dropping it
 			// here is the same as committing it.
-			return Ok(CaseDecision::Redelivered(case));
+			return Ok(CaseDecision::Redelivered(case(decision.status)));
+		}
+
+		// STRICTLY older only. Equal seconds still transition: the vendor stamps whole
+		// seconds, and `in_review` → `approved` inside one of them is an ordinary flow —
+		// dropping it would cost a real user their level to save a tie-break nobody needs.
+		// A replay cannot exploit that: to be judged here at all a delivery must already
+		// have carried a valid signature over a body whose own timestamp sits inside the
+		// 300-second window, and a replayed OLDER verdict is refused by this very check.
+		//
+		// A NULL `stored_at` is a case last written before that column existed. It means
+		// "no ordering evidence", not "the beginning of time", so it allows the
+		// transition — the behaviour these rows were written under.
+		if stored_at.is_some_and(|at| decision.signed_at < at) {
+			return Ok(CaseDecision::Ignored(case(stored)));
+		}
+
+		// A finished case never goes back to running. The timestamp check above cannot
+		// cover this one: a genuine `in_review` retry can carry a LATER stamp than the
+		// `approved` that superseded it when the vendor re-sends the older event after
+		// deciding. Reopening would clear `decision_at`, so the row would stop claiming
+		// the outcome the user's level was granted on — an audit trail contradicting the
+		// account it explains. Decided → decided stays allowed: `approved` → `kyc_expired`
+		// is a real vendor transition, and it moves no level down, since only an approval
+		// grants one at all.
+		if stored.is_decided() && !decision.status.is_decided() {
+			return Ok(CaseDecision::Ignored(case(stored)));
 		}
 
 		// `decision_at` follows `is_decided` exactly, which is what the
@@ -101,18 +134,19 @@ impl KycCaseRepository for PgKycCases {
 		// than leaving a row whose "still running?" has two answers.
 		sqlx::query(
 			"UPDATE kyc_cases SET status = $2, payload = $3, \
-			 decision_at = CASE WHEN $4 THEN now() ELSE NULL END, updated_at = now() \
+			 decision_at = CASE WHEN $4 THEN now() ELSE NULL END, event_at = $5, updated_at = now() \
 			 WHERE id = $1",
 		)
 		.bind(id)
 		.bind(decision.status.as_str())
 		.bind(&decision.metadata)
 		.bind(decision.status.is_decided())
+		.bind(decision.signed_at)
 		.execute(&mut *tx)
 		.await
 		.map_err(repo_err)?;
 
 		tx.commit().await.map_err(repo_err)?;
-		Ok(CaseDecision::Recorded(case))
+		Ok(CaseDecision::Recorded(case(decision.status)))
 	}
 }

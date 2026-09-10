@@ -21,7 +21,7 @@ use domain::{
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::ports::{RoleChange, UserDirectoryRepository};
+use crate::ports::{KycLevelChange, RoleChange, UserDirectoryRepository};
 
 /// The full column projection for the [`UserRow`] reads. sqlx 0.9 requires a
 /// `&'static str` query, so each `SELECT` splices this literal in via `concat!` rather
@@ -256,6 +256,27 @@ impl UserDirectoryRepository for PgUsers {
 			Ok(())
 		})
 		.await
+	}
+
+	/// One transaction: read the target `FOR UPDATE`, compare from THAT read, and either
+	/// raise or roll back. Same shape as [`Self::set_role_outside_ownership`] and for the
+	/// same reason — the comparison that decides the write must not be a separate read.
+	async fn raise_kyc_level_to(&self, id: UserId, target: u32) -> Result<KycLevelChange, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let mut user = load_for_update(&mut tx, id).await?;
+		let current = user.kyc_level();
+		if target <= current {
+			// Nothing written, so dropping the transaction is the same as committing it.
+			// Returning BEFORE `set_kyc_level` is what keeps the outbox clean: the
+			// aggregate would no-op on an equal level, but a `target` BELOW `current`
+			// would not — it would emit a `KYC_CHANGED` carrying a downgrade.
+			return Ok(KycLevelChange::AlreadyHolds(current));
+		}
+		user.set_kyc_level(target);
+		update_row(&mut tx, &user).await?;
+		drain_outbox(&mut tx, &mut user).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(KycLevelChange::Raised { from: current, to: target })
 	}
 
 	async fn set_role(&self, id: UserId, role: Role) -> Result<User, DomainError> {

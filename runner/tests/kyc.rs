@@ -30,7 +30,7 @@ use concierge::{
 		notifications::PgNotifications,
 		users::PgUsers,
 	},
-	ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, UserDirectoryRepository},
+	ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, KycStatus, UserDirectoryRepository},
 	web::{self, KycDeps},
 };
 use domain::{
@@ -184,6 +184,16 @@ impl Harness {
 			.fetch_one(&self.pool)
 			.await
 			.expect("count cases")
+	}
+
+	/// The signed instant the stored verdict was made at — the ordering key an
+	/// out-of-order delivery is judged against.
+	async fn case_event_at(&self, id: Uuid) -> Option<i64> {
+		sqlx::query_scalar::<_, Option<i64>>("SELECT event_at FROM kyc_cases WHERE id = $1")
+			.bind(id)
+			.fetch_one(&self.pool)
+			.await
+			.expect("read case")
 	}
 
 	async fn case_row(&self, id: Uuid) -> (String, bool, Value) {
@@ -413,6 +423,36 @@ async fn a_stale_delivery_is_refused() {
 
 	assert_eq!(h.kyc_level(user).await, 0);
 	assert_eq!(h.case_row(case_id).await.0, "pending");
+}
+
+/// The replay window must not rest on a field the body is free to omit.
+///
+/// `X-Timestamp` is not covered by either signature, so an attacker holding one captured
+/// delivery can re-stamp it at will. The only dateable copy is the one INSIDE the signed
+/// body — and if that one may be absent, the window is a formality: the same bytes stay
+/// acceptable a year later. A body with no `timestamp` is therefore malformed, not
+/// "in-window by default".
+#[tokio::test]
+async fn a_body_with_no_signed_timestamp_is_refused_however_fresh_the_header() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	// A genuine, correctly signed approval captured long ago — with the one field that
+	// dates it stripped out, exactly as a vendor that "forgot" to send it would look.
+	let captured = now() - KYC_CALLBACK_WINDOW_SECS * 10;
+	let mut payload: Value = serde_json::from_slice(&body(&session_id, "Approved", &case_id.to_string(), captured, json!({}))).unwrap();
+	payload.as_object_mut().unwrap().remove("timestamp");
+	let raw = serde_json::to_vec(&payload).unwrap();
+	assert!(!String::from_utf8_lossy(&raw).contains("timestamp"));
+
+	// The signature is VALID over these exact bytes, and the transport header says now.
+	let (status, _) = h.post(raw.clone(), signed(&raw), now()).await;
+
+	assert_eq!(status, StatusCode::BAD_REQUEST, "an undateable body cannot be checked against the replay window");
+	assert_eq!(h.kyc_level(user).await, 0);
+	assert_eq!(h.kyc_changed_count(user).await, 0);
+	assert_eq!(h.case_row(case_id).await.0, "pending", "and nothing about the case moved");
 }
 
 #[tokio::test]
@@ -720,4 +760,176 @@ async fn a_body_without_an_event_id_is_handled_and_still_idempotent() {
 	assert_eq!(again["duplicate"], true, "the second delivery is recognised without an event_id");
 	assert_eq!(h.kyc_level(user).await, 1);
 	assert_eq!(h.kyc_changed_count(user).await, 1, "exactly one crossing of the bridge");
+}
+
+/// The vendor path must not undo a human decision it raced with.
+///
+/// The old handler read the level on one connection and wrote it on another. Between the
+/// two, an operator under `Permission::KycManage` can commit anything — including a grant
+/// ABOVE what a vendor may ever give. The webhook then wrote its own stale conclusion on
+/// top, and a tier 3 the consilium had just granted came back as tier 2, decided by a
+/// vendor that is not allowed past 2 in the first place. Nothing logs an error: from the
+/// inside it looks like an approval being applied.
+///
+/// Asserted as an INVARIANT rather than as one interleaving: whichever of the two commits
+/// first, a vendor approval for tier 2 must never leave the user below the 3 a human set.
+/// The row lock is what makes both orders end the same way, so the test also pins that the
+/// comparison really is inside it — the webhook must BLOCK while the row is held.
+#[tokio::test]
+async fn a_vendor_approval_never_overwrites_a_concurrent_human_grant() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	// Hold the user row exactly where `raise_kyc_level_to` needs it, so both writers line
+	// up behind it instead of interleaving by luck.
+	let mut holder = h.pool.begin().await.unwrap();
+	sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+		.bind(user.raw())
+		.fetch_one(&mut *holder)
+		.await
+		.unwrap();
+
+	let at = now();
+	let raw = body(&session_id, "Approved", &case_id.to_string(), at, json!({}));
+	let router = h.router.clone();
+	let webhook = tokio::spawn(async move {
+		let request = Request::builder()
+			.method("POST")
+			.uri("/kyc/callback/didit")
+			.header("content-type", "application/json")
+			.header("x-timestamp", at.to_string())
+			.header("x-signature", sign_body(SECRET, &raw))
+			.body(Body::from(raw))
+			.unwrap();
+		router.oneshot(request).await.expect("router answered").status()
+	});
+
+	tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+	assert!(
+		!webhook.is_finished(),
+		"the approval must block on the user row — a comparison taken outside the lock is the race this guards"
+	);
+
+	// The human decision lands first, granting a tier no vendor may reach.
+	let operator = h.users.clone();
+	let grant = tokio::spawn(async move { operator.set_kyc_level(user, 3).await });
+	holder.rollback().await.unwrap();
+
+	let webhook_status = tokio::time::timeout(std::time::Duration::from_secs(10), webhook)
+		.await
+		.expect("the webhook completes")
+		.expect("join");
+	tokio::time::timeout(std::time::Duration::from_secs(10), grant)
+		.await
+		.expect("the grant completes")
+		.expect("join")
+		.expect("the operator grant succeeds");
+
+	assert_eq!(webhook_status, StatusCode::OK, "the approval is still handled, whichever order it landed in");
+	assert_eq!(h.kyc_level(user).await, 3, "a vendor approval for tier 2 must never pull a human's tier 3 back down");
+}
+
+/// Arrival order is not send order, and a decided case must not be reopened by a straggler.
+///
+/// Didit retries at roughly one and four minutes, so an `in_review` retry landing after
+/// the `approved` that superseded it is ordinary. Judged only by "the status differs", it
+/// would win: the case would go back to `in_review`, `decision_at` would be cleared, and
+/// the row explaining why this user holds tier 2 would stop claiming any decision at all.
+#[tokio::test]
+async fn a_stale_verdict_never_reopens_a_decided_case() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	// The approval the vendor sent second and we received first.
+	let decided_at = now();
+	let approval = body(&session_id, "Approved", &case_id.to_string(), decided_at, json!({}));
+	let (status, _) = h.post(approval.clone(), signed(&approval), decided_at).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 2);
+
+	// The earlier `in_review`, retried into the window and arriving late. Signed, fresh
+	// enough to pass the replay check, and genuinely older than the verdict on file.
+	let sent_at = decided_at - 60;
+	let straggler = body(&session_id, "In Review", &case_id.to_string(), sent_at, json!({}));
+	let (status, answer) = h.post(straggler.clone(), signed(&straggler), now()).await;
+
+	assert_eq!(status, StatusCode::OK, "the delivery is genuine, so there is nothing for the vendor to retry");
+	assert_eq!(answer["ignored"], "superseded");
+	let (case_status, decided, _) = h.case_row(case_id).await;
+	assert_eq!(case_status, "approved", "the case still holds the verdict it was decided on");
+	assert!(decided, "and it still records WHEN it was decided");
+	assert_eq!(h.case_event_at(case_id).await, Some(decided_at), "the ordering key is the approval's, not the straggler's");
+	assert_eq!(h.kyc_level(user).await, 2);
+	assert_eq!(h.kyc_changed_count(user).await, 1, "an out-of-order delivery emits nothing");
+}
+
+/// The ordering rule must not freeze a case at its first verdict.
+///
+/// `Kyc Expired` after `Approved` is a real Didit transition — a verification that aged
+/// out at the vendor — and it is strictly LATER, so it applies. What it does not do is
+/// move a level: only an approval grants one, and taking one away is a human act under
+/// `KycManage`. A guard that refused this would trade a lost audit trail for the
+/// out-of-order fix.
+#[tokio::test]
+async fn a_later_verdict_still_moves_a_decided_case() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	let approved_at = now() - 120;
+	let approval = body(&session_id, "Approved", &case_id.to_string(), approved_at, json!({}));
+	let (status, _) = h.post(approval.clone(), signed(&approval), now()).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 2);
+
+	let expired_at = now();
+	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
+	let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
+
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(h.case_row(case_id).await.0, "kyc_expired", "a genuinely later verdict is recorded");
+	assert_eq!(h.case_event_at(case_id).await, Some(expired_at));
+	assert_eq!(h.kyc_level(user).await, 2, "but a vendor still never takes a level away");
+	assert_eq!(h.kyc_changed_count(user).await, 1);
+}
+
+/// The verdict and the level are two writes, and only the first is under the case lock.
+///
+/// So there is a real window where `kyc_cases` says `approved` and the account is still
+/// at zero: the level write lost its connection, the pod rolled, Postgres dropped the
+/// session. The vendor's retry is the ONLY thing that ever revisits a decided case — and
+/// this handler used to spend it, answering 200 to the redelivery and returning before
+/// the level was touched. That made the split state permanent, because every later
+/// delivery is a redelivery too. The user stays unverified while their case row says
+/// otherwise, and nothing in the system disagrees loudly enough for anyone to notice.
+#[tokio::test]
+async fn a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	// Exactly the halfway state: `record_decision` committed, the level write never ran.
+	let at = now();
+	let decision = KycDecision {
+		provider_ref: session_id.clone(),
+		status: KycStatus::Approved,
+		vendor_data: case_id.to_string(),
+		metadata: json!({}),
+		signed_at: at,
+	};
+	h.cases.record_decision(PROVIDER, &decision).await.expect("record the verdict");
+	assert_eq!(h.case_row(case_id).await.0, "approved", "the case is decided...");
+	assert_eq!(h.kyc_level(user).await, 0, "...and the account has not caught up");
+
+	// The vendor retries, as it does. This delivery is a REDELIVERY — the stored status
+	// already equals the incoming one — and it must still finish the job.
+	let raw = body(&session_id, "Approved", &case_id.to_string(), at, json!({}));
+	let (status, answer) = h.post(raw.clone(), signed(&raw), at).await;
+
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer["duplicate"], true, "it is still a duplicate, and still answered 2xx");
+	assert_eq!(h.kyc_level(user).await, 2, "the retry is what repairs a verdict whose level never landed");
+	assert_eq!(h.kyc_changed_count(user).await, 1, "and it emits the ONE event the original attempt owed the money plane");
 }

@@ -115,14 +115,39 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   banner, feature flags) behind the shared RBAC gate (`authz`). `notification` and
   `log` stay DEFERRED stubs (`tonic::Status::unimplemented`); their application
   layers are placeholders to grow into. Health returns `"ok"`.
-- **KYC has exactly one writer**: `users.set_kyc_level` (→ `KYC_CHANGED` → outbox →
-  banking's mirror). The verification vendor sits behind the `KycProvider` port and
-  its webhook (`web/kyc.rs`, `POST /kyc/callback/didit` — public, HMAC over the raw
-  body, 300s replay window) lands in that same call, so banking never learns a vendor
-  exists. A provider may only RAISE a level and never past tier 2; tier 3 and every
-  downgrade are human decisions under `Permission::KycManage`. The identity a callback
-  acts on comes from the stored `kyc_cases` row, NEVER from the request body. Absent
-  `DIDIT_*` config, both routes answer 503 — there is no arm that skips the signature.
+- **KYC has exactly one writer**: the `User` aggregate's `set_kyc_level` and the
+  `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
+  banking's mirror). Two ENTRY POINTS reach it, and they differ only in what they
+  are allowed to decide. `users.set_kyc_level` is unconditional and belongs to the
+  human path (`Permission::KycManage`), because a human is precisely who may move a
+  level DOWN. `users.raise_kyc_level_to` is the vendor path: it is MONOTONIC, and the
+  "is this actually a raise?" comparison is taken inside the write transaction from
+  the target row held `FOR UPDATE`. That must not become a read on one connection and
+  a write on another — an operator committing in the gap would have their decision
+  silently overwritten by a vendor's stale conclusion, which is the one thing this
+  surface promises cannot happen. The verification vendor sits behind the
+  `KycProvider` port and its webhook (`web/kyc.rs`, `POST /kyc/callback/didit` —
+  public, HMAC over the raw body, 300s replay window) lands in that same aggregate
+  call, so banking never learns a vendor exists. A provider may only RAISE a level and
+  never past tier 2; tier 3 and every downgrade are human decisions under
+  `Permission::KycManage`. The identity a callback acts on comes from the stored
+  `kyc_cases` row, NEVER from the request body. Absent `DIDIT_*` config, both routes
+  answer 503 — there is no arm that skips the signature.
+- **A verdict is not handled until the level moved.** Recording the decision and
+  writing the level are two transactions, so `kyc_cases` saying `approved` beside an
+  account still at tier 0 is a reachable state. The webhook answers 5xx when the level
+  write fails and re-applies on REDELIVERY rather than short-circuiting it — the
+  vendor's retry is the only thing that ever revisits a decided case, and answering
+  200 to it makes that split state permanent. Re-applying is free: the monotonic
+  writer compares under the row lock and emits nothing when the level is already held.
+- **Verdicts are ordered by the SIGNED timestamp, never by arrival.** Didit retries at
+  ~1 min and ~4 min, so a superseded `in_review` landing after the `approved` that
+  replaced it is routine. `kyc_cases.event_at` holds the signed instant of the stored
+  verdict; a delivery strictly older than it, or one that would move a decided case
+  back to a running state, is answered 200-and-ignored. The body's `timestamp` is
+  REQUIRED for this reason and its absence is a rejection: `X-Timestamp` is not
+  covered by either signature, so ordering taken from the header could be rewritten by
+  anyone holding one captured delivery.
 - **Either webhook signature authenticates a delivery**: `X-Signature-V2` (over the
   canonicalised body) is tried first, `X-Signature` (over the raw bytes) second. The
   delivery crosses a Cloudflare tunnel, Traefik and a Next.js rewrite before reaching us,

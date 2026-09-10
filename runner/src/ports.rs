@@ -53,6 +53,23 @@ pub enum RoleChange {
 	WouldTakeOwnership,
 }
 
+/// What [`UserDirectoryRepository::raise_kyc_level_to`] did.
+///
+/// "Already holds it" is an ORDINARY answer and not an error: at-least-once webhook
+/// delivery makes a verdict for a level the user already reached a routine event, and an
+/// `Err` there would put a genuine, correctly-handled delivery into the vendor's retry
+/// loop.
+pub enum KycLevelChange {
+	/// The level moved up, and exactly one `KYC_CHANGED` went to the outbox with it.
+	/// `from` is carried for the log line — the decision itself was taken under the row
+	/// lock, so nothing downstream may re-derive it with a second read.
+	Raised { from: u32, to: u32 },
+	/// The user already stood at or above the target, so nothing was written. NOT a
+	/// failure: an approval for tier 1 reaching someone who already holds tier 2 is a
+	/// correct delivery whose only correct effect is nothing.
+	AlreadyHolds(u32),
+}
+
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
 #[async_trait]
 pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggregate = User> {
@@ -82,6 +99,28 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// both land here, so the event, the `user_outbox` row and the money plane's mirror
 	/// come out identical — and banking never learns that a KYC vendor exists.
 	async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError>;
+
+	/// RAISE a user's KYC level to `target`, with the "is this actually a raise?"
+	/// comparison taken inside the write transaction from the row held `FOR UPDATE`.
+	///
+	/// The atomicity is the whole point, exactly as in
+	/// [`Self::set_role_outside_ownership`]. Read on a separate connection, "is the
+	/// target above the current level?" is a TOCTOU window, and the vendor webhook is the
+	/// one caller that cannot avoid racing: an operator revoking a level under
+	/// `Permission::KycManage` commits in between, the webhook's stale read still says
+	/// `0 -> 2`, and it then blocks on the row only to write the level a human had just
+	/// taken away — a DOWNGRADE reversed by a vendor, which is the one thing the whole
+	/// KYC surface promises cannot happen. Holding the row across the comparison makes the
+	/// two paths serialize instead.
+	///
+	/// This does NOT replace [`Self::set_kyc_level`]; it wraps the same aggregate call in
+	/// a monotonic guard. The unconditional writer stays the human path's tool, because a
+	/// human under `KycManage` is precisely who is allowed to move a level DOWN.
+	///
+	/// Taking only the target's row cannot deadlock against the consilium path: that one
+	/// acquires the governance revision row, then the owner rows, then the target's, then
+	/// the outbox advisory lock — this acquires a suffix of the same order.
+	async fn raise_kyc_level_to(&self, id: UserId, target: u32) -> Result<KycLevelChange, DomainError>;
 
 	/// Set a user's platform access role UNCONDITIONALLY; emits ROLE_CHANGED across the
 	/// bridge.
@@ -238,6 +277,15 @@ pub struct KycDecision {
 	/// Allowlisted decision METADATA for `kyc_cases.payload` — document country, document
 	/// type, per-check outcomes. Never documents, images, or document numbers.
 	pub metadata: serde_json::Value,
+	/// Unix seconds the vendor stamped INSIDE the signed body — the instant this verdict
+	/// was made, as opposed to the instant this delivery happened to arrive.
+	///
+	/// This is the ordering key [`KycCaseRepository::record_decision`] judges a verdict
+	/// by, which is why it is the signed copy and not the `X-Timestamp` header: the
+	/// header is unauthenticated, so ordering taken from it could be rewritten by anyone
+	/// holding one captured delivery. Non-optional by construction — a body without it is
+	/// refused as [`KycCallbackError::Malformed`] before a decision is ever built.
+	pub signed_at: i64,
 }
 
 /// Why a callback was refused. Every variant is a REJECTION: nothing was written and no
@@ -247,10 +295,12 @@ pub enum KycCallbackError {
 	/// Missing signature header, or one that does not match the body under the shared
 	/// secret.
 	BadSignature,
-	/// The delivery is outside [`KYC_CALLBACK_WINDOW_SECS`], or carries no usable
-	/// timestamp at all.
+	/// The delivery is outside [`KYC_CALLBACK_WINDOW_SECS`], on the transport header or
+	/// on the SIGNED body timestamp, or carries no `X-Timestamp` at all.
 	StaleTimestamp,
-	/// Not the documented body shape.
+	/// Not the documented body shape — including a body that carries no `timestamp`.
+	/// That one is a REJECTION and not a skipped check: the header copy is unsigned, so
+	/// a delivery whose signed body cannot be dated is replayable at any later time.
 	Malformed(String),
 	/// A signed, in-window, well-formed delivery carrying a status word this adapter
 	/// does not know.
@@ -304,6 +354,18 @@ pub enum CaseDecision {
 	/// written and nothing must follow, or a replayed `Approved` would re-emit
 	/// `KYC_CHANGED` onto the cross-plane outbox.
 	Redelivered(KycCase),
+	/// The delivery is genuine but SUPERSEDED: it describes an older verdict than the one
+	/// the case already holds, or it would reopen a case that has finished. Nothing was
+	/// written and nothing must follow.
+	///
+	/// Distinct from [`Self::Redelivered`] on purpose, and the difference decides whether
+	/// the caller may still act. A redelivery asserts the state the case IS in, so
+	/// re-applying it is idempotent and repairs a first delivery that recorded the status
+	/// and then failed to move the level. An ignored delivery asserts a state the case has
+	/// LEFT — acting on it would apply a verdict the vendor has already replaced.
+	///
+	/// Carries the case as it actually stands, never the superseded verdict.
+	Ignored(KycCase),
 	/// No case for this `(provider, provider_ref)`. Also the shape of the legitimate
 	/// race where a webhook overtakes the transaction that opens the case.
 	Unknown,
@@ -322,6 +384,13 @@ pub trait KycCaseRepository: Send + Sync {
 	async fn open_case(&self, id: Uuid, user_id: UserId, provider: &str, provider_ref: &str, requested_tier: u32) -> Result<(), DomainError>;
 
 	/// Apply a verdict to the case it names, if it moves anything.
+	///
+	/// Ordering is decided here and nowhere else, from [`KycDecision::signed_at`] against
+	/// the instant stored with the current status — because arrival order is not send
+	/// order. Didit retries a delivery at roughly one and four minutes, so a retried
+	/// `in_review` landing after the `approved` that replaced it is routine. A verdict
+	/// strictly older than the stored one, and any delivery that would move a finished
+	/// case back to a running state, answer [`CaseDecision::Ignored`].
 	async fn record_decision(&self, provider: &str, decision: &KycDecision) -> Result<CaseDecision, DomainError>;
 }
 
