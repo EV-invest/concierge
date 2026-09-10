@@ -118,9 +118,14 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
 - **KYC has exactly one writer**: the `User` aggregate's `set_kyc_level` and the
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
   banking's mirror). Two ENTRY POINTS reach it, and they differ only in what they
-  are allowed to decide. `users.set_kyc_level` is unconditional and belongs to the
-  human path (`Permission::KycManage`), because a human is precisely who may move a
-  level DOWN. `users.raise_kyc_level_to` is the vendor path: it is MONOTONIC, and the
+  are allowed to decide. `users.set_kyc_level` is unconditional in DIRECTION and belongs
+  to the human path (`Permission::KycManage`), because a human is precisely who may move
+  a level DOWN. It is NOT unconditional in RANGE: the aggregate refuses anything above
+  `domain::users::MAX_KYC_LEVEL` (3), and the `users_kyc_level_range` CHECK refuses it
+  again at the column — the range belongs to the record, not to the one handler that
+  happened to check it. `user_outbox.kyc_level` carries the same CHECK, `NOT VALID` on
+  purpose: it is the copy banking mirrors, so future appends are bounded while the log
+  keeps reporting what it reported. `users.raise_kyc_level_to` is the vendor path: it is MONOTONIC, and the
   "is this actually a raise?" comparison is taken inside the write transaction from
   the target row held `FOR UPDATE`. That must not become a read on one connection and
   a write on another — an operator committing in the gap would have their decision
