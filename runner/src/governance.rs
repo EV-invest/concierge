@@ -951,7 +951,13 @@ struct ConsentNotice {
 enum Recipient {
 	/// The consilium kinds — a payout or payment approval to cast, or the outcome of
 	/// one — speak to a seated owner, so the recipient must hold a seat.
-	FundOwner,
+	///
+	/// `verified_address` adds the consent's second rule for the one consilium kind
+	/// that arrived after it: a payment approval carries a link AND the code that arms
+	/// it, and an address nobody has proved belongs to the owner hands that vote to
+	/// whoever holds the mailbox. The payout kinds keep `false` on purpose — they are a
+	/// live contract, and closing that hole for them is its own change.
+	FundOwner { verified_address: bool },
 	/// A payment consent speaks to exactly one person: the one whose money moves. Role
 	/// decides nothing here, so the rule is identity.
 	Subject(UserId),
@@ -989,7 +995,7 @@ impl MailRelayService for MailRelay {
 					"approval_url": self.approval_link(&mail.approval_url)?,
 					"code": bounded(&mail.code, 64, "code")?,
 				});
-				("payout_approval", payload, Recipient::FundOwner, None)
+				("payout_approval", payload, Recipient::FundOwner { verified_address: false }, None)
 			}
 			// A burned approval token is an outcome the owners are told about, and the
 			// outcome payload already carries everything that mail needs to say. The
@@ -1010,7 +1016,7 @@ impl MailRelayService for MailRelay {
 					"destination": line(&mail.destination, 160, "destination")?,
 					"reason": line(&mail.reason, 500, "reason")?,
 				});
-				("payout_outcome", payload, Recipient::FundOwner, None)
+				("payout_outcome", payload, Recipient::FundOwner { verified_address: false }, None)
 			}
 			// The consilium asked about a PAYMENT of fund-owned money. Addressed like a
 			// payout — to a seat — but described like a consent: two ends of a transfer in
@@ -1033,7 +1039,7 @@ impl MailRelayService for MailRelay {
 					"approval_url": self.approval_link(&mail.approval_url)?,
 					"code": line(&mail.code, 64, "code")?,
 				});
-				("payment_approval", payload, Recipient::FundOwner, None)
+				("payment_approval", payload, Recipient::FundOwner { verified_address: true }, None)
 			}
 			// The one kind that is not addressed to the consilium. Every field is bounded in
 			// bytes and refused if it carries a control character — see `line`.
@@ -1098,10 +1104,14 @@ impl MailRelayService for MailRelay {
 			// sent to someone with no standing in it. The PERSISTED role, never the elevated one:
 			// emergency access authorizes an operator, it does not seat them, and it must
 			// not turn them into a governance correspondent either.
-			Recipient::FundOwner =>
+			Recipient::FundOwner { verified_address } => {
 				if recipient.role() != Role::Owner {
 					return Err(Status::failed_precondition("a governance mail may only be addressed to a fund owner"));
-				},
+				}
+				if verified_address && !recipient.email_verified() {
+					return Err(Status::failed_precondition("a payment approval may only be sent to a verified address"));
+				}
+			}
 			Recipient::Subject(subject) => {
 				// Consent is personal: it is only worth anything from the person whose money
 				// moves, and that person is ordinarily an investor holding no seat. So the

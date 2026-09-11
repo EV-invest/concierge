@@ -119,6 +119,13 @@ impl Fixture {
 		self.provision(false).await
 	}
 
+	/// A seated owner whose address nobody has proved belongs to them.
+	async fn unverified_owner(&self) -> UserId {
+		let id = self.unverified_user().await;
+		self.users.set_role(id, Role::Owner).await.expect("grant the seat");
+		id
+	}
+
 	async fn provision(&self, email_verified: bool) -> UserId {
 		let subject = AuthSubject::parse(&format!("gov-itest-{}", Uuid::new_v4())).unwrap();
 		let email = Email::parse(&format!("gov-{}@example.com", Uuid::new_v4())).unwrap();
@@ -983,6 +990,33 @@ async fn a_payment_approval_reaches_only_a_fund_owner() {
 	assert!(
 		fx.inbox(owner).await.is_empty(),
 		"an owner's approval leaves no inbox trace — the consilium surface is where they find it"
+	);
+}
+
+/// The consent's second rule, for the one consilium kind that arrived after it: an
+/// approval mail carries the link and the code that arms it, so an address nobody has
+/// proved belongs to the owner would hand their vote to whoever holds the mailbox. The
+/// payout kinds are a live contract and deliberately keep accepting such an address.
+#[tokio::test]
+async fn a_payment_approval_refuses_an_unverified_address() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.unverified_owner().await;
+	let request = payment_approval(owner);
+	let key = request.dedupe_key.clone();
+	let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+	assert!(fx.delivery(&key).await.is_none(), "a refused call queues nothing");
+
+	assert!(
+		fx.relay()
+			.send_governance_mail(relayed(payout(owner)))
+			.await
+			.expect("the payout kinds are unchanged")
+			.into_inner()
+			.enqueued,
+		"narrowing the new kind must not have narrowed the live ones"
 	);
 }
 
