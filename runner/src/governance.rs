@@ -908,6 +908,12 @@ fn required_line(value: &str, max_bytes: usize, field: &str) -> Result<String, S
 /// what the payment IS — something to surface as a rejected call, not to print.
 const PAYMENT_TIERS: [&str; 3] = ["internal", "service", "external"];
 
+/// How a consilium can end, as the money plane spells it: its `ConsiliumState::as_str()`
+/// upper-cased for every closed state (never OPEN — an outcome is announced only after a
+/// transition), plus the burn notice's own word. A closed set for the same reason as
+/// [`PAYMENT_TIERS`]: this word becomes the headline of the mail.
+const OUTCOMES: [&str; 7] = ["APPROVED", "REJECTED", "EXPIRED", "CANCELLED", "EXECUTED", "EXECUTION_FAILED", "TOKEN_BURNED"];
+
 /// [`line`], plus: the word must be one of [`PAYMENT_TIERS`].
 fn payment_tier(value: &str) -> Result<String, Status> {
 	let tier = line(value, 16, "tier")?;
@@ -1003,9 +1009,26 @@ impl MailRelayService for MailRelay {
 			// later is held to `line` like every other payment field.
 			Ok(GovernanceMailKind::PayoutOutcome) | Ok(GovernanceMailKind::ApprovalTokenBurned) => {
 				let mail = req.payout_outcome.ok_or_else(|| Status::invalid_argument("payout_outcome is required for this kind"))?;
+				let outcome = bounded(&mail.outcome, 64, "outcome")?;
+				if !OUTCOMES.contains(&outcome.as_str()) {
+					return Err(Status::invalid_argument("outcome must be one of the consilium outcomes"));
+				}
+				// One subject per mail. The renderer switches on which pair is filled, so a
+				// payload naming both would describe a rail on a payment — or the reverse —
+				// and half a payment pair would render a transfer with one end missing.
+				let names_a_rail = !mail.network.is_empty() || !mail.address.is_empty();
+				let names_a_payment = !mail.source.is_empty() || !mail.destination.is_empty() || !mail.tier.is_empty();
+				if names_a_rail && names_a_payment {
+					return Err(Status::invalid_argument(
+						"an outcome names either a rail (network, address) or a payment (tier, source, destination), not both",
+					));
+				}
+				if names_a_payment && (mail.source.is_empty() || mail.destination.is_empty() || mail.tier.is_empty()) {
+					return Err(Status::invalid_argument("a payment outcome needs tier, source and destination together"));
+				}
 				let payload = serde_json::json!({
 					"consilium_id": bounded(&mail.consilium_id, 64, "consilium_id")?,
-					"outcome": bounded(&mail.outcome, 64, "outcome")?,
+					"outcome": outcome,
 					"network": bounded(&mail.network, 64, "network")?,
 					"address": bounded(&mail.address, 128, "address")?,
 					"amount": bounded(&mail.amount, 64, "amount")?,

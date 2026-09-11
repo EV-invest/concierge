@@ -1106,6 +1106,58 @@ async fn a_payment_outcome_rides_the_outcome_payload() {
 	assert_eq!(err.code(), Code::InvalidArgument, "the payment tuple is held to `line`: {err}");
 }
 
+/// An outcome names ONE subject, whole, and ends one of the ways a consilium can end:
+/// the renderer switches on which pair is filled and puts the outcome in the headline,
+/// so a payload naming both, or half of one, or a word of its own, is refused.
+#[tokio::test]
+async fn an_outcome_names_one_whole_subject_and_a_known_ending() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let mutate = |edit: &dyn Fn(&mut PayoutOutcomeMail)| {
+		let mut request = payment_outcome(owner, GovernanceMailKind::PayoutOutcome);
+		edit(request.payout_outcome.as_mut().unwrap());
+		request
+	};
+	for (request, why) in [
+		(mutate(&|m| m.network = "TRON".into()), "a rail on a payment"),
+		(mutate(&|m| m.address = "TJRabc".into()), "an address on a payment"),
+		(mutate(&|m| m.source = String::new()), "a payment with no source"),
+		(mutate(&|m| m.destination = String::new()), "a payment with no destination"),
+		(mutate(&|m| m.tier = String::new()), "a payment with no tier"),
+		(mutate(&|m| m.outcome = "WHATEVER".into()), "an ending the consilium cannot reach"),
+		(mutate(&|m| m.outcome = "executed".into()), "the money plane's own casing is upper"),
+		(mutate(&|m| m.outcome = String::new()), "no ending at all"),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
+
+	// Every ending the money plane actually announces still passes, on a payout too.
+	for outcome in ["APPROVED", "REJECTED", "EXPIRED", "CANCELLED", "EXECUTED", "EXECUTION_FAILED", "TOKEN_BURNED"] {
+		let request = mutate(&|m| {
+			m.outcome = outcome.into();
+			m.tier = String::new();
+			m.source = String::new();
+			m.destination = String::new();
+			m.reason = String::new();
+			m.network = "TRON".into();
+			m.address = "TJRabc".into();
+		});
+		assert!(
+			fx.relay()
+				.send_governance_mail(relayed(request))
+				.await
+				.unwrap_or_else(|e| panic!("{outcome}: {e}"))
+				.into_inner()
+				.enqueued
+		);
+	}
+}
+
 /// The consent's in-app trace. Written for a subject who follows NOTHING — there is no
 /// topic every user follows by default, so an opt-in emit would reach almost nobody — and
 /// it carries neither the link nor the code, which exist in the mail and nowhere else.
