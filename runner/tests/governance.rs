@@ -17,7 +17,7 @@
 //! The clock is an argument to every call, so time is simulated rather than waited on:
 //! expiry is reached by passing a later `now`, never by sleeping.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 mod common;
 
@@ -31,6 +31,7 @@ use concierge::{
 		notifications::PgNotifications,
 		users::PgUsers,
 	},
+	notification::RateLimiter,
 	ports::{GovernanceRepository, UserDirectoryRepository},
 };
 use domain::{
@@ -124,15 +125,31 @@ impl Fixture {
 		self.users.provision(subject, email, email_verified).await.expect("provision").id()
 	}
 
-	/// The money plane's push seam over the same adapters.
+	/// The money plane's push seam over the same adapters, with a ceiling no test here
+	/// reaches by accident.
 	fn relay(&self) -> MailRelay {
+		self.relay_allowing(1_000)
+	}
+
+	/// The same, accepting `per_hour` mails per recipient.
+	fn relay_allowing(&self, per_hour: u32) -> MailRelay {
 		MailRelay::new(
 			self.users.clone(),
 			self.governance.clone(),
 			Arc::new(PgNotifications::new(self.pool.clone())),
+			Arc::new(RateLimiter::new(Duration::from_secs(3600), per_hour)),
 			Some(RELAY_TOKEN.to_owned()),
 			RELAY_ORIGIN.to_owned(),
 		)
+	}
+
+	/// The inbox entries' own dedupe keys — to see the namespace.
+	async fn inbox_keys(&self, id: UserId) -> Vec<String> {
+		sqlx::query_scalar("SELECT n.dedupe_key FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1")
+			.bind(id.raw())
+			.fetch_all(&self.pool)
+			.await
+			.expect("read the inbox keys")
 	}
 
 	async fn email_of(&self, id: UserId) -> String {
@@ -1074,13 +1091,17 @@ async fn a_payment_consent_leaves_a_trace_in_the_subjects_inbox() {
 	let (topic, kind, title, body) = &inbox[0];
 	assert_eq!((topic.as_str(), kind.as_str()), ("account:money-movement", "payment_consent"));
 	assert_eq!(title, "A payment needs your consent");
-	for fact in ["ops@evinvest.ltd", "1 200.00 USDT", "Quy Nhon Fund — distributions", "Your bank account ••4417"] {
-		assert!(body.contains(fact), "the entry states what is being asked: {fact}");
+	for fact in ["ops@evinvest.ltd", "1 200.00 USDT"] {
+		assert!(body.contains(fact), "the entry states who is asking and how much: {fact}");
 	}
 	assert!(!body.contains("483012") && !body.contains("/cabinet/payment-consent/"), "no secret and no link in the inbox");
-	assert!(
-		!body.contains("Scheduled quarterly distribution"),
-		"the operator's own words are not shown where they cannot be attributed"
+	for foreign in ["Scheduled quarterly distribution", "Quy Nhon Fund — distributions", "Your bank account ••4417"] {
+		assert!(!body.contains(foreign), "the money plane's free text is not shown where it cannot be attributed: {foreign}");
+	}
+	assert_eq!(
+		fx.inbox_keys(investor).await,
+		vec![format!("governance:{key}")],
+		"the inbox key is namespaced away from this plane's own emitters"
 	);
 
 	// The money plane retries. The mail is deduped, and so is the trace.
@@ -1093,6 +1114,78 @@ async fn a_payment_consent_leaves_a_trace_in_the_subjects_inbox() {
 	let stranger = fx.user().await;
 	fx.relay().send_governance_mail(relayed(consent(stranger, investor))).await.unwrap_err();
 	assert!(fx.inbox(stranger).await.is_empty(), "a refused mail must not leave an inbox entry either");
+}
+
+/// One trusted caller, many possible recipients: what the ceiling bounds is how much
+/// branded security mail a compromised money plane can aim at ONE person.
+#[tokio::test]
+async fn a_recipient_is_rate_limited_across_kinds() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let relay = fx.relay_allowing(2);
+	let owner = fx.owner().await;
+	for _ in 0..2 {
+		assert!(relay.send_governance_mail(relayed(payout(owner))).await.expect("within budget").into_inner().enqueued);
+	}
+	let err = relay.send_governance_mail(relayed(payment_approval(owner))).await.unwrap_err();
+	assert_eq!(err.code(), Code::ResourceExhausted, "the third mail to the same person in the window: {err}");
+
+	// Another recipient has their own bucket.
+	let other = fx.owner().await;
+	assert!(relay.send_governance_mail(relayed(payout(other))).await.expect("a different person").into_inner().enqueued);
+}
+
+/// `initiator_email` is rendered as "Requested by" and woven into our sentences, so it
+/// must be one address and nothing that reads as a sentence of ours.
+#[tokio::test]
+async fn the_initiator_must_be_an_address() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let investor = fx.user().await;
+	let mut sentence = payout(owner);
+	sentence.payout_approval.as_mut().unwrap().initiator_email = "EV Investment security team".into();
+	let mut trailing = payment_approval(owner);
+	trailing.payment_approval.as_mut().unwrap().initiator_email = "ops@evinvest.ltd please approve".into();
+	let mut no_at = consent(investor, investor);
+	no_at.payment_consent.as_mut().unwrap().initiator_email = "no-at-sign".into();
+	for (request, why) in [
+		(sentence, "a payout approval with a sentence for an initiator"),
+		(trailing, "a payment approval with words after the address"),
+		(no_at, "a consent with no `@` at all"),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
+}
+
+/// The inbox repeats the amount in the platform's own sentence, where nothing marks it
+/// as the money plane's text; and its key has to leave room for the namespace prefix.
+#[tokio::test]
+async fn a_consent_inbox_entry_cannot_carry_a_link_or_squat_a_key() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	for (amount, why) in [
+		("see http://evil.example", "a link"),
+		("1 USDT (www.evil.example)", "a bare host"),
+		("1 USDT HTTPS://x", "case does not help"),
+	] {
+		let mut request = consent(investor, investor);
+		request.payment_consent.as_mut().unwrap().amount = amount.into();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+	}
+	let mut long_key = consent(investor, investor);
+	long_key.dedupe_key = "k".repeat(128);
+	let err = fx.relay().send_governance_mail(relayed(long_key)).await.unwrap_err();
+	assert_eq!(err.code(), Code::InvalidArgument, "a key the prefix would push past the column limit: {err}");
+	assert!(fx.inbox(investor).await.is_empty(), "nothing was queued, so nothing was traced");
 }
 
 /// Pitfall 21/24's server half: the number the live feed emits moves on every write and

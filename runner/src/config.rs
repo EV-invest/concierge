@@ -86,6 +86,13 @@ ev::settings! {
 		/// Account-less subscribe attempts allowed per client IP per window.
 		subscribe_rate_limit: u32 = "5",
 		subscribe_rate_window_secs: u64 = "3600",
+		/// Governance mails the relay accepts per RECIPIENT per window. The money plane is
+		/// the one caller and is trusted enough to be there at all; this bounds how much
+		/// branded security mail a compromised one can aim at a single person before an
+		/// operator notices. A recipient sees a handful per consilium, so ten an hour is
+		/// generous for a person and tight for a campaign.
+		governance_mail_rate_limit: u32 = "10",
+		governance_mail_rate_window_secs: u64 = "3600",
 		/// Base URL of the owner-removal approval page; the emailed token is appended as
 		/// the final path segment, so a message carries `<this>/<token>`.
 		///

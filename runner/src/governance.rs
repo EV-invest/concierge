@@ -63,7 +63,7 @@ use uuid::Uuid;
 use crate::{
 	authz::BreakGlass,
 	infrastructure::governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
-	notification::now_secs,
+	notification::{RateLimiter, now_secs},
 	ports::{GovernanceRepository, NotificationRepository, UserDirectoryRepository},
 	support::{authenticate_service, domain_to_status},
 };
@@ -764,6 +764,12 @@ pub struct MailRelay {
 	/// The in-app inbox, for the one kind whose reader has no other surface to find it
 	/// on — see [`CONSENT_TOPIC`].
 	notifications: Arc<dyn NotificationRepository>,
+	/// Per-RECIPIENT ceiling. The money plane is the one caller and is trusted enough
+	/// to be here at all; what this bounds is how much branded security mail a
+	/// compromised one can aim at a single person before an operator notices. In
+	/// memory and per process, like the subscribe limiter, and for the same reason: the
+	/// durable ceiling is the daily send budget.
+	limiter: Arc<RateLimiter>,
 	/// `None` ⇒ the relay is not configured and every call is rejected (fail closed).
 	/// In production this is the SAME `BRIDGE_SERVICE_TOKEN` banking presents when it
 	/// pulls the outbox: one trust relationship between the planes, one secret to rotate.
@@ -777,6 +783,7 @@ impl MailRelay {
 		users: Arc<dyn UserDirectoryRepository>,
 		governance: Arc<dyn GovernanceRepository>,
 		notifications: Arc<dyn NotificationRepository>,
+		limiter: Arc<RateLimiter>,
 		token: Option<String>,
 		approval_origin: String,
 	) -> Self {
@@ -784,6 +791,7 @@ impl MailRelay {
 			users,
 			governance,
 			notifications,
+			limiter,
 			token: token.filter(|t| !t.is_empty()).map(|t| Arc::from(t.as_str())),
 			approval_origin: approval_origin.trim_end_matches('/').to_owned(),
 		}
@@ -861,6 +869,30 @@ fn line(value: &str, max_bytes: usize, field: &str) -> Result<String, Status> {
 	Ok(value.to_owned())
 }
 
+/// [`line`], plus: the field must look like ONE address — an `@`, no whitespace.
+///
+/// It is rendered as "Requested by" and woven into a sentence of ours, so a value like
+/// `EV Investment security — approve now` would read as our words with our authority.
+/// Not `Email::parse`: that normalises, and what is shown must be what was sent.
+fn address(value: &str, field: &str) -> Result<String, Status> {
+	let value = line(value, 320, field)?;
+	if !value.contains('@') || value.chars().any(char::is_whitespace) {
+		return Err(Status::invalid_argument(format!("{field} must be an email address")));
+	}
+	Ok(value)
+}
+
+/// Refuse anything that a mail client or the cabinet would turn into a link. For the
+/// one field the INBOX repeats: there it cannot be set apart as the money plane's text,
+/// and a tappable `http://…` in the platform's own sentence is a phishing line.
+fn no_link(value: &str, field: &str) -> Result<String, Status> {
+	let lower = value.to_ascii_lowercase();
+	if ["://", "www.", "http"].iter().any(|needle| lower.contains(needle)) {
+		return Err(Status::invalid_argument(format!("{field} must not contain a link")));
+	}
+	Ok(value.to_owned())
+}
+
 /// [`line`], plus: the field must actually say something.
 fn required_line(value: &str, max_bytes: usize, field: &str) -> Result<String, Status> {
 	if value.trim().is_empty() {
@@ -897,9 +929,17 @@ fn payment_tier(value: &str) -> Result<String, Status> {
 /// catalogue test below keeps it from drifting.
 const CONSENT_TOPIC: &str = "account:money-movement";
 
+/// Prefix on the inbox entry's dedupe key. The money plane chooses its own keys, and the
+/// inbox is also written by this plane's own emitters; without a namespace a key the
+/// money plane picked could collide with — and silently suppress — an entry of ours.
+const INBOX_KEY_PREFIX: &str = "governance:";
+
 /// What a payment consent leaves in the subject's inbox. The platform's own words only —
-/// no link, no code (those live in the mail and nowhere else), and not the operator's
-/// `reason`, which the inbox has no way to set apart as somebody else's text.
+/// no link, no code (those live in the mail and nowhere else), and none of the money
+/// plane's free text either: the operator's `reason` obviously, but also `source` and
+/// `destination`, which an honest external destination can make look like an address
+/// or a URL and which the inbox has no way to mark as somebody else's words. The
+/// amount is the one fact repeated, and it is refused if it can carry a link.
 struct ConsentNotice {
 	title: String,
 	body: String,
@@ -927,13 +967,17 @@ impl MailRelayService for MailRelay {
 			return Err(Status::invalid_argument("dedupe_key must be 1-128 characters"));
 		}
 		let user_id = parse_user_id(&req.user_id, "user_id")?;
+		// Keyed by the parsed id, so two spellings of one uuid share a bucket.
+		if !self.limiter.check(&user_id.to_string()) {
+			return Err(Status::resource_exhausted("too many governance mails for this recipient in the current window"));
+		}
 
 		let (kind, payload, recipient_rule, notice) = match GovernanceMailKind::try_from(req.kind) {
 			Ok(GovernanceMailKind::PayoutApproval) => {
 				let mail = req.payout_approval.ok_or_else(|| Status::invalid_argument("payout_approval is required for this kind"))?;
 				let payload = serde_json::json!({
 					"consilium_id": bounded(&mail.consilium_id, 64, "consilium_id")?,
-					"initiator_email": bounded(&mail.initiator_email, 320, "initiator_email")?,
+					"initiator_email": address(&mail.initiator_email, "initiator_email")?,
 					"network": bounded(&mail.network, 64, "network")?,
 					"address": bounded(&mail.address, 128, "address")?,
 					"amount": bounded(&mail.amount, 64, "amount")?,
@@ -976,7 +1020,7 @@ impl MailRelayService for MailRelay {
 				let payload = serde_json::json!({
 					"consilium_id": line(&mail.consilium_id, 64, "consilium_id")?,
 					"payment_id": line(&mail.payment_id, 64, "payment_id")?,
-					"initiator_email": line(&mail.initiator_email, 320, "initiator_email")?,
+					"initiator_email": address(&mail.initiator_email, "initiator_email")?,
 					"tier": payment_tier(&mail.tier)?,
 					"source": line(&mail.source, 160, "source")?,
 					"destination": line(&mail.destination, 160, "destination")?,
@@ -999,20 +1043,30 @@ impl MailRelayService for MailRelay {
 				// Read here and enforced against the RESOLVED record below, so the rule stays
 				// "the recipient IS the subject" rather than "two request fields agree".
 				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
-				let (initiator_email, source) = (line(&mail.initiator_email, 320, "initiator_email")?, line(&mail.source, 160, "source")?);
-				let (destination, amount) = (line(&mail.destination, 160, "destination")?, line(&mail.amount, 64, "amount")?);
+				// The inbox entry keeps its key under the CHECK on `notifications.dedupe_key`
+				// only if the money plane's key leaves room for the prefix.
+				if req.dedupe_key.chars().count() + INBOX_KEY_PREFIX.len() > 128 {
+					return Err(Status::invalid_argument(format!(
+						"dedupe_key must be at most {} characters for this kind",
+						128 - INBOX_KEY_PREFIX.len()
+					)));
+				}
+				let initiator_email = address(&mail.initiator_email, "initiator_email")?;
+				// `amount` is the one payload field the inbox repeats, and the inbox cannot
+				// mark it as somebody else's text — so it must not be able to carry a link.
+				let amount = no_link(&line(&mail.amount, 64, "amount")?, "amount")?;
 				let notice = ConsentNotice {
 					title: "A payment needs your consent".to_owned(),
 					body: format!(
-						"{initiator_email} has opened a payment of {amount} from {source} to {destination}. Nothing moves unless you consent to it from the message sent to your email address."
+						"{initiator_email} has opened a payment of {amount}. What it is and where it goes, and the link to consent or refuse, are in the message sent to your email address."
 					),
 				};
 				let payload = serde_json::json!({
 					"payment_id": line(&mail.payment_id, 64, "payment_id")?,
 					"initiator_email": initiator_email,
 					"tier": tier,
-					"source": source,
-					"destination": destination,
+					"source": line(&mail.source, 160, "source")?,
+					"destination": line(&mail.destination, 160, "destination")?,
 					"amount": amount,
 					// An operator writes this and the subject reads it verbatim. REQUIRED: a
 					// consent request nobody explained is one nobody can judge, and "approve
@@ -1091,7 +1145,7 @@ impl MailRelayService for MailRelay {
 					kind,
 					&notice.title,
 					&notice.body,
-					&req.dedupe_key,
+					&format!("{INBOX_KEY_PREFIX}{}", req.dedupe_key),
 					now_secs(),
 				)
 				.await
