@@ -673,6 +673,7 @@ fn consent(addressee: UserId, subject: UserId) -> SendGovernanceMailRequest {
 			approval_url: format!("{RELAY_ORIGIN}/cabinet/payment-consent/tok"),
 			code: "483012".into(),
 		}),
+		payment_approval: None,
 	}
 }
 
@@ -698,6 +699,7 @@ fn payout(addressee: UserId) -> SendGovernanceMailRequest {
 		}),
 		payout_outcome: None,
 		payment_consent: None,
+		payment_approval: None,
 	}
 }
 
