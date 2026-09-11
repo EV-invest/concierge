@@ -225,6 +225,67 @@ pub fn unanimity(ballots: impl Iterator<Item = Ballot>) -> Outcome {
 	}
 }
 
+/// Simple majority over a NON-EMPTY set of peers — the rule the USER consilia
+/// ([`UserProposal`]) pass under, as opposed to the unanimity the OWNER consilia demand.
+///
+/// WHY THE TWO DIFFER, since a weaker rule always deserves an argument.
+///
+/// [`unanimity`] guards the roster that decides everything else. Its reason is
+/// self-amplification: a minority that could add owners by majority would grow itself
+/// into a majority, so the rule must be unbreakable rather than merely hard. Neither
+/// thing a [`UserProposal`] decides has that property. `admin` cannot vote in any
+/// consilium and `SetRole` refuses `owner` to it, so admitting one adds no voting power
+/// and cannot compound; and a suspension is DEFENSIVE and reversible by the same body
+/// that imposed it.
+///
+/// Against that, unanimity here would actively cost safety. A hold lapses in
+/// [`crate::users::HOLD_TTL_SECS`], so ratifying one is a race against a clock, and under
+/// unanimity a single unreachable owner does not delay the verdict — they decide it, by
+/// releasing a compromised account at the deadline. A rule whose failure mode is
+/// "the fund unfreezes the attacker because somebody was asleep" is the wrong rule.
+///
+/// What survives unchanged is the property that actually matters: `needed >= 1` over a
+/// non-empty peer set means no single actor ever acts alone — the initiator is excluded
+/// from the set and at least one other owner must agree. At two and three owners the
+/// majority IS the unanimity; the two only diverge from four owners up, which is
+/// precisely where unanimity stops being achievable in an emergency.
+///
+/// An empty set yields [`Outcome::Fails`] for the same reason it does in [`unanimity`]:
+/// a rule that passes for nobody is a rule that lets one owner act alone.
+pub fn majority(ballots: impl Iterator<Item = Ballot>) -> Outcome {
+	let mut total = 0usize;
+	let mut for_ = 0usize;
+	let mut against = 0usize;
+	for ballot in ballots {
+		total += 1;
+		match ballot {
+			Ballot::For => for_ += 1,
+			Ballot::Against => against += 1,
+			Ballot::Pending => {}
+		}
+	}
+	if total == 0 {
+		return Outcome::Fails;
+	}
+	let needed = needed_votes(total);
+	if for_ >= needed {
+		return Outcome::Passes;
+	}
+	// Even every remaining pending peer voting FOR could not reach the bar, so the
+	// proposal is decided now rather than left open until it expires.
+	if against > total - needed {
+		return Outcome::Fails;
+	}
+	Outcome::Pending
+}
+
+/// How many of `peers` must agree for [`majority`] to pass: `floor(n/2) + 1`. Frozen onto
+/// the row at open, so a reader can see the bar a live proposal is actually being
+/// measured against rather than re-deriving it from a roster that has since moved.
+pub fn needed_votes(peers: usize) -> usize {
+	peers / 2 + 1
+}
+
 /// A removal's passing rule: EITHER the target accepts, OR the peers are unanimous.
 ///
 /// A peer voting KEEP ends the whole proposal, not merely path (b): the consilium has
@@ -1007,6 +1068,399 @@ impl DomainEvent for GovernanceEvent {
 	const KIND: &'static str = "governance";
 }
 
+/// A user consilium's identity. Its own tag, so it can never be passed where an owner
+/// proposal's id is expected.
+pub type UserProposalId = Id<UserProposalTag>;
+/// Phantom tag making [`UserProposalId`] incompatible with [`RemovalId`]/[`AdmissionId`].
+pub struct UserProposalTag;
+
+/// What a [`UserProposal`] decides. THREE KINDS, ONE AGGREGATE — deliberately, because
+/// all three are the same question ("do the owners agree to change this person's
+/// standing?") differing only in which field of the [`crate::users::User`] the verdict
+/// writes. Three copies of the lifecycle, the snapshotting and the passing rule would
+/// drift the first time one of them was edited, which is the same argument [`Lifecycle`]
+/// itself is built on.
+///
+/// The execution effects are exhaustively matched wherever they are applied, so a fourth
+/// kind breaks the build rather than silently executing as nothing.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserProposalKind {
+	/// Freeze the subject until the owners say otherwise — the permanent half of the
+	/// verb whose emergency half is [`crate::users::User::hold`].
+	Suspension,
+	/// Lift a suspension the owners themselves imposed. It exists so that a single admin
+	/// cannot overturn their verdict from the console: reinstatement stays one act for a
+	/// hold, and becomes a proposal for a ratified suspension.
+	Reinstatement,
+	/// Grant `Role::Admin`. `SetRole` refuses that role and names this, for the same
+	/// reason it already refuses `Role::Owner`: an operator who can appoint operators is
+	/// an operator who can appoint accomplices, and every identity mutation except role
+	/// granting comes with the seat.
+	AdminAdmission,
+}
+
+impl UserProposalKind {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Suspension => "suspension",
+			Self::Reinstatement => "reinstatement",
+			Self::AdminAdmission => "admin_admission",
+		}
+	}
+
+	pub fn parse(raw: &str) -> Result<Self, DomainError> {
+		match raw {
+			"suspension" => Ok(Self::Suspension),
+			"reinstatement" => Ok(Self::Reinstatement),
+			"admin_admission" => Ok(Self::AdminAdmission),
+			other => Err(DomainError::Validation(format!("unknown user proposal kind: {other}"))),
+		}
+	}
+
+	/// The RPC a refusal should name, so an operator who is told "no" is told where to go.
+	pub fn rpc_name(self) -> &'static str {
+		match self {
+			Self::Suspension => "GovernanceService.OpenUserSuspension",
+			Self::Reinstatement => "GovernanceService.OpenUserReinstatement",
+			Self::AdminAdmission => "GovernanceService.OpenAdminAdmission",
+		}
+	}
+}
+
+/// One owner's answer on a [`UserProposal`].
+///
+/// The verbs are neutral — FOR and AGAINST — where the owner consilia use
+/// remove/keep and admit/reject. Three kinds share this aggregate, so a stored verb
+/// would have to be read against the kind to mean anything, and a vocabulary that is
+/// only correct when cross-referenced is a vocabulary that will eventually be rendered
+/// wrong. The kind-specific verb belongs on the SURFACE, which knows the kind; the
+/// stored fact is which way the voter pushed, which is exactly [`Ballot`].
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalVote {
+	#[default]
+	Pending,
+	For,
+	Against,
+}
+
+impl ProposalVote {
+	pub fn ballot(self) -> Ballot {
+		match self {
+			Self::Pending => Ballot::Pending,
+			Self::For => Ballot::For,
+			Self::Against => Ballot::Against,
+		}
+	}
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Pending => "pending",
+			Self::For => "for",
+			Self::Against => "against",
+		}
+	}
+
+	pub fn parse(raw: &str) -> Result<Self, DomainError> {
+		match raw {
+			"pending" => Ok(Self::Pending),
+			"for" => Ok(Self::For),
+			"against" => Ok(Self::Against),
+			other => Err(DomainError::Validation(format!("unknown proposal vote: {other}"))),
+		}
+	}
+
+	pub fn is_cast(self) -> bool {
+		self != Self::Pending
+	}
+}
+
+/// One eligible owner on a [`UserProposal`] and their answer. Snapshotted at open for
+/// the same reason [`Peer`] and [`AdmissionPeer`] are: the roster must not be able to
+/// move underneath a live proposal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalPeer {
+	pub user_id: UserId,
+	pub vote: ProposalVote,
+	pub voted_at: i64,
+}
+
+impl ProposalPeer {
+	pub fn pending(user_id: UserId) -> Self {
+		Self {
+			user_id,
+			vote: ProposalVote::Pending,
+			voted_at: 0,
+		}
+	}
+}
+
+/// The owners' verdict over one PERSON's standing — suspended, reinstated, or made an
+/// admin.
+///
+/// It is the same shape as [`OwnerAdmission`] and embeds the same [`Lifecycle`], with two
+/// deliberate differences.
+///
+/// It passes on [`majority`] rather than [`unanimity`] — argued in full on that function,
+/// and the short form is that neither a suspension nor an `admin` seat can amplify
+/// itself into control of the fund, while a hold racing a 24h clock makes an unreachable
+/// owner into a decision-maker.
+///
+/// And the SUBJECT need not be an owner: these proposals are about any user, which is why
+/// the roster checks that guard [`OwnerAdmission`] ("the candidate already holds a seat",
+/// the floor) have no analogue here. The INITIATOR still must be an owner — the peer set
+/// is `owners \ {initiator}`, so a non-owner initiator would not be excluded from the
+/// body judging their own proposal.
+#[derive(Clone, Debug)]
+pub struct UserProposal {
+	id: UserProposalId,
+	kind: UserProposalKind,
+	subject: UserId,
+	initiator: UserId,
+	reason: String,
+	owner_count: u32,
+	/// The bar, frozen at open: how many of the snapshotted peers must vote FOR. Stored
+	/// rather than re-derived so a surface shows the bar this proposal is actually
+	/// measured against.
+	threshold: u32,
+	peers: Vec<ProposalPeer>,
+	life: Lifecycle,
+}
+
+impl UserProposal {
+	/// Propose against the roster as it stands. An EMPTY peer set is refused here rather
+	/// than left to fail later: a lone owner's proposal could never pass, and an open
+	/// proposal that is already unpassable is a trap for whoever reads the console.
+	#[allow(clippy::too_many_arguments)]
+	pub fn open(id: UserProposalId, kind: UserProposalKind, subject: UserId, initiator: UserId, reason: &str, owners: &[UserId], now: i64, ttl_secs: i64) -> Result<Self, DomainError> {
+		let reason = validate_reason(reason)?;
+		if !owners.contains(&initiator) {
+			return Err(DomainError::Forbidden("only a fund owner may open a user proposal".into()));
+		}
+		if subject == initiator {
+			return Err(DomainError::Conflict("you cannot open a user proposal about yourself".into()));
+		}
+		let peers: Vec<ProposalPeer> = owners.iter().copied().filter(|o| *o != initiator).map(ProposalPeer::pending).collect();
+		if peers.is_empty() {
+			return Err(DomainError::Conflict(
+				"a user proposal needs at least one other owner to agree, and there is none — one owner may not decide alone".into(),
+			));
+		}
+		let threshold = needed_votes(peers.len()) as u32;
+		let mut proposal = Self {
+			id,
+			kind,
+			subject,
+			initiator,
+			reason,
+			owner_count: owners.len() as u32,
+			threshold,
+			peers,
+			life: Lifecycle::opened(now, ttl_secs),
+		};
+		proposal.life.bump_and_emit(GovernanceEvent::Opened);
+		Ok(proposal)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	pub fn rehydrate(
+		id: UserProposalId,
+		kind: UserProposalKind,
+		subject: UserId,
+		initiator: UserId,
+		reason: String,
+		state: ProposalState,
+		owner_count: u32,
+		threshold: u32,
+		peers: Vec<ProposalPeer>,
+		created_at: i64,
+		expires_at: i64,
+		decided_at: i64,
+		void_reason: String,
+		version: u64,
+	) -> Self {
+		Self {
+			id,
+			kind,
+			subject,
+			initiator,
+			reason,
+			owner_count,
+			threshold,
+			peers,
+			life: Lifecycle::rehydrate(state, created_at, expires_at, decided_at, void_reason, version),
+		}
+	}
+
+	/// One owner's answer. The initiator is refused because they are not in the
+	/// snapshotted set — structural, not a check somebody can forget.
+	pub fn vote(&mut self, voter: UserId, vote: ProposalVote, now: i64) -> Result<(), DomainError> {
+		self.require_open()?;
+		if !vote.is_cast() {
+			return Err(DomainError::Validation("a vote must be FOR or AGAINST".into()));
+		}
+		let Some(peer) = self.peers.iter_mut().find(|p| p.user_id == voter) else {
+			return Err(DomainError::Forbidden("you are not an eligible voter on this proposal".into()));
+		};
+		if peer.vote == vote {
+			return Ok(());
+		}
+		if peer.vote.is_cast() {
+			return Err(DomainError::Conflict("a cast vote is final".into()));
+		}
+		peer.vote = vote;
+		peer.voted_at = now;
+		self.life.bump_and_emit(GovernanceEvent::PeerVoted);
+		if self.state().is_open() && self.outcome() == Outcome::Fails {
+			self.life.close(ProposalState::Rejected, GovernanceEvent::Rejected, now);
+		}
+		Ok(())
+	}
+
+	/// Withdraw a proposal. Only the initiator may.
+	pub fn cancel(&mut self, by: UserId, now: i64) -> Result<(), DomainError> {
+		if by != self.initiator {
+			return Err(DomainError::Forbidden("only the initiator may withdraw a proposal".into()));
+		}
+		if self.state() == ProposalState::Cancelled {
+			return Ok(());
+		}
+		self.require_open()?;
+		self.life.close(ProposalState::Cancelled, GovernanceEvent::Cancelled, now);
+		Ok(())
+	}
+
+	pub fn expire(&mut self, now: i64) -> Result<(), DomainError> {
+		self.life.expire("proposal", now)
+	}
+
+	/// Carry the verdict, re-deciding against the roster as it stands at THIS moment.
+	///
+	/// Two things can have moved underneath an open proposal, and both are re-checked
+	/// here rather than trusted from the vote: a voter who has since lost their seat does
+	/// not count (so a set emptied by attrition falls back to the non-empty guard in
+	/// [`majority`] and voids instead of passing over nobody), and the initiator's own
+	/// seat, so a proposal opened by someone who has since lost theirs is void rather
+	/// than executed.
+	///
+	/// Returns the resulting state, so the adapter knows whether to apply the effect.
+	pub fn execute(&mut self, owners_now: &[UserId], now: i64) -> Result<ProposalState, DomainError> {
+		if matches!(self.state(), ProposalState::Executed | ProposalState::Void) {
+			return Ok(self.state());
+		}
+		self.require_open()?;
+		if self.outcome_among(owners_now) != Outcome::Passes {
+			return Err(DomainError::Conflict("the consilium has not passed against the current roster".into()));
+		}
+		if owners_now.contains(&self.initiator) {
+			self.life.close(ProposalState::Executed, GovernanceEvent::Executed, now);
+		} else {
+			self.life.close_void("the initiator no longer holds an owner seat", now);
+		}
+		Ok(self.state())
+	}
+
+	/// Close a passed-but-uncarryable proposal explicitly.
+	pub fn void(&mut self, reason: &str, now: i64) -> Result<(), DomainError> {
+		if self.state() == ProposalState::Void {
+			return Ok(());
+		}
+		self.require_open()?;
+		self.life.close_void(reason, now);
+		Ok(())
+	}
+
+	/// The verdict counting only voters who still hold a seat.
+	pub fn outcome_among(&self, owners_now: &[UserId]) -> Outcome {
+		majority(self.peers.iter().filter(|p| owners_now.contains(&p.user_id)).map(|p| p.vote.ballot()))
+	}
+
+	pub fn outcome(&self) -> Outcome {
+		majority(self.peers.iter().map(|p| p.vote.ballot()))
+	}
+
+	fn require_open(&self) -> Result<(), DomainError> {
+		self.life.require_open("proposal")
+	}
+
+	pub fn id(&self) -> UserProposalId {
+		self.id
+	}
+
+	pub fn kind(&self) -> UserProposalKind {
+		self.kind
+	}
+
+	pub fn subject(&self) -> UserId {
+		self.subject
+	}
+
+	pub fn initiator(&self) -> UserId {
+		self.initiator
+	}
+
+	pub fn reason(&self) -> &str {
+		&self.reason
+	}
+
+	pub fn state(&self) -> ProposalState {
+		self.life.state
+	}
+
+	pub fn owner_count(&self) -> u32 {
+		self.owner_count
+	}
+
+	pub fn threshold(&self) -> u32 {
+		self.threshold
+	}
+
+	pub fn peers(&self) -> &[ProposalPeer] {
+		&self.peers
+	}
+
+	pub fn created_at(&self) -> i64 {
+		self.life.created_at
+	}
+
+	pub fn expires_at(&self) -> i64 {
+		self.life.expires_at
+	}
+
+	pub fn decided_at(&self) -> i64 {
+		self.life.decided_at
+	}
+
+	pub fn void_reason(&self) -> &str {
+		&self.life.void_reason
+	}
+
+	pub fn version(&self) -> u64 {
+		self.life.version
+	}
+}
+
+impl Entity for UserProposal {
+	type Id = UserProposalId;
+
+	fn id(&self) -> UserProposalId {
+		self.id
+	}
+}
+
+impl AggregateRoot for UserProposal {
+	const NAME: &'static str = "user_proposal";
+}
+
+impl EmitsEvents for UserProposal {
+	type Event = GovernanceEvent;
+
+	fn drain_events(&mut self) -> Vec<GovernanceEvent> {
+		core::mem::take(&mut self.life.pending)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1428,5 +1882,235 @@ mod tests {
 		assert_eq!(removal.drain_events(), [GovernanceEvent::PeerVoted, GovernanceEvent::PeerVoted, GovernanceEvent::Rejected]);
 		assert_eq!(removal.version(), 4, "open + two votes + the close");
 		assert!(removal.drain_events().is_empty());
+	}
+
+	// -----------------------------------------------------------------------------
+	// The USER consilia: a majority, not unanimity.
+	// -----------------------------------------------------------------------------
+
+	/// The same rule `unanimity_over_an_empty_set_never_passes` states, on the other
+	/// helper: a threshold met by nobody is a threshold that lets one person act alone.
+	#[test]
+	fn majority_over_an_empty_set_never_passes() {
+		assert_eq!(majority([].into_iter()), Outcome::Fails);
+	}
+
+	#[test]
+	fn majority_needs_more_than_half_and_decides_as_soon_as_it_can() {
+		// One peer: that peer IS the majority, so the initiator still cannot act alone.
+		assert_eq!(majority([Ballot::For].into_iter()), Outcome::Passes);
+		assert_eq!(majority([Ballot::Against].into_iter()), Outcome::Fails);
+		assert_eq!(majority([Ballot::Pending].into_iter()), Outcome::Pending);
+
+		// Two peers (a three-owner fund): the bar is two, which is unanimity — the two
+		// rules only diverge above this size.
+		assert_eq!(needed_votes(2), 2);
+		assert_eq!(majority([Ballot::For, Ballot::Pending].into_iter()), Outcome::Pending);
+		assert_eq!(majority([Ballot::For, Ballot::For].into_iter()), Outcome::Passes);
+		assert_eq!(majority([Ballot::For, Ballot::Against].into_iter()), Outcome::Fails);
+
+		// Three peers (a four-owner fund): two carry it, and one AGAINST no longer ends
+		// it. This is the divergence, and the reason for it — an owner who cannot be
+		// reached must not decide a 24h deadline by not answering.
+		assert_eq!(needed_votes(3), 2);
+		assert_eq!(majority([Ballot::For, Ballot::For, Ballot::Pending].into_iter()), Outcome::Passes);
+		assert_eq!(majority([Ballot::Against, Ballot::Pending, Ballot::Pending].into_iter()), Outcome::Pending);
+		// Two AGAINST leave one peer, who cannot reach two alone: decided now rather than
+		// left open until it expires.
+		assert_eq!(majority([Ballot::Against, Ballot::Against, Ballot::Pending].into_iter()), Outcome::Fails);
+	}
+
+	fn proposal(kind: UserProposalKind, owners: &[UserId], subject: UserId) -> UserProposal {
+		UserProposal::open(UserProposalId::new(), kind, subject, owners[0], "cause", owners, 1_000, REMOVAL_TTL_SECS).expect("open")
+	}
+
+	#[test]
+	fn a_lone_owner_cannot_open_a_user_proposal() {
+		let owners = ids(1);
+		let err = UserProposal::open(
+			UserProposalId::new(),
+			UserProposalKind::Suspension,
+			UserId::new(),
+			owners[0],
+			"cause",
+			&owners,
+			1_000,
+			REMOVAL_TTL_SECS,
+		)
+		.expect_err("unanimity over nobody and a majority of nobody are the same hole");
+		assert!(matches!(err, DomainError::Conflict(_)));
+	}
+
+	#[test]
+	fn only_an_owner_may_open_and_never_about_themselves() {
+		let owners = ids(3);
+		let outsider = UserId::new();
+		assert!(matches!(
+			UserProposal::open(
+				UserProposalId::new(),
+				UserProposalKind::Suspension,
+				owners[1],
+				outsider,
+				"cause",
+				&owners,
+				1_000,
+				REMOVAL_TTL_SECS
+			),
+			Err(DomainError::Forbidden(_))
+		));
+		assert!(matches!(
+			UserProposal::open(
+				UserProposalId::new(),
+				UserProposalKind::Suspension,
+				owners[0],
+				owners[0],
+				"cause",
+				&owners,
+				1_000,
+				REMOVAL_TTL_SECS
+			),
+			Err(DomainError::Conflict(_))
+		));
+	}
+
+	/// The peer set is `owners \ {initiator}` and the initiator gets no vote — structural,
+	/// exactly as it is for the two owner consilia.
+	#[test]
+	fn the_initiator_is_not_among_their_own_voters() {
+		let owners = ids(3);
+		let subject = UserId::new();
+		let mut p = proposal(UserProposalKind::Suspension, &owners, subject);
+		assert_eq!(p.peers().len(), 2);
+		assert_eq!(p.threshold(), 2, "two peers means both, which is where majority and unanimity coincide");
+		assert!(matches!(p.vote(owners[0], ProposalVote::For, 1_100), Err(DomainError::Forbidden(_))));
+	}
+
+	/// The SUBJECT is any user, not an owner — the difference from `OwnerAdmission`, and
+	/// the reason it has no floor and no "already holds a seat" check.
+	#[test]
+	fn the_subject_need_not_be_an_owner() {
+		let owners = ids(3);
+		let p = proposal(UserProposalKind::AdminAdmission, &owners, UserId::new());
+		assert_eq!(p.owner_count(), 3);
+		assert_eq!(p.state(), ProposalState::Open);
+	}
+
+	#[test]
+	fn a_reached_threshold_passes_and_a_blocked_one_rejects() {
+		let owners = ids(4);
+		let subject = UserId::new();
+
+		let mut carried = proposal(UserProposalKind::Suspension, &owners, subject);
+		assert_eq!(carried.threshold(), 2, "three peers, so two carry it");
+		carried.vote(owners[1], ProposalVote::For, 1_100).expect("first vote");
+		assert_eq!(carried.outcome(), Outcome::Pending);
+		carried.vote(owners[2], ProposalVote::For, 1_200).expect("second vote");
+		assert_eq!(carried.outcome(), Outcome::Passes, "it passes without waiting for the third owner");
+
+		let mut blocked = proposal(UserProposalKind::Suspension, &owners, subject);
+		blocked.vote(owners[1], ProposalVote::Against, 1_100).expect("first vote");
+		assert_eq!(blocked.state(), ProposalState::Open, "one AGAINST out of three peers decides nothing");
+		blocked.vote(owners[2], ProposalVote::Against, 1_200).expect("second vote");
+		assert_eq!(blocked.state(), ProposalState::Rejected, "the bar is now unreachable");
+	}
+
+	/// A cast vote is final and repeating it is free — the same contract the owner
+	/// consilia carry, asserted here so the shared aggregate cannot drift from them.
+	#[test]
+	fn a_cast_vote_is_final_and_repeating_it_is_free() {
+		let owners = ids(4);
+		let mut p = proposal(UserProposalKind::Suspension, &owners, UserId::new());
+		p.vote(owners[1], ProposalVote::For, 1_100).expect("cast");
+		p.vote(owners[1], ProposalVote::For, 1_200).expect("repeating is a no-op");
+		assert!(matches!(p.vote(owners[1], ProposalVote::Against, 1_300), Err(DomainError::Conflict(_))));
+	}
+
+	/// The roster moving underneath an open proposal can only make it HARDER: voters who
+	/// lost their seats drop out of the tally, and a set emptied by attrition falls back
+	/// to the non-empty guard rather than passing over nobody.
+	#[test]
+	fn execution_re_decides_against_the_roster_of_the_moment() {
+		let owners = ids(3);
+		let mut p = proposal(UserProposalKind::Suspension, &owners, UserId::new());
+		p.vote(owners[1], ProposalVote::For, 1_100).expect("vote");
+		p.vote(owners[2], ProposalVote::For, 1_200).expect("vote");
+		assert_eq!(p.outcome(), Outcome::Passes);
+		// Both carriers have since lost their seats.
+		assert_eq!(p.outcome_among(&[owners[0]]), Outcome::Fails);
+		assert!(matches!(p.execute(&[owners[0]], 1_300), Err(DomainError::Conflict(_))));
+
+		// The initiator losing theirs voids rather than executes.
+		let mut q = proposal(UserProposalKind::Suspension, &owners, UserId::new());
+		q.vote(owners[1], ProposalVote::For, 1_100).expect("vote");
+		q.vote(owners[2], ProposalVote::For, 1_200).expect("vote");
+		assert_eq!(q.execute(&owners[1..], 1_300).expect("re-decided"), ProposalState::Void);
+		assert!(q.void_reason().contains("initiator"));
+	}
+
+	#[test]
+	fn only_the_initiator_may_cancel_and_a_closed_proposal_is_final() {
+		let owners = ids(3);
+		let mut p = proposal(UserProposalKind::Reinstatement, &owners, UserId::new());
+		assert!(matches!(p.cancel(owners[1], 1_100), Err(DomainError::Forbidden(_))));
+		p.cancel(owners[0], 1_100).expect("the initiator may withdraw");
+		p.cancel(owners[0], 1_200).expect("repeating is a no-op");
+		assert_eq!(p.state(), ProposalState::Cancelled);
+		assert!(matches!(p.vote(owners[1], ProposalVote::For, 1_300), Err(DomainError::Conflict(_))));
+	}
+
+	#[test]
+	fn an_expired_proposal_can_no_longer_be_carried() {
+		let owners = ids(3);
+		let mut p = proposal(UserProposalKind::Suspension, &owners, UserId::new());
+		assert!(p.expire(1_100).is_err(), "it is not due yet");
+		p.expire(1_000 + REMOVAL_TTL_SECS).expect("due");
+		assert_eq!(p.state(), ProposalState::Expired);
+		assert!(matches!(p.vote(owners[1], ProposalVote::For, 1_000 + REMOVAL_TTL_SECS + 1), Err(DomainError::Conflict(_))));
+	}
+
+	#[test]
+	fn a_reason_is_required_and_bounded() {
+		let owners = ids(3);
+		for bad in ["", "   "] {
+			assert!(matches!(
+				UserProposal::open(
+					UserProposalId::new(),
+					UserProposalKind::Suspension,
+					UserId::new(),
+					owners[0],
+					bad,
+					&owners,
+					1_000,
+					REMOVAL_TTL_SECS
+				),
+				Err(DomainError::Validation(_))
+			));
+		}
+		let too_long = "x".repeat(MAX_REASON_CHARS + 1);
+		assert!(matches!(
+			UserProposal::open(
+				UserProposalId::new(),
+				UserProposalKind::Suspension,
+				UserId::new(),
+				owners[0],
+				&too_long,
+				&owners,
+				1_000,
+				REMOVAL_TTL_SECS
+			),
+			Err(DomainError::Validation(_))
+		));
+	}
+
+	#[test]
+	fn proposal_vocabulary_round_trips() {
+		for kind in [UserProposalKind::Suspension, UserProposalKind::Reinstatement, UserProposalKind::AdminAdmission] {
+			assert_eq!(UserProposalKind::parse(kind.as_str()).unwrap(), kind);
+		}
+		assert!(UserProposalKind::parse("nope").is_err());
+		for vote in [ProposalVote::Pending, ProposalVote::For, ProposalVote::Against] {
+			assert_eq!(ProposalVote::parse(vote.as_str()).unwrap(), vote);
+		}
+		assert!(ProposalVote::parse("maybe").is_err());
 	}
 }

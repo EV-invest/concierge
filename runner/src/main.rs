@@ -228,6 +228,15 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		},
 	));
 
+	// The hold sweep. Unlike consilium expiry — which is lazy, so nothing has to be
+	// running for a stale proposal to be unusable — a hold's lapse must be a WRITE: the
+	// money plane learns an account is unfrozen only from a `user_outbox` row. If this
+	// loop stops, one operator's 24h brake quietly becomes indefinite.
+	tokio::spawn(concierge::dispatch::run_hold_sweep(
+		users.clone(),
+		std::time::Duration::from_secs(config.hold_sweep_interval_secs),
+	));
+
 	let subscribe_limiter = Arc::new(notification::RateLimiter::new(
 		std::time::Duration::from_secs(config.subscribe_rate_window_secs),
 		config.subscribe_rate_limit,

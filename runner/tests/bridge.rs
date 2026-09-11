@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use concierge::{
 	bridge::Bridge,
-	infrastructure::{db, users::PgUsers},
+	infrastructure::{
+		db,
+		users::{AdminAction, PgUsers},
+	},
 	ports::UserDirectoryRepository,
 };
 use domain::users::{AuthSubject, Email};
@@ -62,8 +65,8 @@ async fn pull_returns_ordered_events_and_advances_cursor() {
 	// Seed a known sequence of mutations across two users → multiple outbox rows.
 	let a = repo.provision(unique_subject(), Email::parse("a@example.com").unwrap(), true).await.unwrap();
 	let b = repo.provision(unique_subject(), Email::parse("b@example.com").unwrap(), true).await.unwrap();
-	repo.set_kyc_level(a.id(), 2).await.unwrap();
-	repo.revoke_tokens(b.id()).await.unwrap();
+	repo.set_kyc_level(a.id(), 2, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
+	repo.revoke_tokens(b.id(), &AdminAction::system("tokens_revoked"), 0).await.unwrap();
 
 	// Pull the whole outbox from the beginning.
 	let resp = bridge
@@ -104,7 +107,7 @@ async fn cursor_pagination_does_not_re_serve() {
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
 
 	let user = repo.provision(unique_subject(), Email::parse("page@example.com").unwrap(), true).await.unwrap();
-	repo.set_kyc_level(user.id(), 1).await.unwrap();
+	repo.set_kyc_level(user.id(), 1, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
 
 	// First page of 1 starting at the row just before this user's CREATED. Even with
 	// other tests writing concurrently, this user's CREATED is the lowest-positioned
@@ -241,7 +244,7 @@ async fn outbox_append_serializes_position_with_commit_order() {
 	// A real mutation that must append an outbox row cannot proceed while the lock is held.
 	let writer = repo.clone();
 	let id = user.id();
-	let mutation = tokio::spawn(async move { writer.set_kyc_level(id, 1).await });
+	let mutation = tokio::spawn(async move { writer.set_kyc_level(id, 1, &AdminAction::system("kyc_level_set"), 0).await });
 
 	tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 	assert!(!mutation.is_finished(), "the outbox append must block while the lock is held elsewhere");

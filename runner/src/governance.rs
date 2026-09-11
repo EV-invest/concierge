@@ -37,16 +37,21 @@ use std::{
 
 use domain::{
 	authz::{Permission, Role},
-	governance::{AdmissionId, AdmissionVote as DomainAdmissionVote, PAYOUT_MIN_OWNERS, ProposalState, RemovalId, RemovalState, Vote},
+	governance::{
+		AdmissionId, AdmissionVote as DomainAdmissionVote, PAYOUT_MIN_OWNERS, ProposalState, ProposalVote as DomainProposalVote, RemovalId, RemovalState, UserProposalId, UserProposalKind,
+		Vote,
+	},
 	users::{Email, User, UserId},
 };
 use evconcierge_contracts::concierge::v1::{
-	AdmissionPeer as AdmissionPeerMsg, AdmissionVote, CancelOwnerAdmissionRequest, CancelOwnerRemovalRequest, GetOwnerAdmissionRequest, GetOwnerRemovalRequest, GetRemovalInvitationRequest,
-	GovernanceMailKind, GovernanceTick, ListOwnerAdmissionsRequest, ListOwnerRemovalsRequest, ListOwnersRequest, OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest, Owner,
+	AdmissionPeer as AdmissionPeerMsg, AdmissionVote, CancelOwnerAdmissionRequest, CancelOwnerRemovalRequest, CancelUserProposalRequest, GetOwnerAdmissionRequest, GetOwnerRemovalRequest,
+	GetRemovalInvitationRequest, GetUserProposalRequest, GovernanceMailKind, GovernanceTick, ListOwnerAdmissionsRequest, ListOwnerRemovalsRequest, ListOwnersRequest,
+	ListUserProposalsRequest, OpenAdminAdmissionRequest, OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest, OpenUserReinstatementRequest, OpenUserSuspensionRequest, Owner,
 	OwnerAdmission as OwnerAdmissionMsg, OwnerAdmissionList, OwnerAdmissionState, OwnerList, OwnerRemoval as OwnerRemovalMsg, OwnerRemovalInvitation, OwnerRemovalList, OwnerRemovalState,
-	RemovalPeer, RemovalVote, ResignOwnershipRequest, SendGovernanceMailRequest, SendGovernanceMailResponse, SubmitAdmissionVoteRequest, SubmitPeerVoteRequest, SubmitSelfDecisionRequest,
-	SubmitSelfDecisionResponse, WatchGovernanceRequest, governance_service_server::GovernanceService, mail_relay_service_server::MailRelayService,
-	owner_removal_approval_service_server::OwnerRemovalApprovalService,
+	ProposalVote as ProposalVoteMsg, RemovalPeer, RemovalVote, ResignOwnershipRequest, SendGovernanceMailRequest, SendGovernanceMailResponse, SubmitAdmissionVoteRequest,
+	SubmitPeerVoteRequest, SubmitSelfDecisionRequest, SubmitSelfDecisionResponse, SubmitUserProposalVoteRequest, UserProposal as UserProposalMsg, UserProposalKind as UserProposalKindMsg,
+	UserProposalList, UserProposalPeer as UserProposalPeerMsg, UserProposalState, WatchGovernanceRequest, governance_service_server::GovernanceService,
+	mail_relay_service_server::MailRelayService, owner_removal_approval_service_server::OwnerRemovalApprovalService,
 };
 use tokio::sync::{broadcast, mpsc};
 use tonic::{Request, Response, Status, codegen::tokio_stream::Stream};
@@ -54,7 +59,7 @@ use uuid::Uuid;
 
 use crate::{
 	authz::BreakGlass,
-	infrastructure::governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision},
+	infrastructure::governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
 	notification::now_secs,
 	ports::{GovernanceRepository, UserDirectoryRepository},
 	support::{authenticate_service, domain_to_status},
@@ -122,6 +127,18 @@ impl Governance {
 		})
 	}
 
+	/// The three `Open*` RPCs differ only in the kind they mint. They stay three RPCs
+	/// rather than one taking a kind so that a refusal elsewhere can name the exact verb
+	/// an operator needs — `SetRole` telling them "OpenAdminAdmission" is a usable
+	/// instruction, "OpenUserProposal with kind=ADMIN_ADMISSION" is a puzzle — and so the
+	/// three can be permissioned apart later without a wire change.
+	async fn open_proposal(&self, kind: UserProposalKind, user_id: &str, reason: &str, initiator: UserId) -> Result<Response<UserProposalMsg>, Status> {
+		let subject = parse_user_id(user_id, "user_id")?;
+		let record = self.governance.open_user_proposal(kind, subject, initiator, reason, now_secs()).await.map_err(domain_to_status)?;
+		announce(self.governance.as_ref(), &self.revisions).await;
+		Ok(Response::new(proposal_to_proto(&record)))
+	}
+
 	/// The authenticated owner acting, as their full identity record — governance needs
 	/// the caller's own address, not only their id.
 	async fn acting_owner<T>(&self, request: &Request<T>) -> Result<User, Status> {
@@ -146,7 +163,7 @@ async fn announce(repo: &dyn GovernanceRepository, revisions: &broadcast::Sender
 
 /// The transport facts an answer arrived with. `SubmitSelfDecision` carries them
 /// explicitly because the BFF, not the browser, is this server's peer.
-fn audit_of<T>(request: &Request<T>) -> Audit {
+pub(crate) fn audit_of<T>(request: &Request<T>) -> Audit {
 	Audit {
 		client_ip: request.remote_addr().map(|addr| addr.ip().to_string()).unwrap_or_default(),
 		user_agent: request.metadata().get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned(),
@@ -211,6 +228,92 @@ fn admission_vote_to_proto(vote: DomainAdmissionVote) -> AdmissionVote {
 		DomainAdmissionVote::Pending => AdmissionVote::Pending,
 		DomainAdmissionVote::Admit => AdmissionVote::Admit,
 		DomainAdmissionVote::Reject => AdmissionVote::Reject,
+	}
+}
+
+fn parse_proposal_id(raw: &str) -> Result<UserProposalId, Status> {
+	Uuid::parse_str(raw)
+		.map(UserProposalId::from_raw)
+		.map_err(|_| Status::invalid_argument("proposal_id is not a valid UUID"))
+}
+
+fn proposal_vote_from_proto(raw: i32) -> Result<DomainProposalVote, Status> {
+	match ProposalVoteMsg::try_from(raw) {
+		Ok(ProposalVoteMsg::For) => Ok(DomainProposalVote::For),
+		Ok(ProposalVoteMsg::Against) => Ok(DomainProposalVote::Against),
+		_ => Err(Status::invalid_argument("vote must be FOR or AGAINST")),
+	}
+}
+
+fn proposal_vote_to_proto(vote: DomainProposalVote) -> ProposalVoteMsg {
+	match vote {
+		DomainProposalVote::Pending => ProposalVoteMsg::Pending,
+		DomainProposalVote::For => ProposalVoteMsg::For,
+		DomainProposalVote::Against => ProposalVoteMsg::Against,
+	}
+}
+
+/// UNSPECIFIED means "every kind" on a list, so it is `None` rather than a rejection; an
+/// unknown number is a client sending a kind this build does not have and IS a rejection,
+/// because silently listing everything would answer a question nobody asked.
+fn proposal_kind_from_proto(raw: i32) -> Result<Option<UserProposalKind>, Status> {
+	match UserProposalKindMsg::try_from(raw) {
+		Ok(UserProposalKindMsg::Unspecified) => Ok(None),
+		Ok(UserProposalKindMsg::Suspension) => Ok(Some(UserProposalKind::Suspension)),
+		Ok(UserProposalKindMsg::Reinstatement) => Ok(Some(UserProposalKind::Reinstatement)),
+		Ok(UserProposalKindMsg::AdminAdmission) => Ok(Some(UserProposalKind::AdminAdmission)),
+		Err(_) => Err(Status::invalid_argument("unknown user proposal kind")),
+	}
+}
+
+fn proposal_kind_to_proto(kind: UserProposalKind) -> UserProposalKindMsg {
+	match kind {
+		UserProposalKind::Suspension => UserProposalKindMsg::Suspension,
+		UserProposalKind::Reinstatement => UserProposalKindMsg::Reinstatement,
+		UserProposalKind::AdminAdmission => UserProposalKindMsg::AdminAdmission,
+	}
+}
+
+fn proposal_state_to_proto(state: ProposalState) -> UserProposalState {
+	match state {
+		ProposalState::Open => UserProposalState::Open,
+		ProposalState::Executed => UserProposalState::Executed,
+		ProposalState::Rejected => UserProposalState::Rejected,
+		ProposalState::Expired => UserProposalState::Expired,
+		ProposalState::Cancelled => UserProposalState::Cancelled,
+		ProposalState::Void => UserProposalState::Void,
+	}
+}
+
+fn proposal_to_proto(record: &UserProposalRecord) -> UserProposalMsg {
+	let proposal = &record.proposal;
+	UserProposalMsg {
+		id: proposal.id().to_string(),
+		kind: proposal_kind_to_proto(proposal.kind()) as i32,
+		state: proposal_state_to_proto(record.state) as i32,
+		subject_user_id: proposal.subject().to_string(),
+		subject_email: record.subject_email.clone(),
+		initiator_user_id: proposal.initiator().to_string(),
+		initiator_email: record.initiator_email.clone(),
+		reason: proposal.reason().to_owned(),
+		peers: proposal
+			.peers()
+			.iter()
+			.zip(record.peer_emails.iter())
+			.map(|(peer, email)| UserProposalPeerMsg {
+				user_id: peer.user_id.to_string(),
+				email: email.clone(),
+				vote: proposal_vote_to_proto(peer.vote) as i32,
+				voted_at: peer.voted_at,
+			})
+			.collect(),
+		owner_count: proposal.owner_count(),
+		threshold: proposal.threshold(),
+		created_at: proposal.created_at(),
+		expires_at: proposal.expires_at(),
+		decided_at: proposal.decided_at(),
+		void_reason: proposal.void_reason().to_owned(),
+		version: proposal.version(),
 	}
 }
 
@@ -418,6 +521,82 @@ impl GovernanceService for Governance {
 		let records = self.governance.list_admissions(i64::from(limit), now_secs()).await.map_err(domain_to_status)?;
 		Ok(Response::new(OwnerAdmissionList {
 			items: records.iter().map(admission_to_proto).collect(),
+		}))
+	}
+
+	/// Make a hold permanent. The half of the retired `DisableUser` verb that is NOT an
+	/// emergency: `UserDirectory.HoldUser` freezes the account now and lapses in 24h, and
+	/// this is what makes it stay.
+	async fn open_user_suspension(&self, request: Request<OpenUserSuspensionRequest>) -> Result<Response<UserProposalMsg>, Status> {
+		let caller = self.acting_owner(&request).await?;
+		let req = request.into_inner();
+		self.open_proposal(UserProposalKind::Suspension, &req.user_id, &req.reason, caller.id()).await
+	}
+
+	/// Lift a suspension THE OWNERS imposed. It exists because `ReinstateUser` refuses
+	/// those: without this RPC their verdict would be either permanent or reversible by
+	/// any one admin, and both are wrong.
+	async fn open_user_reinstatement(&self, request: Request<OpenUserReinstatementRequest>) -> Result<Response<UserProposalMsg>, Status> {
+		let caller = self.acting_owner(&request).await?;
+		let req = request.into_inner();
+		self.open_proposal(UserProposalKind::Reinstatement, &req.user_id, &req.reason, caller.id()).await
+	}
+
+	/// Grant `Role::Admin`. `UserDirectory.SetRole` refuses that role in the granting
+	/// direction and names this, the same refusal `owner` already gets and for a related
+	/// reason: an operator who can appoint operators can appoint accomplices, and the
+	/// admin seat carries every identity mutation except role granting.
+	async fn open_admin_admission(&self, request: Request<OpenAdminAdmissionRequest>) -> Result<Response<UserProposalMsg>, Status> {
+		let caller = self.acting_owner(&request).await?;
+		let req = request.into_inner();
+		self.open_proposal(UserProposalKind::AdminAdmission, &req.user_id, &req.reason, caller.id()).await
+	}
+
+	async fn cancel_user_proposal(&self, request: Request<CancelUserProposalRequest>) -> Result<Response<UserProposalMsg>, Status> {
+		let caller = self.acting_owner(&request).await?;
+		let id = parse_proposal_id(&request.get_ref().proposal_id)?;
+		let record = self.governance.cancel_user_proposal(id, caller.id(), now_secs()).await.map_err(domain_to_status)?;
+		announce(self.governance.as_ref(), &self.revisions).await;
+		Ok(Response::new(proposal_to_proto(&record)))
+	}
+
+	/// The initiator is refused here by the SNAPSHOTTED voter set not containing them,
+	/// never by a check at this layer. A vote that meets the threshold ALSO applies the
+	/// verdict, inside the same transaction — see `GovernanceRepository::user_proposal_vote`.
+	async fn submit_user_proposal_vote(&self, request: Request<SubmitUserProposalVoteRequest>) -> Result<Response<UserProposalMsg>, Status> {
+		let caller = self.acting_owner(&request).await?;
+		let audit = audit_of(&request);
+		let req = request.into_inner();
+		let id = parse_proposal_id(&req.proposal_id)?;
+		let vote = proposal_vote_from_proto(req.vote)?;
+		let record = self.governance.user_proposal_vote(id, caller.id(), vote, now_secs(), &audit).await.map_err(domain_to_status)?;
+		announce(self.governance.as_ref(), &self.revisions).await;
+		Ok(Response::new(proposal_to_proto(&record)))
+	}
+
+	async fn get_user_proposal(&self, request: Request<GetUserProposalRequest>) -> Result<Response<UserProposalMsg>, Status> {
+		self.require_owner(&request).await?;
+		let id = parse_proposal_id(&request.get_ref().proposal_id)?;
+		let record = self
+			.governance
+			.find_user_proposal(id, now_secs())
+			.await
+			.map_err(domain_to_status)?
+			.ok_or_else(|| Status::not_found("user proposal not found"))?;
+		Ok(Response::new(proposal_to_proto(&record)))
+	}
+
+	async fn list_user_proposals(&self, request: Request<ListUserProposalsRequest>) -> Result<Response<UserProposalList>, Status> {
+		self.require_owner(&request).await?;
+		let req = request.get_ref();
+		let limit = match req.limit {
+			0 => DEFAULT_REMOVAL_PAGE,
+			n => n.min(MAX_REMOVAL_PAGE),
+		};
+		let kind = proposal_kind_from_proto(req.kind)?;
+		let records = self.governance.list_user_proposals(kind, i64::from(limit), now_secs()).await.map_err(domain_to_status)?;
+		Ok(Response::new(UserProposalList {
+			items: records.iter().map(proposal_to_proto).collect(),
 		}))
 	}
 

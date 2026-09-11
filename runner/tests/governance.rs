@@ -796,6 +796,7 @@ async fn set_role_refuses_to_mint_or_to_strip_an_owner() {
 			SetRoleRequest {
 				user_id: candidate.to_string(),
 				role: "owner".into(),
+				reason: String::new(),
 			},
 		))
 		.await
@@ -810,6 +811,7 @@ async fn set_role_refuses_to_mint_or_to_strip_an_owner() {
 			SetRoleRequest {
 				user_id: owners[1].to_string(),
 				role: "investor".into(),
+				reason: String::new(),
 			},
 		))
 		.await
@@ -817,18 +819,38 @@ async fn set_role_refuses_to_mint_or_to_strip_an_owner() {
 	assert_eq!(stripped.code(), Code::FailedPrecondition, "{stripped}");
 	assert_eq!(fx.role_of(owners[1]).await, Role::Owner, "the seat stays");
 
-	// Every OTHER role change is untouched — this closes ownership, not the console.
-	directory
+	// `admin` joined the refusal list, in the GRANTING direction only: the seat carries
+	// every identity mutation except role granting, so an operator who can appoint
+	// operators can appoint accomplices.
+	let appointed = directory
 		.set_role(as_user(
 			owners[0],
 			SetRoleRequest {
 				user_id: candidate.to_string(),
 				role: "admin".into(),
+				reason: String::new(),
+			},
+		))
+		.await
+		.unwrap_err();
+	assert_eq!(appointed.code(), Code::FailedPrecondition, "{appointed}");
+	assert!(appointed.message().contains("OpenAdminAdmission"), "the refusal points at the consilium: {appointed}");
+	assert_eq!(fx.role_of(candidate).await, Role::Investor);
+
+	// Every OTHER role change is untouched — this closes ownership and appointment, not
+	// the console.
+	directory
+		.set_role(as_user(
+			owners[0],
+			SetRoleRequest {
+				user_id: candidate.to_string(),
+				role: "operator".into(),
+				reason: String::new(),
 			},
 		))
 		.await
 		.expect("an ordinary role change still works");
-	assert_eq!(fx.role_of(candidate).await, Role::Admin);
+	assert_eq!(fx.role_of(candidate).await, Role::Operator);
 }
 
 /// The bootstrap carve-out that used to live in `guard_ownership` is GONE, and this is
@@ -855,6 +877,7 @@ async fn set_role_refuses_to_seat_an_owner_even_on_an_empty_registry() {
 			SetRoleRequest {
 				user_id: candidate.to_string(),
 				role: "owner".into(),
+				reason: String::new(),
 			},
 		))
 		.await
@@ -864,18 +887,21 @@ async fn set_role_refuses_to_seat_an_owner_even_on_an_empty_registry() {
 	assert_eq!(fx.role_of(candidate).await, Role::Investor, "an empty registry is not a licence to seat anyone");
 
 	// The rest of the console still works on that same authority — emergency access
-	// grants `operator`/`admin`, it just never grants a seat.
+	// grants `operator`, it just never grants a seat. It does not grant `admin` either
+	// any more: appointing one is a proposal, and on an empty registry there is nobody to
+	// propose to, which is the correct answer rather than a gap.
 	directory
 		.set_role(as_user(
 			operator,
 			SetRoleRequest {
 				user_id: candidate.to_string(),
-				role: "admin".into(),
+				role: "operator".into(),
+				reason: String::new(),
 			},
 		))
 		.await
 		.expect("an ordinary role change is exactly what emergency access is for");
-	assert_eq!(fx.role_of(candidate).await, Role::Admin);
+	assert_eq!(fx.role_of(candidate).await, Role::Operator);
 }
 
 /// Emergency access is self-extinguishing: the moment the registry holds one owner, an
@@ -1064,6 +1090,7 @@ async fn set_role_cannot_strip_a_seat_granted_while_it_was_deciding() {
 		SetRoleRequest {
 			user_id: candidate.to_string(),
 			role: "investor".into(),
+			reason: String::new(),
 		},
 	));
 	let commit = async {

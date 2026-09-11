@@ -11,7 +11,11 @@ use std::sync::Arc;
 use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
-	infrastructure::{db, platform::PgPlatform, users::PgUsers},
+	infrastructure::{
+		db,
+		platform::PgPlatform,
+		users::{AdminAction, PgUsers},
+	},
 	platform::Platform,
 	ports::{PlatformConfigRepository, UserDirectoryRepository},
 	support::domain_to_status,
@@ -108,13 +112,27 @@ async fn set_kyc_level_is_bounded() {
 	let directory = Directory::new(users, break_glass);
 
 	let err = directory
-		.set_kyc_level(request_with(&sub, SetKycLevelRequest { user_id: sub.clone(), kyc_level: 4 }))
+		.set_kyc_level(request_with(
+			&sub,
+			SetKycLevelRequest {
+				user_id: sub.clone(),
+				kyc_level: 4,
+				reason: String::new(),
+			},
+		))
 		.await
 		.unwrap_err();
 	assert_eq!(err.code(), Code::InvalidArgument);
 
 	let ok = directory
-		.set_kyc_level(request_with(&sub, SetKycLevelRequest { user_id: sub.clone(), kyc_level: 3 }))
+		.set_kyc_level(request_with(
+			&sub,
+			SetKycLevelRequest {
+				user_id: sub.clone(),
+				kyc_level: 3,
+				reason: String::new(),
+			},
+		))
 		.await
 		.unwrap()
 		.into_inner();
@@ -133,7 +151,7 @@ async fn kyc_level_is_bounded_beneath_the_handler() {
 	let user = users.provision(subject, Email::parse("kyc-bound@example.com").unwrap(), true).await.unwrap();
 
 	for level in [MAX_KYC_LEVEL + 1, 999, u32::MAX] {
-		let err = users.set_kyc_level(user.id(), level).await.unwrap_err();
+		let err = users.set_kyc_level(user.id(), level, &AdminAction::system("kyc_level_set"), 0).await.unwrap_err();
 		assert_eq!(domain_to_status(err).code(), Code::InvalidArgument, "level {level} must be refused as bad input");
 	}
 

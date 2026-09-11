@@ -28,8 +28,8 @@ use domain::{
 	authz::Role,
 	error::DomainError,
 	governance::{
-		AdmissionId, AdmissionPeer, AdmissionVote, GovernanceEvent, MAX_CODE_ATTEMPTS, MIN_OWNERS, Outcome, OwnerAdmission, OwnerRemoval, Peer, ProposalState, REMOVAL_TTL_SECS, RemovalId,
-		RemovalState, Vote, check_floor,
+		AdmissionId, AdmissionPeer, AdmissionVote, GovernanceEvent, MAX_CODE_ATTEMPTS, MIN_OWNERS, Outcome, OwnerAdmission, OwnerRemoval, Peer, ProposalPeer, ProposalState, ProposalVote,
+		REMOVAL_TTL_SECS, RemovalId, RemovalState, UserProposal, UserProposalId, UserProposalKind, Vote, check_floor,
 	},
 	users::{UserId, UserStatus},
 };
@@ -53,6 +53,13 @@ const CODE_LEN: usize = 10;
 const INVITE_DEDUPE_PREFIX: &str = "owner-removal-invite";
 /// The delivery kind the dispatcher renders the invitation with.
 pub const INVITE_MAIL_KIND: &str = "owner_removal_self_accept";
+
+macro_rules! proposal_columns {
+	() => {
+		"p.id, p.kind, p.subject_user_id, p.initiator_user_id, p.reason, p.state, p.owner_count, p.threshold, \
+		 p.created_at, p.expires_at, COALESCE(p.decided_at, 0) AS decided_at, p.void_reason, p.version"
+	};
+}
 
 macro_rules! admission_columns {
 	() => {
@@ -119,6 +126,19 @@ pub struct AdmissionRecord {
 	pub candidate_email: String,
 	pub initiator_email: String,
 	/// Snapshotted voters, in the same order as `admission.peers()`.
+	pub peer_emails: Vec<String>,
+}
+
+/// A user proposal plus the addresses its surfaces show.
+#[derive(Debug)]
+pub struct UserProposalRecord {
+	pub proposal: UserProposal,
+	/// The state a surface should show — a due proposal reads as expired without a read
+	/// path having to write. Same projection as [`RemovalRecord::state`].
+	pub state: ProposalState,
+	pub subject_email: String,
+	pub initiator_email: String,
+	/// Snapshotted voters, in the same order as `proposal.peers()`.
 	pub peer_emails: Vec<String>,
 }
 
@@ -191,26 +211,29 @@ pub fn effective_state(stored: RemovalState, expires_at: i64, now: i64) -> Remov
 enum Subject {
 	Removal(Uuid),
 	Admission(Uuid),
+	UserProposal(Uuid),
 }
 
 /// Drain an aggregate's events into the audit log. Shared by both consilia so the
 /// version-stamping rule below is written down once.
 async fn insert_events(conn: &mut PgConnection, subject: Subject, version: u64, events: Vec<GovernanceEvent>, actor: Option<UserId>, audit: &Audit, now: i64) -> Result<(), DomainError> {
 	let (client_ip, user_agent) = audit.truncated();
-	let (removal_id, admission_id) = match subject {
-		Subject::Removal(id) => (Some(id), None),
-		Subject::Admission(id) => (None, Some(id)),
+	let (removal_id, admission_id, user_proposal_id) = match subject {
+		Subject::Removal(id) => (Some(id), None, None),
+		Subject::Admission(id) => (None, Some(id), None),
+		Subject::UserProposal(id) => (None, None, Some(id)),
 	};
 	// The i-th of n drained events was minted at `version - (n - 1 - i)`, exactly as the
 	// user outbox stamps its sequence, so the log and the row's version agree.
 	let count = events.len() as u64;
 	for (i, event) in events.into_iter().enumerate() {
 		sqlx::query(
-			"INSERT INTO governance_event (removal_id, admission_id, kind, actor_user_id, version, occurred_at, client_ip, user_agent) \
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+			"INSERT INTO governance_event (removal_id, admission_id, user_proposal_id, kind, actor_user_id, version, occurred_at, client_ip, user_agent) \
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 		)
 		.bind(removal_id)
 		.bind(admission_id)
+		.bind(user_proposal_id)
 		.bind(event.kind())
 		.bind(actor.map(|a| a.raw()))
 		.bind((version - (count - 1 - i as u64)) as i64)
@@ -458,6 +481,198 @@ async fn settle_admission(conn: &mut PgConnection, admission: &mut OwnerAdmissio
 
 fn expire_admission_if_due(admission: &mut OwnerAdmission, now: i64) -> bool {
 	admission.state().is_open() && now >= admission.expires_at() && admission.expire(now).is_ok()
+}
+
+fn expire_proposal_if_due(proposal: &mut UserProposal, now: i64) -> bool {
+	proposal.state().is_open() && now >= proposal.expires_at() && proposal.expire(now).is_ok()
+}
+
+async fn load_proposal_peers(conn: &mut PgConnection, id: UserProposalId) -> Result<Vec<ProposalPeer>, DomainError> {
+	let rows = sqlx::query("SELECT user_id, vote, COALESCE(voted_at, 0) AS voted_at FROM user_proposal_peer WHERE proposal_id = $1 ORDER BY user_id")
+		.bind(id.raw())
+		.fetch_all(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	rows.iter()
+		.map(|r| {
+			Ok(ProposalPeer {
+				user_id: UserId::from_raw(r.try_get("user_id").map_err(repo_err)?),
+				vote: ProposalVote::parse(r.try_get::<&str, _>("vote").map_err(repo_err)?)?,
+				voted_at: r.try_get("voted_at").map_err(repo_err)?,
+			})
+		})
+		.collect()
+}
+
+fn rehydrate_proposal(row: &sqlx::postgres::PgRow, peers: Vec<ProposalPeer>) -> Result<UserProposal, DomainError> {
+	Ok(UserProposal::rehydrate(
+		UserProposalId::from_raw(row.try_get("id").map_err(repo_err)?),
+		UserProposalKind::parse(row.try_get::<&str, _>("kind").map_err(repo_err)?)?,
+		UserId::from_raw(row.try_get("subject_user_id").map_err(repo_err)?),
+		UserId::from_raw(row.try_get("initiator_user_id").map_err(repo_err)?),
+		row.try_get::<String, _>("reason").map_err(repo_err)?,
+		ProposalState::parse(row.try_get::<&str, _>("state").map_err(repo_err)?)?,
+		row.try_get::<i32, _>("owner_count").map_err(repo_err)? as u32,
+		row.try_get::<i32, _>("threshold").map_err(repo_err)? as u32,
+		peers,
+		row.try_get("created_at").map_err(repo_err)?,
+		row.try_get("expires_at").map_err(repo_err)?,
+		row.try_get("decided_at").map_err(repo_err)?,
+		row.try_get::<String, _>("void_reason").map_err(repo_err)?,
+		row.try_get::<i64, _>("version").map_err(repo_err)? as u64,
+	))
+}
+
+async fn load_proposal_for_update(conn: &mut PgConnection, id: UserProposalId) -> Result<UserProposal, DomainError> {
+	let row = sqlx::query(concat!("SELECT ", proposal_columns!(), " FROM user_proposal p WHERE p.id = $1 FOR UPDATE"))
+		.bind(id.raw())
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?
+		.ok_or_else(|| DomainError::NotFound {
+			entity: "user proposal",
+			id: id.to_string(),
+		})?;
+	let peers = load_proposal_peers(conn, id).await?;
+	rehydrate_proposal(&row, peers)
+}
+
+/// Write the proposal row back, drain its events into the shared consilium log, and bump
+/// the live feed's clock — the same three-in-one step the other two consilia take.
+async fn persist_proposal(conn: &mut PgConnection, proposal: &mut UserProposal, actor: Option<UserId>, audit: &Audit, now: i64) -> Result<(), DomainError> {
+	sqlx::query("UPDATE user_proposal SET state = $2, decided_at = $3, void_reason = $4, version = $5 WHERE id = $1")
+		.bind(proposal.id().raw())
+		.bind(proposal.state().as_str())
+		.bind(if proposal.state().is_open() { None } else { Some(proposal.decided_at()) })
+		.bind(proposal.void_reason())
+		.bind(proposal.version() as i64)
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+
+	for peer in proposal.peers() {
+		sqlx::query("UPDATE user_proposal_peer SET vote = $3, voted_at = $4 WHERE proposal_id = $1 AND user_id = $2")
+			.bind(proposal.id().raw())
+			.bind(peer.user_id.raw())
+			.bind(peer.vote.as_str())
+			.bind(if peer.vote.is_cast() { Some(peer.voted_at) } else { None })
+			.execute(&mut *conn)
+			.await
+			.map_err(repo_err)?;
+	}
+
+	let version = proposal.version();
+	let events = proposal.drain_events();
+	insert_events(conn, Subject::UserProposal(proposal.id().raw()), version, events, actor, audit, now).await
+}
+
+/// Carry a passed proposal, re-reading the roster at THIS moment, and APPLY its effect on
+/// the same transaction — so the verdict, the identity write, the cross-plane event and
+/// the audit row can never land apart.
+async fn settle_proposal(conn: &mut PgConnection, proposal: &mut UserProposal, now: i64) -> Result<(), DomainError> {
+	if !proposal.state().is_open() || proposal.outcome() != Outcome::Passes {
+		return Ok(());
+	}
+	let owners = owner_ids_for_update(conn).await?;
+	// It passed over the SNAPSHOT but not against the roster as it stands: the owners who
+	// carried it have since lost their seats. Void it rather than failing the vote — the
+	// last voter did nothing wrong, and an open proposal that can never pass is a trap for
+	// whoever reads the console.
+	if proposal.outcome_among(&owners) != Outcome::Passes {
+		proposal.void("the owners who carried this no longer hold their seats", now)?;
+		return Ok(());
+	}
+	// Whether the effect is still applicable is decided HERE, under the subject's row
+	// lock, never from a read taken when the proposal was opened — 72h earlier.
+	let mut subject = users::load_for_update(conn, proposal.subject()).await?;
+	if let Some(blocked) = inapplicable(&subject, proposal.kind()) {
+		proposal.void(blocked, now)?;
+		return Ok(());
+	}
+	if proposal.execute(&owners, now)? != ProposalState::Executed {
+		return Ok(());
+	}
+	let action = match proposal.kind() {
+		UserProposalKind::Suspension => {
+			subject.suspend();
+			"suspended_by_consilium"
+		}
+		UserProposalKind::Reinstatement => {
+			subject.enable();
+			"reinstated_by_consilium"
+		}
+		UserProposalKind::AdminAdmission => {
+			subject.set_role(Role::Admin);
+			"admin_granted_by_consilium"
+		}
+	};
+	users::update_row(conn, &subject).await?;
+	users::drain_outbox(conn, &mut subject).await?;
+	users::record_action(
+		conn,
+		proposal.subject(),
+		&users::AdminAction::system(action).with_reason(proposal.reason()).with_proposal(proposal.id().raw()),
+		now,
+	)
+	.await
+}
+
+/// Why a passed proposal cannot be carried out against the subject as they stand now, if
+/// it cannot. The states are re-read under the row lock rather than trusted from open,
+/// because 72h is long enough for every one of them to have moved.
+fn inapplicable(subject: &domain::users::User, kind: UserProposalKind) -> Option<&'static str> {
+	match kind {
+		UserProposalKind::Suspension => None,
+		UserProposalKind::Reinstatement =>
+			if subject.suspension().is_some_and(|by| !by.is_reversible_by_one_admin()) {
+				None
+			} else {
+				// Nothing left to lift, or a hold that one admin could lift anyway — in
+				// either case the owners' verdict would not be what freed this account.
+				Some("the account is no longer suspended by the consilium")
+			},
+		UserProposalKind::AdminAdmission => match subject.role() {
+			// Writing `admin` over `owner` would be an expulsion with no removal
+			// consilium, no floor check and no audit of the seat — the exact thing
+			// `set_role_outside_ownership` refuses, reached by another door.
+			Role::Owner => Some("the subject holds an owner seat, which outranks admin"),
+			Role::Admin => Some("the subject already holds the admin role"),
+			Role::Investor | Role::Operator => None,
+		},
+	}
+}
+
+async fn proposal_record_of(conn: &mut PgConnection, row: &sqlx::postgres::PgRow, now: i64) -> Result<UserProposalRecord, DomainError> {
+	let id = UserProposalId::from_raw(row.try_get("id").map_err(repo_err)?);
+	let peer_rows = sqlx::query(
+		"SELECT p.user_id, p.vote, COALESCE(p.voted_at, 0) AS voted_at, COALESCE(u.email, '') AS email \
+		 FROM user_proposal_peer p JOIN users u ON u.id = p.user_id WHERE p.proposal_id = $1 ORDER BY p.user_id",
+	)
+	.bind(id.raw())
+	.fetch_all(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+
+	let mut peers = Vec::with_capacity(peer_rows.len());
+	let mut peer_emails = Vec::with_capacity(peer_rows.len());
+	for r in &peer_rows {
+		peers.push(ProposalPeer {
+			user_id: UserId::from_raw(r.try_get("user_id").map_err(repo_err)?),
+			vote: ProposalVote::parse(r.try_get::<&str, _>("vote").map_err(repo_err)?)?,
+			voted_at: r.try_get("voted_at").map_err(repo_err)?,
+		});
+		peer_emails.push(r.try_get::<String, _>("email").map_err(repo_err)?);
+	}
+
+	let proposal = rehydrate_proposal(row, peers)?;
+	let state = effective_state(proposal.state(), proposal.expires_at(), now);
+	Ok(UserProposalRecord {
+		proposal,
+		state,
+		subject_email: row.try_get("subject_email").map_err(repo_err)?,
+		initiator_email: row.try_get("initiator_email").map_err(repo_err)?,
+		peer_emails,
+	})
 }
 
 async fn admission_record_of(conn: &mut PgConnection, row: &sqlx::postgres::PgRow, now: i64) -> Result<AdmissionRecord, DomainError> {
@@ -992,6 +1207,144 @@ impl GovernanceRepository for PgGovernance {
 		tx.commit().await.map_err(repo_err)?;
 		self.find_admission(id, now).await?.ok_or_else(|| DomainError::NotFound {
 			entity: "owner admission",
+			id: id.to_string(),
+		})
+	}
+
+	async fn open_user_proposal(&self, kind: UserProposalKind, subject: UserId, initiator: UserId, reason: &str, now: i64) -> Result<UserProposalRecord, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		lock_governance(&mut tx).await?;
+
+		// A due proposal of this kind still occupies the one-open-per-subject index. Close
+		// it first, so a lapsed attempt cannot block every future one.
+		if let Some(stale) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM user_proposal WHERE subject_user_id = $1 AND kind = $2 AND state = 'open' AND expires_at <= $3")
+			.bind(subject.raw())
+			.bind(kind.as_str())
+			.bind(now)
+			.fetch_optional(&mut *tx)
+			.await
+			.map_err(repo_err)?
+		{
+			let mut due = load_proposal_for_update(&mut tx, UserProposalId::from_raw(stale)).await?;
+			if expire_proposal_if_due(&mut due, now) {
+				persist_proposal(&mut tx, &mut due, None, &Audit::default(), now).await?;
+			}
+		}
+
+		let owners = owner_ids_for_update(&mut tx).await?;
+		let mut proposal = UserProposal::open(UserProposalId::new(), kind, subject, initiator, reason, &owners, now, REMOVAL_TTL_SECS)?;
+
+		sqlx::query(
+			"INSERT INTO user_proposal (id, kind, subject_user_id, initiator_user_id, reason, state, owner_count, threshold, created_at, expires_at, version) \
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+		)
+		.bind(proposal.id().raw())
+		.bind(kind.as_str())
+		.bind(subject.raw())
+		.bind(initiator.raw())
+		.bind(proposal.reason())
+		.bind(proposal.state().as_str())
+		.bind(proposal.owner_count() as i32)
+		.bind(proposal.threshold() as i32)
+		.bind(proposal.created_at())
+		.bind(proposal.expires_at())
+		.bind(proposal.version() as i64)
+		.execute(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+
+		for peer in proposal.peers() {
+			sqlx::query("INSERT INTO user_proposal_peer (proposal_id, user_id) VALUES ($1, $2)")
+				.bind(proposal.id().raw())
+				.bind(peer.user_id.raw())
+				.execute(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+		}
+
+		persist_proposal(&mut tx, &mut proposal, Some(initiator), &Audit::default(), now).await?;
+		tx.commit().await.map_err(repo_err)?;
+
+		self.find_user_proposal(proposal.id(), now)
+			.await?
+			.ok_or_else(|| DomainError::Repository("the proposal vanished after being opened".into()))
+	}
+
+	async fn find_user_proposal(&self, id: UserProposalId, now: i64) -> Result<Option<UserProposalRecord>, DomainError> {
+		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		let row = sqlx::query(concat!(
+			"SELECT ",
+			proposal_columns!(),
+			", COALESCE(s.email, '') AS subject_email, COALESCE(i.email, '') AS initiator_email \
+			 FROM user_proposal p JOIN users s ON s.id = p.subject_user_id JOIN users i ON i.id = p.initiator_user_id \
+			 WHERE p.id = $1"
+		))
+		.bind(id.raw())
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+		match row {
+			Some(row) => Ok(Some(proposal_record_of(&mut conn, &row, now).await?)),
+			None => Ok(None),
+		}
+	}
+
+	async fn list_user_proposals(&self, kind: Option<UserProposalKind>, limit: i64, now: i64) -> Result<Vec<UserProposalRecord>, DomainError> {
+		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		// Empty string = no filter, so the statement stays a single `&'static str`
+		// (sqlx 0.9 requires one) rather than two near-identical queries.
+		let rows = sqlx::query(concat!(
+			"SELECT ",
+			proposal_columns!(),
+			", COALESCE(s.email, '') AS subject_email, COALESCE(i.email, '') AS initiator_email \
+			 FROM user_proposal p JOIN users s ON s.id = p.subject_user_id JOIN users i ON i.id = p.initiator_user_id \
+			 WHERE ($1 = '' OR p.kind = $1) ORDER BY p.created_at DESC LIMIT $2"
+		))
+		.bind(kind.map_or("", UserProposalKind::as_str))
+		.bind(limit)
+		.fetch_all(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+		let mut records = Vec::with_capacity(rows.len());
+		for row in &rows {
+			records.push(proposal_record_of(&mut conn, row, now).await?);
+		}
+		Ok(records)
+	}
+
+	async fn user_proposal_vote(&self, id: UserProposalId, voter: UserId, vote: ProposalVote, now: i64, audit: &Audit) -> Result<UserProposalRecord, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		lock_governance(&mut tx).await?;
+		let mut proposal = load_proposal_for_update(&mut tx, id).await?;
+		if expire_proposal_if_due(&mut proposal, now) {
+			persist_proposal(&mut tx, &mut proposal, None, &Audit::default(), now).await?;
+			tx.commit().await.map_err(repo_err)?;
+			return Err(DomainError::Conflict("the proposal is expired".into()));
+		}
+		proposal.vote(voter, vote, now)?;
+		settle_proposal(&mut tx, &mut proposal, now).await?;
+		persist_proposal(&mut tx, &mut proposal, Some(voter), audit, now).await?;
+		tx.commit().await.map_err(repo_err)?;
+		self.find_user_proposal(id, now).await?.ok_or_else(|| DomainError::NotFound {
+			entity: "user proposal",
+			id: id.to_string(),
+		})
+	}
+
+	async fn cancel_user_proposal(&self, id: UserProposalId, by: UserId, now: i64) -> Result<UserProposalRecord, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		lock_governance(&mut tx).await?;
+		let mut proposal = load_proposal_for_update(&mut tx, id).await?;
+		if expire_proposal_if_due(&mut proposal, now) {
+			persist_proposal(&mut tx, &mut proposal, None, &Audit::default(), now).await?;
+			tx.commit().await.map_err(repo_err)?;
+			return Err(DomainError::Conflict("the proposal is expired".into()));
+		}
+		proposal.cancel(by, now)?;
+		persist_proposal(&mut tx, &mut proposal, Some(by), &Audit::default(), now).await?;
+		tx.commit().await.map_err(repo_err)?;
+		self.find_user_proposal(id, now).await?.ok_or_else(|| DomainError::NotFound {
+			entity: "user proposal",
 			id: id.to_string(),
 		})
 	}

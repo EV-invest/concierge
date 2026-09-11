@@ -21,12 +21,30 @@ service UserDirectory {
   // tokens are rejected. The token-revocation control surface.
   rpc RevokeTokens(RevokeTokensRequest) returns (RevokeTokensResponse);
 
-  // Admin (allowlist): disable a user, freezing future sign-in/refresh without
-  // deleting the record. Emits SUSPENDED across the cross-plane bridge.
-  rpc DisableUser(DisableUserRequest) returns (DisableUserResponse);
+  // DEPRECATED — always refuses, naming HoldUser or
+  // GovernanceService.OpenUserSuspension.
+  //
+  // The verb was ambiguous in the one way that mattered: it was both the emergency
+  // brake (the frozen flag the money plane re-reads at dispatch, which stops a
+  // withdrawal already in the queue) and a permanent judgement on an account, decided
+  // by one person with no record of why. Those need opposite treatments — the first
+  // must stay instant, the second must not be one person's to make — so the caller now
+  // has to say which one they mean. Kept in the contract rather than deleted so an
+  // older console gets an explanatory refusal instead of an UNIMPLEMENTED.
+  rpc DisableUser(DisableUserRequest) returns (DisableUserResponse) { option deprecated = true; };
+
+  // Admin (UserSuspend): the emergency brake. Freezes the account NOW and lapses on
+  // its own after 24h unless the owners ratify it with OpenUserSuspension. One actor
+  // may stop money temporarily; one actor may never stop it permanently. Emits
+  // SUSPENDED across the cross-plane bridge, and REINSTATED again when it lapses.
+  rpc HoldUser(HoldUserRequest) returns (HoldUserResponse);
 
   // Admin (allowlist): re-enable a disabled user, lifting the sign-in/refresh
   // freeze. Emits REINSTATED across the cross-plane bridge.
+  //
+  // Refuses with FAILED_PRECONDITION when the suspension was the owners' verdict,
+  // naming GovernanceService.OpenUserReinstatement — otherwise one admin could
+  // overturn a consilium and the consilium would be advisory.
   rpc ReinstateUser(ReinstateUserRequest) returns (ReinstateUserResponse);
 
   // Admin (allowlist): set a user's KYC level. Emits KYC_CHANGED across the
@@ -79,6 +97,16 @@ message UserProfile {
   // same meaning: real authority, granted by the environment while the fund has no
   // persisted owner, seating nobody. Render it as a warning, never as ownership.
   bool role_is_break_glass = 18;
+  // WHY the account is disabled — and therefore who may undo it. Empty on an active
+  // user, and also on one suspended before this field existed (those keep the old
+  // one-act, never-lapsing semantics they were actually suspended under).
+  //   "admin_hold"  — one operator's brake; lapses at hold_expires_at; ReinstateUser
+  //                   lifts it in one act.
+  //   "governance"  — the owners' ratified verdict; never lapses; ReinstateUser
+  //                   refuses and names OpenUserReinstatement.
+  string suspended_by = 19;
+  // Unix SECONDS an "admin_hold" lapses. 0 when nothing lapses.
+  int64 hold_expires_at = 20;
 }
 
 // The caller's editable profile, full-replace. Same 10 fields as the editable part of
@@ -98,6 +126,9 @@ message UpdateProfileRequest {
 
 message RevokeTokensRequest {
   string user_id = 1;
+  // Recorded verbatim on the audit row. Optional here: revoking sessions is the
+  // reflex you want an operator to reach for without composing a sentence first.
+  string reason = 2;
 }
 
 message RevokeTokensResponse {
@@ -110,8 +141,22 @@ message DisableUserRequest {
 
 message DisableUserResponse {}
 
+message HoldUserRequest {
+  string user_id = 1;
+  // REQUIRED. A brake that stops someone's money with no stated cause cannot be
+  // reviewed afterwards, and the owners asked to ratify it are reading exactly this.
+  string reason = 2;
+}
+
+message HoldUserResponse {
+  // Unix SECONDS the hold lapses unless the owners ratify it.
+  int64 hold_expires_at = 1;
+}
+
 message ReinstateUserRequest {
   string user_id = 1;
+  // Recorded verbatim on the audit row.
+  string reason = 2;
 }
 
 message ReinstateUserResponse {}
@@ -119,6 +164,8 @@ message ReinstateUserResponse {}
 message SetKycLevelRequest {
   string user_id = 1;
   uint32 kyc_level = 2;
+  // Recorded verbatim on the audit row.
+  string reason = 3;
 }
 
 message SetKycLevelResponse {
@@ -141,6 +188,12 @@ message AdminUserSummary {
   // from `users.role` — see UserProfile.role_is_break_glass. This is the field that
   // stops the console listing an "owner" the consilium has never heard of.
   bool role_is_break_glass = 8;
+  // Why the account is disabled; see UserProfile.suspended_by. On the list because a
+  // held account and a suspended one need different action buttons, and a console that
+  // cannot tell them apart offers the wrong one.
+  string suspended_by = 9;
+  // Unix SECONDS an "admin_hold" lapses. 0 when nothing lapses.
+  int64 hold_expires_at = 10;
 }
 
 message ListUsersRequest {
@@ -167,7 +220,13 @@ message GetUserRequest {
 message SetRoleRequest {
   string user_id = 1;
   // The role to grant (snake_case: investor/operator/admin/owner).
+  //
+  // `owner` is refused in both directions and `admin` in the GRANTING direction, each
+  // naming the proposal that does it instead. Taking `admin` away is still one act:
+  // containing a rogue operator must never be the slower path.
   string role = 2;
+  // Recorded verbatim on the audit row.
+  string reason = 3;
 }
 
 message SetRoleResponse {

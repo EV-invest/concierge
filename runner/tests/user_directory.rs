@@ -11,7 +11,10 @@
 //! — and assert both the user row and the `user_outbox` rows it emits in the same tx.
 
 use concierge::{
-	infrastructure::{db, users::PgUsers},
+	infrastructure::{
+		db,
+		users::{AdminAction, PgUsers},
+	},
 	ports::UserDirectoryRepository,
 };
 use domain::{
@@ -100,7 +103,7 @@ async fn revoke_bumps_version_and_emits_sessions_revoked() {
 		return;
 	};
 	let user = repo.provision(unique_subject(), Email::parse("rev@example.com").unwrap(), true).await.unwrap();
-	let revoked = repo.revoke_tokens(user.id()).await.unwrap();
+	let revoked = repo.revoke_tokens(user.id(), &AdminAction::system("tokens_revoked"), 0).await.unwrap();
 	assert_eq!(revoked.token_version(), 1);
 
 	let reloaded = repo.find_by_id(user.id()).await.unwrap().unwrap();
@@ -139,7 +142,7 @@ async fn kyc_change_emits_kyc_changed_with_level() {
 		return;
 	};
 	let user = repo.provision(unique_subject(), Email::parse("kyc@example.com").unwrap(), true).await.unwrap();
-	repo.set_kyc_level(user.id(), 2).await.unwrap();
+	repo.set_kyc_level(user.id(), 2, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
 
 	let row = outbox_for(&pool, user.id().raw()).await.pop().expect("a row");
 	assert_eq!(row.kind, "KYC_CHANGED");

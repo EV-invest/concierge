@@ -221,6 +221,45 @@ pub async fn run_dispatcher(repo: Arc<dyn NotificationDispatchRepository>, trans
 	}
 }
 
+/// One pass of the hold sweep, bounded so a backlog cannot hold one transaction open for
+/// an unbounded time. Returns how many accounts it released.
+pub const HOLD_SWEEP_BATCH: i64 = 100;
+
+/// The hold sweep. Spawned by the composition root; runs until the process ends.
+///
+/// THE ONE THING IN THIS PLANE THAT SWEEPS. Governance expiry is deliberately lazy —
+/// nothing has to be running for a stale proposal to be unusable, because a write path
+/// expires it before acting and read paths project it as expired. A hold cannot work that
+/// way. Its entire purpose is the frozen flag the MONEY PLANE mirrors, and the money plane
+/// learns of a change only from a `user_outbox` row; a lapse that were merely projected at
+/// read time would release the account here and leave it frozen there, permanently. The
+/// release has to be a write, so something has to run.
+///
+/// That makes this loop load-bearing in a way the dispatcher is not: if it stops, holds
+/// stop lapsing and one operator's 24h brake quietly becomes indefinite. It is the exact
+/// property the split verb exists to prevent, so a failing pass is logged at `error!`
+/// rather than swallowed.
+pub async fn run_hold_sweep(users: Arc<dyn crate::ports::UserDirectoryRepository>, interval: Duration) {
+	tracing::info!(interval_secs = interval.as_secs(), "hold sweep started");
+	loop {
+		let now = crate::notification::now_secs();
+		match users.lapse_due_holds(now, HOLD_SWEEP_BATCH).await {
+			Ok(lapsed) if lapsed.is_empty() => {}
+			Ok(lapsed) => {
+				for id in &lapsed {
+					tracing::info!(user_id = %id, "a hold lapsed unratified; the account is active again");
+				}
+				// A full batch means there is probably more behind it.
+				if lapsed.len() as i64 >= HOLD_SWEEP_BATCH {
+					continue;
+				}
+			}
+			Err(err) => tracing::error!(%err, "the hold sweep failed; holds are not lapsing"),
+		}
+		tokio::time::sleep(interval).await;
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

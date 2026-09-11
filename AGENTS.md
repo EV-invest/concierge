@@ -41,6 +41,10 @@ an executed admission consilium and taken only by an executed removal, so
 `UserDirectory.SetRole` refuses both directions (`governance` module; the policy is
 `banking`'s `docs/CONSILIUM.md`).
 
+**So is `Role::Admin`, and so is a permanent suspension** — see the Hard rule below.
+`SetRole` refuses to GRANT `admin` (never to take it away), and `DisableUser` is
+retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
+
 ---
 
 ## Where things are documented
@@ -49,7 +53,7 @@ an executed admission consilium and taken only by an executed removal, so
 | ----- | ------ |
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
-| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the ownership consilium: owner admission/removal + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
+| `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
 | `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation with reuse detection · `Exchange`/`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`) provisioning users to the directory over an in-process `Provisioner` channel, **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
@@ -222,6 +226,59 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   two planes' and must stay so: the header is matched against the readable cookie AND the
   server-side copy in the session locker, and the whole check runs BEFORE the session is
   read, so a request that fails it never touches session state.
+- **Stopping an account is TWO verbs, and the split is the emergency budget.** A freeze
+  is the only control that stops money ALREADY queued — banking re-reads the frozen flag
+  in `require_dispatchable` at dispatch, so a freeze catches a withdrawal inside the
+  dispatcher's sweep. Moving that wholesale to a quorum by mail would trade a ~30s brake
+  for one that takes hours, and a broadcast made in those hours is irreversible; so
+  `DisableUser` is retired (it refuses, naming both replacements) and splits into
+  `HoldUser` — one operator, `Permission::UserSuspend`, `users.suspended_by =
+  'admin_hold'` with `hold_expires_at = now + HOLD_TTL_SECS` (24h) — and
+  `GovernanceService.OpenUserSuspension`, the owners' proposal, which writes
+  `suspended_by = 'governance'` and carries no deadline. One actor may stop money
+  temporarily and never permanently. `ReinstateUser` reads that column and is the mirror
+  rule: one act for a hold, refused for a verdict (naming `OpenUserReinstatement`), or
+  the consilium would be advisory. A disabled row with `suspended_by IS NULL` predates
+  the column and deliberately keeps the OLD semantics — one-act, never lapsing — because
+  that is the rule those accounts were suspended under; there is no backfill.
+- **The hold sweep is the ONE thing in this plane that sweeps.** Consilium expiry is
+  lazy on purpose (a write path expires a due proposal before acting, read paths project
+  it as expired), so nothing has to be running for a stale proposal to be unusable. A
+  hold cannot work that way: its whole purpose is the frozen flag the money plane
+  MIRRORS, and the money plane learns of a change only from a `user_outbox` row — a
+  lapse that were merely projected would release the account here and leave it frozen
+  there, forever. `dispatch::run_hold_sweep` (every `HOLD_SWEEP_INTERVAL_SECS`) is
+  therefore load-bearing: if it stops, one operator's 24h brake quietly becomes
+  indefinite.
+- **`Role::Admin` is granted by proposal and revoked by one act.** `SetRole` refuses to
+  GRANT it (naming `GovernanceService.OpenAdminAdmission`) for a relative of the reason
+  it refuses `owner`: an operator who can appoint operators can appoint accomplices, and
+  the seat carries every identity mutation except role granting. Taking it away stays a
+  single act deliberately — containing a rogue operator must never be the slower path.
+  The refusal is decided INSIDE the write transaction from the row held `FOR UPDATE`,
+  the same TOCTOU argument as the `owner` refusal beside it.
+- **The USER consilia pass on a MAJORITY, the OWNER consilia on unanimity**, and the
+  asymmetry is argued in `domain::governance::majority`. Unanimity guards the owner
+  roster because a minority able to add owners by majority grows itself into a majority;
+  neither an `admin` seat (which cannot vote and cannot be granted `owner`) nor a
+  suspension (defensive, reversible by the same body) can amplify itself that way.
+  Against that, unanimity here would COST safety: ratifying a hold races a 24h clock, and
+  under unanimity one unreachable owner does not delay the verdict — they decide it, by
+  releasing a compromised account at the deadline. What is preserved is the property that
+  matters: the initiator is excluded from the voter set and the threshold is at least
+  one, so no single actor ever acts alone. All three kinds share ONE aggregate
+  (`UserProposal`), one table and one `Lifecycle`, for the reason `0009_governance.sql`
+  already gives for its two: near-identical copies drift the first time one is edited.
+- **Two audit logs, answering two questions.** `governance_event` is "what happened to
+  this PROPOSAL" — keyed by the three proposal ids under a CHECK that exactly one is set,
+  and the reason it is one log is that "who has held a seat, and by whose decision" is a
+  single ordering. `admin_action` is "what has been done TO this person, by whom" —
+  keyed by the subject, and the home of the rows suspension, reinstatement, `SetRole`,
+  `SetKycLevel` and `RevokeTokens` never wrote at all. Every one of them is appended in
+  the SAME transaction as the change it describes: a log that can be missing the entry
+  for a change that happened is a source of false confidence, so a rolled-back command
+  takes its audit row with it. `actor_user_id` is NULL only where nobody acted (the hold
+  sweep) — never as a stand-in for an actor we failed to resolve.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.

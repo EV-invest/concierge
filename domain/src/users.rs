@@ -102,6 +102,72 @@ impl UserStatus {
 	}
 }
 
+/// How long one admin's emergency brake lasts before it lapses on its own.
+///
+/// TWENTY-FOUR HOURS, and the number is the whole design. Freezing an account is the
+/// only control that stops money ALREADY queued — the money plane re-reads the frozen
+/// flag at dispatch, so a hold catches a withdrawal inside the dispatcher's sweep. A
+/// quorum by mail takes hours, and in those hours a compromised account can have a
+/// broadcast on chain, which is irreversible. So one actor may stop money TEMPORARILY.
+/// Making it permanent is [`Suspension::Governance`], and that needs the owners.
+pub const HOLD_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// WHY a disabled account is disabled — and therefore who is allowed to undo it.
+///
+/// The split exists because the two are not the same decision. A hold is one operator's
+/// reflex under `Permission::UserSuspend`, deliberately cheap to reach and deliberately
+/// self-cancelling. A governance suspension is the owners' ratified verdict, and a
+/// single admin must not be able to overturn it from the console — which is exactly what
+/// would happen if reinstatement stayed unqualified.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Suspension {
+	/// One operator's emergency brake. Lapses at `expires_at` unless the owners ratify
+	/// it, and until then reinstatement lifts it in one act.
+	AdminHold { expires_at: i64 },
+	/// Ratified by the owner consilium. Reinstatement refuses it and names the proposal
+	/// that undoes it; nothing lapses.
+	Governance,
+}
+
+impl Suspension {
+	/// The stored `users.suspended_by` discriminant.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::AdminHold { .. } => "admin_hold",
+			Self::Governance => "governance",
+		}
+	}
+
+	/// Parse a stored row. `expires_at` is the column beside it; absent there means a
+	/// hold with no clock, which never lapses.
+	pub fn parse(raw: &str, expires_at: Option<i64>) -> Result<Self, DomainError> {
+		match raw {
+			"admin_hold" => Ok(Self::AdminHold {
+				expires_at: expires_at.unwrap_or(i64::MAX),
+			}),
+			"governance" => Ok(Self::Governance),
+			other => Err(DomainError::Validation(format!("unknown suspension: {other}"))),
+		}
+	}
+
+	/// The instant this lapses, when it lapses at all.
+	pub fn hold_expires_at(self) -> Option<i64> {
+		match self {
+			Self::AdminHold { expires_at } => Some(expires_at),
+			Self::Governance => None,
+		}
+	}
+
+	/// Whether one admin may lift this alone.
+	pub fn is_reversible_by_one_admin(self) -> bool {
+		match self {
+			Self::AdminHold { .. } => true,
+			Self::Governance => false,
+		}
+	}
+}
+
 /// The caller's editable profile fields (the full-replace set). All optional —
 /// `None`/an empty value clears the field. Identity/auth fields (email, status) are
 /// deliberately absent: they are not user-editable here.
@@ -153,6 +219,10 @@ pub struct User {
 	email: Email,
 	email_verified: bool,
 	status: UserStatus,
+	/// Why the account is disabled, when it is. `None` on an active user — and also on a
+	/// row disabled before this field existed, which therefore reads as the unqualified
+	/// suspension it was: liftable in one act, and lapsing never.
+	suspension: Option<Suspension>,
 	token_version: u64,
 	kyc_level: u32,
 	/// The platform-wide access role. This plane OWNS it; a change is mirrored to the
@@ -174,6 +244,7 @@ impl User {
 			email,
 			email_verified,
 			status: UserStatus::Active,
+			suspension: None,
 			token_version: 0,
 			kyc_level: 0,
 			role: Role::default(),
@@ -194,6 +265,7 @@ impl User {
 		email: Email,
 		email_verified: bool,
 		status: UserStatus,
+		suspension: Option<Suspension>,
 		token_version: u64,
 		kyc_level: u32,
 		role: Role,
@@ -206,6 +278,7 @@ impl User {
 			email,
 			email_verified,
 			status,
+			suspension,
 			token_version,
 			kyc_level,
 			role,
@@ -255,24 +328,87 @@ impl User {
 		self.token_version
 	}
 
-	/// Disable the user, freezing future sign-in/refresh, and emit
+	/// Disable the user UNQUALIFIED, freezing future sign-in/refresh, and emit
 	/// [`UserEvent::Suspended`]. No-op when already disabled.
+	///
+	/// ⚠️ This records no [`Suspension`], so the account reads as liftable by one admin
+	/// and lapses never. It is the raw brake the fixtures and the unqualified port method
+	/// are built on — a request-driven path calls [`Self::hold`] or, for the owners'
+	/// verdict, [`Self::suspend`], the same way `set_role` sits beneath
+	/// `set_role_outside_ownership`.
 	pub fn disable(&mut self) {
-		if self.status == UserStatus::Disabled {
-			return;
+		self.suspend_as(None);
+	}
+
+	/// One operator's emergency brake: freeze now, and lapse in [`HOLD_TTL_SECS`] unless
+	/// the owners ratify it.
+	///
+	/// Refused over an already-ratified suspension. A hold is the WEAKER measure, and
+	/// letting one admin restate the owners' verdict as their own would hand them the
+	/// expiry clock that goes with it — the verdict would then lapse in a day because one
+	/// person pressed the softer button.
+	///
+	/// Re-holding an account that is already held restarts the clock. That is deliberate:
+	/// after a lapse the account may still be compromised, and refusing the second brake
+	/// to keep the first one's deadline would be a worse trade. The repeated holds are
+	/// each audited, so a brake being renewed indefinitely is visible rather than silent.
+	pub fn hold(&mut self, now: i64) -> Result<(), DomainError> {
+		if self.suspension == Some(Suspension::Governance) {
+			return Err(DomainError::Conflict(
+				"this account is suspended by the owner consilium; a hold cannot replace that verdict".into(),
+			));
 		}
-		self.status = UserStatus::Disabled;
-		self.bump_and_emit(UserEvent::Suspended);
+		self.suspend_as(Some(Suspension::AdminHold {
+			expires_at: now.saturating_add(HOLD_TTL_SECS),
+		}));
+		Ok(())
+	}
+
+	/// The owners' ratified verdict. Freezes the account if it was not frozen already and
+	/// stamps it as theirs, so [`Self::suspension`] tells reinstatement to refuse.
+	pub fn suspend(&mut self) {
+		self.suspend_as(Some(Suspension::Governance));
 	}
 
 	/// Re-enable a disabled user and emit [`UserEvent::Reinstated`]. No-op when already
-	/// active.
+	/// active. Unqualified: the decision about WHO may lift a given suspension is taken
+	/// from [`Self::suspension`] by the caller, not here.
 	pub fn enable(&mut self) {
+		self.suspension = None;
 		if self.status == UserStatus::Active {
 			return;
 		}
 		self.status = UserStatus::Active;
 		self.bump_and_emit(UserEvent::Reinstated);
+	}
+
+	/// Let a due hold fall away, emitting [`UserEvent::Reinstated`] so the money plane
+	/// unfreezes too. True when it did.
+	///
+	/// This is the half of the design that makes a hold safe to hand to one person: the
+	/// brake releases itself, and staying stopped is something only the owners can
+	/// decide. A governance suspension has no expiry and is never touched here.
+	pub fn lapse_hold(&mut self, now: i64) -> bool {
+		let Some(expires_at) = self.suspension.and_then(Suspension::hold_expires_at) else {
+			return false;
+		};
+		if now < expires_at {
+			return false;
+		}
+		self.enable();
+		true
+	}
+
+	/// The one writer of `status = disabled`, so "was it already frozen?" is asked in
+	/// exactly one place: the event marks the FREEZE, and re-stamping why an already
+	/// frozen account is frozen is not a second suspension for the money plane to mirror.
+	fn suspend_as(&mut self, by: Option<Suspension>) {
+		let was_active = self.status == UserStatus::Active;
+		self.status = UserStatus::Disabled;
+		self.suspension = by;
+		if was_active {
+			self.bump_and_emit(UserEvent::Suspended);
+		}
 	}
 
 	/// Set the KYC level and emit [`UserEvent::KycChanged`]. No-op when unchanged.
@@ -330,6 +466,13 @@ impl User {
 
 	pub fn is_active(&self) -> bool {
 		self.status == UserStatus::Active
+	}
+
+	/// Why the account is frozen, when it is. `None` on an active user, and also on a row
+	/// frozen before the field existed — which therefore reads as liftable in one act,
+	/// preserving exactly the behaviour those rows were suspended under.
+	pub fn suspension(&self) -> Option<Suspension> {
+		self.suspension
 	}
 
 	pub fn token_version(&self) -> u64 {
@@ -904,5 +1047,98 @@ mod tests {
 		assert!(tz("Asia").is_err(), "an area alone is not a timezone");
 		assert!(tz("Asia/").is_err());
 		assert!(tz("Mars/Olympus").is_err());
+	}
+
+	// -----------------------------------------------------------------------------
+	// The split verb: a hold that lapses, and a verdict that does not.
+	// -----------------------------------------------------------------------------
+
+	#[test]
+	fn a_hold_freezes_now_and_carries_its_own_deadline() {
+		let mut user = fixture();
+		user.drain_events();
+		user.hold(1_000).expect("nothing is suspending this account yet");
+		assert_eq!(user.status(), UserStatus::Disabled);
+		assert_eq!(user.suspension(), Some(Suspension::AdminHold { expires_at: 1_000 + HOLD_TTL_SECS }));
+		assert_eq!(user.drain_events(), [UserEvent::Suspended], "the money plane learns of the freeze");
+	}
+
+	/// The half that makes a one-actor brake safe to hand out: it releases itself, and a
+	/// REINSTATED goes with it so the money plane unfreezes too.
+	#[test]
+	fn a_hold_lapses_on_its_own_and_tells_the_bridge() {
+		let mut user = fixture();
+		user.hold(1_000).expect("hold");
+		user.drain_events();
+
+		assert!(!user.lapse_hold(1_000 + HOLD_TTL_SECS - 1), "not due yet");
+		assert_eq!(user.status(), UserStatus::Disabled);
+
+		assert!(user.lapse_hold(1_000 + HOLD_TTL_SECS), "due");
+		assert_eq!(user.status(), UserStatus::Active);
+		assert_eq!(user.suspension(), None);
+		assert_eq!(user.drain_events(), [UserEvent::Reinstated]);
+		assert!(!user.lapse_hold(i64::MAX), "there is nothing left to lapse");
+	}
+
+	/// The owners' verdict has no clock, and the weaker measure cannot restate it — which
+	/// would hand one admin the expiry that goes with a hold.
+	#[test]
+	fn a_governance_suspension_never_lapses_and_a_hold_cannot_replace_it() {
+		let mut user = fixture();
+		user.suspend();
+		user.drain_events();
+		assert_eq!(user.suspension(), Some(Suspension::Governance));
+		assert_eq!(user.suspension().unwrap().hold_expires_at(), None);
+		assert!(!user.lapse_hold(i64::MAX), "a verdict does not expire");
+
+		let err = user.hold(2_000).expect_err("a hold must not downgrade the owners' verdict");
+		assert!(matches!(err, DomainError::Conflict(_)));
+		assert_eq!(user.suspension(), Some(Suspension::Governance), "the refusal left it alone");
+	}
+
+	#[test]
+	fn only_a_hold_is_reversible_by_one_admin() {
+		assert!(Suspension::AdminHold { expires_at: 1 }.is_reversible_by_one_admin());
+		assert!(!Suspension::Governance.is_reversible_by_one_admin());
+	}
+
+	/// The freeze is the event, not the reason for it: ratifying an account that is
+	/// already held must not emit a second SUSPENDED for the money plane to mirror.
+	#[test]
+	fn ratifying_a_live_hold_restamps_it_without_a_second_event() {
+		let mut user = fixture();
+		user.hold(1_000).expect("hold");
+		user.drain_events();
+		let version = user.row_version();
+
+		user.suspend();
+		assert_eq!(user.suspension(), Some(Suspension::Governance));
+		assert!(user.drain_events().is_empty(), "it was already frozen");
+		assert_eq!(user.row_version(), version);
+	}
+
+	/// A row disabled before the column existed reads as `None`, which is the OLD
+	/// semantics on purpose — liftable in one act, lapsing never — because that is the
+	/// rule those accounts were actually suspended under.
+	#[test]
+	fn a_pre_existing_suspension_keeps_the_semantics_it_was_made_under() {
+		let mut user = fixture();
+		user.disable();
+		assert_eq!(user.status(), UserStatus::Disabled);
+		assert_eq!(user.suspension(), None);
+		assert!(!user.lapse_hold(i64::MAX), "nothing to lapse");
+		user.enable();
+		assert_eq!(user.status(), UserStatus::Active);
+	}
+
+	#[test]
+	fn suspension_round_trips_through_the_stored_pair() {
+		assert_eq!(Suspension::parse("admin_hold", Some(42)).unwrap(), Suspension::AdminHold { expires_at: 42 });
+		assert_eq!(Suspension::parse("governance", None).unwrap(), Suspension::Governance);
+		// A hold with no stored deadline is one that never lapses, not one that lapsed
+		// at the epoch — the direction of that default is the whole safety of it.
+		assert_eq!(Suspension::parse("admin_hold", None).unwrap(), Suspension::AdminHold { expires_at: i64::MAX });
+		assert!(Suspension::parse("because", None).is_err());
 	}
 }
