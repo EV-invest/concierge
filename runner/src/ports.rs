@@ -573,6 +573,32 @@ pub trait NotificationRepository: Send + Sync {
 	#[allow(clippy::too_many_arguments)]
 	async fn emit(&self, user_id: Uuid, topic: &str, kind: &str, title: &str, body: &str, link: &str, dedupe_key: &str, occurred_at: i64) -> Result<EmitOutcome, DomainError>;
 
+	/// Write an inbox entry REGARDLESS of what the user follows, and queue no email copy.
+	///
+	/// [`Self::emit`] is opt-in per topic, which is right for fund news and wrong for a
+	/// notice that somebody is asking to move this person's own money: nobody subscribes
+	/// to that, and there is no topic every user follows by default. The mail itself has
+	/// already gone down the governance queue, which bypasses preferences for the same
+	/// reason — this is its in-app trace. The subscriber row is created on first touch, as
+	/// [`Self::subscriber_for_user`] does. False when `dedupe_key` had already been used
+	/// for this user. Reading is still gated: `in_app_enabled = false` hides it like every
+	/// other entry — suppression stays a read-path concern.
+	// Positional like `emit` above: the two are the same write with one gate removed, and
+	// reading them side by side is the point.
+	#[allow(clippy::too_many_arguments)]
+	async fn record(
+		&self,
+		user_id: Uuid,
+		email: &str,
+		email_verified: bool,
+		topic: &str,
+		kind: &str,
+		title: &str,
+		body: &str,
+		dedupe_key: &str,
+		occurred_at: i64,
+	) -> Result<bool, DomainError>;
+
 	/// One page of the inbox, newest first. `cursor` is the last id of the previous page.
 	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>) -> Result<Vec<NotificationRow>, DomainError>;
 

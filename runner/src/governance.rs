@@ -64,7 +64,7 @@ use crate::{
 	authz::BreakGlass,
 	infrastructure::governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
 	notification::now_secs,
-	ports::{GovernanceRepository, UserDirectoryRepository},
+	ports::{GovernanceRepository, NotificationRepository, UserDirectoryRepository},
 	support::{authenticate_service, domain_to_status},
 };
 
@@ -761,6 +761,9 @@ impl OwnerRemovalApprovalService for RemovalApproval {
 pub struct MailRelay {
 	users: Arc<dyn UserDirectoryRepository>,
 	governance: Arc<dyn GovernanceRepository>,
+	/// The in-app inbox, for the one kind whose reader has no other surface to find it
+	/// on — see [`CONSENT_TOPIC`].
+	notifications: Arc<dyn NotificationRepository>,
 	/// `None` ⇒ the relay is not configured and every call is rejected (fail closed).
 	/// In production this is the SAME `BRIDGE_SERVICE_TOKEN` banking presents when it
 	/// pulls the outbox: one trust relationship between the planes, one secret to rotate.
@@ -770,10 +773,17 @@ pub struct MailRelay {
 }
 
 impl MailRelay {
-	pub fn new(users: Arc<dyn UserDirectoryRepository>, governance: Arc<dyn GovernanceRepository>, token: Option<String>, approval_origin: String) -> Self {
+	pub fn new(
+		users: Arc<dyn UserDirectoryRepository>,
+		governance: Arc<dyn GovernanceRepository>,
+		notifications: Arc<dyn NotificationRepository>,
+		token: Option<String>,
+		approval_origin: String,
+	) -> Self {
 		Self {
 			users,
 			governance,
+			notifications,
 			token: token.filter(|t| !t.is_empty()).map(|t| Arc::from(t.as_str())),
 			approval_origin: approval_origin.trim_end_matches('/').to_owned(),
 		}
@@ -864,6 +874,26 @@ fn payment_tier(value: &str) -> Result<String, Status> {
 	Ok(tier)
 }
 
+/// Where the in-app trace of a payment consent is filed.
+///
+/// The mail is the security channel and cannot be muted; this is what the subject finds
+/// in the cabinet when that mail is late, filtered or lost. It is written REGARDLESS of
+/// whether they follow the topic (`NotificationRepository::record`, not `emit`): nobody
+/// subscribes to being asked about their own money, and there is no topic every user
+/// follows by default — `upsert_subscriber` creates the subscriber row and nothing under
+/// it, so an `emit` here would reach only the few who had opened their notification
+/// settings. The topic still has to be a real one, so the inbox can filter on it and the
+/// catalogue test below keeps it from drifting.
+const CONSENT_TOPIC: &str = "account:money-movement";
+
+/// What a payment consent leaves in the subject's inbox. The platform's own words only —
+/// no link, no code (those live in the mail and nowhere else), and not the operator's
+/// `reason`, which the inbox has no way to set apart as somebody else's text.
+struct ConsentNotice {
+	title: String,
+	body: String,
+}
+
 /// Who a mail of a given kind may be addressed to, decided from the KIND before the
 /// identity record is read. The address itself is resolved from that record either way;
 /// this decides only whether the person it belongs to may be sent THIS mail.
@@ -887,7 +917,7 @@ impl MailRelayService for MailRelay {
 		}
 		let user_id = parse_user_id(&req.user_id, "user_id")?;
 
-		let (kind, payload, recipient_rule) = match GovernanceMailKind::try_from(req.kind) {
+		let (kind, payload, recipient_rule, notice) = match GovernanceMailKind::try_from(req.kind) {
 			Ok(GovernanceMailKind::PayoutApproval) => {
 				let mail = req.payout_approval.ok_or_else(|| Status::invalid_argument("payout_approval is required for this kind"))?;
 				let payload = serde_json::json!({
@@ -904,7 +934,7 @@ impl MailRelayService for MailRelay {
 					"approval_url": self.approval_link(&mail.approval_url)?,
 					"code": bounded(&mail.code, 64, "code")?,
 				});
-				("payout_approval", payload, Recipient::FundOwner)
+				("payout_approval", payload, Recipient::FundOwner, None)
 			}
 			// A burned approval token is an outcome the owners are told about, and the
 			// outcome payload already carries everything that mail needs to say. The
@@ -925,7 +955,7 @@ impl MailRelayService for MailRelay {
 					"destination": line(&mail.destination, 160, "destination")?,
 					"reason": line(&mail.reason, 500, "reason")?,
 				});
-				("payout_outcome", payload, Recipient::FundOwner)
+				("payout_outcome", payload, Recipient::FundOwner, None)
 			}
 			// The consilium asked about a PAYMENT of fund-owned money. Addressed like a
 			// payout — to a seat — but described like a consent: two ends of a transfer in
@@ -948,7 +978,7 @@ impl MailRelayService for MailRelay {
 					"approval_url": self.approval_link(&mail.approval_url)?,
 					"code": line(&mail.code, 64, "code")?,
 				});
-				("payment_approval", payload, Recipient::FundOwner)
+				("payment_approval", payload, Recipient::FundOwner, None)
 			}
 			// The one kind that is not addressed to the consilium. Every field is bounded in
 			// bytes and refused if it carries a control character — see `line`.
@@ -958,13 +988,21 @@ impl MailRelayService for MailRelay {
 				// Read here and enforced against the RESOLVED record below, so the rule stays
 				// "the recipient IS the subject" rather than "two request fields agree".
 				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
+				let (initiator_email, source) = (line(&mail.initiator_email, 320, "initiator_email")?, line(&mail.source, 160, "source")?);
+				let (destination, amount) = (line(&mail.destination, 160, "destination")?, line(&mail.amount, 64, "amount")?);
+				let notice = ConsentNotice {
+					title: "A payment needs your consent".to_owned(),
+					body: format!(
+						"{initiator_email} has opened a payment of {amount} from {source} to {destination}. Nothing moves unless you consent to it from the message sent to your email address."
+					),
+				};
 				let payload = serde_json::json!({
 					"payment_id": line(&mail.payment_id, 64, "payment_id")?,
-					"initiator_email": line(&mail.initiator_email, 320, "initiator_email")?,
+					"initiator_email": initiator_email,
 					"tier": tier,
-					"source": line(&mail.source, 160, "source")?,
-					"destination": line(&mail.destination, 160, "destination")?,
-					"amount": line(&mail.amount, 64, "amount")?,
+					"source": source,
+					"destination": destination,
+					"amount": amount,
 					// An operator writes this and the subject reads it verbatim. REQUIRED: a
 					// consent request nobody explained is one nobody can judge, and "approve
 					// this because we say so" is the shape of the mail we do not want to send.
@@ -974,7 +1012,7 @@ impl MailRelayService for MailRelay {
 					"approval_url": self.approval_link(&mail.approval_url)?,
 					"code": line(&mail.code, 64, "code")?,
 				});
-				("payment_consent", payload, Recipient::Subject(subject))
+				("payment_consent", payload, Recipient::Subject(subject), Some(notice))
 			}
 			_ => return Err(Status::invalid_argument("kind must be a known governance mail kind")),
 		};
@@ -1025,6 +1063,30 @@ impl MailRelayService for MailRelay {
 			.await
 			.map_err(domain_to_status)?;
 
+		// The inbox trace, written AFTER the mail is queued and never in its way: the
+		// queue row is the security channel and the thing the money plane retries on; the
+		// inbox entry is a courtesy copy, so a failure here is logged, not returned. Written
+		// on a repeat too (`enqueued == false`): the same dedupe key makes it a no-op when
+		// the entry exists, and the money plane's retry is exactly when a trace that failed
+		// the first time gets its second chance.
+		if let Some(notice) = notice
+			&& let Err(err) = self
+				.notifications
+				.record(
+					user_id.raw(),
+					recipient.email().as_str(),
+					recipient.email_verified(),
+					CONSENT_TOPIC,
+					kind,
+					&notice.title,
+					&notice.body,
+					&req.dedupe_key,
+					now_secs(),
+				)
+				.await
+		{
+			tracing::warn!(%err, dedupe_key = %req.dedupe_key, "mail relay: could not record the consent in the subject's inbox");
+		}
 		Ok(Response::new(SendGovernanceMailResponse { enqueued }))
 	}
 }
@@ -1083,6 +1145,13 @@ mod tests {
 		] {
 			assert!(link(hostile).is_err(), "must be refused: {hostile}");
 		}
+	}
+
+	/// The inbox filters by topic and the catalogue is closed, so the topic a consent is
+	/// filed under has to be one the catalogue actually lists.
+	#[test]
+	fn the_consent_inbox_topic_is_in_the_catalogue() {
+		assert!(crate::notification::topic(CONSENT_TOPIC).is_some(), "{CONSENT_TOPIC} is not a catalogued topic");
 	}
 
 	#[test]

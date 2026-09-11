@@ -28,6 +28,7 @@ use concierge::{
 	infrastructure::{
 		db,
 		governance::{PgGovernance, SelfDecision},
+		notifications::PgNotifications,
 		users::PgUsers,
 	},
 	ports::{GovernanceRepository, UserDirectoryRepository},
@@ -125,7 +126,13 @@ impl Fixture {
 
 	/// The money plane's push seam over the same adapters.
 	fn relay(&self) -> MailRelay {
-		MailRelay::new(self.users.clone(), self.governance.clone(), Some(RELAY_TOKEN.to_owned()), RELAY_ORIGIN.to_owned())
+		MailRelay::new(
+			self.users.clone(),
+			self.governance.clone(),
+			Arc::new(PgNotifications::new(self.pool.clone())),
+			Some(RELAY_TOKEN.to_owned()),
+			RELAY_ORIGIN.to_owned(),
+		)
 	}
 
 	async fn email_of(&self, id: UserId) -> String {

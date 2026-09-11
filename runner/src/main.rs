@@ -293,6 +293,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(MailRelayServiceServer::new(governance::MailRelay::new(
 				users.clone(),
 				governance_repo.clone(),
+				notification_repo.clone(),
 				// The SAME secret the bridge uses. One trust relationship between the two
 				// planes, one secret to rotate — and banking presents this token on both
 				// seams, so a second variable could only ever drift out of step with it.
