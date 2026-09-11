@@ -12,8 +12,9 @@
 //!   directory       — the user/profile gRPC service + the auth→directory provisioner loop
 //!   bridge          — the cross-plane (identity→money) producer over the user_outbox
 //!   platform        — the platform/cabinet config service (maintenance · announcement · flags)
-//!   governance      — the ownership consilium: the owner roster, owner-removal proposals,
-//!                     the target's emailed approval surface, and the money plane's mail relay
+//!   governance      — the consilia: the owner roster, owner admission/removal proposals,
+//!                     the user proposals over suspension/reinstatement/`admin`, the
+//!                     target's emailed approval surface, and the money plane's mail relay
 //!   authz           — the shared RBAC gate (persisted role + status/revocation enforcement),
 //!                     plus the emergency access that retires itself at the first owner
 //!   genesis         — the boot-time seeding of the fund's first owner registry
@@ -23,7 +24,9 @@
 //!   support         — cross-module gRPC plumbing (domain-error → Status mapping)
 //!   web             — the site-level auth HTTP surface (login/callback/session cookies)
 //!   notification    — the notification plane: subscribers, the in-app inbox, queued email
-//!   dispatch        — the background loop draining the outbound email queue
+//!   dispatch        — the background loops: draining the outbound email queue, and the
+//!                     hold sweep (the ONE thing here that sweeps — a lapse must be a
+//!                     write, or the money plane never learns the account is unfrozen)
 //!   log             — DEFERRED stub (no platform audit surface yet)
 
 pub mod authz;
