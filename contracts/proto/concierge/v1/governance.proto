@@ -146,10 +146,11 @@ service OwnerRemovalApprovalService {
 // The payload is TYPED, never rendered HTML: this plane renders it. A compromised money
 // plane must not be able to put arbitrary markup into an owner's mailbox.
 //
-// WHO MAY RECEIVE ONE is decided per KIND, and the default is the strict one. The three
-// payout kinds speak to the consilium, so they go to a seated owner and to nobody else —
-// that rule is what stops a compromised money plane aiming a concierge-branded security
-// mail at any address on the platform. PAYMENT_CONSENT cannot use it: consenting to a
+// WHO MAY RECEIVE ONE is decided per KIND, and the default is the strict one. The
+// consilium kinds — the three payout kinds and PAYMENT_APPROVAL — speak to the
+// consilium, so they go to a seated owner and to nobody else — that rule is what stops a
+// compromised money plane aiming a concierge-branded security mail at any address on
+// the platform. PAYMENT_CONSENT cannot use it: consenting to a
 // transfer of your own money has nothing to do with holding a seat. It gets its own rule,
 // narrower in the dimension that matters — the recipient must BE the payment's subject,
 // named in the typed payload — so the surface widens by exactly one person per message
