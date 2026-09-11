@@ -16,9 +16,9 @@ use domain::{
 	architecture::{EmitsEvents, Reader, Repository},
 	authz::Role,
 	error::DomainError,
-	users::{AuthSubject, Email, ProfileFields, User, UserId, UserStatus},
+	users::{AuthSubject, Email, ProfileFields, Suspension, User, UserId, UserStatus},
 };
-use sqlx::{PgConnection, PgPool};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::ports::{KycLevelChange, RoleChange, UserDirectoryRepository};
@@ -28,7 +28,7 @@ use crate::ports::{KycLevelChange, RoleChange, UserDirectoryRepository};
 /// than a runtime `format!` — keep this list in sync with [`UserRow`].
 macro_rules! user_columns {
 	() => {
-		"id, auth_subject, email, email_verified, status, token_version, kyc_level, role, \
+		"id, auth_subject, email, email_verified, status, suspended_by, hold_expires_at, token_version, kyc_level, role, \
 		legal_name, preferred_name, phone, date_of_birth, nationality, tax_residence, \
 		residential_address, language, base_currency, timezone, row_version"
 	};
@@ -61,6 +61,35 @@ impl PgUsers {
 		tx.commit().await.map_err(repo_err)?;
 		Ok(user)
 	}
+
+	/// [`Self::mutate`] with the operator's decision appended to `admin_action` on the
+	/// SAME transaction. A command error rolls back the audit row with the change, which
+	/// is the only ordering that keeps the log honest in both directions: no row without
+	/// a change, and no change without a row.
+	///
+	/// `detail` is computed from the aggregate AFTER the command, so it records what the
+	/// action actually did rather than what the caller asked for.
+	async fn mutate_audited(
+		&self,
+		id: UserId,
+		action: &AdminAction,
+		now: i64,
+		command: impl FnOnce(&mut User) -> Result<(), DomainError>,
+		detail: impl FnOnce(&User) -> Option<serde_json::Value>,
+	) -> Result<User, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let mut user = load_for_update(&mut tx, id).await?;
+		command(&mut user)?;
+		update_row(&mut tx, &user).await?;
+		drain_outbox(&mut tx, &mut user).await?;
+		let mut action = action.clone();
+		if action.detail.is_none() {
+			action.detail = detail(&user);
+		}
+		record_action(&mut tx, id, &action, now).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(user)
+	}
 }
 
 impl Repository for PgUsers {
@@ -83,7 +112,81 @@ pub struct AdminUserRow {
 	pub role: String,
 	pub token_version: i64,
 	pub created_at: i64,
+	pub suspended_by: Option<String>,
+	pub hold_expires_at: Option<i64>,
 }
+/// One operator decision about one person, on its way to the `admin_action` log.
+///
+/// It travels WITH the command rather than being written by the caller afterwards,
+/// because the row and the change it describes have to commit together: an audit trail
+/// that can be missing the entry for a change that happened is not an audit trail, it is
+/// a source of false confidence. Every method that takes one writes it inside the same
+/// transaction as the mutation.
+#[derive(Clone, Default)]
+pub struct AdminAction {
+	/// Who acted. `None` when nobody did — the hold sweep is the only such writer today,
+	/// and recording it as though an operator had pressed a button would be worse than
+	/// recording nothing.
+	pub actor: Option<UserId>,
+	/// The verb, in the log's own vocabulary (`held`, `reinstated`, `kyc_level_set`, …).
+	pub action: &'static str,
+	/// The actor's stated cause. Empty where the surface does not ask for one.
+	pub reason: String,
+	/// The proposal that authorized this, when one did.
+	pub proposal_id: Option<Uuid>,
+	/// What the action did, in the vocabulary of the action itself.
+	pub detail: Option<serde_json::Value>,
+	/// Where the request came from. Same provenance the consilium records.
+	pub client_ip: String,
+	pub user_agent: String,
+}
+
+impl AdminAction {
+	/// An action with no human behind it.
+	pub fn system(action: &'static str) -> Self {
+		Self { action, ..Self::default() }
+	}
+
+	/// An action by a signed-in operator, with the request's provenance attached.
+	pub fn by(actor: UserId, action: &'static str, audit: &super::governance::Audit) -> Self {
+		Self {
+			actor: Some(actor),
+			action,
+			client_ip: audit.client_ip.clone(),
+			user_agent: audit.user_agent.clone(),
+			..Self::default()
+		}
+	}
+
+	pub fn with_reason(mut self, reason: &str) -> Self {
+		self.reason = reason.chars().take(500).collect();
+		self
+	}
+
+	pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
+		self.detail = Some(detail);
+		self
+	}
+
+	pub fn with_proposal(mut self, proposal_id: Uuid) -> Self {
+		self.proposal_id = Some(proposal_id);
+		self
+	}
+}
+
+/// What [`UserDirectoryRepository::reinstate_outside_governance`] did.
+///
+/// The refusal is the point. `ReinstateUser` is one admin's button, and a suspension the
+/// OWNERS voted for must not be liftable by one admin — that would make the consilium
+/// advisory. The decision is taken inside the write transaction from the row held
+/// `FOR UPDATE`, for the same TOCTOU reason `set_role_outside_ownership` is.
+pub enum Reinstatement {
+	/// The account is active again, and exactly one `REINSTATED` went to the outbox.
+	Applied(Box<User>),
+	/// The suspension is the owners' verdict; only they may lift it.
+	GovernanceHeld,
+}
+
 /// The fields the admin authz gate decides on: the persisted access role, the account
 /// status (a suspended principal is denied even while an unexpired token still verifies),
 /// and the authoritative `token_version` (a "revoke all" bumps it, so a token minted
@@ -100,6 +203,8 @@ struct UserRow {
 	email: Option<String>,
 	email_verified: bool,
 	status: String,
+	suspended_by: Option<String>,
+	hold_expires_at: Option<i64>,
 	token_version: i64,
 	kyc_level: i32,
 	role: String,
@@ -125,6 +230,10 @@ impl UserRow {
 			Email::parse(&email)?,
 			self.email_verified,
 			UserStatus::parse(&self.status)?,
+			// A disabled row with no `suspended_by` predates the column and is meant to
+			// read as `None` — see the migration: those accounts keep the one-act,
+			// never-lapsing semantics they were actually suspended under.
+			self.suspended_by.as_deref().map(|by| Suspension::parse(by, self.hold_expires_at)).transpose()?,
 			self.token_version as u64,
 			self.kyc_level as u32,
 			Role::parse(&self.role)?,
@@ -226,11 +335,17 @@ impl UserDirectoryRepository for PgUsers {
 		self.mutate(id, |user| user.update_profile(fields)).await
 	}
 
-	async fn revoke_tokens(&self, id: UserId) -> Result<User, DomainError> {
-		self.mutate(id, |user| {
-			user.revoke_tokens();
-			Ok(())
-		})
+	async fn revoke_tokens(&self, id: UserId, action: &AdminAction, now: i64) -> Result<User, DomainError> {
+		self.mutate_audited(
+			id,
+			action,
+			now,
+			|user| {
+				user.revoke_tokens();
+				Ok(())
+			},
+			|user| Some(serde_json::json!({ "token_version": user.token_version() })),
+		)
 		.await
 	}
 
@@ -242,6 +357,21 @@ impl UserDirectoryRepository for PgUsers {
 		.await
 	}
 
+	async fn hold_user(&self, id: UserId, action: &AdminAction, now: i64) -> Result<User, DomainError> {
+		self.mutate_audited(
+			id,
+			action,
+			now,
+			|user| user.hold(now),
+			|user| {
+				Some(serde_json::json!({
+					"hold_expires_at": user.suspension().and_then(Suspension::hold_expires_at),
+				}))
+			},
+		)
+		.await
+	}
+
 	async fn enable_user(&self, id: UserId) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
 			user.enable();
@@ -250,10 +380,81 @@ impl UserDirectoryRepository for PgUsers {
 		.await
 	}
 
-	async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError> {
+	/// One transaction: read the target `FOR UPDATE`, decide from THAT read, and either
+	/// write or roll back — the shape [`Self::set_role_outside_ownership`] uses, for the
+	/// same reason. Read on a separate connection, "is this suspension the owners'?" is a
+	/// TOCTOU window: a proposal executing in between is invisible to it, so the admin's
+	/// button sails past the refusal and then blocks on the row only to lift the verdict
+	/// the consilium had just imposed.
+	async fn reinstate_outside_governance(&self, id: UserId, action: &AdminAction, now: i64) -> Result<Reinstatement, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let mut user = load_for_update(&mut tx, id).await?;
+		if user.suspension().is_some_and(|by| !by.is_reversible_by_one_admin()) {
+			// Nothing was written, so dropping the transaction is the same as committing
+			// it — and a refusal leaves no audit row, because nothing happened to audit.
+			return Ok(Reinstatement::GovernanceHeld);
+		}
+		user.enable();
+		update_row(&mut tx, &user).await?;
+		drain_outbox(&mut tx, &mut user).await?;
+		record_action(&mut tx, id, action, now).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(Reinstatement::Applied(Box::new(user)))
+	}
+
+	/// Let every due hold fall away, each in its own transaction so one bad row cannot
+	/// strand the rest, and return who was released.
+	///
+	/// This one thing does NOT follow the plane's lazy-expiry convention, and the reason
+	/// is the bridge. A governance proposal going stale has no effect outside this
+	/// database, so projecting it as expired at read time is enough. A hold's whole
+	/// purpose is the FROZEN flag the money plane mirrors, and the money plane learns
+	/// about it only from a `user_outbox` row — so a lapse that is merely projected would
+	/// release the account here and leave it frozen there, forever. The release has to be
+	/// a write, which means something has to run.
+	async fn lapse_due_holds(&self, now: i64, limit: i64) -> Result<Vec<UserId>, DomainError> {
+		let due: Vec<Uuid> = sqlx::query("SELECT id FROM users WHERE hold_expires_at IS NOT NULL AND hold_expires_at <= $1 ORDER BY hold_expires_at LIMIT $2")
+			.bind(now)
+			.bind(limit)
+			.fetch_all(&self.pool)
+			.await
+			.map_err(repo_err)?
+			.iter()
+			.map(|row| row.try_get("id"))
+			.collect::<Result<_, _>>()
+			.map_err(repo_err)?;
+
+		let mut lapsed = Vec::new();
+		for raw in due {
+			let id = UserId::from_raw(raw);
+			let mut tx = self.pool.begin().await.map_err(repo_err)?;
+			let mut user = load_for_update(&mut tx, id).await?;
+			// Re-decided under the row lock: the hold may have been ratified, lifted or
+			// renewed between the scan and this read, and the scan's answer is not
+			// authority to release anybody.
+			if !user.lapse_hold(now) {
+				continue;
+			}
+			update_row(&mut tx, &user).await?;
+			drain_outbox(&mut tx, &mut user).await?;
+			record_action(&mut tx, id, &AdminAction::system("hold_lapsed"), now).await?;
+			tx.commit().await.map_err(repo_err)?;
+			lapsed.push(id);
+		}
+		Ok(lapsed)
+	}
+
+	async fn set_kyc_level(&self, id: UserId, level: u32, action: &AdminAction, now: i64) -> Result<User, DomainError> {
 		// The level reaches here straight from a request, so the aggregate's refusal is
 		// the caller's bad input and travels back as `Validation` -> `INVALID_ARGUMENT`.
-		self.mutate(id, |user| user.set_kyc_level(level)).await
+		self.mutate_audited(
+			id,
+			action,
+			now,
+			|user| user.set_kyc_level(level),
+			|user| Some(serde_json::json!({ "kyc_level": user.kyc_level() })),
+		)
+		.await
 	}
 
 	/// One transaction: read the target `FOR UPDATE`, compare from THAT read, and either
@@ -293,7 +494,7 @@ impl UserDirectoryRepository for PgUsers {
 	/// One transaction: read the target `FOR UPDATE`, decide from THAT read, and either
 	/// write or roll back. A refusal returns before the commit, so it leaves nothing —
 	/// not even the row lock, once the transaction drops.
-	async fn set_role_outside_ownership(&self, id: UserId, role: Role) -> Result<RoleChange, DomainError> {
+	async fn set_role_outside_ownership(&self, id: UserId, role: Role, action: &AdminAction, now: i64) -> Result<RoleChange, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let mut user = load_for_update(&mut tx, id).await?;
 		// The PERSISTED role, never an elevated one: emergency access authorizes an
@@ -305,9 +506,18 @@ impl UserDirectoryRepository for PgUsers {
 		if holds_seat && role != Role::Owner {
 			return Ok(RoleChange::WouldTakeOwnership);
 		}
+		// GRANTING admin only. Taking it away stays one act on purpose: de-escalation must
+		// never be the slower path, or the fastest way to contain a rogue operator becomes
+		// a quorum by mail.
+		if role == Role::Admin && user.role() != Role::Admin {
+			return Ok(RoleChange::WouldGrantAdmin);
+		}
 		user.set_role(role);
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
+		let mut action = action.clone();
+		action.detail.get_or_insert_with(|| serde_json::json!({ "role": user.role().as_str() }));
+		record_action(&mut tx, id, &action, now).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(RoleChange::Applied(Box::new(user)))
 	}
@@ -347,7 +557,7 @@ impl UserDirectoryRepository for PgUsers {
 	/// static statement (sqlx 0.9 needs a `&'static str`).
 	async fn list(&self, query: &str, role: &str, status: &str, limit: i64, offset: i64) -> Result<(Vec<AdminUserRow>, i64), DomainError> {
 		let rows = sqlx::query_as::<_, AdminUserRow>(
-			"SELECT id, email, status, kyc_level, role, token_version, \
+			"SELECT id, email, status, kyc_level, role, token_version, suspended_by, hold_expires_at, \
 			 EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at \
 			 FROM users \
 			 WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR id::text ILIKE '%' || $1 || '%') \
@@ -400,7 +610,8 @@ pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(
 		"UPDATE users SET email = $2, email_verified = $3, status = $4, token_version = $5, kyc_level = $6, \
 		legal_name = $7, preferred_name = $8, phone = $9, date_of_birth = $10, nationality = $11, \
 		tax_residence = $12, residential_address = $13, language = $14, base_currency = $15, \
-		timezone = $16, role = $17, row_version = $18, updated_at = now() WHERE id = $1",
+		timezone = $16, role = $17, row_version = $18, suspended_by = $19, hold_expires_at = $20, \
+		updated_at = now() WHERE id = $1",
 	)
 	.bind(user.id().raw())
 	.bind(user.email().as_str())
@@ -420,6 +631,33 @@ pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(
 	.bind(user.timezone())
 	.bind(user.role().as_str())
 	.bind(user.row_version() as i64)
+	.bind(user.suspension().map(Suspension::as_str))
+	// `i64::MAX` is what a hold with no stored deadline rehydrates as (the column is
+	// nullable independently of `suspended_by`). Writing it back as NULL rather than as
+	// the sentinel keeps the round trip stable and keeps the sweep's index useful.
+	.bind(user.suspension().and_then(Suspension::hold_expires_at).filter(|expires| *expires != i64::MAX))
+	.execute(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+	Ok(())
+}
+
+/// Append one operator decision to `admin_action` on the OPEN transaction, so the row and
+/// the mutation it describes commit together or not at all.
+pub(crate) async fn record_action(conn: &mut PgConnection, subject: UserId, action: &AdminAction, now: i64) -> Result<(), DomainError> {
+	sqlx::query(
+		"INSERT INTO admin_action (subject_user_id, actor_user_id, action, proposal_id, reason, detail, occurred_at, client_ip, user_agent) \
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+	)
+	.bind(subject.raw())
+	.bind(action.actor.map(|a| a.raw()))
+	.bind(action.action)
+	.bind(action.proposal_id)
+	.bind(&action.reason)
+	.bind(action.detail.as_ref())
+	.bind(now)
+	.bind(action.client_ip.chars().take(64).collect::<String>())
+	.bind(action.user_agent.chars().take(256).collect::<String>())
 	.execute(&mut *conn)
 	.await
 	.map_err(repo_err)?;

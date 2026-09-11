@@ -74,9 +74,44 @@ service GovernanceService {
   rpc GetOwnerAdmission(GetOwnerAdmissionRequest) returns (OwnerAdmission);
   rpc ListOwnerAdmissions(ListOwnerAdmissionsRequest) returns (OwnerAdmissionList);
 
+  // Propose PERMANENTLY suspending a user (Owner only). The half of the old
+  // DisableUser verb that is not an emergency: UserDirectory.HoldUser freezes the
+  // account now and lapses in 24h, and this is what makes it stay.
+  //
+  // A reason is required. It is what the other owners are voting on, and a decision to
+  // freeze somebody's account with no stated cause cannot be reviewed afterwards.
+  rpc OpenUserSuspension(OpenUserSuspensionRequest) returns (UserProposal);
+
+  // Propose lifting a suspension THE OWNERS imposed (Owner only). It exists because
+  // UserDirectory.ReinstateUser refuses those: without this RPC the consilium's verdict
+  // would be either permanent or reversible by any one admin, and both are wrong.
+  //
+  // A hold needs nothing from here — ReinstateUser lifts one in a single act.
+  rpc OpenUserReinstatement(OpenUserReinstatementRequest) returns (UserProposal);
+
+  // Propose granting Role::Admin (Owner only). UserDirectory.SetRole refuses that role
+  // in the granting direction and names this, for the same reason it already refuses
+  // `owner`: an operator who can appoint operators can appoint accomplices, and the
+  // admin seat carries every identity mutation except role granting.
+  //
+  // Taking the role away is NOT here and stays one act on purpose — containing a rogue
+  // operator must never be the slower path.
+  rpc OpenAdminAdmission(OpenAdminAdmissionRequest) returns (UserProposal);
+
+  // Withdraw a user proposal the caller opened, while it is still OPEN.
+  rpc CancelUserProposal(CancelUserProposalRequest) returns (UserProposal);
+
+  // An owner's vote on a user proposal. Unlike the OWNER consilia this passes on a
+  // MAJORITY of the snapshotted voters rather than unanimity — see UserProposal.
+  rpc SubmitUserProposalVote(SubmitUserProposalVoteRequest) returns (UserProposal);
+
+  rpc GetUserProposal(GetUserProposalRequest) returns (UserProposal);
+  rpc ListUserProposals(ListUserProposalsRequest) returns (UserProposalList);
+
   // The live consilium feed (Owner only). Emits a tick whenever the governance
-  // revision moves, plus a periodic heartbeat. ONE revision covers both removals and
-  // admissions, so a single subscription follows the whole ownership surface.
+  // revision moves, plus a periodic heartbeat. ONE revision covers removals,
+  // admissions and user proposals alike, so a single subscription follows the whole
+  // governance surface.
   //
   // A tick carries a REVISION, never a tally: the client refetches the authoritative
   // snapshot when it moves, so a stale or replayed frame can never render a wrong
@@ -277,6 +312,139 @@ message GetOwnerAdmissionRequest {
 message ListOwnerAdmissionsRequest {
   // 0 means the server default. Includes closed proposals — nothing is deleted.
   uint32 limit = 1;
+}
+
+// What a UserProposal decides. Three kinds share one message because all three are the
+// same question — "do the owners agree to change this person's standing?" — differing
+// only in what the verdict writes.
+enum UserProposalKind {
+  USER_PROPOSAL_KIND_UNSPECIFIED = 0;
+  // Freeze the subject until the owners say otherwise.
+  USER_PROPOSAL_KIND_SUSPENSION = 1;
+  // Lift a suspension the owners themselves imposed.
+  USER_PROPOSAL_KIND_REINSTATEMENT = 2;
+  // Grant Role::Admin.
+  USER_PROPOSAL_KIND_ADMIN_ADMISSION = 3;
+}
+
+// The six states, again as their own enum: proto enum VALUES share one namespace per
+// package, so the identical states have to be spelled three times even though the
+// domain models them with one type.
+enum UserProposalState {
+  USER_PROPOSAL_STATE_UNSPECIFIED = 0;
+  USER_PROPOSAL_STATE_OPEN = 1;
+  // The threshold was met and the effect has already been applied.
+  USER_PROPOSAL_STATE_EXECUTED = 2;
+  // Enough owners voted AGAINST that the threshold can no longer be reached.
+  USER_PROPOSAL_STATE_REJECTED = 3;
+  USER_PROPOSAL_STATE_EXPIRED = 4;
+  USER_PROPOSAL_STATE_CANCELLED = 5;
+  // Passed, but the effect could not be applied — the initiator had lost their seat,
+  // the owners who carried it had lost theirs, or the subject's standing had already
+  // moved (they hold an owner seat, they are already an admin, the suspension being
+  // lifted is no longer the owners').
+  USER_PROPOSAL_STATE_VOID = 6;
+}
+
+// Deliberately NEUTRAL verbs, where the owner consilia use remove/keep and
+// admit/reject. Three kinds share this vote, so a kind-specific verb would only mean
+// something read against UserProposal.kind — and a vocabulary that is correct only when
+// cross-referenced is one that eventually gets rendered wrong. The kind-specific verb
+// belongs on the SURFACE, which knows the kind; this is which way the voter pushed.
+enum ProposalVote {
+  PROPOSAL_VOTE_UNSPECIFIED = 0;
+  PROPOSAL_VOTE_PENDING = 1;
+  // Carry the proposal.
+  PROPOSAL_VOTE_FOR = 2;
+  // Block it.
+  PROPOSAL_VOTE_AGAINST = 3;
+}
+
+message UserProposalPeer {
+  string user_id = 1;
+  string email = 2;
+  ProposalVote vote = 3;
+  int64 voted_at = 4;
+}
+
+// The owners' verdict over one PERSON's standing.
+//
+// It passes on a MAJORITY of the snapshotted voters, not the unanimity the OWNER
+// consilia demand, and the difference is deliberate. Unanimity guards the owner roster
+// because a minority able to add owners by majority grows itself into a majority.
+// Neither thing decided here has that property: `admin` cannot vote in any consilium
+// and cannot be granted `owner`, and a suspension is defensive and reversible by the
+// same body. Against that, unanimity here would COST safety — a hold lapses in 24h, so
+// ratifying one races a clock, and under unanimity one unreachable owner does not delay
+// the verdict, they decide it by releasing a compromised account at the deadline.
+//
+// What is preserved is the property that matters: the initiator is excluded from the
+// voter set and the threshold is at least one, so no single actor ever acts alone.
+message UserProposal {
+  string id = 1;
+  UserProposalKind kind = 2;
+  UserProposalState state = 3;
+  // Any user — NOT necessarily an owner. That is the difference from OwnerAdmission,
+  // and the reason none of its roster checks have an analogue here.
+  string subject_user_id = 4;
+  string subject_email = 5;
+  string initiator_user_id = 6;
+  string initiator_email = 7;
+  // Why, in the initiator's words. Required, and shown to every voter.
+  string reason = 8;
+  // Every owner except the initiator, with their answers. Never empty: a proposal with
+  // nobody to agree is refused at open rather than left open and unpassable.
+  repeated UserProposalPeer peers = 9;
+  // Owners at open. The initiator is counted but does not vote.
+  uint32 owner_count = 10;
+  // How many of `peers` must vote FOR, frozen at open — so a surface shows the bar this
+  // proposal is actually measured against, not one re-derived from a roster that moved.
+  uint32 threshold = 11;
+  int64 created_at = 12;
+  int64 expires_at = 13;
+  int64 decided_at = 14;
+  string void_reason = 15;
+  uint64 version = 16;
+}
+
+message UserProposalList {
+  repeated UserProposal items = 1;
+}
+
+message OpenUserSuspensionRequest {
+  string user_id = 1;
+  // REQUIRED — it is what the other owners are voting on.
+  string reason = 2;
+}
+
+message OpenUserReinstatementRequest {
+  string user_id = 1;
+  string reason = 2;
+}
+
+message OpenAdminAdmissionRequest {
+  string user_id = 1;
+  string reason = 2;
+}
+
+message CancelUserProposalRequest {
+  string proposal_id = 1;
+}
+
+message SubmitUserProposalVoteRequest {
+  string proposal_id = 1;
+  ProposalVote vote = 2;
+}
+
+message GetUserProposalRequest {
+  string proposal_id = 1;
+}
+
+message ListUserProposalsRequest {
+  // 0 means the server default. Includes closed proposals — nothing is deleted.
+  uint32 limit = 1;
+  // UNSPECIFIED lists every kind.
+  UserProposalKind kind = 2;
 }
 
 message ListOwnersRequest {}

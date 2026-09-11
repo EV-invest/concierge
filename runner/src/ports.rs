@@ -24,7 +24,7 @@ use domain::{
 	architecture::{Reader, Repository},
 	authz::Role,
 	error::DomainError,
-	governance::{AdmissionId, AdmissionVote, RemovalId, Vote},
+	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	users::{AuthSubject, Email, ProfileFields, User, UserId},
 };
 use uuid::Uuid;
@@ -32,10 +32,10 @@ use uuid::Uuid;
 use crate::{
 	genesis::{GenesisOutcome, GenesisSubject},
 	infrastructure::{
-		governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision},
+		governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision, UserProposalRecord},
 		notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
 		platform::{FeatureFlagRow, PlatformConfigRow},
-		users::{AdminUserRow, AuthzRecord},
+		users::{AdminAction, AdminUserRow, AuthzRecord, Reinstatement},
 	},
 };
 
@@ -51,6 +51,9 @@ pub enum RoleChange {
 	WouldGrantOwnership,
 	/// The target holds a seat and something other than `Owner` was asked for.
 	WouldTakeOwnership,
+	/// `Admin` was asked for and the target does not hold it. Granting it goes through
+	/// the owners; taking it away deliberately does not.
+	WouldGrantAdmin,
 }
 
 /// What [`UserDirectoryRepository::raise_kyc_level_to`] did.
@@ -83,14 +86,50 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// Full-replace the caller's editable profile fields.
 	async fn update_profile(&self, id: UserId, fields: ProfileFields) -> Result<User, DomainError>;
 
-	/// Bump the user's authoritative `token_version` ("revoke all"); emits SESSIONS_REVOKED.
-	async fn revoke_tokens(&self, id: UserId) -> Result<User, DomainError>;
+	/// Bump the user's authoritative `token_version` ("revoke all"); emits
+	/// SESSIONS_REVOKED and one `admin_action` row in the same transaction.
+	async fn revoke_tokens(&self, id: UserId, action: &AdminAction, now: i64) -> Result<User, DomainError>;
 
-	/// Disable a user (freeze sign-in/refresh); emits SUSPENDED.
+	/// Disable a user UNQUALIFIED (freeze sign-in/refresh); emits SUSPENDED.
+	///
+	/// ⚠️ Records no [`domain::users::Suspension`] and no audit row, so the account reads
+	/// as one an admin may lift and one that never lapses. It is the raw brake the
+	/// fixtures and the provisioner sit on — a request-driven path calls [`Self::hold_user`]
+	/// or opens a suspension proposal, exactly as a role write must go through
+	/// [`Self::set_role_outside_ownership`] rather than [`Self::set_role`].
 	async fn disable_user(&self, id: UserId) -> Result<User, DomainError>;
 
-	/// Re-enable a disabled user; emits REINSTATED.
+	/// One operator's emergency brake: freeze now, lapse in
+	/// [`domain::users::HOLD_TTL_SECS`] unless the owners ratify it. Emits SUSPENDED and
+	/// one audit row.
+	///
+	/// This is the reason suspension could not simply become a quorum. The frozen flag is
+	/// re-read by the money plane when it dispatches, so a hold stops a withdrawal that is
+	/// already queued within a sweep; a quorum by mail takes hours, and a broadcast made
+	/// in those hours cannot be undone. Refused over a suspension the owners imposed —
+	/// the weaker measure must not be able to restate the stronger one and inherit its
+	/// own expiry clock.
+	async fn hold_user(&self, id: UserId, action: &AdminAction, now: i64) -> Result<User, DomainError>;
+
+	/// Re-enable a disabled user UNQUALIFIED; emits REINSTATED. The raw writer beneath
+	/// [`Self::reinstate_outside_governance`].
 	async fn enable_user(&self, id: UserId) -> Result<User, DomainError>;
+
+	/// Re-enable a user, refusing to lift what the OWNERS imposed, with the decision taken
+	/// inside the write transaction from the target row held `FOR UPDATE`.
+	///
+	/// Without the refusal the whole suspension consilium is advisory: the owners vote to
+	/// freeze an account and any one admin presses "reinstate". The atomicity is the same
+	/// point [`Self::set_role_outside_ownership`] makes — a proposal executing between a
+	/// separate read and this write would be invisible to the check.
+	async fn reinstate_outside_governance(&self, id: UserId, action: &AdminAction, now: i64) -> Result<Reinstatement, DomainError>;
+
+	/// Release every hold whose deadline has passed, emitting REINSTATED for each so the
+	/// money plane unfreezes too. Returns whom it released; `limit` bounds one pass.
+	///
+	/// The one place this plane sweeps rather than expiring lazily — see the
+	/// implementation for why the bridge leaves no choice.
+	async fn lapse_due_holds(&self, now: i64, limit: i64) -> Result<Vec<UserId>, DomainError>;
 
 	/// Set a user's KYC level; emits KYC_CHANGED.
 	///
@@ -103,7 +142,7 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// `Permission::KycManage` and the identity provider's webhook ([`KycProvider`])
 	/// both land here, so the event, the `user_outbox` row and the money plane's mirror
 	/// come out identical — and banking never learns that a KYC vendor exists.
-	async fn set_kyc_level(&self, id: UserId, level: u32) -> Result<User, DomainError>;
+	async fn set_kyc_level(&self, id: UserId, level: u32, action: &AdminAction, now: i64) -> Result<User, DomainError>;
 
 	/// RAISE a user's KYC level to `target`, with the "is this actually a raise?"
 	/// comparison taken inside the write transaction from the row held `FOR UPDATE`.
@@ -146,10 +185,16 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// the seat it had just granted, with no consilium, no floor check and no audit row.
 	/// Holding the row across the decision makes the two paths serialize instead.
 	///
+	/// `Admin` is refused in the GRANTING direction too, and named to the caller. An
+	/// operator who can appoint operators can appoint accomplices, and the seat carries
+	/// every identity mutation except role granting — suspending accounts, moving KYC
+	/// levels, revoking anyone's sessions. Taking the role AWAY stays one act by design:
+	/// containing a rogue operator must never be the slower path.
+	///
 	/// Taking only the target's row cannot deadlock against the consilium: that path
 	/// acquires the governance revision row, then the owner rows, then the target's, then
 	/// the outbox advisory lock — this one acquires a suffix of the same order.
-	async fn set_role_outside_ownership(&self, id: UserId, role: Role) -> Result<RoleChange, DomainError>;
+	async fn set_role_outside_ownership(&self, id: UserId, role: Role, action: &AdminAction, now: i64) -> Result<RoleChange, DomainError>;
 
 	/// The role + status + authoritative `token_version` the authz gates decide on.
 	/// `None` when the user does not exist.
@@ -603,6 +648,24 @@ pub trait GovernanceRepository: Send + Sync {
 	async fn admission_vote(&self, id: AdmissionId, voter: UserId, vote: AdmissionVote, now: i64, audit: &Audit) -> Result<AdmissionRecord, DomainError>;
 
 	async fn cancel_admission(&self, id: AdmissionId, by: UserId, now: i64) -> Result<AdmissionRecord, DomainError>;
+
+	/// Snapshot the voter set and open a proposal over one PERSON's standing — a permanent
+	/// suspension, a reinstatement from one, or the `admin` seat. No token and no mail:
+	/// every voter is a signed-in owner, and the subject has no say.
+	async fn open_user_proposal(&self, kind: UserProposalKind, subject: UserId, initiator: UserId, reason: &str, now: i64) -> Result<UserProposalRecord, DomainError>;
+
+	async fn find_user_proposal(&self, id: UserProposalId, now: i64) -> Result<Option<UserProposalRecord>, DomainError>;
+
+	/// Every proposal, newest first, optionally narrowed to one kind. Nothing is filtered
+	/// out: a rejected, expired or void one stays readable.
+	async fn list_user_proposals(&self, kind: Option<UserProposalKind>, limit: i64, now: i64) -> Result<Vec<UserProposalRecord>, DomainError>;
+
+	/// Record one owner's answer and, if the threshold is met, APPLY the verdict — the
+	/// status or role write, its cross-plane event and the audit row, all in this
+	/// transaction.
+	async fn user_proposal_vote(&self, id: UserProposalId, voter: UserId, vote: ProposalVote, now: i64, audit: &Audit) -> Result<UserProposalRecord, DomainError>;
+
+	async fn cancel_user_proposal(&self, id: UserProposalId, by: UserId, now: i64) -> Result<UserProposalRecord, DomainError>;
 
 	/// The redacted invitation behind an emailed token. STRICTLY read-only.
 	async fn invitation(&self, token: &str, now: i64) -> Result<Option<InvitationRecord>, DomainError>;

@@ -41,12 +41,13 @@ use std::sync::Arc;
 use domain::{
 	authz::{Permission, Role},
 	error::DomainError,
-	users::{AuthSubject, Email, MAX_KYC_LEVEL, ProfileFields, User, UserId, UserStatus},
+	governance::MAX_REASON_CHARS,
+	users::{AuthSubject, Email, MAX_KYC_LEVEL, ProfileFields, Suspension, User, UserId, UserStatus},
 };
 use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser};
 use evconcierge_contracts::concierge::v1::{
-	AdminUserSummary, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse,
-	RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
+	AdminUserSummary, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, HoldUserRequest, HoldUserResponse, ListUsersRequest, ListUsersResponse, ReinstateUserRequest,
+	ReinstateUserResponse, RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
 	user_directory_server::UserDirectory,
 };
 use tokio::sync::mpsc;
@@ -55,7 +56,9 @@ use uuid::Uuid;
 
 use crate::{
 	authz::{BreakGlass, EffectiveRole, Elevation},
-	infrastructure::users::AdminUserRow,
+	governance::audit_of,
+	infrastructure::users::{AdminAction, AdminUserRow, Reinstatement},
+	notification::now_secs,
 	ports::{RoleChange, UserDirectoryRepository},
 	support::domain_to_status,
 };
@@ -97,6 +100,18 @@ impl Directory {
 	async fn elevation(&self) -> Elevation<'_> {
 		self.break_glass.snapshot(self.users.as_ref()).await
 	}
+
+	/// WHO is acting, for the audit row — resolved from the verified `sub` after the
+	/// permission gate has already passed.
+	///
+	/// An audit log whose actor column can be empty for an ordinary console action is a
+	/// log that answers "who did this" with a shrug, so a caller whose `sub` is not a user
+	/// id is refused rather than recorded as nobody. Emergency access does not change
+	/// this: a break-glass operator has a real user id and it is theirs that belongs here.
+	async fn acting_operator<T>(&self, request: &Request<T>) -> Result<UserId, Status> {
+		let caller = crate::authz::caller_gate(self.users.as_ref(), request).await?;
+		caller.id.ok_or_else(|| Status::unauthenticated("subject is not a user id"))
+	}
 }
 
 /// Drain provisioning requests from the auth task until the channel closes — the
@@ -127,6 +142,19 @@ fn parse_target_id(raw: &str) -> Result<UserId, Status> {
 
 fn optional(raw: &str) -> Option<String> {
 	if raw.is_empty() { None } else { Some(raw.to_owned()) }
+}
+
+/// A reason the caller MUST give, bounded by the same limit the consilium's is.
+///
+/// Required where the action stops somebody's money: the owners asked to ratify a hold
+/// are reading this sentence, and a freeze with no stated cause cannot be reviewed
+/// afterwards by anyone, including the operator who made it.
+fn require_reason(raw: &str) -> Result<String, Status> {
+	let reason = raw.trim();
+	if reason.is_empty() || reason.chars().count() > MAX_REASON_CHARS {
+		return Err(Status::invalid_argument(format!("reason must be 1-{MAX_REASON_CHARS} characters")));
+	}
+	Ok(reason.to_owned())
 }
 
 #[tonic::async_trait]
@@ -161,29 +189,85 @@ impl UserDirectory for Directory {
 
 	async fn revoke_tokens(&self, request: Request<RevokeTokensRequest>) -> Result<Response<RevokeTokensResponse>, Status> {
 		require_permission(self, &request, Permission::UserRevoke).await?;
-		let target = parse_target_id(&request.get_ref().user_id)?;
-		let user = self.users.revoke_tokens(target).await.map_err(domain_to_status)?;
+		let actor = self.acting_operator(&request).await?;
+		let audit = audit_of(&request);
+		let req = request.into_inner();
+		let target = parse_target_id(&req.user_id)?;
+		let action = AdminAction::by(actor, "tokens_revoked", &audit).with_reason(&req.reason);
+		let user = self.users.revoke_tokens(target, &action, now_secs()).await.map_err(domain_to_status)?;
 		Ok(Response::new(RevokeTokensResponse {
 			token_version: user.token_version(),
 		}))
 	}
 
+	/// REFUSES, always, naming the two verbs this one used to be at once.
+	///
+	/// It was the emergency brake — the frozen flag the money plane re-reads when it
+	/// dispatches, so it stops a withdrawal that is already queued — and it was also a
+	/// permanent judgement on an account, made by one person, recorded nowhere. Those want
+	/// opposite treatments. The brake must stay instant, so it survives as
+	/// [`Self::hold_user`] with a deadline attached; the judgement must not be one
+	/// person's to make, so it survives as a proposal. There is no correct thing for this
+	/// RPC to guess, so it asks.
 	async fn disable_user(&self, request: Request<DisableUserRequest>) -> Result<Response<DisableUserResponse>, Status> {
+		// Still gated, so the refusal never becomes a way for an unauthorized caller to
+		// probe which user ids exist.
 		require_permission(self, &request, Permission::UserSuspend).await?;
-		let target = parse_target_id(&request.get_ref().user_id)?;
-		self.users.disable_user(target).await.map_err(domain_to_status)?;
-		Ok(Response::new(DisableUserResponse {}))
+		Err(Status::failed_precondition(
+			"DisableUser is retired because it meant two different things: use UserDirectory.HoldUser to freeze \
+			 this account now (it lapses in 24h unless ratified), or GovernanceService.OpenUserSuspension to \
+			 make it permanent, which every other owner votes on",
+		))
 	}
 
+	/// The emergency brake, and the reason suspension could not simply become a quorum.
+	///
+	/// A hold is instant and one operator's to reach for, because the thing it stops —
+	/// money already in the queue — cannot wait for a quorum by mail, and a broadcast made
+	/// while the owners were deciding is irreversible. What makes that safe to hand to one
+	/// person is that it undoes itself: the hold lapses in
+	/// [`domain::users::HOLD_TTL_SECS`] unless the owners ratify it, so one actor can stop
+	/// money temporarily and never permanently.
+	async fn hold_user(&self, request: Request<HoldUserRequest>) -> Result<Response<HoldUserResponse>, Status> {
+		require_permission(self, &request, Permission::UserSuspend).await?;
+		let actor = self.acting_operator(&request).await?;
+		let audit = audit_of(&request);
+		let req = request.into_inner();
+		let target = parse_target_id(&req.user_id)?;
+		let reason = require_reason(&req.reason)?;
+		let action = AdminAction::by(actor, "held", &audit).with_reason(&reason);
+		let user = self.users.hold_user(target, &action, now_secs()).await.map_err(domain_to_status)?;
+		Ok(Response::new(HoldUserResponse {
+			hold_expires_at: user.suspension().and_then(Suspension::hold_expires_at).unwrap_or_default(),
+		}))
+	}
+
+	/// One act for a hold, refused for the owners' verdict.
+	///
+	/// Without the second half the suspension consilium would be decorative: the owners
+	/// vote to freeze an account and any one admin presses this button. The decision is
+	/// taken inside the write transaction, not here, for the same TOCTOU reason
+	/// [`Self::set_role`] takes its own there.
 	async fn reinstate_user(&self, request: Request<ReinstateUserRequest>) -> Result<Response<ReinstateUserResponse>, Status> {
 		require_permission(self, &request, Permission::UserSuspend).await?;
-		let target = parse_target_id(&request.get_ref().user_id)?;
-		self.users.enable_user(target).await.map_err(domain_to_status)?;
-		Ok(Response::new(ReinstateUserResponse {}))
+		let actor = self.acting_operator(&request).await?;
+		let audit = audit_of(&request);
+		let req = request.into_inner();
+		let target = parse_target_id(&req.user_id)?;
+		let action = AdminAction::by(actor, "reinstated", &audit).with_reason(&req.reason);
+		match self.users.reinstate_outside_governance(target, &action, now_secs()).await.map_err(domain_to_status)? {
+			Reinstatement::Applied(_) => Ok(Response::new(ReinstateUserResponse {})),
+			Reinstatement::GovernanceHeld => Err(Status::failed_precondition(
+				"this suspension is the owner consilium's verdict; lifting it goes through \
+				 GovernanceService.OpenUserReinstatement, which the other owners vote on",
+			)),
+		}
 	}
 
 	async fn set_kyc_level(&self, request: Request<SetKycLevelRequest>) -> Result<Response<SetKycLevelResponse>, Status> {
 		require_permission(self, &request, Permission::KycManage).await?;
+		let actor = self.acting_operator(&request).await?;
+		let audit = audit_of(&request);
 		let req = request.into_inner();
 		let target = parse_target_id(&req.user_id)?;
 		// The aggregate and the `users_kyc_level_range` CHECK both refuse this too — the
@@ -192,7 +276,8 @@ impl UserDirectory for Directory {
 		if req.kyc_level > MAX_KYC_LEVEL {
 			return Err(Status::invalid_argument(format!("kyc_level must be between 0 and {MAX_KYC_LEVEL}")));
 		}
-		let user = self.users.set_kyc_level(target, req.kyc_level).await.map_err(domain_to_status)?;
+		let action = AdminAction::by(actor, "kyc_level_set", &audit).with_reason(&req.reason);
+		let user = self.users.set_kyc_level(target, req.kyc_level, &action, now_secs()).await.map_err(domain_to_status)?;
 		Ok(Response::new(SetKycLevelResponse { kyc_level: user.kyc_level() }))
 	}
 
@@ -267,10 +352,13 @@ impl UserDirectory for Directory {
 	/// writers of `owner`" invariant briefly false.
 	async fn set_role(&self, request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
 		require_permission(self, &request, Permission::RoleGrant).await?;
+		let actor = self.acting_operator(&request).await?;
+		let audit = audit_of(&request);
 		let req = request.into_inner();
 		let target = parse_target_id(&req.user_id)?;
 		let role = Role::parse(&req.role).map_err(domain_to_status)?;
-		match self.users.set_role_outside_ownership(target, role).await.map_err(domain_to_status)? {
+		let action = AdminAction::by(actor, "role_set", &audit).with_reason(&req.reason);
+		match self.users.set_role_outside_ownership(target, role, &action, now_secs()).await.map_err(domain_to_status)? {
 			RoleChange::Applied(user) => Ok(Response::new(SetRoleResponse {
 				role: user.role().as_str().to_owned(),
 			})),
@@ -279,6 +367,10 @@ impl UserDirectory for Directory {
 			)),
 			RoleChange::WouldTakeOwnership => Err(Status::failed_precondition(
 				"taking ownership away goes through GovernanceService.OpenOwnerRemoval, or ResignOwnership for your own seat",
+			)),
+			RoleChange::WouldGrantAdmin => Err(Status::failed_precondition(
+				"granting the admin role goes through GovernanceService.OpenAdminAdmission, which the other owners vote on — \
+				 an operator who can appoint operators can appoint accomplices. Taking the role away is still one act",
 			)),
 		}
 	}
@@ -304,6 +396,8 @@ fn user_to_proto(user: &User, resolved: EffectiveRole) -> UserProfile {
 		kyc_level: user.kyc_level(),
 		role: resolved.role.as_str().to_owned(),
 		role_is_break_glass: resolved.break_glass,
+		suspended_by: user.suspension().map(Suspension::as_str).unwrap_or_default().to_owned(),
+		hold_expires_at: user.suspension().and_then(Suspension::hold_expires_at).unwrap_or_default(),
 	}
 }
 
@@ -319,6 +413,8 @@ fn summary_to_proto(row: AdminUserRow, role: String, role_is_break_glass: bool) 
 		token_version: row.token_version as u64,
 		created_at: row.created_at,
 		role_is_break_glass,
+		suspended_by: row.suspended_by.unwrap_or_default(),
+		hold_expires_at: row.hold_expires_at.unwrap_or_default(),
 	}
 }
 
@@ -339,7 +435,15 @@ async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand, 
 		}
 		ProvisionCommand::RevokeAll { user_id } => {
 			let id = parse_id(&user_id)?;
-			users.revoke_tokens(id).await.map_err(to_auth)?
+			// The user acting on themselves ("sign out everywhere"), not an operator —
+			// recorded with its own verb so the log never reads as though somebody's
+			// sessions had been revoked FOR them.
+			let action = AdminAction {
+				actor: Some(id),
+				action: "tokens_revoked_by_self",
+				..AdminAction::default()
+			};
+			users.revoke_tokens(id, &action, now_secs()).await.map_err(to_auth)?
 		}
 	};
 	let resolved = break_glass.snapshot(users).await.role_of(user.role(), &user.id().to_string());

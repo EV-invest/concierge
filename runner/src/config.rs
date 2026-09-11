@@ -77,6 +77,12 @@ ev::settings! {
 		notification_daily_email_budget: i64 = "1500",
 		/// How often the dispatcher looks for due mail.
 		notification_dispatch_interval_secs: u64 = "15",
+		/// How often the sweep looks for holds whose 24h is up.
+		///
+		/// A minute, because the cost of being late is bounded and small — a user stays
+		/// locked out a little past the deadline — while polling harder buys nothing: the
+		/// deadline is a day away and the query is one index scan.
+		hold_sweep_interval_secs: u64 = "60",
 		/// Account-less subscribe attempts allowed per client IP per window.
 		subscribe_rate_limit: u32 = "5",
 		subscribe_rate_window_secs: u64 = "3600",
