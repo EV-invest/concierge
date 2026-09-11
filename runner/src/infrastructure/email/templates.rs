@@ -205,11 +205,109 @@ pub fn payout_outcome(consilium_id: &str, outcome: &str, network: &str, address:
 	}
 }
 
+/// The money plane asking ONE user to consent to a payment that moves their own money.
+///
+/// Unlike the payout mails this sits beside, the reader holds no seat and is being asked
+/// about their OWN balance — so the copy names the two ends of the transfer in words they
+/// recognise, and `reason` (what the operator typed) is set apart under its own label
+/// rather than woven into our sentences. Someone deciding whether to release their money
+/// has to be able to tell which words are the platform's and which are the requester's.
+#[allow(clippy::too_many_arguments)]
+pub fn payment_consent(
+	payment_id: &str,
+	initiator_email: &str,
+	tier: &str,
+	source: &str,
+	destination: &str,
+	amount: &str,
+	reason: &str,
+	payload_hash: &str,
+	expires_at: i64,
+	approval_url: &str,
+	code: &str,
+) -> RenderedEmail {
+	// Folded BEFORE either part is built: the HTML escaper would render a stray newline
+	// harmlessly, the text assembler below would not. See `one_line`.
+	let (payment_id, initiator_email, tier) = (one_line(payment_id), one_line(initiator_email), one_line(tier));
+	let (source, destination, amount) = (one_line(source), one_line(destination), one_line(amount));
+	let (reason, payload_hash, code) = (one_line(reason), one_line(payload_hash), one_line(code));
+
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Payments"));
+	inner.push_str(&heading("A payment needs your consent"));
+	inner.push_str(&paragraph(&format!(
+		"{initiator_email} has opened a payment that moves money in your account. It does not execute unless you consent to it here."
+	)));
+	inner.push_str(&detail_box(&[
+		("Amount", amount.clone()),
+		("From", source.clone()),
+		("To", destination.clone()),
+		("Type", tier.clone()),
+		("Requested by", initiator_email.clone()),
+		("Expires", fmt_ts(expires_at)),
+		("Payment", payment_id.clone()),
+	]));
+	inner.push_str(&exact_value("Payload hash", &hash_prefix(&payload_hash)));
+	inner.push_str(&initiator_note(&reason));
+	inner.push_str(&button("Review and consent", approval_url));
+	inner.push_str(&code_panel(&code));
+	inner.push_str(&paragraph(
+		"Opening the link alone consents to nothing. If you did not expect this payment, do not enter the code — ignoring this message leaves the payment unapproved.",
+	));
+
+	RenderedEmail {
+		// The stated reason is NEVER in the subject line. It is the one field an operator
+		// writes freely, and a subject line is the part that gets quoted, previewed on a
+		// lock screen and forwarded — always stripped of the label that says whose words
+		// these are.
+		subject: format!("Consent needed for a payment of {amount}"),
+		html: shell("A payment needs your consent", &card(&inner), FOOTER_CONSENT, "", "Payments"),
+		text: format!(
+			"A payment needs your consent\n\n{initiator_email} has opened a payment that moves money in your account.\n\nAmount: {amount}\nFrom: {source}\nTo: {destination}\nType: {tier}\nPayload hash: {}\nExpires: {}\nPayment: {payment_id}\n\n{INITIATOR_NOTE_LABEL}\n  {reason}\n\nReview and consent: {approval_url}\n\nYour code: {code}\n\nOpening the link alone consents to nothing. If you did not expect this payment, do not enter the code — ignoring this message leaves the payment unapproved.\n\n—\n{FOOTER_CONSENT}\n",
+			hash_prefix(&payload_hash),
+			fmt_ts(expires_at)
+		),
+	}
+}
+
 // ── building blocks ────────────────────────────────────────────────────────
 
 /// Why a governance mail has no unsubscribe link, said out loud.
 const FOOTER_SECURITY: &str =
 	"You are receiving this because you hold an owner seat. Security mail cannot be switched off — if it could, muting it would be the first thing an attacker did.";
+
+/// The same, for the one governance mail whose reader holds no seat.
+const FOOTER_CONSENT: &str =
+	"You are receiving this because this payment moves money in your own account. Security mail cannot be switched off — if it could, muting it would be the first thing an attacker did.";
+
+/// Says whose words follow. Carried by BOTH parts of the mail, so the HTML label and the
+/// text label cannot drift apart.
+const INITIATOR_NOTE_LABEL: &str = "Text entered by the requester (not written by EV Investment)";
+
+/// Collapse anything that could break a line into a space.
+///
+/// The HTML part escapes, so markup is already accounted for. The TEXT part does not: it
+/// is a `Label: value` block assembled by `format!`, and a newline inside a value forges
+/// a line of that block — `Amount:` and `To:` being precisely the lines a payment mail
+/// exists to state. The relay refuses control characters before a row is queued; this is
+/// the same rule standing where the forgery would actually happen, so a row that reached
+/// the queue by some other route still cannot do it.
+fn one_line(value: &str) -> String {
+	value.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// Free text somebody else wrote, shown verbatim and marked as theirs.
+///
+/// Set apart rather than folded into a sentence of ours: it is the one field an operator
+/// types freely, and a reader who cannot tell it from the platform's own copy is a reader
+/// who can be told anything ("EV Investment has verified this recipient") in our voice.
+fn initiator_note(text: &str) -> String {
+	format!(
+		r#"<p style="margin:0 0 4px;font-family:{SANS};font-size:11px;line-height:15px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:{MUTED};">{}</p><p style="margin:0 0 14px;padding:12px 14px;background:{BLACK};border-left:3px solid {HAIR};border-radius:0 8px 8px 0;font-family:{SANS};font-size:14px;line-height:22px;color:{MIST};">{}</p>"#,
+		esc(INITIATOR_NOTE_LABEL),
+		esc(text)
+	)
+}
 
 /// A value that must be read EXACTLY: rendered in full, monospace, and allowed to wrap
 /// rather than truncate. A `0x1234…abcd` in an approval mail is an invitation to
@@ -464,6 +562,69 @@ mod tests {
 			!mail.html.contains("NAV") && !mail.html.contains("distribution"),
 			"nothing substantive may reach an address before it has confirmed"
 		);
+	}
+
+	/// One helper, so every assertion below reads the same mail.
+	fn consent(reason: &str) -> RenderedEmail {
+		payment_consent(
+			"pay-7",
+			"ops@evinvest.ltd",
+			"external",
+			"Quy Nhon Fund — distributions",
+			"Your bank account ••4417",
+			"1 200.00 USDT",
+			reason,
+			"9f2c1ab4de5607891122334455667788",
+			1_785_143_640,
+			"https://evinvest.ltd/cabinet/payment-consent/tok",
+			"483012",
+		)
+	}
+
+	/// `reason` is the one field an operator writes freely and the subject reads verbatim.
+	/// In HTML it goes through the escaper, and it is set apart as the requester's words —
+	/// a reader who cannot tell those from ours can be told anything in our voice.
+	#[test]
+	fn a_stated_reason_is_escaped_and_attributed() {
+		let mail = consent(r#"<img src=x onerror="alert(1)"> & "quoted""#);
+		assert!(!mail.html.contains("<img"), "markup from the money plane must never reach a mailbox as markup");
+		assert!(mail.html.contains("&lt;img src=x onerror=&quot;alert(1)&quot;&gt; &amp; &quot;quoted&quot;"));
+		assert!(mail.html.contains(INITIATOR_NOTE_LABEL), "the reason carries a label saying whose words it is");
+		assert!(mail.text.contains(INITIATOR_NOTE_LABEL), "and so does the text part, which has no styling to lean on");
+	}
+
+	/// A subject line is the part that gets previewed on a lock screen, quoted and
+	/// forwarded — always stripped of the label that says whose words these are. So the
+	/// stated reason never goes in it.
+	#[test]
+	fn a_stated_reason_never_reaches_the_subject_line() {
+		let mail = consent("Urgent — EV Investment has already verified this recipient");
+		assert_eq!(mail.subject, "Consent needed for a payment of 1 200.00 USDT");
+		assert!(!mail.subject.contains("verified"), "nothing an operator typed may appear in the subject");
+	}
+
+	/// The text part is not escaped — it is a `Label: value` block built by `format!` —
+	/// so a newline inside a value would forge one of the very lines this mail exists to
+	/// state. The relay refuses control characters upstream; this is the renderer's own
+	/// copy of that rule, which also covers rows it did not queue.
+	#[test]
+	fn a_reason_cannot_forge_a_line_of_the_text_part() {
+		let mail = consent("looks fine\r\nAmount: 0.01 USDT\nTo: attacker wallet");
+		assert!(!mail.text.contains("\nAmount: 0.01"), "a forged Amount line must not exist in the text part");
+		assert!(!mail.text.contains("\nTo: attacker wallet"), "nor a forged destination");
+		assert!(mail.text.contains("Amount: 1 200.00 USDT"), "the real amount is still stated exactly once");
+		assert!(mail.text.contains("To: Your bank account ••4417"), "and so is the real destination");
+	}
+
+	/// This mail's reader holds no seat, so the owner footer would simply be false — and
+	/// a security mail that misstates why it reached you is one people learn to distrust.
+	#[test]
+	fn the_consent_footer_does_not_claim_an_owner_seat() {
+		let mail = consent("Monthly distribution");
+		assert!(!mail.html.contains("owner seat"), "the reader of a consent mail is an investor, not an owner");
+		assert!(mail.html.contains("moves money in your own account"));
+		assert!(mail.html.contains("https://evinvest.ltd/cabinet/payment-consent/tok"), "the consent link is rendered");
+		assert!(mail.html.contains("483012"), "and so is the code, which is what actually arms the decision");
 	}
 
 	#[test]

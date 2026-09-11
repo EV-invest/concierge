@@ -27,9 +27,17 @@ never calls `banking`:
    `MailRelayService.SendGovernanceMail` (`governance` module), because this plane
    owns the only mailer and standing up a second one would duplicate the queue,
    the backoff and the daily budget. The payload is TYPED, never rendered markup;
-   the recipient's address is resolved HERE from the identity record and must
-   belong to a fund owner, and every emailed link is pinned to `PUBLIC_ORIGIN` —
-   a compromised money plane must not become a phishing cannon aimed at owners.
+   the recipient's address is resolved HERE from the identity record, never from
+   the request; and every emailed link is pinned to `PUBLIC_ORIGIN` — a
+   compromised money plane must not become a phishing cannon aimed at owners.
+   WHO may receive one is decided per KIND, and the default is the strict one:
+   the three payout kinds are addressed to the consilium, so they go to a seated
+   owner and to nobody else. `PAYMENT_CONSENT` cannot use that rule — consenting
+   to a transfer of your own money has nothing to do with holding a seat — so it
+   gets its own, narrower in the dimension that matters: the recipient must BE
+   the payment's subject, named in the typed payload and matched against the
+   resolved identity record, and their address must be verified. The surface
+   widens by exactly one person per message rather than to everyone.
 
 Both seams are authenticated by the SAME shared bridge service token
 (`BRIDGE_SERVICE_TOKEN`), compared in constant time and mounted OUTSIDE the user
