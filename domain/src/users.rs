@@ -379,11 +379,24 @@ impl User {
 	/// votes that could stop it. The one legitimate reason to keep the account frozen past
 	/// a day is that the owners are deciding whether to, and then the hold extends until
 	/// they have.
-	pub fn hold(&mut self, now: i64, ratification_pending: bool) -> Result<(), DomainError> {
+	///
+	/// `by` is the PERSISTED role of whoever is pressing. An admin or owner seat may be
+	/// held only by a fund owner: the votes on every user proposal need a session, so an
+	/// admin who could hold the owners could hold them out of the very consilium that
+	/// decides whether the hold stands — and the one control over a rogue operator is
+	/// another operator being able to stop them. An owner holding an admin is that
+	/// control; an admin holding an owner is its inversion.
+	pub fn hold(&mut self, by: Role, now: i64, ratification_pending: bool) -> Result<(), DomainError> {
 		if self.suspension == Some(Suspension::Governance) {
 			return Err(DomainError::Conflict(
 				"this account is suspended by the owner consilium; a hold cannot replace that verdict".into(),
 			));
+		}
+		if matches!(self.role, Role::Admin | Role::Owner) && by != Role::Owner {
+			return Err(DomainError::Forbidden(format!(
+				"an account holding the {} seat is held only by a fund owner; anyone else asks the owners through GovernanceService.OpenUserSuspension",
+				self.role.as_str()
+			)));
 		}
 		if !ratification_pending {
 			if let Some(expires_at) = self.suspension.and_then(Suspension::hold_expires_at) {
@@ -1111,7 +1124,7 @@ mod tests {
 	fn a_hold_freezes_now_and_carries_its_own_deadline() {
 		let mut user = fixture();
 		user.drain_events();
-		user.hold(1_000, false).expect("nothing is suspending this account yet");
+		user.hold(Role::Admin, 1_000, false).expect("nothing is suspending this account yet");
 		assert_eq!(user.status(), UserStatus::Disabled);
 		assert_eq!(user.suspension(), Some(Suspension::AdminHold { expires_at: 1_000 + HOLD_TTL_SECS }));
 		assert_eq!(user.drain_events(), [UserEvent::Suspended], "the money plane learns of the freeze");
@@ -1122,7 +1135,7 @@ mod tests {
 	#[test]
 	fn a_hold_lapses_on_its_own_and_tells_the_bridge() {
 		let mut user = fixture();
-		user.hold(1_000, false).expect("hold");
+		user.hold(Role::Admin, 1_000, false).expect("hold");
 		user.drain_events();
 
 		assert!(!user.lapse_hold(1_000 + HOLD_TTL_SECS - 1), "not due yet");
@@ -1147,7 +1160,7 @@ mod tests {
 		assert_eq!(user.suspension().unwrap().hold_expires_at(), None);
 		assert!(!user.lapse_hold(i64::MAX), "a verdict does not expire");
 
-		let err = user.hold(2_000, false).expect_err("a hold must not downgrade the owners' verdict");
+		let err = user.hold(Role::Owner, 2_000, false).expect_err("a hold must not downgrade the owners' verdict");
 		assert!(matches!(err, DomainError::Conflict(_)));
 		assert_eq!(user.suspension(), Some(Suspension::Governance), "the refusal left it alone");
 	}
@@ -1163,7 +1176,7 @@ mod tests {
 	#[test]
 	fn ratifying_a_live_hold_restamps_it_without_a_second_event() {
 		let mut user = fixture();
-		user.hold(1_000, false).expect("hold");
+		user.hold(Role::Admin, 1_000, false).expect("hold");
 		user.drain_events();
 		let version = user.row_version();
 
@@ -1195,15 +1208,16 @@ mod tests {
 	#[test]
 	fn a_hold_is_not_renewed_by_holding_again() {
 		let mut user = fixture();
-		user.hold(1_000, false).expect("the first brake");
+		user.hold(Role::Admin, 1_000, false).expect("the first brake");
 		user.drain_events();
 
-		let err = user.hold(2_000, false).expect_err("a second press while held must not restart the clock");
+		let err = user.hold(Role::Admin, 2_000, false).expect_err("a second press while held must not restart the clock");
 		assert!(matches!(err, DomainError::Forbidden(_)), "{err}");
 		assert_eq!(user.suspension(), Some(Suspension::AdminHold { expires_at: 1_000 + HOLD_TTL_SECS }), "the deadline stood");
 		assert!(user.drain_events().is_empty());
 
-		user.hold(2_000, true).expect("with a suspension proposal open, the hold extends until the owners decide");
+		user.hold(Role::Admin, 2_000, true)
+			.expect("with a suspension proposal open, the hold extends until the owners decide");
 		assert_eq!(user.suspension(), Some(Suspension::AdminHold { expires_at: 2_000 + HOLD_TTL_SECS }));
 		assert!(user.drain_events().is_empty(), "still one freeze for the money plane");
 	}
@@ -1211,23 +1225,25 @@ mod tests {
 	#[test]
 	fn a_lapsed_hold_starts_a_cooldown_that_only_the_owners_can_shorten() {
 		let mut user = fixture();
-		user.hold(1_000, false).expect("hold");
+		user.hold(Role::Admin, 1_000, false).expect("hold");
 		let ended = 1_000 + HOLD_TTL_SECS;
 		assert!(user.lapse_hold(ended));
 		user.drain_events();
 
-		let err = user.hold(ended + HOLD_COOLDOWN_SECS - 1, false).expect_err("inside the cooldown");
+		let err = user.hold(Role::Admin, ended + HOLD_COOLDOWN_SECS - 1, false).expect_err("inside the cooldown");
 		assert!(matches!(err, DomainError::Forbidden(_)), "{err}");
 		assert_eq!(user.status(), UserStatus::Active, "the refusal changed nothing");
 
-		user.hold(ended + 1, true).expect("an open suspension proposal lifts the cooldown");
+		user.hold(Role::Admin, ended + 1, true).expect("an open suspension proposal lifts the cooldown");
 		assert_eq!(user.status(), UserStatus::Disabled);
 		assert_eq!(user.drain_events(), [UserEvent::Suspended]);
 
 		let mut again = fixture();
-		again.hold(1_000, false).expect("hold");
+		again.hold(Role::Admin, 1_000, false).expect("hold");
 		again.lapse_hold(ended);
-		again.hold(ended + HOLD_COOLDOWN_SECS, false).expect("the cooldown is over, one actor may brake again");
+		again
+			.hold(Role::Admin, ended + HOLD_COOLDOWN_SECS, false)
+			.expect("the cooldown is over, one actor may brake again");
 	}
 
 	/// Lifted early by one act counts the same as lapsing: the account was one actor's
@@ -1235,10 +1251,10 @@ mod tests {
 	#[test]
 	fn a_lifted_hold_starts_the_cooldown_too() {
 		let mut user = fixture();
-		user.hold(1_000, false).expect("hold");
+		user.hold(Role::Admin, 1_000, false).expect("hold");
 		user.enable(5_000);
 		assert_eq!(user.hold_ended_at(), Some(5_000));
-		assert!(matches!(user.hold(6_000, false), Err(DomainError::Forbidden(_))));
+		assert!(matches!(user.hold(Role::Admin, 6_000, false), Err(DomainError::Forbidden(_))));
 	}
 
 	/// A hold the owners ratified ended as THEIR verdict, not as a hold; lifting the
@@ -1246,11 +1262,33 @@ mod tests {
 	#[test]
 	fn a_ratified_hold_leaves_no_cooldown_behind() {
 		let mut user = fixture();
-		user.hold(1_000, false).expect("hold");
+		user.hold(Role::Admin, 1_000, false).expect("hold");
 		user.suspend();
 		user.enable(9_000);
 		assert_eq!(user.hold_ended_at(), None);
-		user.hold(9_001, false).expect("the owners lifted their verdict; the brake is available again");
+		user.hold(Role::Admin, 9_001, false).expect("the owners lifted their verdict; the brake is available again");
+	}
+
+	/// The votes on every user proposal need a session, so an admin who could hold the
+	/// owners could hold them out of the consilium that decides whether the hold stands.
+	/// Only an owner holds a seat; anyone may hold an investor.
+	#[test]
+	fn a_seat_is_held_only_by_an_owner() {
+		for seat in [Role::Admin, Role::Owner] {
+			let mut seated = fixture();
+			seated.set_role(seat);
+			seated.drain_events();
+			for pressing in [Role::Investor, Role::Operator, Role::Admin] {
+				let err = seated.hold(pressing, 1_000, false).expect_err("not by this role");
+				assert!(matches!(err, DomainError::Forbidden(_)), "{err}");
+				assert_eq!(seated.status(), UserStatus::Active, "the refusal changed nothing");
+			}
+			seated.hold(Role::Owner, 1_000, false).expect("an owner may hold a seat");
+			assert_eq!(seated.status(), UserStatus::Disabled);
+		}
+
+		let mut investor = fixture();
+		investor.hold(Role::Admin, 1_000, false).expect("an investor is held by any operator with the permission");
 	}
 
 	#[test]

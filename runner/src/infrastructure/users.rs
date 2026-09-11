@@ -365,7 +365,7 @@ impl UserDirectoryRepository for PgUsers {
 	/// TOCTOU window in the direction that matters — a proposal cancelled between the read
 	/// and the write would let a hold extend on the strength of a decision nobody is
 	/// making any more.
-	async fn hold_user(&self, id: UserId, action: &AdminAction, now: i64) -> Result<User, DomainError> {
+	async fn hold_user(&self, id: UserId, action: &AdminAction, by: Role, now: i64) -> Result<User, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let mut user = load_for_update(&mut tx, id).await?;
 		// The plane's lazy-expiry convention: a proposal past its deadline is not open,
@@ -377,7 +377,7 @@ impl UserDirectoryRepository for PgUsers {
 				.fetch_one(&mut *tx)
 				.await
 				.map_err(repo_err)?;
-		user.hold(now, ratification_pending)?;
+		user.hold(by, now, ratification_pending)?;
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
 		let action = action.clone().with_detail(serde_json::json!({

@@ -104,6 +104,13 @@ impl Fixture {
 		id
 	}
 
+	/// An admin seat, straight through the repository for the reason `owner` gives.
+	async fn admin(&self) -> UserId {
+		let id = self.user().await;
+		self.users.set_role(id, Role::Admin).await.expect("grant the seat");
+		id
+	}
+
 	async fn roster(&self, n: usize) -> Vec<UserId> {
 		let mut owners = Vec::with_capacity(n);
 		for _ in 0..n {
@@ -156,7 +163,7 @@ impl Fixture {
 	async fn hold_at(&self, actor: UserId, target: UserId, now: i64) -> Result<i64, domain::error::DomainError> {
 		let action = AdminAction::by(actor, "held", &Audit::default()).with_reason("credential stuffing");
 		self.users
-			.hold_user(target, &action, now)
+			.hold_user(target, &action, Role::Owner, now)
 			.await
 			.map(|user| user.suspension().and_then(Suspension::hold_expires_at).unwrap())
 	}
@@ -466,6 +473,47 @@ async fn an_open_suspension_lets_the_hold_extend_until_the_verdict() {
 	// The extension left a hold due at a real-world instant; lift it so a neighbour's
 	// sweep is not handed somebody else's release to count.
 	fx.users.enable_user(target, T_FAR).await.expect("cleanup");
+}
+
+/// The votes on every user proposal need a session, so an admin who could hold the
+/// owners could hold them out of the consilium that decides whether the hold stands.
+/// Only an owner holds a seat. The refusal names the proposal, and writes nothing.
+#[tokio::test]
+async fn a_seat_is_held_only_by_an_owner() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let admin = fx.admin().await;
+	let another_admin = fx.admin().await;
+
+	for target in [owner, another_admin] {
+		let err = fx.hold(admin, target, "silence the roster").await.unwrap_err();
+		assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+		assert!(err.message().contains("OpenUserSuspension"), "{err}");
+		assert_eq!(fx.reload(target).await.status(), UserStatus::Active);
+		assert!(fx.audit(target).await.is_empty(), "a refusal is not an action");
+	}
+
+	// The control over a rogue operator: an owner may hold an admin.
+	fx.hold(owner, another_admin, "rogue operator").await.expect("an owner holds a seat");
+	assert_eq!(fx.reload(another_admin).await.status(), UserStatus::Disabled);
+	fx.users.enable_user(another_admin, T_FAR).await.expect("cleanup — see T_FAR");
+}
+
+/// A hold on yourself ends your own session, and with it your ability to explain, lift
+/// or ratify it. Refused before anything is read or written.
+#[tokio::test]
+async fn nobody_holds_their_own_account() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let err = fx.hold(owner, owner, "stepping back").await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+	assert!(err.message().contains("OpenUserSuspension"), "{err}");
+	assert_eq!(fx.reload(owner).await.status(), UserStatus::Active);
+	assert!(fx.audit(owner).await.is_empty());
 }
 
 // ---------------------------------------------------------------------------------
