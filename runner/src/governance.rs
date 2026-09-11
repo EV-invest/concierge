@@ -18,8 +18,9 @@
 //! is. The payload is TYPED, never rendered markup, and the recipient's address is
 //! resolved HERE from the identity record — a compromised money plane must not be able
 //! to redirect a governance mail or put arbitrary HTML in an owner's inbox. WHO may
-//! receive one is decided per KIND: the payout kinds go to a seated owner, and a payment
-//! consent goes to the one person whose money the payment moves and to nobody else.
+//! receive one is decided per KIND: the consilium kinds — the payouts and a payment
+//! approval — go to a seated owner, and a payment consent goes to the one person whose
+//! money the payment moves and to nobody else.
 //!
 //! WHAT CROSSES THE WIRE ON THE LIVE FEED. A revision, never a tally. The client
 //! refetches the authoritative snapshot when the number moves, so a stale or replayed
@@ -850,16 +851,25 @@ fn required_line(value: &str, max_bytes: usize, field: &str) -> Result<String, S
 /// The payment tiers the money plane may name.
 ///
 /// A closed set rather than free text: this word is rendered at a person deciding whether
-/// to release their own money, and a tier neither plane recognises means the two disagree
-/// about what the payment IS — something to surface as a rejected call, not to print.
+/// to release money, and a tier neither plane recognises means the two disagree about
+/// what the payment IS — something to surface as a rejected call, not to print.
 const PAYMENT_TIERS: [&str; 3] = ["internal", "service", "external"];
+
+/// [`line`], plus: the word must be one of [`PAYMENT_TIERS`].
+fn payment_tier(value: &str) -> Result<String, Status> {
+	let tier = line(value, 16, "tier")?;
+	if !PAYMENT_TIERS.contains(&tier.as_str()) {
+		return Err(Status::invalid_argument("tier must be one of internal, service, external"));
+	}
+	Ok(tier)
+}
 
 /// Who a mail of a given kind may be addressed to, decided from the KIND before the
 /// identity record is read. The address itself is resolved from that record either way;
 /// this decides only whether the person it belongs to may be sent THIS mail.
 enum Recipient {
-	/// The payout kinds speak to the consilium — an approval to cast, or the outcome of
-	/// one — so the recipient must hold a seat.
+	/// The consilium kinds — a payout or payment approval to cast, or the outcome of
+	/// one — speak to a seated owner, so the recipient must hold a seat.
 	FundOwner,
 	/// A payment consent speaks to exactly one person: the one whose money moves. Role
 	/// decides nothing here, so the rule is identity.
@@ -897,7 +907,9 @@ impl MailRelayService for MailRelay {
 				("payout_approval", payload, Recipient::FundOwner)
 			}
 			// A burned approval token is an outcome the owners are told about, and the
-			// outcome payload already carries everything that mail needs to say.
+			// outcome payload already carries everything that mail needs to say. The
+			// payout fields keep `bounded` (a live contract); the payment tuple added
+			// later is held to `line` like every other payment field.
 			Ok(GovernanceMailKind::PayoutOutcome) | Ok(GovernanceMailKind::ApprovalTokenBurned) => {
 				let mail = req.payout_outcome.ok_or_else(|| Status::invalid_argument("payout_outcome is required for this kind"))?;
 				let payload = serde_json::json!({
@@ -907,17 +919,42 @@ impl MailRelayService for MailRelay {
 					"address": bounded(&mail.address, 128, "address")?,
 					"amount": bounded(&mail.amount, 64, "amount")?,
 					"detail": bounded(&mail.detail, 500, "detail")?,
+					// Empty for a payout; the burn notice over a payment carries no reason.
+					"tier": if mail.tier.is_empty() { String::new() } else { payment_tier(&mail.tier)? },
+					"source": line(&mail.source, 160, "source")?,
+					"destination": line(&mail.destination, 160, "destination")?,
+					"reason": line(&mail.reason, 500, "reason")?,
 				});
 				("payout_outcome", payload, Recipient::FundOwner)
+			}
+			// The consilium asked about a PAYMENT of fund-owned money. Addressed like a
+			// payout — to a seat — but described like a consent: two ends of a transfer in
+			// words, and the operator's reason as theirs. Field rules are the consent's.
+			Ok(GovernanceMailKind::PaymentApproval) => {
+				let mail = req.payment_approval.ok_or_else(|| Status::invalid_argument("payment_approval is required for this kind"))?;
+				let payload = serde_json::json!({
+					"consilium_id": line(&mail.consilium_id, 64, "consilium_id")?,
+					"payment_id": line(&mail.payment_id, 64, "payment_id")?,
+					"initiator_email": line(&mail.initiator_email, 320, "initiator_email")?,
+					"tier": payment_tier(&mail.tier)?,
+					"source": line(&mail.source, 160, "source")?,
+					"destination": line(&mail.destination, 160, "destination")?,
+					"amount": line(&mail.amount, 64, "amount")?,
+					"reason": required_line(&mail.reason, 500, "reason")?,
+					"payload_hash": line(&mail.payload_hash, 128, "payload_hash")?,
+					"threshold": mail.threshold,
+					"owner_count": mail.owner_count,
+					"expires_at": mail.expires_at,
+					"approval_url": self.approval_link(&mail.approval_url)?,
+					"code": line(&mail.code, 64, "code")?,
+				});
+				("payment_approval", payload, Recipient::FundOwner)
 			}
 			// The one kind that is not addressed to the consilium. Every field is bounded in
 			// bytes and refused if it carries a control character — see `line`.
 			Ok(GovernanceMailKind::PaymentConsent) => {
 				let mail = req.payment_consent.ok_or_else(|| Status::invalid_argument("payment_consent is required for this kind"))?;
-				let tier = line(&mail.tier, 16, "tier")?;
-				if !PAYMENT_TIERS.contains(&tier.as_str()) {
-					return Err(Status::invalid_argument("tier must be one of internal, service, external"));
-				}
+				let tier = payment_tier(&mail.tier)?;
 				// Read here and enforced against the RESOLVED record below, so the rule stays
 				// "the recipient IS the subject" rather than "two request fields agree".
 				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
@@ -952,10 +989,10 @@ impl MailRelayService for MailRelay {
 			.ok_or_else(|| Status::not_found("recipient is not a user of this plane"))?;
 
 		match recipient_rule {
-			// A payout mail goes to a FUND OWNER and nobody else. Those kinds are addressed
-			// to the consilium — an approval to cast, or the outcome of one — so any other
-			// recipient means the money plane asked for a security mail to be sent to
-			// someone with no standing in it. The PERSISTED role, never the elevated one:
+			// A consilium mail goes to a FUND OWNER and nobody else. Those kinds are
+			// addressed to the consilium — an approval to cast, or the outcome of one — so
+			// any other recipient means the money plane asked for a security mail to be
+			// sent to someone with no standing in it. The PERSISTED role, never the elevated one:
 			// emergency access authorizes an operator, it does not seat them, and it must
 			// not turn them into a governance correspondent either.
 			Recipient::FundOwner =>
@@ -987,6 +1024,7 @@ impl MailRelayService for MailRelay {
 			.enqueue_mail(user_id.raw(), recipient.email().as_str(), kind, &req.dedupe_key, &payload)
 			.await
 			.map_err(domain_to_status)?;
+
 		Ok(Response::new(SendGovernanceMailResponse { enqueued }))
 	}
 }
