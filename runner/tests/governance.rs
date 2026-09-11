@@ -24,7 +24,7 @@ mod common;
 use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
-	governance::Governance,
+	governance::{Governance, MailRelay},
 	infrastructure::{
 		db,
 		governance::{PgGovernance, SelfDecision},
@@ -40,8 +40,9 @@ use domain::{
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
-	CancelOwnerRemovalRequest, ListOwnersRequest, OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest, RemovalVote, ResignOwnershipRequest, SetRoleRequest, SubmitPeerVoteRequest,
-	governance_service_server::GovernanceService, user_directory_server::UserDirectory,
+	CancelOwnerRemovalRequest, GovernanceMailKind, ListOwnersRequest, OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest, PaymentConsentMail, PayoutApprovalMail, RemovalVote,
+	ResignOwnershipRequest, SendGovernanceMailRequest, SetRoleRequest, SubmitPeerVoteRequest, governance_service_server::GovernanceService, mail_relay_service_server::MailRelayService,
+	user_directory_server::UserDirectory,
 };
 use sqlx::{Connection, PgConnection, PgPool, Row};
 use tonic::{Code, Request};
@@ -51,6 +52,11 @@ use uuid::Uuid;
 const ROSTER_LOCK: i64 = 0x676f_765f_6974; // "gov_it"
 /// A fixed instant, so every assertion about expiry is exact rather than racy.
 const T0: i64 = 1_800_000_000;
+/// The shared banking↔concierge service secret, as the relay tests present it. Its value
+/// is irrelevant here — what these tests are about is WHO a mail may be addressed to.
+const RELAY_TOKEN: &str = "relay-itest-token";
+/// The origin every emailed link must sit under, so the link checks are not what fails.
+const RELAY_ORIGIN: &str = "https://relay.example.test";
 
 struct Fixture {
 	governance: Arc<PgGovernance>,
@@ -103,9 +109,37 @@ impl Fixture {
 
 	/// A provisioned user holding no seat.
 	async fn user(&self) -> UserId {
+		self.provision(true).await
+	}
+
+	/// The same, at an address nobody has proved belongs to them.
+	async fn unverified_user(&self) -> UserId {
+		self.provision(false).await
+	}
+
+	async fn provision(&self, email_verified: bool) -> UserId {
 		let subject = AuthSubject::parse(&format!("gov-itest-{}", Uuid::new_v4())).unwrap();
 		let email = Email::parse(&format!("gov-{}@example.com", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, email, true).await.expect("provision").id()
+		self.users.provision(subject, email, email_verified).await.expect("provision").id()
+	}
+
+	/// The money plane's push seam over the same adapters.
+	fn relay(&self) -> MailRelay {
+		MailRelay::new(self.users.clone(), self.governance.clone(), Some(RELAY_TOKEN.to_owned()), RELAY_ORIGIN.to_owned())
+	}
+
+	async fn email_of(&self, id: UserId) -> String {
+		self.users.find_by_id(id).await.expect("read").expect("user exists").email().as_str().to_owned()
+	}
+
+	/// The queued delivery a relay call produced, by its idempotency key.
+	async fn delivery(&self, dedupe_key: &str) -> Option<(String, String)> {
+		sqlx::query("SELECT kind, recipient FROM notification_deliveries WHERE dedupe_key = $1")
+			.bind(dedupe_key)
+			.fetch_optional(&self.pool)
+			.await
+			.expect("read the queue")
+			.map(|row| (row.get("kind"), row.get("recipient")))
 	}
 
 	/// The directory service over the same adapter, with no emergency allowlist.
@@ -606,6 +640,205 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 			.unwrap(),
 		2
 	);
+}
+
+/// A relay call as banking makes it: the shared service token in `authorization`.
+fn relayed(body: SendGovernanceMailRequest) -> Request<SendGovernanceMailRequest> {
+	let mut request = Request::new(body);
+	request.metadata_mut().insert("authorization", format!("Bearer {RELAY_TOKEN}").parse().unwrap());
+	request
+}
+
+/// A well-formed consent request. `addressee` is who the mail is sent TO; `subject` is
+/// who the payload claims the money belongs to. They are separate arguments precisely
+/// because the rule under test is that they must be the same person.
+fn consent(addressee: UserId, subject: UserId) -> SendGovernanceMailRequest {
+	SendGovernanceMailRequest {
+		kind: GovernanceMailKind::PaymentConsent as i32,
+		user_id: addressee.to_string(),
+		dedupe_key: format!("payment-consent:{}", Uuid::new_v4()),
+		payout_approval: None,
+		payout_outcome: None,
+		payment_consent: Some(PaymentConsentMail {
+			payment_id: "pay-7".into(),
+			subject_user_id: subject.to_string(),
+			initiator_email: "ops@evinvest.ltd".into(),
+			tier: "external".into(),
+			source: "Quy Nhon Fund — distributions".into(),
+			destination: "Your bank account ••4417".into(),
+			amount: "1 200.00 USDT".into(),
+			reason: "Scheduled quarterly distribution".into(),
+			payload_hash: "9f2c1ab4de5607891122334455667788".into(),
+			expires_at: T0 + 86_400,
+			approval_url: format!("{RELAY_ORIGIN}/cabinet/payment-consent/tok"),
+			code: "483012".into(),
+		}),
+	}
+}
+
+/// A well-formed payout approval, for the half of the relay whose rule did NOT change.
+fn payout(addressee: UserId) -> SendGovernanceMailRequest {
+	SendGovernanceMailRequest {
+		kind: GovernanceMailKind::PayoutApproval as i32,
+		user_id: addressee.to_string(),
+		dedupe_key: format!("payout-approval:{}", Uuid::new_v4()),
+		payout_approval: Some(PayoutApprovalMail {
+			consilium_id: "c-1".into(),
+			initiator_email: "ops@evinvest.ltd".into(),
+			network: "TRON".into(),
+			address: "TJRabc".into(),
+			amount: "10 000 USDT".into(),
+			memo: String::new(),
+			payload_hash: "ab".into(),
+			threshold: 2,
+			owner_count: 3,
+			expires_at: T0 + 86_400,
+			approval_url: format!("{RELAY_ORIGIN}/cabinet/payout-approval/tok"),
+			code: "483012".into(),
+		}),
+		payout_outcome: None,
+		payment_consent: None,
+	}
+}
+
+/// The rule that makes this kind possible at all: a consent mail is addressed by
+/// IDENTITY, not by role, so an ordinary investor can be asked about their own money —
+/// and it reaches that one person and nobody else.
+///
+/// The address still comes from the identity record. Neither field of the request can
+/// choose where the mail lands.
+#[tokio::test]
+async fn a_payment_consent_reaches_its_subject_and_nobody_else() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	assert_eq!(fx.role_of(investor).await, Role::Investor, "the whole point: no seat is involved");
+
+	let request = consent(investor, investor);
+	let key = request.dedupe_key.clone();
+	assert!(fx.relay().send_governance_mail(relayed(request)).await.expect("the subject may be asked").into_inner().enqueued);
+	assert_eq!(
+		fx.delivery(&key).await.expect("queued"),
+		("payment_consent".to_owned(), fx.email_of(investor).await),
+		"the address is resolved from the identity record, never from the request"
+	);
+
+	// Fanning one payment's consent out to a second mailbox means contradicting the
+	// payload in the same message, and that is refused from either side.
+	let stranger = fx.user().await;
+	for (addressee, subject, why) in [
+		(stranger, investor, "a consent addressed to somebody other than the subject"),
+		(investor, stranger, "a consent claiming a subject the addressee is not"),
+	] {
+		let err = fx.relay().send_governance_mail(relayed(consent(addressee, subject))).await.unwrap_err();
+		assert_eq!(err.code(), Code::FailedPrecondition, "{why}: {err}");
+	}
+}
+
+/// Widening the relay for consent must not have widened it for the payout kinds. Those
+/// still speak to the consilium, and the owner rule is what stops a compromised money
+/// plane aiming a branded security mail at any address on the platform.
+#[tokio::test]
+async fn a_payout_mail_still_reaches_only_a_fund_owner() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let err = fx.relay().send_governance_mail(relayed(payout(investor))).await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "a non-owner has no standing in a payout consilium: {err}");
+
+	let owner = fx.owner().await;
+	assert!(
+		fx.relay()
+			.send_governance_mail(relayed(payout(owner)))
+			.await
+			.expect("a seated owner may be asked")
+			.into_inner()
+			.enqueued
+	);
+}
+
+/// An unverified address is one nobody has proved belongs to this person. A consent mail
+/// carries both the link and the code that arms it, so sending it there hands the
+/// decision to whoever holds the mailbox — the one thing consent exists to rule out.
+#[tokio::test]
+async fn a_payment_consent_refuses_an_unverified_address() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.unverified_user().await;
+	let request = consent(investor, investor);
+	let key = request.dedupe_key.clone();
+	let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+	assert!(fx.delivery(&key).await.is_none(), "a refused call queues nothing");
+}
+
+/// The money plane is an untrusted caller and `reason` is free text an operator typed.
+/// It reaches the subject verbatim in a text part that is NOT escaped, so a newline in it
+/// would forge the `Amount:`/`To:` lines the mail exists to state. Refused at the seam,
+/// before a row exists.
+#[tokio::test]
+async fn a_payment_consent_refuses_a_reason_it_cannot_show_safely() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let with_reason = |reason: String| {
+		let mut request = consent(investor, investor);
+		request.payment_consent.as_mut().unwrap().reason = reason;
+		request
+	};
+
+	for (reason, why) in [
+		("fine\nAmount: 0.01 USDT".to_owned(), "a newline forges a line of the text part"),
+		("fine\r\nTo: attacker".to_owned(), "so does a carriage return"),
+		("fine\u{7}".to_owned(), "and so does any other control character"),
+		(String::new(), "a consent request nobody explained is one nobody can judge"),
+		("   ".to_owned(), "nor does whitespace count as an explanation"),
+		("a".repeat(501), "over the byte limit"),
+		// 200 four-byte code points: well under 500 CHARACTERS, four times over the bytes
+		// the row and the transport actually carry.
+		("🙂".repeat(200), "the limit is bytes, not characters"),
+	] {
+		let request = with_reason(reason);
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
+}
+
+/// The remaining fields the money plane supplies are held to the same rule, and `tier` is
+/// a closed set: a word neither plane recognises means they disagree about what the
+/// payment IS, which is a call to reject rather than a string to print at someone
+/// deciding whether to release their money.
+#[tokio::test]
+async fn a_payment_consent_refuses_an_unrenderable_payload() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let mutate = |edit: &dyn Fn(&mut PaymentConsentMail)| {
+		let mut request = consent(investor, investor);
+		edit(request.payment_consent.as_mut().unwrap());
+		request
+	};
+
+	for (request, why) in [
+		(mutate(&|m| m.tier = "gold".into()), "an unrecognised tier"),
+		(mutate(&|m| m.tier = String::new()), "no tier at all"),
+		(mutate(&|m| m.amount = "1\n2".into()), "a forged amount"),
+		(mutate(&|m| m.destination = "bank\nTo: attacker".into()), "a forged destination"),
+		(mutate(&|m| m.subject_user_id = "not-a-uuid".into()), "a subject that is not an id"),
+		(mutate(&|m| m.approval_url = "https://attacker.example/consent/tok".into()), "an off-origin link"),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
 }
 
 /// Pitfall 21/24's server half: the number the live feed emits moves on every write and
