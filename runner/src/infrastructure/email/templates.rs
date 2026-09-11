@@ -98,6 +98,8 @@ pub fn confirm_subscription(topic_label: &str, confirm_url: &str, unsubscribe_ur
 /// because someone who believes a click has already decided is someone who will not
 /// come back to finish.
 pub fn owner_removal_self_accept(initiator_email: &str, reason: &str, approval_url: &str, code: &str, expires_at: i64) -> RenderedEmail {
+	// The link is printed bare on its own line of the text part — see `one_line`.
+	let approval_url = &one_line(approval_url);
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Ownership"));
 	inner.push_str(&heading("Your owner seat is being voted on"));
@@ -142,6 +144,8 @@ pub fn payout_approval(
 	approval_url: &str,
 	code: &str,
 ) -> RenderedEmail {
+	// The link is printed bare on its own line of the text part — see `one_line`.
+	let approval_url = &one_line(approval_url);
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Treasury"));
 	inner.push_str(&heading("A payout needs your approval"));
@@ -304,6 +308,7 @@ pub fn payment_approval(
 	let (consilium_id, payment_id, initiator_email, tier) = (one_line(consilium_id), one_line(payment_id), one_line(initiator_email), one_line(tier));
 	let (source, destination, amount) = (one_line(source), one_line(destination), one_line(amount));
 	let (reason, payload_hash, code) = (one_line(reason), one_line(payload_hash), one_line(code));
+	let approval_url = &one_line(approval_url);
 
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Treasury"));
@@ -368,6 +373,7 @@ pub fn payment_consent(
 	let (payment_id, initiator_email, tier) = (one_line(payment_id), one_line(initiator_email), one_line(tier));
 	let (source, destination, amount) = (one_line(source), one_line(destination), one_line(amount));
 	let (reason, payload_hash, code) = (one_line(reason), one_line(payload_hash), one_line(code));
+	let approval_url = &one_line(approval_url);
 
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Payments"));
@@ -422,6 +428,10 @@ const FOOTER_CONSENT: &str =
 const INITIATOR_NOTE_LABEL: &str = "Text entered by the requester (not written by EV Investment)";
 
 /// Collapse anything that could break a line into a space.
+///
+/// The emailed LINK goes through this too: the text part prints it bare on a line of its
+/// own, so a newline inside it would end our link and start somebody else's on the next
+/// line. The relay refuses such a URL outright; this is the renderer's copy of the rule.
 ///
 /// The HTML part escapes, so markup is already accounted for. The TEXT part does not: it
 /// is a `Label: value` block assembled by `format!`, and a newline inside a value forges
@@ -898,6 +908,31 @@ mod tests {
 		let payout = payout_outcome("c-1", "EXECUTED", "Ethereum", LONG_ADDRESS, "12,500.00 USDT", "Broadcast.", "", "", "", "");
 		assert_eq!(payout.subject, "Payout executed — 12,500.00 USDT on Ethereum", "the payout copy is untouched");
 		assert!(payout.html.contains("Destination address") && payout.html.contains(LONG_ADDRESS));
+	}
+
+	/// Every mail prints its link bare on a line of the text part. A newline smuggled into
+	/// the URL would end our link and start somebody else's on the next line; the relay
+	/// refuses it, and the renderer folds it anyway.
+	#[test]
+	fn a_link_cannot_be_split_into_two_in_the_text_part() {
+		let forged = "https://evinvest.ltd/approve/tok\nhttps://attacker.example/";
+		let mails = [
+			owner_removal_self_accept("ada@example.com", "reason", forged, "H7K2M9PQRS", 1_785_143_640),
+			payout_approval(
+				"c-1", "ada@example.com", "Ethereum", LONG_ADDRESS, "1 USDT", "", "hash", 3, 5, 1_785_143_640, forged, "H7K2M9PQRS",
+			),
+			payment_approval(
+				"c-9", "pay-7", "ops@evinvest.ltd", "service", "treasury", "pool", "1 USDT", "why", "hash", 3, 5, 1_785_143_640, forged, "483012",
+			),
+			payment_consent("pay-7", "ops@evinvest.ltd", "external", "fund", "bank", "1 USDT", "why", "hash", 1_785_143_640, forged, "483012"),
+		];
+		for mail in mails {
+			assert!(!mail.text.contains("\nhttps://attacker.example/"), "a foreign link must never start a line: {}", mail.subject);
+			assert!(
+				mail.text.contains("https://evinvest.ltd/approve/tok https://attacker.example/"),
+				"the fold keeps the bytes on one line"
+			);
+		}
 	}
 
 	#[test]

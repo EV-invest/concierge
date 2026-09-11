@@ -799,13 +799,24 @@ impl MailRelay {
 	/// The boundary is checked explicitly rather than by a bare `starts_with`, which
 	/// would also accept `https://evinvest.ltd.attacker.example`.
 	fn approval_link(&self, raw: &str) -> Result<String, Status> {
-		let url = bounded(raw, 512, "approval_url")?;
+		let url = line(raw, 512, "approval_url")?;
 		Self::check_origin(&self.approval_origin, &url)?;
 		Ok(url)
 	}
 
-	/// The origin rule alone, free of the ports, so it can be exercised directly.
+	/// The link rule alone, free of the ports, so it can be exercised directly.
+	///
+	/// The origin is a PREFIX check, and a prefix check says nothing about what follows.
+	/// The text part of every mail prints the link bare on its own line, so a URL that
+	/// passes the origin and then carries a space or a newline —
+	/// `https://evinvest.ltd/x https://attacker.example` — puts a second, foreign link
+	/// on that line, in a mail this plane signed. A URL has no business containing
+	/// whitespace or anything outside printable ASCII (an encoded one never does), so
+	/// the whole string is held to that before the origin is even looked at.
 	fn check_origin(origin: &str, url: &str) -> Result<(), Status> {
+		if url.chars().any(|c| c.is_whitespace() || !c.is_ascii_graphic()) {
+			return Err(Status::invalid_argument("approval_url must not contain whitespace or non-printable characters"));
+		}
 		let refuse = || Status::invalid_argument("approval_url must be on this platform's public origin");
 		let rest = url.strip_prefix(origin).filter(|rest| rest.is_empty() || rest.starts_with('/')).ok_or_else(refuse)?;
 		// `//host` is protocol-relative and leaves our origin behind entirely.
@@ -1142,8 +1153,17 @@ mod tests {
 			"http://evinvest.ltd/cabinet/payout-approval/abc",
 			"https://attacker.example/cabinet/payout-approval/abc",
 			"javascript:alert(1)",
+			// The origin is only a prefix. Anything that breaks the line after it puts a
+			// second link — somebody else's — on the same bare line of the text part.
+			"https://evinvest.ltd/cabinet/payout-approval/abc https://attacker.example/",
+			"https://evinvest.ltd/cabinet/payout-approval/abc\nhttps://attacker.example/",
+			"https://evinvest.ltd/cabinet/payout-approval/abc\r\n",
+			"https://evinvest.ltd/cabinet/payout-approval/abc\t",
+			"https://evinvest.ltd/cabinet/payout-approval/\u{a0}abc",
+			"https://evinvest.ltd/cabinet/payout-approval/abc\u{7}",
+			"https://evinvest.ltd/cabinet/payout-approval/ábc",
 		] {
-			assert!(link(hostile).is_err(), "must be refused: {hostile}");
+			assert!(link(hostile).is_err(), "must be refused: {hostile:?}");
 		}
 	}
 

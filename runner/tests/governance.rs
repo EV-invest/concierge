@@ -990,6 +990,14 @@ async fn a_payment_approval_refuses_an_unrenderable_payload() {
 		(mutate(&|m| m.reason = "   ".into()), "no reason at all"),
 		(mutate(&|m| m.reason = "🙂".repeat(200)), "a reason over the byte limit"),
 		(mutate(&|m| m.approval_url = "https://attacker.example/approve/tok".into()), "an off-origin link"),
+		(
+			mutate(&|m| m.approval_url = format!("{RELAY_ORIGIN}/approve/tok\nhttps://attacker.example/")),
+			"a link that breaks the line",
+		),
+		(
+			mutate(&|m| m.approval_url = format!("{RELAY_ORIGIN}/approve/tok https://attacker.example/")),
+			"a link with a space after the origin",
+		),
 	] {
 		let key = request.dedupe_key.clone();
 		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
