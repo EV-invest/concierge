@@ -24,18 +24,22 @@ use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
 	governance::Governance,
-	infrastructure::{db, governance::PgGovernance, users::PgUsers},
+	infrastructure::{
+		db,
+		governance::{Audit, PgGovernance},
+		users::{AdminAction, PgUsers},
+	},
 	ports::{GovernanceRepository, UserDirectoryRepository},
 };
 use domain::{
 	authz::Role,
 	governance::{ProposalState, UserProposalId},
-	users::{AuthSubject, Email, HOLD_TTL_SECS, Suspension, UserId, UserStatus},
+	users::{AuthSubject, Email, HOLD_COOLDOWN_SECS, HOLD_TTL_SECS, Suspension, UserId, UserStatus},
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
-	DisableUserRequest, HoldUserRequest, OpenAdminAdmissionRequest, OpenUserReinstatementRequest, OpenUserSuspensionRequest, ProposalVote as ProposalVoteMsg, ReinstateUserRequest,
-	RevokeTokensRequest, SetKycLevelRequest, SubmitUserProposalVoteRequest, governance_service_server::GovernanceService, user_directory_server::UserDirectory,
+	CancelUserProposalRequest, DisableUserRequest, HoldUserRequest, OpenAdminAdmissionRequest, OpenUserReinstatementRequest, OpenUserSuspensionRequest, ProposalVote as ProposalVoteMsg,
+	ReinstateUserRequest, RevokeTokensRequest, SetKycLevelRequest, SubmitUserProposalVoteRequest, governance_service_server::GovernanceService, user_directory_server::UserDirectory,
 };
 use sqlx::{Connection, PgConnection, PgPool, Row};
 use tonic::{Code, Request};
@@ -45,6 +49,11 @@ use uuid::Uuid;
 const ROSTER_LOCK: i64 = 0x676f_765f_6974; // "gov_it"
 /// A fixed instant, so every assertion about a deadline is exact rather than racy.
 const T0: i64 = 1_800_000_000;
+/// A clock far past any sweep another test in this binary runs. The sweep is GLOBAL —
+/// `lapse_due_holds(now)` releases every hold due by `now` in the database — so a hold
+/// placed at a real-world instant can be released by a neighbour's sweep mid-test. A
+/// hold placed here is due in 2096 and nobody sweeps that far.
+const T_FAR: i64 = 4_000_000_000;
 
 struct Fixture {
 	governance: Arc<PgGovernance>,
@@ -127,6 +136,38 @@ impl Fixture {
 			.iter()
 			.map(|r| r.get::<String, _>("kind"))
 			.collect()
+	}
+
+	/// One operator pulling the brake through the console.
+	async fn hold(&self, actor: UserId, target: UserId, reason: &str) -> Result<i64, tonic::Status> {
+		self.directory()
+			.hold_user(as_user(
+				actor,
+				HoldUserRequest {
+					user_id: target.to_string(),
+					reason: reason.into(),
+				},
+			))
+			.await
+			.map(|response| response.into_inner().hold_expires_at)
+	}
+
+	/// The brake straight through the port at a chosen instant — see `T_FAR`.
+	async fn hold_at(&self, actor: UserId, target: UserId, now: i64) -> Result<i64, domain::error::DomainError> {
+		let action = AdminAction::by(actor, "held", &Audit::default()).with_reason("credential stuffing");
+		self.users
+			.hold_user(target, &action, now)
+			.await
+			.map(|user| user.suspension().and_then(Suspension::hold_expires_at).unwrap())
+	}
+
+	/// The `detail` JSON of every `held` row for one subject, oldest first.
+	async fn held_details(&self, id: UserId) -> Vec<serde_json::Value> {
+		sqlx::query_scalar("SELECT detail FROM admin_action WHERE subject_user_id = $1 AND action = 'held' ORDER BY position")
+			.bind(id.raw())
+			.fetch_all(&self.pool)
+			.await
+			.expect("read the held rows")
 	}
 
 	/// `(action, actor, reason)` for one subject, oldest first.
@@ -276,8 +317,10 @@ async fn a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge() {
 
 	// A minute before the deadline the sweep leaves it alone — the brake is real until it
 	// is not.
+	// Asserted on THIS target: the sweep is global, and what another test left due by
+	// this instant is not this test's business.
 	assert!(
-		fx.users.lapse_due_holds(held.hold_expires_at - 60, 10).await.expect("sweep").is_empty(),
+		!fx.users.lapse_due_holds(held.hold_expires_at - 60, 10).await.expect("sweep").contains(&target),
 		"a hold that is not due must not be released early"
 	);
 	assert_eq!(fx.reload(target).await.status(), UserStatus::Disabled);
@@ -295,6 +338,7 @@ async fn a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge() {
 	);
 	assert_eq!(fx.audit(target).await.last().map(|a| a.0.clone()), Some("hold_lapsed".into()));
 	assert_eq!(fx.audit(target).await.last().unwrap().1, None, "nobody acted, and the log says so");
+	assert_eq!(user.hold_ended_at(), Some(held.hold_expires_at), "the lapse is what the next hold's cooldown counts from");
 }
 
 /// A reason is required because the owners asked to ratify a hold are reading exactly
@@ -321,6 +365,107 @@ async fn a_hold_without_a_reason_is_refused_before_anything_is_written() {
 	assert_eq!(err.code(), Code::InvalidArgument, "{err}");
 	assert_eq!(fx.reload(target).await.status(), UserStatus::Active);
 	assert!(fx.audit(target).await.is_empty());
+}
+
+/// A hold lapses, and that has to mean something. Pressed again while it is live, the
+/// button used to restart the clock — so one admin pressing it daily held an investor
+/// indefinitely with no owner asked, or held every other owner out of the votes that
+/// could stop it. Now it is refused, the deadline stands, and nothing is written.
+#[tokio::test]
+async fn a_hold_is_not_renewed_by_holding_again() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let target = fx.user().await;
+	let first = fx.hold_at(owner, target, T_FAR).await.expect("the first brake");
+
+	let err = fx.hold(owner, target, "still stuffing").await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+	assert!(err.message().contains("OpenUserSuspension"), "the refusal names the proposal to open instead: {err}");
+	assert_eq!(fx.reload(target).await.suspension().unwrap().hold_expires_at(), Some(first), "the deadline did not move");
+	assert_eq!(fx.audit(target).await.len(), 1, "a refusal is not an action");
+	assert_eq!(fx.outbox_kinds(target).await, ["CREATED", "SUSPENDED"], "and the money plane heard of one freeze");
+}
+
+/// After a lapse the next hold waits out `HOLD_COOLDOWN_SECS`, or the lapse would be a
+/// formality: a day on, one sweep off, forever. The owners are the only way past it.
+#[tokio::test]
+async fn a_lapsed_hold_starts_a_cooldown() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let target = fx.user().await;
+	fx.hold_at(owner, target, T_FAR).await.expect("hold");
+	// Lifted by one act rather than swept: the sweep is global (see `T_FAR`), and the
+	// aggregate records the end the same way for both — the lapse path is proved in
+	// `a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge`.
+	let ended = T_FAR + HOLD_TTL_SECS;
+	fx.users.enable_user(target, ended).await.expect("lifted");
+	assert_eq!(fx.reload(target).await.hold_ended_at(), Some(ended));
+
+	let err = fx.hold_at(owner, target, ended + HOLD_COOLDOWN_SECS - 1).await.unwrap_err();
+	assert!(matches!(err, domain::error::DomainError::Forbidden(_)), "inside the cooldown: {err}");
+	assert_eq!(fx.reload(target).await.status(), UserStatus::Active, "nothing was written");
+	assert_eq!(fx.held_details(target).await.len(), 1, "and no audit row claims otherwise");
+
+	// The console sees the same refusal as a precondition it can act on.
+	let err = fx.hold(owner, target, "again").await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+
+	fx.hold_at(owner, target, ended + HOLD_COOLDOWN_SECS)
+		.await
+		.expect("the cooldown is over; one actor may brake again");
+	assert_eq!(fx.reload(target).await.status(), UserStatus::Disabled);
+}
+
+/// The one legitimate reason to keep an account frozen past a day is that the owners are
+/// deciding whether to: while a suspension proposal is open, the hold extends. The
+/// moment it is not, the ordinary rule is back.
+#[tokio::test]
+async fn an_open_suspension_lets_the_hold_extend_until_the_verdict() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owners = fx.roster(3).await;
+	let target = fx.user().await;
+	let first = fx.hold_at(owners[0], target, T_FAR).await.expect("the brake");
+
+	let opened = fx
+		.service()
+		.open_user_suspension(as_user(
+			owners[0],
+			OpenUserSuspensionRequest {
+				user_id: target.to_string(),
+				reason: "ratify the hold".into(),
+			},
+		))
+		.await
+		.expect("an owner proposes")
+		.into_inner();
+
+	// Through the console, at the real clock: the proposal is open NOW, so the check
+	// inside the write transaction sees it and the hold is restamped from now.
+	let extended = fx
+		.hold(owners[1], target, "keeping it frozen while you decide")
+		.await
+		.expect("the owners are deciding, so the hold extends");
+	assert_ne!(extended, first, "the deadline was restamped");
+	let details = fx.held_details(target).await;
+	assert_eq!(details.len(), 2);
+	assert_eq!(details[0]["ratification_pending"], false, "the first press was a fresh brake");
+	assert_eq!(details[1]["ratification_pending"], true, "the second was an extension, and the log says so");
+
+	fx.service()
+		.cancel_user_proposal(as_user(owners[0], CancelUserProposalRequest { proposal_id: opened.id }))
+		.await
+		.expect("withdrawn");
+	let err = fx.hold(owners[1], target, "once more").await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "with nobody deciding, the ordinary rule is back: {err}");
+	// The extension left a hold due at a real-world instant; lift it so a neighbour's
+	// sweep is not handed somebody else's release to count.
+	fx.users.enable_user(target, T_FAR).await.expect("cleanup");
 }
 
 // ---------------------------------------------------------------------------------
@@ -496,7 +641,7 @@ async fn a_reinstatement_voids_when_there_is_no_verdict_left_to_lift() {
 		.into_inner();
 
 	// The suspension goes away underneath the open proposal.
-	fx.users.enable_user(target).await.expect("lifted by something else");
+	fx.users.enable_user(target, T0).await.expect("lifted by something else");
 
 	fx.carry(proposal_id(&opened.id), &owners[1..3]).await;
 	let record = fx.governance.find_user_proposal(proposal_id(&opened.id), T0).await.expect("read").expect("exists");
@@ -738,8 +883,15 @@ async fn a_hold_cannot_downgrade_a_governance_suspension() {
 
 	let user = fx.reload(target).await;
 	assert_eq!(user.suspension(), Some(Suspension::Governance));
-	assert!(
-		fx.users.lapse_due_holds(T0 + HOLD_TTL_SECS * 10, 10).await.expect("sweep").is_empty(),
-		"and no sweep will ever release it"
-	);
+	// The sweep selects on `hold_expires_at IS NOT NULL` and nothing else, so a verdict
+	// with no deadline is invisible to it. Asserted on the column rather than by running
+	// the sweep: `lapse_due_holds` is global, and a far-future sweep here would release
+	// every hold the tests beside this one are in the middle of asserting on.
+	assert_eq!(user.suspension().unwrap().hold_expires_at(), None, "and no sweep will ever release it");
+	let due: bool = sqlx::query_scalar("SELECT hold_expires_at IS NOT NULL FROM users WHERE id = $1")
+		.bind(target.raw())
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert!(!due);
 }

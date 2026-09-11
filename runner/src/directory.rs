@@ -127,6 +127,18 @@ pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Ar
 	}
 }
 
+/// A hold the aggregate would not place. Its policy refusals — the account is already
+/// held, or was until recently — come back as `FAILED_PRECONDITION` rather than the
+/// `PERMISSION_DENIED` a `Forbidden` maps to by default, because the BFF folds
+/// `PERMISSION_DENIED` into an opaque 404 and the whole point of these messages is that
+/// the operator reads which proposal to open instead.
+fn hold_refusal(err: DomainError) -> Status {
+	match err {
+		DomainError::Forbidden(why) => Status::failed_precondition(why),
+		other => domain_to_status(other),
+	}
+}
+
 /// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix.
 async fn require_permission<T>(directory: &Directory, request: &Request<T>, permission: Permission) -> Result<(), Status> {
 	crate::authz::require_permission(directory.users.as_ref(), &directory.break_glass, request, permission).await
@@ -236,7 +248,7 @@ impl UserDirectory for Directory {
 		let target = parse_target_id(&req.user_id)?;
 		let reason = require_reason(&req.reason)?;
 		let action = AdminAction::by(actor, "held", &audit).with_reason(&reason);
-		let user = self.users.hold_user(target, &action, now_secs()).await.map_err(domain_to_status)?;
+		let user = self.users.hold_user(target, &action, now_secs()).await.map_err(hold_refusal)?;
 		Ok(Response::new(HoldUserResponse {
 			hold_expires_at: user.suspension().and_then(Suspension::hold_expires_at).unwrap_or_default(),
 		}))
