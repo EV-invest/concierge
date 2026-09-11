@@ -24,7 +24,10 @@ mod common;
 use concierge::{
 	authz::{BreakGlass, require_permission},
 	directory::{self, Directory},
-	infrastructure::{db, users::PgUsers},
+	infrastructure::{
+		db,
+		users::{AdminAction, PgUsers},
+	},
 	ports::UserDirectoryRepository,
 };
 use domain::{
@@ -32,7 +35,7 @@ use domain::{
 	users::{AuthSubject, Email, UserId},
 };
 use evconcierge_auth::{Claims, TokenType, provisioner_channel};
-use evconcierge_contracts::concierge::v1::{DisableUserRequest, GetMeRequest, GetUserRequest, ListUsersRequest, user_directory_server::UserDirectory};
+use evconcierge_contracts::concierge::v1::{GetMeRequest, GetUserRequest, HoldUserRequest, ListUsersRequest, user_directory_server::UserDirectory};
 use sqlx::{Connection, PgConnection, PgPool};
 use tonic::{Code, Request};
 use uuid::Uuid;
@@ -151,7 +154,7 @@ async fn gate_enforces_role_status_and_revocation() {
 	// Reinstate, then revoke tokens (bumps token_version) → a token minted under the OLD
 	// version is rejected, while a token at the new floor is accepted.
 	users.enable_user(id).await.unwrap();
-	let revoked = users.revoke_tokens(id).await.unwrap();
+	let revoked = users.revoke_tokens(id, &AdminAction::system("tokens_revoked"), 0).await.unwrap();
 	assert!(revoked.token_version() >= 1, "revoke_tokens bumps the floor");
 	let stale = require_permission(users, &closed, &request_as(access_claims(&sub, 0)), Permission::RoleGrant).await.unwrap_err();
 	assert_eq!(stale.code(), Code::Unauthenticated, "a token below the revocation floor is rejected");
@@ -262,7 +265,7 @@ async fn allowlisted_operator_is_still_gated_by_status_and_revocation() {
 	assert_eq!(suspended.code(), Code::PermissionDenied, "a disabled allowlisted operator is denied");
 
 	users.enable_user(id).await.unwrap();
-	let revoked = users.revoke_tokens(id).await.unwrap();
+	let revoked = users.revoke_tokens(id, &AdminAction::system("tokens_revoked"), 0).await.unwrap();
 	let stale = require_permission(users, &allowlist, &request_as(access_claims(&sub, revoked.token_version() - 1)), Permission::RoleGrant)
 		.await
 		.unwrap_err();
@@ -351,8 +354,16 @@ async fn malformed_admin_target_user_id_is_invalid_argument() {
 		.unwrap_err();
 	assert_eq!(bad_read.code(), Code::InvalidArgument, "a malformed target user_id is bad input, not an auth failure");
 
+	// `HoldUser`, because `DisableUser` no longer reaches its target field at all — it
+	// refuses every call and names the two verbs it used to be at once.
 	let bad_write = directory
-		.disable_user(request_with(access_claims(&sub, 0), DisableUserRequest { user_id: "123-not-a-uuid".into() }))
+		.hold_user(request_with(
+			access_claims(&sub, 0),
+			HoldUserRequest {
+				user_id: "123-not-a-uuid".into(),
+				reason: "compromised".into(),
+			},
+		))
 		.await
 		.unwrap_err();
 	assert_eq!(bad_write.code(), Code::InvalidArgument, "mutations agree with reads on the target-field status code");

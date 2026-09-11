@@ -31,7 +31,7 @@ use concierge::{
 			stub::StubKyc,
 		},
 		notifications::PgNotifications,
-		users::PgUsers,
+		users::{AdminAction, PgUsers},
 	},
 	ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, KycStatus, UserDirectoryRepository},
 	web::{self, KycDeps, START_MAX_PER_WINDOW},
@@ -393,7 +393,7 @@ async fn a_failed_attempt_never_lowers_an_existing_level() {
 	let h = harness!();
 	let user = h.user().await;
 	// An operator granted tier 2 by hand.
-	h.users.set_kyc_level(user, 2).await.expect("manual grant");
+	h.users.set_kyc_level(user, 2, &AdminAction::system("kyc_level_set"), 0).await.expect("manual grant");
 	let manual_events = h.kyc_changed_count(user).await;
 
 	// Every way an attempt can fail, one after another, on cases at the entry tier.
@@ -1048,7 +1048,7 @@ async fn a_vendor_approval_never_overwrites_a_concurrent_human_grant() {
 
 	// The human decision lands first, granting a tier no vendor may reach.
 	let operator = h.users.clone();
-	let grant = tokio::spawn(async move { operator.set_kyc_level(user, 3).await });
+	let grant = tokio::spawn(async move { operator.set_kyc_level(user, 3, &AdminAction::system("kyc_level_set"), 0).await });
 	holder.rollback().await.unwrap();
 
 	let webhook_status = tokio::time::timeout(std::time::Duration::from_secs(10), webhook)

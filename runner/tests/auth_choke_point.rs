@@ -15,8 +15,9 @@ use std::{net::TcpListener, time::Duration};
 
 use evconcierge_auth::{Verifier, grpc_auth_layer};
 use evconcierge_contracts::concierge::v1::{
-	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse,
-	RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
+	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, HoldUserRequest, HoldUserResponse, ListUsersRequest, ListUsersResponse,
+	ReinstateUserRequest, ReinstateUserResponse, RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest,
+	UserProfile,
 	health_service_client::HealthServiceClient,
 	health_service_server::{HealthService, HealthServiceServer},
 	user_directory_client::UserDirectoryClient,
@@ -57,6 +58,10 @@ impl UserDirectory for Directory {
 
 	async fn disable_user(&self, _request: Request<DisableUserRequest>) -> Result<Response<DisableUserResponse>, Status> {
 		Err(Status::unimplemented("UserDirectory.DisableUser is not implemented"))
+	}
+
+	async fn hold_user(&self, _request: Request<HoldUserRequest>) -> Result<Response<HoldUserResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.HoldUser is not implemented"))
 	}
 
 	async fn reinstate_user(&self, _request: Request<ReinstateUserRequest>) -> Result<Response<ReinstateUserResponse>, Status> {

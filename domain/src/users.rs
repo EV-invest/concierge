@@ -1048,4 +1048,97 @@ mod tests {
 		assert!(tz("Asia/").is_err());
 		assert!(tz("Mars/Olympus").is_err());
 	}
+
+	// -----------------------------------------------------------------------------
+	// The split verb: a hold that lapses, and a verdict that does not.
+	// -----------------------------------------------------------------------------
+
+	#[test]
+	fn a_hold_freezes_now_and_carries_its_own_deadline() {
+		let mut user = fixture();
+		user.drain_events();
+		user.hold(1_000).expect("nothing is suspending this account yet");
+		assert_eq!(user.status(), UserStatus::Disabled);
+		assert_eq!(user.suspension(), Some(Suspension::AdminHold { expires_at: 1_000 + HOLD_TTL_SECS }));
+		assert_eq!(user.drain_events(), [UserEvent::Suspended], "the money plane learns of the freeze");
+	}
+
+	/// The half that makes a one-actor brake safe to hand out: it releases itself, and a
+	/// REINSTATED goes with it so the money plane unfreezes too.
+	#[test]
+	fn a_hold_lapses_on_its_own_and_tells_the_bridge() {
+		let mut user = fixture();
+		user.hold(1_000).expect("hold");
+		user.drain_events();
+
+		assert!(!user.lapse_hold(1_000 + HOLD_TTL_SECS - 1), "not due yet");
+		assert_eq!(user.status(), UserStatus::Disabled);
+
+		assert!(user.lapse_hold(1_000 + HOLD_TTL_SECS), "due");
+		assert_eq!(user.status(), UserStatus::Active);
+		assert_eq!(user.suspension(), None);
+		assert_eq!(user.drain_events(), [UserEvent::Reinstated]);
+		assert!(!user.lapse_hold(i64::MAX), "there is nothing left to lapse");
+	}
+
+	/// The owners' verdict has no clock, and the weaker measure cannot restate it — which
+	/// would hand one admin the expiry that goes with a hold.
+	#[test]
+	fn a_governance_suspension_never_lapses_and_a_hold_cannot_replace_it() {
+		let mut user = fixture();
+		user.suspend();
+		user.drain_events();
+		assert_eq!(user.suspension(), Some(Suspension::Governance));
+		assert_eq!(user.suspension().unwrap().hold_expires_at(), None);
+		assert!(!user.lapse_hold(i64::MAX), "a verdict does not expire");
+
+		let err = user.hold(2_000).expect_err("a hold must not downgrade the owners' verdict");
+		assert!(matches!(err, DomainError::Conflict(_)));
+		assert_eq!(user.suspension(), Some(Suspension::Governance), "the refusal left it alone");
+	}
+
+	#[test]
+	fn only_a_hold_is_reversible_by_one_admin() {
+		assert!(Suspension::AdminHold { expires_at: 1 }.is_reversible_by_one_admin());
+		assert!(!Suspension::Governance.is_reversible_by_one_admin());
+	}
+
+	/// The freeze is the event, not the reason for it: ratifying an account that is
+	/// already held must not emit a second SUSPENDED for the money plane to mirror.
+	#[test]
+	fn ratifying_a_live_hold_restamps_it_without_a_second_event() {
+		let mut user = fixture();
+		user.hold(1_000).expect("hold");
+		user.drain_events();
+		let version = user.row_version();
+
+		user.suspend();
+		assert_eq!(user.suspension(), Some(Suspension::Governance));
+		assert!(user.drain_events().is_empty(), "it was already frozen");
+		assert_eq!(user.row_version(), version);
+	}
+
+	/// A row disabled before the column existed reads as `None`, which is the OLD
+	/// semantics on purpose — liftable in one act, lapsing never — because that is the
+	/// rule those accounts were actually suspended under.
+	#[test]
+	fn a_pre_existing_suspension_keeps_the_semantics_it_was_made_under() {
+		let mut user = fixture();
+		user.disable();
+		assert_eq!(user.status(), UserStatus::Disabled);
+		assert_eq!(user.suspension(), None);
+		assert!(!user.lapse_hold(i64::MAX), "nothing to lapse");
+		user.enable();
+		assert_eq!(user.status(), UserStatus::Active);
+	}
+
+	#[test]
+	fn suspension_round_trips_through_the_stored_pair() {
+		assert_eq!(Suspension::parse("admin_hold", Some(42)).unwrap(), Suspension::AdminHold { expires_at: 42 });
+		assert_eq!(Suspension::parse("governance", None).unwrap(), Suspension::Governance);
+		// A hold with no stored deadline is one that never lapses, not one that lapsed
+		// at the epoch — the direction of that default is the whole safety of it.
+		assert_eq!(Suspension::parse("admin_hold", None).unwrap(), Suspension::AdminHold { expires_at: i64::MAX });
+		assert!(Suspension::parse("because", None).is_err());
+	}
 }
