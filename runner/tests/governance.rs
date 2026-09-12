@@ -1211,11 +1211,33 @@ async fn a_recipient_is_rate_limited_across_kinds() {
 	};
 	let relay = fx.relay_allowing(2);
 	let owner = fx.owner().await;
-	for _ in 0..2 {
-		assert!(relay.send_governance_mail(relayed(payout(owner))).await.expect("within budget").into_inner().enqueued);
+	let first = payout(owner);
+	assert!(relay.send_governance_mail(relayed(first.clone())).await.expect("within budget").into_inner().enqueued);
+
+	// Neither a retry the dedupe key turns into a no-op nor a refused call spends the
+	// budget: the money plane's worker retries every 30s and gives a mail up after ten
+	// attempts, so a budget drained by retries would lose an approval mail for good.
+	for _ in 0..5 {
+		assert!(!relay.send_governance_mail(relayed(first.clone())).await.expect("a retry").into_inner().enqueued);
 	}
+	let mut refused = payout(owner);
+	refused.payout_approval.as_mut().unwrap().approval_url = "https://attacker.example/".into();
+	assert_eq!(relay.send_governance_mail(relayed(refused)).await.unwrap_err().code(), Code::InvalidArgument);
+
+	assert!(
+		relay
+			.send_governance_mail(relayed(payout(owner)))
+			.await
+			.expect("the second NEW mail still fits")
+			.into_inner()
+			.enqueued
+	);
 	let err = relay.send_governance_mail(relayed(payment_approval(owner))).await.unwrap_err();
-	assert_eq!(err.code(), Code::ResourceExhausted, "the third mail to the same person in the window: {err}");
+	assert_eq!(err.code(), Code::ResourceExhausted, "the third new mail to the same person in the window: {err}");
+	// Over budget, even a retry of a mail already queued is refused — the budget is
+	// peeked before the queue is consulted. Transient: the worker retries, the window
+	// turns, and the retry is then answered `enqueued: false` without spending anything.
+	assert_eq!(relay.send_governance_mail(relayed(first)).await.unwrap_err().code(), Code::ResourceExhausted);
 
 	// Another recipient has their own bucket.
 	let other = fx.owner().await;

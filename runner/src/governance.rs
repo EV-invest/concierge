@@ -885,6 +885,12 @@ fn address(value: &str, field: &str) -> Result<String, Status> {
 /// Refuse anything that a mail client or the cabinet would turn into a link. For the
 /// one field the INBOX repeats: there it cannot be set apart as the money plane's text,
 /// and a tappable `http://…` in the platform's own sentence is a phishing line.
+///
+/// Deliberately coarser than "contains a URL": the needles are `://`, `www.` and the
+/// bare word `http` (which also covers `https`, `http:evil` and `HTTP evil.example`,
+/// which a client may still linkify). The field this guards is an AMOUNT — a number
+/// and a currency — so the false positives that coarseness buys are strings that had no
+/// business in it anyway.
 fn no_link(value: &str, field: &str) -> Result<String, Status> {
 	let lower = value.to_ascii_lowercase();
 	if ["://", "www.", "http"].iter().any(|needle| lower.contains(needle)) {
@@ -979,8 +985,13 @@ impl MailRelayService for MailRelay {
 			return Err(Status::invalid_argument("dedupe_key must be 1-128 characters"));
 		}
 		let user_id = parse_user_id(&req.user_id, "user_id")?;
-		// Keyed by the parsed id, so two spellings of one uuid share a bucket.
-		if !self.limiter.check(&user_id.to_string()) {
+		// Keyed by the parsed id, so two spellings of one uuid share a bucket. PEEKED here
+		// and SPENT only once a new mail is actually queued: the money plane's worker
+		// retries every 30s and gives a mail up for good after ten attempts, so a budget
+		// that every retry drained — the dedupe no-ops, the validation refusals — would
+		// turn one busy hour into an approval mail lost forever.
+		let budget_key = user_id.to_string();
+		if !self.limiter.peek(&budget_key) {
 			return Err(Status::resource_exhausted("too many governance mails for this recipient in the current window"));
 		}
 
@@ -1160,6 +1171,9 @@ impl MailRelayService for MailRelay {
 			.enqueue_mail(user_id.raw(), recipient.email().as_str(), kind, &req.dedupe_key, &payload)
 			.await
 			.map_err(domain_to_status)?;
+		if enqueued {
+			self.limiter.record(&budget_key);
+		}
 
 		// The inbox trace, written AFTER the mail is queued and never in its way: the
 		// queue row is the security channel and the thing the money plane retries on; the
