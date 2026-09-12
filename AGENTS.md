@@ -244,9 +244,17 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   'admin_hold'` with `hold_expires_at = now + HOLD_TTL_SECS` (24h) — and
   `GovernanceService.OpenUserSuspension`, the owners' proposal, which writes
   `suspended_by = 'governance'` and carries no deadline. One actor may stop money
-  temporarily and never permanently. `ReinstateUser` reads that column and is the mirror
-  rule: one act for a hold, refused for a verdict (naming `OpenUserReinstatement`), or
-  the consilium would be advisory. A disabled row with `suspended_by IS NULL` predates
+  temporarily and never permanently — and "temporarily" is enforced, not assumed: a
+  hold is refused while one is live and for `HOLD_COOLDOWN_SECS` (7 days, longer than
+  a proposal lives) after one ends (`users.hold_ended_at`), unless a suspension
+  proposal about the account is OPEN, in which case the owners are deciding and the
+  hold extends until they have. Re-holding used to restart the clock, which let one
+  admin hold an investor indefinitely with no owner asked. An account holding the
+  `admin` or `owner` seat is held only by an owner (persisted role, decided under the
+  target's row lock) — an admin who could hold the owners could hold them out of the
+  votes that stop the hold — and nobody holds their own account. `ReinstateUser`
+  reads `suspended_by` and is the mirror rule: one act for a hold, refused for a
+  verdict (naming `OpenUserReinstatement`), or the consilium would be advisory. A disabled row with `suspended_by IS NULL` predates
   the column and deliberately keeps the OLD semantics — one-act, never lapsing — because
   that is the rule those accounts were suspended under; there is no backfill.
 - **The hold sweep is the ONE thing in this plane that sweeps.** Consilium expiry is

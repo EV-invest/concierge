@@ -1,0 +1,31 @@
+-- When the last admin hold on an account ENDED — lapsed on the sweep, or lifted by one
+-- act — as unix seconds. NULL where none ever did.
+--
+-- WHY A COLUMN. `User::hold` now refuses a second hold for `HOLD_COOLDOWN_SECS` after
+-- the previous one ended unless the owners are already deciding (an open suspension
+-- proposal). That instant has to be a fact of the aggregate, decided under the same row
+-- lock as the hold itself. `admin_action` already records `hold_lapsed` and `reinstated`
+-- rows, but that log answers "what was done to this person" after the fact and is not
+-- state the aggregate reasons over — a rule that read its own inputs out of the audit
+-- log would make the log load-bearing, which its header says it is not, and would have
+-- to tell a `reinstated` that lifted a hold from one that lifted a pre-column
+-- suspension by the row before it.
+--
+-- ADDITIVE AND NULLABLE, like 0015's two columns and for the same reason: migrations run
+-- at boot, so the previous build keeps serving against this schema through the rollout
+-- and never writes the column. A hold that ended under the old build therefore starts
+-- no cooldown — accepted, because the alternative is a backfill guessed from the log.
+--
+-- Numbered 0018 rather than the next free slot on this branch: 0017 is taken by the
+-- payment-approval mail kind on `feat/payment-approval-mail`, and sqlx orders by version
+-- without requiring the sequence to be contiguous.
+--
+-- No index: the column is only ever read on the row already held FOR UPDATE.
+--
+-- REVERSIBLE while the code that writes it is rolled back:
+--   ALTER TABLE users DROP COLUMN hold_ended_at;
+-- Dropping it loses the cooldown for every account whose hold ended in the meantime,
+-- which is the pre-fix behaviour, not data anyone is waiting on.
+SET lock_timeout = '3s';
+
+ALTER TABLE users ADD COLUMN hold_ended_at BIGINT;

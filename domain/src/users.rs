@@ -112,6 +112,21 @@ impl UserStatus {
 /// Making it permanent is [`Suspension::Governance`], and that needs the owners.
 pub const HOLD_TTL_SECS: i64 = 24 * 60 * 60;
 
+/// How long after a hold ends before one admin may place another on the same account
+/// without the owners being asked.
+///
+/// SEVEN DAYS, and the number is what keeps [`HOLD_TTL_SECS`] honest. The brake is safe
+/// to hand to one person only because it lapses; a hold that could be pressed again the
+/// moment it lapsed would lapse in name only — twenty-four hours on, one sweep interval
+/// off, forever, with no consilium ever asked. So a second hold inside this window is
+/// refused unless a suspension proposal about the account is OPEN, in which case the
+/// owners are already deciding and keeping the account frozen until they do is the
+/// point. A week is longer than a proposal lives ([`crate::governance::REMOVAL_TTL_SECS`],
+/// 72h), so "the owners never got round to it" cannot be bridged by re-holding, and
+/// short enough that a threat which genuinely returns after the owners declined can be
+/// braked again without a change of policy.
+pub const HOLD_COOLDOWN_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// WHY a disabled account is disabled — and therefore who is allowed to undo it.
 ///
 /// The split exists because the two are not the same decision. A hold is one operator's
@@ -223,6 +238,10 @@ pub struct User {
 	/// row disabled before this field existed, which therefore reads as the unqualified
 	/// suspension it was: liftable in one act, and lapsing never.
 	suspension: Option<Suspension>,
+	/// When the last admin hold on this account ended — lapsed, or lifted by one act.
+	/// `None` if none ever did. What [`Self::hold`] measures [`HOLD_COOLDOWN_SECS`]
+	/// against; a hold the owners ratified into a verdict never ends this way.
+	hold_ended_at: Option<i64>,
 	token_version: u64,
 	kyc_level: u32,
 	/// The platform-wide access role. This plane OWNS it; a change is mirrored to the
@@ -245,6 +264,7 @@ impl User {
 			email_verified,
 			status: UserStatus::Active,
 			suspension: None,
+			hold_ended_at: None,
 			token_version: 0,
 			kyc_level: 0,
 			role: Role::default(),
@@ -266,6 +286,7 @@ impl User {
 		email_verified: bool,
 		status: UserStatus,
 		suspension: Option<Suspension>,
+		hold_ended_at: Option<i64>,
 		token_version: u64,
 		kyc_level: u32,
 		role: Role,
@@ -279,6 +300,7 @@ impl User {
 			email_verified,
 			status,
 			suspension,
+			hold_ended_at,
 			token_version,
 			kyc_level,
 			role,
@@ -348,15 +370,48 @@ impl User {
 	/// expiry clock that goes with it — the verdict would then lapse in a day because one
 	/// person pressed the softer button.
 	///
-	/// Re-holding an account that is already held restarts the clock. That is deliberate:
-	/// after a lapse the account may still be compromised, and refusing the second brake
-	/// to keep the first one's deadline would be a worse trade. The repeated holds are
-	/// each audited, so a brake being renewed indefinitely is visible rather than silent.
-	pub fn hold(&mut self, now: i64) -> Result<(), DomainError> {
+	/// Refused, too, while a hold is already live and for [`HOLD_COOLDOWN_SECS`] after
+	/// one ends — UNLESS `ratification_pending`, meaning a suspension proposal about this
+	/// account is open. Re-holding used to restart the clock, on the argument that the
+	/// audit rows made a renewed brake visible; visible is not the same as governed. One
+	/// admin pressing the button once a day held an investor indefinitely with no owner
+	/// ever asked, and held every OTHER owner out of their sessions — and out of the very
+	/// votes that could stop it. The one legitimate reason to keep the account frozen past
+	/// a day is that the owners are deciding whether to, and then the hold extends until
+	/// they have.
+	///
+	/// `by` is the PERSISTED role of whoever is pressing. An admin or owner seat may be
+	/// held only by a fund owner: the votes on every user proposal need a session, so an
+	/// admin who could hold the owners could hold them out of the very consilium that
+	/// decides whether the hold stands — and the one control over a rogue operator is
+	/// another operator being able to stop them. An owner holding an admin is that
+	/// control; an admin holding an owner is its inversion.
+	pub fn hold(&mut self, by: Role, now: i64, ratification_pending: bool) -> Result<(), DomainError> {
 		if self.suspension == Some(Suspension::Governance) {
 			return Err(DomainError::Conflict(
 				"this account is suspended by the owner consilium; a hold cannot replace that verdict".into(),
 			));
+		}
+		if matches!(self.role, Role::Admin | Role::Owner) && by != Role::Owner {
+			return Err(DomainError::Forbidden(format!(
+				"an account holding the {} seat is held only by a fund owner; anyone else asks the owners through GovernanceService.OpenUserSuspension",
+				self.role.as_str()
+			)));
+		}
+		if !ratification_pending {
+			if let Some(expires_at) = self.suspension.and_then(Suspension::hold_expires_at) {
+				return Err(DomainError::Forbidden(format!(
+					"this account is already held until {expires_at}; a hold is not renewed by holding again — keeping it frozen past that is the owners' decision, through GovernanceService.OpenUserSuspension, and the hold extends while they decide"
+				)));
+			}
+			if let Some(ended_at) = self.hold_ended_at
+				&& now < ended_at.saturating_add(HOLD_COOLDOWN_SECS)
+			{
+				return Err(DomainError::Forbidden(format!(
+					"a hold on this account ended at {ended_at}, less than {} days ago; a second one needs the owners — open GovernanceService.OpenUserSuspension, and the account may be held again while they decide",
+					HOLD_COOLDOWN_SECS / (24 * 60 * 60)
+				)));
+			}
 		}
 		self.suspend_as(Some(Suspension::AdminHold {
 			expires_at: now.saturating_add(HOLD_TTL_SECS),
@@ -373,7 +428,14 @@ impl User {
 	/// Re-enable a disabled user and emit [`UserEvent::Reinstated`]. No-op when already
 	/// active. Unqualified: the decision about WHO may lift a given suspension is taken
 	/// from [`Self::suspension`] by the caller, not here.
-	pub fn enable(&mut self) {
+	///
+	/// `now` is remembered only when what ends is an admin hold — that is the instant
+	/// [`Self::hold`] measures its cooldown from. Lifting the owners' verdict, or a
+	/// pre-column suspension, starts no cooldown: neither was one actor's brake.
+	pub fn enable(&mut self, now: i64) {
+		if matches!(self.suspension, Some(Suspension::AdminHold { .. })) {
+			self.hold_ended_at = Some(now);
+		}
 		self.suspension = None;
 		if self.status == UserStatus::Active {
 			return;
@@ -395,7 +457,7 @@ impl User {
 		if now < expires_at {
 			return false;
 		}
-		self.enable();
+		self.enable(now);
 		true
 	}
 
@@ -473,6 +535,11 @@ impl User {
 	/// preserving exactly the behaviour those rows were suspended under.
 	pub fn suspension(&self) -> Option<Suspension> {
 		self.suspension
+	}
+
+	/// When the last admin hold ended, if one ever did — see [`Self::hold`].
+	pub fn hold_ended_at(&self) -> Option<i64> {
+		self.hold_ended_at
 	}
 
 	pub fn token_version(&self) -> u64 {
@@ -770,8 +837,8 @@ mod tests {
 		user.disable();
 		assert_eq!(user.drain_events(), [UserEvent::Suspended]);
 		assert!(!user.is_active());
-		user.enable();
-		user.enable();
+		user.enable(2_000);
+		user.enable(2_000);
 		assert_eq!(user.drain_events(), [UserEvent::Reinstated]);
 		assert!(user.is_active());
 	}
@@ -1057,7 +1124,7 @@ mod tests {
 	fn a_hold_freezes_now_and_carries_its_own_deadline() {
 		let mut user = fixture();
 		user.drain_events();
-		user.hold(1_000).expect("nothing is suspending this account yet");
+		user.hold(Role::Admin, 1_000, false).expect("nothing is suspending this account yet");
 		assert_eq!(user.status(), UserStatus::Disabled);
 		assert_eq!(user.suspension(), Some(Suspension::AdminHold { expires_at: 1_000 + HOLD_TTL_SECS }));
 		assert_eq!(user.drain_events(), [UserEvent::Suspended], "the money plane learns of the freeze");
@@ -1068,7 +1135,7 @@ mod tests {
 	#[test]
 	fn a_hold_lapses_on_its_own_and_tells_the_bridge() {
 		let mut user = fixture();
-		user.hold(1_000).expect("hold");
+		user.hold(Role::Admin, 1_000, false).expect("hold");
 		user.drain_events();
 
 		assert!(!user.lapse_hold(1_000 + HOLD_TTL_SECS - 1), "not due yet");
@@ -1078,6 +1145,7 @@ mod tests {
 		assert_eq!(user.status(), UserStatus::Active);
 		assert_eq!(user.suspension(), None);
 		assert_eq!(user.drain_events(), [UserEvent::Reinstated]);
+		assert_eq!(user.hold_ended_at(), Some(1_000 + HOLD_TTL_SECS), "the lapse is what the cooldown counts from");
 		assert!(!user.lapse_hold(i64::MAX), "there is nothing left to lapse");
 	}
 
@@ -1092,7 +1160,7 @@ mod tests {
 		assert_eq!(user.suspension().unwrap().hold_expires_at(), None);
 		assert!(!user.lapse_hold(i64::MAX), "a verdict does not expire");
 
-		let err = user.hold(2_000).expect_err("a hold must not downgrade the owners' verdict");
+		let err = user.hold(Role::Owner, 2_000, false).expect_err("a hold must not downgrade the owners' verdict");
 		assert!(matches!(err, DomainError::Conflict(_)));
 		assert_eq!(user.suspension(), Some(Suspension::Governance), "the refusal left it alone");
 	}
@@ -1108,7 +1176,7 @@ mod tests {
 	#[test]
 	fn ratifying_a_live_hold_restamps_it_without_a_second_event() {
 		let mut user = fixture();
-		user.hold(1_000).expect("hold");
+		user.hold(Role::Admin, 1_000, false).expect("hold");
 		user.drain_events();
 		let version = user.row_version();
 
@@ -1128,8 +1196,99 @@ mod tests {
 		assert_eq!(user.status(), UserStatus::Disabled);
 		assert_eq!(user.suspension(), None);
 		assert!(!user.lapse_hold(i64::MAX), "nothing to lapse");
-		user.enable();
+		user.enable(2_000);
 		assert_eq!(user.status(), UserStatus::Active);
+		assert_eq!(user.hold_ended_at(), None, "lifting a pre-column suspension starts no cooldown");
+	}
+
+	/// The brake lapses, and that has to mean something: pressed again while live it is
+	/// refused, and pressed again within the cooldown it is refused. What lifts both is
+	/// the owners already deciding — an open suspension proposal — and then the hold
+	/// extends until they have.
+	#[test]
+	fn a_hold_is_not_renewed_by_holding_again() {
+		let mut user = fixture();
+		user.hold(Role::Admin, 1_000, false).expect("the first brake");
+		user.drain_events();
+
+		let err = user.hold(Role::Admin, 2_000, false).expect_err("a second press while held must not restart the clock");
+		assert!(matches!(err, DomainError::Forbidden(_)), "{err}");
+		assert_eq!(user.suspension(), Some(Suspension::AdminHold { expires_at: 1_000 + HOLD_TTL_SECS }), "the deadline stood");
+		assert!(user.drain_events().is_empty());
+
+		user.hold(Role::Admin, 2_000, true)
+			.expect("with a suspension proposal open, the hold extends until the owners decide");
+		assert_eq!(user.suspension(), Some(Suspension::AdminHold { expires_at: 2_000 + HOLD_TTL_SECS }));
+		assert!(user.drain_events().is_empty(), "still one freeze for the money plane");
+	}
+
+	#[test]
+	fn a_lapsed_hold_starts_a_cooldown_that_only_the_owners_can_shorten() {
+		let mut user = fixture();
+		user.hold(Role::Admin, 1_000, false).expect("hold");
+		let ended = 1_000 + HOLD_TTL_SECS;
+		assert!(user.lapse_hold(ended));
+		user.drain_events();
+
+		let err = user.hold(Role::Admin, ended + HOLD_COOLDOWN_SECS - 1, false).expect_err("inside the cooldown");
+		assert!(matches!(err, DomainError::Forbidden(_)), "{err}");
+		assert_eq!(user.status(), UserStatus::Active, "the refusal changed nothing");
+
+		user.hold(Role::Admin, ended + 1, true).expect("an open suspension proposal lifts the cooldown");
+		assert_eq!(user.status(), UserStatus::Disabled);
+		assert_eq!(user.drain_events(), [UserEvent::Suspended]);
+
+		let mut again = fixture();
+		again.hold(Role::Admin, 1_000, false).expect("hold");
+		again.lapse_hold(ended);
+		again
+			.hold(Role::Admin, ended + HOLD_COOLDOWN_SECS, false)
+			.expect("the cooldown is over, one actor may brake again");
+	}
+
+	/// Lifted early by one act counts the same as lapsing: the account was one actor's
+	/// to brake and one actor's to release, and the next brake waits.
+	#[test]
+	fn a_lifted_hold_starts_the_cooldown_too() {
+		let mut user = fixture();
+		user.hold(Role::Admin, 1_000, false).expect("hold");
+		user.enable(5_000);
+		assert_eq!(user.hold_ended_at(), Some(5_000));
+		assert!(matches!(user.hold(Role::Admin, 6_000, false), Err(DomainError::Forbidden(_))));
+	}
+
+	/// A hold the owners ratified ended as THEIR verdict, not as a hold; lifting the
+	/// verdict later starts no cooldown against the next emergency.
+	#[test]
+	fn a_ratified_hold_leaves_no_cooldown_behind() {
+		let mut user = fixture();
+		user.hold(Role::Admin, 1_000, false).expect("hold");
+		user.suspend();
+		user.enable(9_000);
+		assert_eq!(user.hold_ended_at(), None);
+		user.hold(Role::Admin, 9_001, false).expect("the owners lifted their verdict; the brake is available again");
+	}
+
+	/// The votes on every user proposal need a session, so an admin who could hold the
+	/// owners could hold them out of the consilium that decides whether the hold stands.
+	/// Only an owner holds a seat; anyone may hold an investor.
+	#[test]
+	fn a_seat_is_held_only_by_an_owner() {
+		for seat in [Role::Admin, Role::Owner] {
+			let mut seated = fixture();
+			seated.set_role(seat);
+			seated.drain_events();
+			for pressing in [Role::Investor, Role::Operator, Role::Admin] {
+				let err = seated.hold(pressing, 1_000, false).expect_err("not by this role");
+				assert!(matches!(err, DomainError::Forbidden(_)), "{err}");
+				assert_eq!(seated.status(), UserStatus::Active, "the refusal changed nothing");
+			}
+			seated.hold(Role::Owner, 1_000, false).expect("an owner may hold a seat");
+			assert_eq!(seated.status(), UserStatus::Disabled);
+		}
+
+		let mut investor = fixture();
+		investor.hold(Role::Admin, 1_000, false).expect("an investor is held by any operator with the permission");
 	}
 
 	#[test]

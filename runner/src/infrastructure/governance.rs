@@ -598,7 +598,7 @@ async fn settle_proposal(conn: &mut PgConnection, proposal: &mut UserProposal, n
 			"suspended_by_consilium"
 		}
 		UserProposalKind::Reinstatement => {
-			subject.enable();
+			subject.enable(now);
 			"reinstated_by_consilium"
 		}
 		UserProposalKind::AdminAdmission => {
