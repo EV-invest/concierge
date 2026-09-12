@@ -31,13 +31,19 @@ never calls `banking`:
    the request; and every emailed link is pinned to `PUBLIC_ORIGIN` — a
    compromised money plane must not become a phishing cannon aimed at owners.
    WHO may receive one is decided per KIND, and the default is the strict one:
-   the three payout kinds are addressed to the consilium, so they go to a seated
-   owner and to nobody else. `PAYMENT_CONSENT` cannot use that rule — consenting
-   to a transfer of your own money has nothing to do with holding a seat — so it
-   gets its own, narrower in the dimension that matters: the recipient must BE
-   the payment's subject, named in the typed payload and matched against the
-   resolved identity record, and their address must be verified. The surface
-   widens by exactly one person per message rather than to everyone.
+   the consilium kinds — the three payout kinds and `PAYMENT_APPROVAL`, the
+   owners' question about a payment of fund-owned money — are addressed to the
+   consilium, so they go to a seated owner and to nobody else. `PAYMENT_CONSENT`
+   cannot use that rule — consenting to a transfer of your own money has nothing
+   to do with holding a seat — so it gets its own, narrower in the dimension that
+   matters: the recipient must BE the payment's subject, named in the typed
+   payload and matched against the resolved identity record, and their address
+   must be verified. The surface widens by exactly one person per message rather
+   than to everyone. A consent also leaves an in-app trace in the subject's inbox
+   — written regardless of what they follow, because nobody subscribes to being
+   asked about their own money and no topic is followed by default — so the
+   request is findable in the cabinet when the mail is late or lost; the link and
+   the code stay in the mail.
 
 Both seams are authenticated by the SAME shared bridge service token
 (`BRIDGE_SERVICE_TOKEN`), compared in constant time and mounted OUTSIDE the user

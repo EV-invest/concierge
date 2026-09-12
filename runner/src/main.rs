@@ -241,6 +241,10 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		std::time::Duration::from_secs(config.subscribe_rate_window_secs),
 		config.subscribe_rate_limit,
 	));
+	let governance_mail_limiter = Arc::new(notification::RateLimiter::new(
+		std::time::Duration::from_secs(config.governance_mail_rate_window_secs),
+		config.governance_mail_rate_limit,
+	));
 
 	// The site-level auth HTTP surface: the conductor rewrites the shared origin's
 	// `/api/auth/*` + `/api/callback/auth/*` here, so login/session cookies land
@@ -293,6 +297,8 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.add_service(MailRelayServiceServer::new(governance::MailRelay::new(
 				users.clone(),
 				governance_repo.clone(),
+				notification_repo.clone(),
+				governance_mail_limiter,
 				// The SAME secret the bridge uses. One trust relationship between the two
 				// planes, one secret to rotate — and banking presents this token on both
 				// seams, so a second variable could only ever drift out of step with it.

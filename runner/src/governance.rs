@@ -18,8 +18,9 @@
 //! is. The payload is TYPED, never rendered markup, and the recipient's address is
 //! resolved HERE from the identity record — a compromised money plane must not be able
 //! to redirect a governance mail or put arbitrary HTML in an owner's inbox. WHO may
-//! receive one is decided per KIND: the payout kinds go to a seated owner, and a payment
-//! consent goes to the one person whose money the payment moves and to nobody else.
+//! receive one is decided per KIND: the consilium kinds — the payouts and a payment
+//! approval — go to a seated owner, and a payment consent goes to the one person whose
+//! money the payment moves and to nobody else.
 //!
 //! WHAT CROSSES THE WIRE ON THE LIVE FEED. A revision, never a tally. The client
 //! refetches the authoritative snapshot when the number moves, so a stale or replayed
@@ -62,8 +63,8 @@ use uuid::Uuid;
 use crate::{
 	authz::BreakGlass,
 	infrastructure::governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
-	notification::now_secs,
-	ports::{GovernanceRepository, UserDirectoryRepository},
+	notification::{RateLimiter, now_secs},
+	ports::{GovernanceRepository, NotificationRepository, UserDirectoryRepository},
 	support::{authenticate_service, domain_to_status},
 };
 
@@ -760,6 +761,15 @@ impl OwnerRemovalApprovalService for RemovalApproval {
 pub struct MailRelay {
 	users: Arc<dyn UserDirectoryRepository>,
 	governance: Arc<dyn GovernanceRepository>,
+	/// The in-app inbox, for the one kind whose reader has no other surface to find it
+	/// on — see [`CONSENT_TOPIC`].
+	notifications: Arc<dyn NotificationRepository>,
+	/// Per-RECIPIENT ceiling. The money plane is the one caller and is trusted enough
+	/// to be here at all; what this bounds is how much branded security mail a
+	/// compromised one can aim at a single person before an operator notices. In
+	/// memory and per process, like the subscribe limiter, and for the same reason: the
+	/// durable ceiling is the daily send budget.
+	limiter: Arc<RateLimiter>,
 	/// `None` ⇒ the relay is not configured and every call is rejected (fail closed).
 	/// In production this is the SAME `BRIDGE_SERVICE_TOKEN` banking presents when it
 	/// pulls the outbox: one trust relationship between the planes, one secret to rotate.
@@ -769,10 +779,19 @@ pub struct MailRelay {
 }
 
 impl MailRelay {
-	pub fn new(users: Arc<dyn UserDirectoryRepository>, governance: Arc<dyn GovernanceRepository>, token: Option<String>, approval_origin: String) -> Self {
+	pub fn new(
+		users: Arc<dyn UserDirectoryRepository>,
+		governance: Arc<dyn GovernanceRepository>,
+		notifications: Arc<dyn NotificationRepository>,
+		limiter: Arc<RateLimiter>,
+		token: Option<String>,
+		approval_origin: String,
+	) -> Self {
 		Self {
 			users,
 			governance,
+			notifications,
+			limiter,
 			token: token.filter(|t| !t.is_empty()).map(|t| Arc::from(t.as_str())),
 			approval_origin: approval_origin.trim_end_matches('/').to_owned(),
 		}
@@ -788,13 +807,24 @@ impl MailRelay {
 	/// The boundary is checked explicitly rather than by a bare `starts_with`, which
 	/// would also accept `https://evinvest.ltd.attacker.example`.
 	fn approval_link(&self, raw: &str) -> Result<String, Status> {
-		let url = bounded(raw, 512, "approval_url")?;
+		let url = line(raw, 512, "approval_url")?;
 		Self::check_origin(&self.approval_origin, &url)?;
 		Ok(url)
 	}
 
-	/// The origin rule alone, free of the ports, so it can be exercised directly.
+	/// The link rule alone, free of the ports, so it can be exercised directly.
+	///
+	/// The origin is a PREFIX check, and a prefix check says nothing about what follows.
+	/// The text part of every mail prints the link bare on its own line, so a URL that
+	/// passes the origin and then carries a space or a newline —
+	/// `https://evinvest.ltd/x https://attacker.example` — puts a second, foreign link
+	/// on that line, in a mail this plane signed. A URL has no business containing
+	/// whitespace or anything outside printable ASCII (an encoded one never does), so
+	/// the whole string is held to that before the origin is even looked at.
 	fn check_origin(origin: &str, url: &str) -> Result<(), Status> {
+		if url.chars().any(|c| c.is_whitespace() || !c.is_ascii_graphic()) {
+			return Err(Status::invalid_argument("approval_url must not contain whitespace or non-printable characters"));
+		}
 		let refuse = || Status::invalid_argument("approval_url must be on this platform's public origin");
 		let rest = url.strip_prefix(origin).filter(|rest| rest.is_empty() || rest.starts_with('/')).ok_or_else(refuse)?;
 		// `//host` is protocol-relative and leaves our origin behind entirely.
@@ -839,6 +869,36 @@ fn line(value: &str, max_bytes: usize, field: &str) -> Result<String, Status> {
 	Ok(value.to_owned())
 }
 
+/// [`line`], plus: the field must look like ONE address — an `@`, no whitespace.
+///
+/// It is rendered as "Requested by" and woven into a sentence of ours, so a value like
+/// `EV Investment security — approve now` would read as our words with our authority.
+/// Not `Email::parse`: that normalises, and what is shown must be what was sent.
+fn address(value: &str, field: &str) -> Result<String, Status> {
+	let value = line(value, 320, field)?;
+	if !value.contains('@') || value.chars().any(char::is_whitespace) {
+		return Err(Status::invalid_argument(format!("{field} must be an email address")));
+	}
+	Ok(value)
+}
+
+/// Refuse anything that a mail client or the cabinet would turn into a link. For the
+/// one field the INBOX repeats: there it cannot be set apart as the money plane's text,
+/// and a tappable `http://…` in the platform's own sentence is a phishing line.
+///
+/// Deliberately coarser than "contains a URL": the needles are `://`, `www.` and the
+/// bare word `http` (which also covers `https`, `http:evil` and `HTTP evil.example`,
+/// which a client may still linkify). The field this guards is an AMOUNT — a number
+/// and a currency — so the false positives that coarseness buys are strings that had no
+/// business in it anyway.
+fn no_link(value: &str, field: &str) -> Result<String, Status> {
+	let lower = value.to_ascii_lowercase();
+	if ["://", "www.", "http"].iter().any(|needle| lower.contains(needle)) {
+		return Err(Status::invalid_argument(format!("{field} must not contain a link")));
+	}
+	Ok(value.to_owned())
+}
+
 /// [`line`], plus: the field must actually say something.
 fn required_line(value: &str, max_bytes: usize, field: &str) -> Result<String, Status> {
 	if value.trim().is_empty() {
@@ -850,17 +910,66 @@ fn required_line(value: &str, max_bytes: usize, field: &str) -> Result<String, S
 /// The payment tiers the money plane may name.
 ///
 /// A closed set rather than free text: this word is rendered at a person deciding whether
-/// to release their own money, and a tier neither plane recognises means the two disagree
-/// about what the payment IS — something to surface as a rejected call, not to print.
+/// to release money, and a tier neither plane recognises means the two disagree about
+/// what the payment IS — something to surface as a rejected call, not to print.
 const PAYMENT_TIERS: [&str; 3] = ["internal", "service", "external"];
+
+/// How a consilium can end, as the money plane spells it: its `ConsiliumState::as_str()`
+/// upper-cased for every closed state (never OPEN — an outcome is announced only after a
+/// transition), plus the burn notice's own word. A closed set for the same reason as
+/// [`PAYMENT_TIERS`]: this word becomes the headline of the mail.
+const OUTCOMES: [&str; 7] = ["APPROVED", "REJECTED", "EXPIRED", "CANCELLED", "EXECUTED", "EXECUTION_FAILED", "TOKEN_BURNED"];
+
+/// [`line`], plus: the word must be one of [`PAYMENT_TIERS`].
+fn payment_tier(value: &str) -> Result<String, Status> {
+	let tier = line(value, 16, "tier")?;
+	if !PAYMENT_TIERS.contains(&tier.as_str()) {
+		return Err(Status::invalid_argument("tier must be one of internal, service, external"));
+	}
+	Ok(tier)
+}
+
+/// Where the in-app trace of a payment consent is filed.
+///
+/// The mail is the security channel and cannot be muted; this is what the subject finds
+/// in the cabinet when that mail is late, filtered or lost. It is written REGARDLESS of
+/// whether they follow the topic (`NotificationRepository::record`, not `emit`): nobody
+/// subscribes to being asked about their own money, and there is no topic every user
+/// follows by default — `upsert_subscriber` creates the subscriber row and nothing under
+/// it, so an `emit` here would reach only the few who had opened their notification
+/// settings. The topic still has to be a real one, so the inbox can filter on it and the
+/// catalogue test below keeps it from drifting.
+const CONSENT_TOPIC: &str = "account:money-movement";
+
+/// Prefix on the inbox entry's dedupe key. The money plane chooses its own keys, and the
+/// inbox is also written by this plane's own emitters; without a namespace a key the
+/// money plane picked could collide with — and silently suppress — an entry of ours.
+const INBOX_KEY_PREFIX: &str = "governance:";
+
+/// What a payment consent leaves in the subject's inbox. The platform's own words only —
+/// no link, no code (those live in the mail and nowhere else), and none of the money
+/// plane's free text either: the operator's `reason` obviously, but also `source` and
+/// `destination`, which an honest external destination can make look like an address
+/// or a URL and which the inbox has no way to mark as somebody else's words. The
+/// amount is the one fact repeated, and it is refused if it can carry a link.
+struct ConsentNotice {
+	title: String,
+	body: String,
+}
 
 /// Who a mail of a given kind may be addressed to, decided from the KIND before the
 /// identity record is read. The address itself is resolved from that record either way;
 /// this decides only whether the person it belongs to may be sent THIS mail.
 enum Recipient {
-	/// The payout kinds speak to the consilium — an approval to cast, or the outcome of
-	/// one — so the recipient must hold a seat.
-	FundOwner,
+	/// The consilium kinds — a payout or payment approval to cast, or the outcome of
+	/// one — speak to a seated owner, so the recipient must hold a seat.
+	///
+	/// `verified_address` adds the consent's second rule for the one consilium kind
+	/// that arrived after it: a payment approval carries a link AND the code that arms
+	/// it, and an address nobody has proved belongs to the owner hands that vote to
+	/// whoever holds the mailbox. The payout kinds keep `false` on purpose — they are a
+	/// live contract, and closing that hole for them is its own change.
+	FundOwner { verified_address: bool },
 	/// A payment consent speaks to exactly one person: the one whose money moves. Role
 	/// decides nothing here, so the rule is identity.
 	Subject(UserId),
@@ -876,13 +985,22 @@ impl MailRelayService for MailRelay {
 			return Err(Status::invalid_argument("dedupe_key must be 1-128 characters"));
 		}
 		let user_id = parse_user_id(&req.user_id, "user_id")?;
+		// Keyed by the parsed id, so two spellings of one uuid share a bucket. PEEKED here
+		// and SPENT only once a new mail is actually queued: the money plane's worker
+		// retries every 30s and gives a mail up for good after ten attempts, so a budget
+		// that every retry drained — the dedupe no-ops, the validation refusals — would
+		// turn one busy hour into an approval mail lost forever.
+		let budget_key = user_id.to_string();
+		if !self.limiter.peek(&budget_key) {
+			return Err(Status::resource_exhausted("too many governance mails for this recipient in the current window"));
+		}
 
-		let (kind, payload, recipient_rule) = match GovernanceMailKind::try_from(req.kind) {
+		let (kind, payload, recipient_rule, notice) = match GovernanceMailKind::try_from(req.kind) {
 			Ok(GovernanceMailKind::PayoutApproval) => {
 				let mail = req.payout_approval.ok_or_else(|| Status::invalid_argument("payout_approval is required for this kind"))?;
 				let payload = serde_json::json!({
 					"consilium_id": bounded(&mail.consilium_id, 64, "consilium_id")?,
-					"initiator_email": bounded(&mail.initiator_email, 320, "initiator_email")?,
+					"initiator_email": address(&mail.initiator_email, "initiator_email")?,
 					"network": bounded(&mail.network, 64, "network")?,
 					"address": bounded(&mail.address, 128, "address")?,
 					"amount": bounded(&mail.amount, 64, "amount")?,
@@ -894,40 +1012,102 @@ impl MailRelayService for MailRelay {
 					"approval_url": self.approval_link(&mail.approval_url)?,
 					"code": bounded(&mail.code, 64, "code")?,
 				});
-				("payout_approval", payload, Recipient::FundOwner)
+				("payout_approval", payload, Recipient::FundOwner { verified_address: false }, None)
 			}
 			// A burned approval token is an outcome the owners are told about, and the
-			// outcome payload already carries everything that mail needs to say.
+			// outcome payload already carries everything that mail needs to say. The
+			// payout fields keep `bounded` (a live contract); the payment tuple added
+			// later is held to `line` like every other payment field.
 			Ok(GovernanceMailKind::PayoutOutcome) | Ok(GovernanceMailKind::ApprovalTokenBurned) => {
 				let mail = req.payout_outcome.ok_or_else(|| Status::invalid_argument("payout_outcome is required for this kind"))?;
+				let outcome = bounded(&mail.outcome, 64, "outcome")?;
+				if !OUTCOMES.contains(&outcome.as_str()) {
+					return Err(Status::invalid_argument("outcome must be one of the consilium outcomes"));
+				}
+				// One subject per mail. The renderer switches on which pair is filled, so a
+				// payload naming both would describe a rail on a payment — or the reverse —
+				// and half a payment pair would render a transfer with one end missing.
+				let names_a_rail = !mail.network.is_empty() || !mail.address.is_empty();
+				let names_a_payment = !mail.source.is_empty() || !mail.destination.is_empty() || !mail.tier.is_empty();
+				if names_a_rail && names_a_payment {
+					return Err(Status::invalid_argument(
+						"an outcome names either a rail (network, address) or a payment (tier, source, destination), not both",
+					));
+				}
+				if names_a_payment && (mail.source.is_empty() || mail.destination.is_empty() || mail.tier.is_empty()) {
+					return Err(Status::invalid_argument("a payment outcome needs tier, source and destination together"));
+				}
 				let payload = serde_json::json!({
 					"consilium_id": bounded(&mail.consilium_id, 64, "consilium_id")?,
-					"outcome": bounded(&mail.outcome, 64, "outcome")?,
+					"outcome": outcome,
 					"network": bounded(&mail.network, 64, "network")?,
 					"address": bounded(&mail.address, 128, "address")?,
 					"amount": bounded(&mail.amount, 64, "amount")?,
 					"detail": bounded(&mail.detail, 500, "detail")?,
+					// Empty for a payout; the burn notice over a payment carries no reason.
+					"tier": if mail.tier.is_empty() { String::new() } else { payment_tier(&mail.tier)? },
+					"source": line(&mail.source, 160, "source")?,
+					"destination": line(&mail.destination, 160, "destination")?,
+					"reason": line(&mail.reason, 500, "reason")?,
 				});
-				("payout_outcome", payload, Recipient::FundOwner)
+				("payout_outcome", payload, Recipient::FundOwner { verified_address: false }, None)
+			}
+			// The consilium asked about a PAYMENT of fund-owned money. Addressed like a
+			// payout — to a seat — but described like a consent: two ends of a transfer in
+			// words, and the operator's reason as theirs. Field rules are the consent's.
+			Ok(GovernanceMailKind::PaymentApproval) => {
+				let mail = req.payment_approval.ok_or_else(|| Status::invalid_argument("payment_approval is required for this kind"))?;
+				let payload = serde_json::json!({
+					"consilium_id": line(&mail.consilium_id, 64, "consilium_id")?,
+					"payment_id": line(&mail.payment_id, 64, "payment_id")?,
+					"initiator_email": address(&mail.initiator_email, "initiator_email")?,
+					"tier": payment_tier(&mail.tier)?,
+					"source": line(&mail.source, 160, "source")?,
+					"destination": line(&mail.destination, 160, "destination")?,
+					"amount": line(&mail.amount, 64, "amount")?,
+					"reason": required_line(&mail.reason, 500, "reason")?,
+					"payload_hash": line(&mail.payload_hash, 128, "payload_hash")?,
+					"threshold": mail.threshold,
+					"owner_count": mail.owner_count,
+					"expires_at": mail.expires_at,
+					"approval_url": self.approval_link(&mail.approval_url)?,
+					"code": line(&mail.code, 64, "code")?,
+				});
+				("payment_approval", payload, Recipient::FundOwner { verified_address: true }, None)
 			}
 			// The one kind that is not addressed to the consilium. Every field is bounded in
 			// bytes and refused if it carries a control character — see `line`.
 			Ok(GovernanceMailKind::PaymentConsent) => {
 				let mail = req.payment_consent.ok_or_else(|| Status::invalid_argument("payment_consent is required for this kind"))?;
-				let tier = line(&mail.tier, 16, "tier")?;
-				if !PAYMENT_TIERS.contains(&tier.as_str()) {
-					return Err(Status::invalid_argument("tier must be one of internal, service, external"));
-				}
+				let tier = payment_tier(&mail.tier)?;
 				// Read here and enforced against the RESOLVED record below, so the rule stays
 				// "the recipient IS the subject" rather than "two request fields agree".
 				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
+				// The inbox entry keeps its key under the CHECK on `notifications.dedupe_key`
+				// only if the money plane's key leaves room for the prefix.
+				if req.dedupe_key.chars().count() + INBOX_KEY_PREFIX.len() > 128 {
+					return Err(Status::invalid_argument(format!(
+						"dedupe_key must be at most {} characters for this kind",
+						128 - INBOX_KEY_PREFIX.len()
+					)));
+				}
+				let initiator_email = address(&mail.initiator_email, "initiator_email")?;
+				// `amount` is the one payload field the inbox repeats, and the inbox cannot
+				// mark it as somebody else's text — so it must not be able to carry a link.
+				let amount = no_link(&line(&mail.amount, 64, "amount")?, "amount")?;
+				let notice = ConsentNotice {
+					title: "A payment needs your consent".to_owned(),
+					body: format!(
+						"{initiator_email} has opened a payment of {amount}. What it is and where it goes, and the link to consent or refuse, are in the message sent to your email address."
+					),
+				};
 				let payload = serde_json::json!({
 					"payment_id": line(&mail.payment_id, 64, "payment_id")?,
-					"initiator_email": line(&mail.initiator_email, 320, "initiator_email")?,
+					"initiator_email": initiator_email,
 					"tier": tier,
 					"source": line(&mail.source, 160, "source")?,
 					"destination": line(&mail.destination, 160, "destination")?,
-					"amount": line(&mail.amount, 64, "amount")?,
+					"amount": amount,
 					// An operator writes this and the subject reads it verbatim. REQUIRED: a
 					// consent request nobody explained is one nobody can judge, and "approve
 					// this because we say so" is the shape of the mail we do not want to send.
@@ -937,7 +1117,7 @@ impl MailRelayService for MailRelay {
 					"approval_url": self.approval_link(&mail.approval_url)?,
 					"code": line(&mail.code, 64, "code")?,
 				});
-				("payment_consent", payload, Recipient::Subject(subject))
+				("payment_consent", payload, Recipient::Subject(subject), Some(notice))
 			}
 			_ => return Err(Status::invalid_argument("kind must be a known governance mail kind")),
 		};
@@ -952,16 +1132,20 @@ impl MailRelayService for MailRelay {
 			.ok_or_else(|| Status::not_found("recipient is not a user of this plane"))?;
 
 		match recipient_rule {
-			// A payout mail goes to a FUND OWNER and nobody else. Those kinds are addressed
-			// to the consilium — an approval to cast, or the outcome of one — so any other
-			// recipient means the money plane asked for a security mail to be sent to
-			// someone with no standing in it. The PERSISTED role, never the elevated one:
+			// A consilium mail goes to a FUND OWNER and nobody else. Those kinds are
+			// addressed to the consilium — an approval to cast, or the outcome of one — so
+			// any other recipient means the money plane asked for a security mail to be
+			// sent to someone with no standing in it. The PERSISTED role, never the elevated one:
 			// emergency access authorizes an operator, it does not seat them, and it must
 			// not turn them into a governance correspondent either.
-			Recipient::FundOwner =>
+			Recipient::FundOwner { verified_address } => {
 				if recipient.role() != Role::Owner {
 					return Err(Status::failed_precondition("a governance mail may only be addressed to a fund owner"));
-				},
+				}
+				if verified_address && !recipient.email_verified() {
+					return Err(Status::failed_precondition("a payment approval may only be sent to a verified address"));
+				}
+			}
 			Recipient::Subject(subject) => {
 				// Consent is personal: it is only worth anything from the person whose money
 				// moves, and that person is ordinarily an investor holding no seat. So the
@@ -987,6 +1171,34 @@ impl MailRelayService for MailRelay {
 			.enqueue_mail(user_id.raw(), recipient.email().as_str(), kind, &req.dedupe_key, &payload)
 			.await
 			.map_err(domain_to_status)?;
+		if enqueued {
+			self.limiter.record(&budget_key);
+		}
+
+		// The inbox trace, written AFTER the mail is queued and never in its way: the
+		// queue row is the security channel and the thing the money plane retries on; the
+		// inbox entry is a courtesy copy, so a failure here is logged, not returned. Written
+		// on a repeat too (`enqueued == false`): the same dedupe key makes it a no-op when
+		// the entry exists, and the money plane's retry is exactly when a trace that failed
+		// the first time gets its second chance.
+		if let Some(notice) = notice
+			&& let Err(err) = self
+				.notifications
+				.record(
+					user_id.raw(),
+					recipient.email().as_str(),
+					recipient.email_verified(),
+					CONSENT_TOPIC,
+					kind,
+					&notice.title,
+					&notice.body,
+					&format!("{INBOX_KEY_PREFIX}{}", req.dedupe_key),
+					now_secs(),
+				)
+				.await
+		{
+			tracing::warn!(%err, dedupe_key = %req.dedupe_key, "mail relay: could not record the consent in the subject's inbox");
+		}
 		Ok(Response::new(SendGovernanceMailResponse { enqueued }))
 	}
 }
@@ -1042,9 +1254,25 @@ mod tests {
 			"http://evinvest.ltd/cabinet/payout-approval/abc",
 			"https://attacker.example/cabinet/payout-approval/abc",
 			"javascript:alert(1)",
+			// The origin is only a prefix. Anything that breaks the line after it puts a
+			// second link — somebody else's — on the same bare line of the text part.
+			"https://evinvest.ltd/cabinet/payout-approval/abc https://attacker.example/",
+			"https://evinvest.ltd/cabinet/payout-approval/abc\nhttps://attacker.example/",
+			"https://evinvest.ltd/cabinet/payout-approval/abc\r\n",
+			"https://evinvest.ltd/cabinet/payout-approval/abc\t",
+			"https://evinvest.ltd/cabinet/payout-approval/\u{a0}abc",
+			"https://evinvest.ltd/cabinet/payout-approval/abc\u{7}",
+			"https://evinvest.ltd/cabinet/payout-approval/ábc",
 		] {
-			assert!(link(hostile).is_err(), "must be refused: {hostile}");
+			assert!(link(hostile).is_err(), "must be refused: {hostile:?}");
 		}
+	}
+
+	/// The inbox filters by topic and the catalogue is closed, so the topic a consent is
+	/// filed under has to be one the catalogue actually lists.
+	#[test]
+	fn the_consent_inbox_topic_is_in_the_catalogue() {
+		assert!(crate::notification::topic(CONSENT_TOPIC).is_some(), "{CONSENT_TOPIC} is not a catalogued topic");
 	}
 
 	#[test]

@@ -105,8 +105,26 @@ impl RateLimiter {
 		}
 	}
 
-	/// True when the call is within budget.
+	/// Spend one unit of `key`'s budget; true when the call was within it.
 	pub fn check(&self, key: &str) -> bool {
+		self.hit(key, true)
+	}
+
+	/// Whether `key` still has budget, spending none. For a caller that must not be
+	/// charged for a call that goes on to do nothing — a validation refusal, or a retry
+	/// the dedupe key turns into a no-op — pair this with [`Self::record`] after the work.
+	pub fn peek(&self, key: &str) -> bool {
+		self.hit(key, false)
+	}
+
+	/// Spend one unit of `key`'s budget for work already done. The answer is deliberately
+	/// not returned: the decision was [`Self::peek`]'s, and refusing after the fact would
+	/// refuse nothing.
+	pub fn record(&self, key: &str) {
+		self.hit(key, true);
+	}
+
+	fn hit(&self, key: &str, spend: bool) -> bool {
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 		let bucket = now / self.window_secs;
 		let Ok(mut hits) = self.hits.lock() else {
@@ -122,8 +140,10 @@ impl RateLimiter {
 		if entry.0 != bucket {
 			*entry = (bucket, 0);
 		}
-		entry.1 += 1;
-		entry.1 <= self.max
+		if spend {
+			entry.1 += 1;
+		}
+		entry.1 < self.max + u32::from(spend)
 	}
 }
 

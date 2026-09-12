@@ -261,6 +261,40 @@ impl NotificationRepository for PgNotifications {
 		})
 	}
 
+	async fn record(
+		&self,
+		user_id: Uuid,
+		email: &str,
+		email_verified: bool,
+		topic: &str,
+		kind: &str,
+		title: &str,
+		body: &str,
+		dedupe_key: &str,
+		occurred_at: i64,
+	) -> Result<bool, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let sub = upsert_subscriber(&mut tx, user_id, email, email_verified).await?;
+		// No `notification_subscriptions` read: that gate is the whole difference from
+		// `emit`. `DO NOTHING` on the dedupe index is what makes a retry a no-op.
+		let inserted = sqlx::query(
+			"INSERT INTO notifications (subscriber_id, topic, kind, title, body, dedupe_key, occurred_at) \
+			 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (subscriber_id, dedupe_key) DO NOTHING RETURNING id",
+		)
+		.bind(sub.id)
+		.bind(topic)
+		.bind(kind)
+		.bind(title)
+		.bind(body)
+		.bind(dedupe_key)
+		.bind(occurred_at)
+		.fetch_optional(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(inserted.is_some())
+	}
+
 	async fn list(&self, subscriber_id: Uuid, cursor: Option<Uuid>, limit: i64, unread_only: bool, topic: Option<&str>) -> Result<Vec<NotificationRow>, DomainError> {
 		// Keyset pagination on (created_at, id): the cursor row's own key is resolved in a
 		// subquery, so the caller never has to encode or trust a composite cursor.

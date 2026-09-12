@@ -146,10 +146,11 @@ service OwnerRemovalApprovalService {
 // The payload is TYPED, never rendered HTML: this plane renders it. A compromised money
 // plane must not be able to put arbitrary markup into an owner's mailbox.
 //
-// WHO MAY RECEIVE ONE is decided per KIND, and the default is the strict one. The three
-// payout kinds speak to the consilium, so they go to a seated owner and to nobody else —
-// that rule is what stops a compromised money plane aiming a concierge-branded security
-// mail at any address on the platform. PAYMENT_CONSENT cannot use it: consenting to a
+// WHO MAY RECEIVE ONE is decided per KIND, and the default is the strict one. The
+// consilium kinds — the three payout kinds and PAYMENT_APPROVAL — speak to the
+// consilium, so they go to a seated owner and to nobody else — that rule is what stops a
+// compromised money plane aiming a concierge-branded security mail at any address on
+// the platform. PAYMENT_CONSENT cannot use it: consenting to a
 // transfer of your own money has nothing to do with holding a seat. It gets its own rule,
 // narrower in the dimension that matters — the recipient must BE the payment's subject,
 // named in the typed payload — so the surface widens by exactly one person per message
@@ -547,6 +548,12 @@ enum GovernanceMailKind {
   // one whose recipient rule is IDENTITY rather than role: an ordinary investor
   // consents to their own transfer, and no seat is involved. See PaymentConsentMail.
   GOVERNANCE_MAIL_KIND_PAYMENT_CONSENT = 4;
+  // The money plane asking an owner to approve a PAYMENT whose source is fund-owned
+  // money — the consilium counterpart of PAYMENT_CONSENT. Addressed to a seated owner
+  // under the same rule as the payout kinds; what differs is only what the mail
+  // describes: two ends of a transfer in words, not a rail and an address. See
+  // PaymentApprovalMail for why the payout template cannot carry it.
+  GOVERNANCE_MAIL_KIND_PAYMENT_APPROVAL = 5;
 }
 
 message SendGovernanceMailRequest {
@@ -560,6 +567,7 @@ message SendGovernanceMailRequest {
   PayoutApprovalMail payout_approval = 4;
   PayoutOutcomeMail payout_outcome = 5;
   PaymentConsentMail payment_consent = 6;
+  PaymentApprovalMail payment_approval = 7;
 }
 
 message PayoutApprovalMail {
@@ -580,14 +588,70 @@ message PayoutApprovalMail {
   string code = 12;
 }
 
+// How a consilium ended — over a revenue payout OR over a payment — and, under
+// APPROVAL_TOKEN_BURNED, that one of its tokens burned.
+//
+// ONE message for both subjects, additively. The burn notice already rides this shape
+// under its own kind, so a payment consilium's outcome and burn ride it too rather than
+// each growing a message of their own: `network` + `address` describe a payout,
+// `source` + `destination` (+ `tier`, `reason`) describe a payment, and the renderer
+// switches on which pair is filled. A caller sets one pair and leaves the other empty.
 message PayoutOutcomeMail {
   string consilium_id = 1;
-  // APPROVED / REJECTED / EXPIRED / CANCELLED / EXECUTED / EXECUTION_FAILED.
+  // APPROVED / REJECTED / EXPIRED / CANCELLED / EXECUTED / EXECUTION_FAILED, or
+  // TOKEN_BURNED under the burn kind.
   string outcome = 2;
+  // The payout pair. Empty for a payment.
   string network = 3;
   string address = 4;
   string amount = 5;
   string detail = 6;
+  // The payment tuple. Empty for a payout. Same rules as PaymentApprovalMail: `tier`
+  // is the closed set, `source` and `destination` are words a person recognises, and
+  // `reason` is the operator's own text, shown attributed and refused if it carries a
+  // control character.
+  string tier = 7;
+  string source = 8;
+  string destination = 9;
+  string reason = 10;
+}
+
+// An owner asked to approve a payment of fund-owned money.
+//
+// WHY NOT PayoutApprovalMail. That template opens with "a request to pay fund revenue
+// out on-chain" and labels its middle rows Network and Destination address. A payment
+// is a transfer between two claims the platform holds — `Piggybank → Revenue`, or into a
+// service's pooled funds, or off the platform — and rendering it through the payout
+// copy would mail the whole roster a sentence naming the wrong claim and the wrong rail
+// on a money move they are being asked to authorize. The one thing an approval mail
+// must do is describe correctly what is being approved, so a payment gets its own.
+//
+// The recipient rule is the payout one: a seated owner, resolved from the identity
+// record, and nobody else. Field rules are PaymentConsentMail's — every string is
+// bounded in bytes and refused if it carries a control character, `tier` is a closed
+// set, and `reason` is required and rendered attributed to the operator who typed it.
+message PaymentApprovalMail {
+  string consilium_id = 1;
+  string payment_id = 2;
+  string initiator_email = 3;
+  // internal | service | external.
+  string tier = 4;
+  // Where the money leaves from, in words a person recognises (not an account id).
+  string source = 5;
+  // Where it lands, in words a person recognises.
+  string destination = 6;
+  string amount = 7;
+  // Why the payment was opened, in the operator's words. Required.
+  string reason = 8;
+  string payload_hash = 9;
+  uint32 threshold = 10;
+  uint32 owner_count = 11;
+  int64 expires_at = 12;
+  // Absolute URL of the approval page, carrying the opaque token.
+  string approval_url = 13;
+  // The secret code the owner types on that page. Held only until the mail is sent,
+  // then cleared from the delivery row.
+  string code = 14;
 }
 
 // One user's consent to a payment that moves their own money.

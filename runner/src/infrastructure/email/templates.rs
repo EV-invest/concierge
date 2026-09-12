@@ -98,6 +98,8 @@ pub fn confirm_subscription(topic_label: &str, confirm_url: &str, unsubscribe_ur
 /// because someone who believes a click has already decided is someone who will not
 /// come back to finish.
 pub fn owner_removal_self_accept(initiator_email: &str, reason: &str, approval_url: &str, code: &str, expires_at: i64) -> RenderedEmail {
+	// The link is printed bare on its own line of the text part — see `one_line`.
+	let approval_url = &one_line(approval_url);
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Ownership"));
 	inner.push_str(&heading("Your owner seat is being voted on"));
@@ -142,6 +144,8 @@ pub fn payout_approval(
 	approval_url: &str,
 	code: &str,
 ) -> RenderedEmail {
+	// The link is printed bare on its own line of the text part — see `one_line`.
+	let approval_url = &one_line(approval_url);
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Treasury"));
 	inner.push_str(&heading("A payout needs your approval"));
@@ -178,8 +182,76 @@ pub fn payout_approval(
 	}
 }
 
-/// What the owners are told after a payout request was decided, executed or failed.
-pub fn payout_outcome(consilium_id: &str, outcome: &str, network: &str, address: &str, amount: &str, detail: &str) -> RenderedEmail {
+/// What the owners are told after a consilium — over a payout or over a payment — was
+/// decided, executed or failed, and the burn notice that rides the same payload.
+///
+/// One renderer for both subjects, switching on which pair the payload filled: a payout
+/// names a rail and an address, a payment names two ends of a transfer in words. The
+/// payout copy is byte-for-byte what it was before payments existed.
+// Positional like its neighbours: the arguments are the payload's fields in the order
+// the wire declares them, and a struct here would exist only to satisfy the lint.
+#[allow(clippy::too_many_arguments)]
+pub fn payout_outcome(
+	consilium_id: &str,
+	outcome: &str,
+	network: &str,
+	address: &str,
+	amount: &str,
+	detail: &str,
+	tier: &str,
+	source: &str,
+	destination: &str,
+	reason: &str,
+) -> RenderedEmail {
+	// Folded BEFORE either part is built, for the reason `payment_consent` gives: the
+	// text part below is a `Label: value` block that escapes nothing.
+	let (consilium_id, outcome, amount, detail) = (one_line(consilium_id), one_line(outcome), one_line(amount), one_line(detail));
+	let (network, address) = (one_line(network), one_line(address));
+	let (tier, source, destination, reason) = (one_line(tier), one_line(source), one_line(destination), one_line(reason));
+
+	if destination.is_empty() && source.is_empty() {
+		return payout_outcome_on_a_rail(&consilium_id, &outcome, &network, &address, &amount, &detail);
+	}
+
+	let headline = format!("Payment {}", outcome.to_lowercase());
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Treasury"));
+	inner.push_str(&heading(&headline));
+	inner.push_str(&detail_box(&[
+		("Outcome", outcome.clone()),
+		("Amount", amount.clone()),
+		("From", source.clone()),
+		("To", destination.clone()),
+		("Type", tier.clone()),
+		("Request", consilium_id.clone()),
+	]));
+	// The burn notice rides this payload with no reason of its own; an empty one gets
+	// no attribution block rather than a label over nothing.
+	let note = if reason.is_empty() {
+		String::new()
+	} else {
+		format!("{INITIATOR_NOTE_LABEL}\n  {reason}\n\n")
+	};
+	if !reason.is_empty() {
+		inner.push_str(&initiator_note(&reason));
+	}
+	if !detail.is_empty() {
+		inner.push_str(&paragraph(&detail));
+	}
+	inner.push_str(&paragraph("This message needs no action from you. It is the record of what the consilium decided."));
+
+	RenderedEmail {
+		// The stated reason is never in the subject line — see `payment_consent`.
+		subject: format!("{headline} — {amount}"),
+		html: shell(&headline, &card(&inner), FOOTER_SECURITY, "", "Treasury"),
+		text: format!(
+			"{headline}\n\nOutcome: {outcome}\nAmount: {amount}\nFrom: {source}\nTo: {destination}\nType: {tier}\nRequest: {consilium_id}\n\n{note}{detail}\n\n—\n{FOOTER_SECURITY}\n"
+		),
+	}
+}
+
+/// The payout half of [`payout_outcome`], unchanged from before payments existed.
+fn payout_outcome_on_a_rail(consilium_id: &str, outcome: &str, network: &str, address: &str, amount: &str, detail: &str) -> RenderedEmail {
 	let headline = format!("Payout {}", outcome.to_lowercase());
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Treasury"));
@@ -201,6 +273,76 @@ pub fn payout_outcome(consilium_id: &str, outcome: &str, network: &str, address:
 		html: shell(&headline, &card(&inner), FOOTER_SECURITY, "", "Treasury"),
 		text: format!(
 			"{headline}\n\nOutcome: {outcome}\nAmount: {amount}\nNetwork: {network}\nDestination address: {address}\nRequest: {consilium_id}\n\n{detail}\n\n—\n{FOOTER_SECURITY}\n"
+		),
+	}
+}
+
+/// The money plane asking an owner to approve a payment of fund-owned money.
+///
+/// The consilium counterpart of [`payment_consent`], and it borrows that mail's shape
+/// rather than [`payout_approval`]'s: a payment is a transfer between two claims, not a
+/// rail and an address, and an approval mail that names the wrong thing is worse than
+/// none. `reason` is the operator's own text and is set apart as theirs — an owner
+/// deciding whether to release the fund's money must be able to tell which words are the
+/// platform's and which are the requester's.
+// Positional like its neighbours: the arguments are the payload's fields in the order
+// the wire declares them, and a struct here would exist only to satisfy the lint.
+#[allow(clippy::too_many_arguments)]
+pub fn payment_approval(
+	consilium_id: &str,
+	payment_id: &str,
+	initiator_email: &str,
+	tier: &str,
+	source: &str,
+	destination: &str,
+	amount: &str,
+	reason: &str,
+	payload_hash: &str,
+	threshold: u32,
+	owner_count: u32,
+	expires_at: i64,
+	approval_url: &str,
+	code: &str,
+) -> RenderedEmail {
+	// Folded BEFORE either part is built — see `one_line`.
+	let (consilium_id, payment_id, initiator_email, tier) = (one_line(consilium_id), one_line(payment_id), one_line(initiator_email), one_line(tier));
+	let (source, destination, amount) = (one_line(source), one_line(destination), one_line(amount));
+	let (reason, payload_hash, code) = (one_line(reason), one_line(payload_hash), one_line(code));
+	let approval_url = &one_line(approval_url);
+
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Treasury"));
+	inner.push_str(&heading("A payment needs your approval"));
+	inner.push_str(&paragraph(&format!(
+		"{initiator_email} has opened a payment of the fund's own money. It executes only once {threshold} of {owner_count} owners have approved it."
+	)));
+	inner.push_str(&detail_box(&[
+		("Amount", amount.clone()),
+		("From", source.clone()),
+		("To", destination.clone()),
+		("Type", tier.clone()),
+		("Requested by", initiator_email.clone()),
+		("Approvals needed", format!("{threshold} of {owner_count}")),
+		("Expires", fmt_ts(expires_at)),
+		("Request", consilium_id.clone()),
+		("Payment", payment_id.clone()),
+	]));
+	inner.push_str(&exact_value("Payload hash", &hash_prefix(&payload_hash)));
+	inner.push_str(&initiator_note(&reason));
+	inner.push_str(&button("Review and approve", approval_url));
+	inner.push_str(&code_panel(&code));
+	inner.push_str(&paragraph(
+		"Opening the link alone approves nothing. Check both ends of the transfer above against what you expect before you enter the code — an approved payment cannot be recalled.",
+	));
+
+	RenderedEmail {
+		// The stated reason is never in the subject line — see `payment_consent`.
+		subject: format!("Approve a payment of {amount}"),
+		html: shell("A payment needs your approval", &card(&inner), FOOTER_SECURITY, "", "Treasury"),
+		text: format!(
+			"A payment needs your approval\n\n{initiator_email} has opened a payment of the fund's own money.\n\nAmount: {amount}\nFrom: {source}\nTo: {destination}\nType: {tier}\nPayload hash: {}\nApprovals needed: {threshold} of {owner_count}\nExpires: {}\nRequest: {consilium_id}\nPayment: {payment_id}\n\n{INITIATOR_NOTE_LABEL}\n  {reason}\n\nReview and approve: {approval_url}\n\nYour code: {code}\n\nOpening the link alone approves nothing. Check both ends of the transfer against what you expect before you enter the code — an approved payment cannot be recalled.\n\n—\n{FOOTER_SECURITY}\n",
+			hash_prefix(&payload_hash),
+			fmt_ts(expires_at)
 		),
 	}
 }
@@ -231,6 +373,7 @@ pub fn payment_consent(
 	let (payment_id, initiator_email, tier) = (one_line(payment_id), one_line(initiator_email), one_line(tier));
 	let (source, destination, amount) = (one_line(source), one_line(destination), one_line(amount));
 	let (reason, payload_hash, code) = (one_line(reason), one_line(payload_hash), one_line(code));
+	let approval_url = &one_line(approval_url);
 
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Payments"));
@@ -285,6 +428,10 @@ const FOOTER_CONSENT: &str =
 const INITIATOR_NOTE_LABEL: &str = "Text entered by the requester (not written by EV Investment)";
 
 /// Collapse anything that could break a line into a space.
+///
+/// The emailed LINK goes through this too: the text part prints it bare on a line of its
+/// own, so a newline inside it would end our link and start somebody else's on the next
+/// line. The relay refuses such a URL outright; this is the renderer's copy of the rule.
 ///
 /// The HTML part escapes, so markup is already accounted for. The TEXT part does not: it
 /// is a `Label: value` block assembled by `format!`, and a newline inside a value forges
@@ -517,7 +664,7 @@ mod tests {
 
 	#[test]
 	fn the_outcome_mail_is_a_record_and_asks_for_nothing() {
-		let mail = payout_outcome("c-1", "EXECUTED", "Ethereum", LONG_ADDRESS, "12,500.00 USDT", "Broadcast at block 21000000.");
+		let mail = payout_outcome("c-1", "EXECUTED", "Ethereum", LONG_ADDRESS, "12,500.00 USDT", "Broadcast at block 21000000.", "", "", "", "");
 		assert!(mail.html.contains(LONG_ADDRESS), "the destination is shown in full here too");
 		assert!(mail.html.contains("needs no action"), "nobody should hunt for a button that is not there");
 		assert!(!mail.html.contains("Type this code"), "an outcome carries no secret");
@@ -625,6 +772,167 @@ mod tests {
 		assert!(mail.html.contains("moves money in your own account"));
 		assert!(mail.html.contains("https://evinvest.ltd/cabinet/payment-consent/tok"), "the consent link is rendered");
 		assert!(mail.html.contains("483012"), "and so is the code, which is what actually arms the decision");
+	}
+
+	/// One helper, so every assertion below reads the same mail.
+	fn approval_of_a_payment(reason: &str) -> RenderedEmail {
+		payment_approval(
+			"c-9",
+			"pay-7",
+			"ops@evinvest.ltd",
+			"service",
+			"Piggybank — fund treasury",
+			"Quy Nhon Fund — pooled funds",
+			"25 000.00 USDT",
+			reason,
+			"9f2c1ab4de5607891122334455667788",
+			3,
+			5,
+			1_785_143_640,
+			"https://evinvest.ltd/cabinet/payment-approval/tok",
+			"483012",
+		)
+	}
+
+	/// The reason this mail exists rather than reusing the payout one: an owner must be
+	/// shown the thing they are approving, and for a payment that is two ends of a
+	/// transfer in words, not a rail and an address.
+	#[test]
+	fn the_payment_approval_shows_both_ends_and_the_bar() {
+		let mail = approval_of_a_payment("Seed the fund's pooled balance for Q3");
+		for expected in [
+			"25 000.00 USDT",
+			"Piggybank — fund treasury",
+			"Quy Nhon Fund — pooled funds",
+			"service",
+			"3 of 5",
+			"483012",
+			"https://evinvest.ltd/cabinet/payment-approval/tok",
+			"pay-7",
+		] {
+			assert!(mail.html.contains(expected), "the approval page must show {expected}");
+			assert!(mail.text.contains(expected), "and so must the text part: {expected}");
+		}
+		assert!(
+			!mail.html.contains("on-chain") && !mail.html.contains("Destination address"),
+			"none of the payout wording may leak in"
+		);
+		assert!(mail.html.contains("owner seat"), "the reader holds a seat, so the owner footer is the true one");
+		for part in [&mail.html, &mail.text] {
+			assert!(part.contains("link alone approves nothing"), "a click must be said to decide nothing");
+		}
+	}
+
+	/// Same rules as the consent mail: the operator's words are escaped, attributed, and
+	/// kept out of the subject line.
+	#[test]
+	fn a_payment_approval_attributes_the_reason_and_keeps_it_out_of_the_subject() {
+		let mail = approval_of_a_payment(r#"<b>URGENT</b> — EV Investment has verified this"#);
+		assert!(!mail.html.contains("<b>"), "markup from the money plane never reaches a mailbox as markup");
+		assert!(mail.html.contains("&lt;b&gt;URGENT&lt;/b&gt;"));
+		assert!(mail.html.contains(INITIATOR_NOTE_LABEL) && mail.text.contains(INITIATOR_NOTE_LABEL));
+		assert_eq!(mail.subject, "Approve a payment of 25 000.00 USDT");
+	}
+
+	/// A line forged inside any field of a payment approval collapses, exactly as it does
+	/// for a consent.
+	#[test]
+	fn a_payment_approval_cannot_have_a_line_forged_into_its_text_part() {
+		let mail = payment_approval(
+			"c-9",
+			"pay-7",
+			"ops@evinvest.ltd",
+			"service",
+			"treasury",
+			"pool\nAmount: 0.01 USDT",
+			"25 000.00 USDT",
+			"ok\r\nTo: attacker",
+			"hash",
+			3,
+			5,
+			1_785_143_640,
+			"https://evinvest.ltd/a",
+			"483012",
+		);
+		assert!(!mail.text.contains("\nAmount: 0.01"), "a forged Amount line must not exist");
+		assert!(!mail.text.contains("\nTo: attacker"), "nor a forged destination");
+		assert!(mail.text.contains("Amount: 25 000.00 USDT") && mail.text.contains("To: pool Amount: 0.01 USDT"));
+	}
+
+	/// The outcome of a payment consilium rides the payout outcome payload and must come
+	/// out describing a payment — while a payout's outcome is exactly what it always was.
+	#[test]
+	fn an_outcome_describes_a_payment_when_the_payload_names_one() {
+		let payment = payout_outcome(
+			"c-9",
+			"EXECUTED",
+			"",
+			"",
+			"25 000.00 USDT",
+			"Settled as one ledger transfer.",
+			"service",
+			"Piggybank — fund treasury",
+			"Quy Nhon Fund — pooled funds",
+			"Seed <Q3>",
+		);
+		assert_eq!(payment.subject, "Payment executed — 25 000.00 USDT");
+		for expected in ["Piggybank — fund treasury", "Quy Nhon Fund — pooled funds", "service", "Settled as one ledger transfer."] {
+			assert!(payment.html.contains(expected) && payment.text.contains(expected), "{expected}");
+		}
+		assert!(payment.html.contains("needs no action"), "nobody should hunt for a button that is not there");
+		assert!(
+			payment.html.contains("Seed &lt;Q3&gt;") && payment.html.contains(INITIATOR_NOTE_LABEL),
+			"the reason is shown, escaped and attributed"
+		);
+		assert!(!payment.html.contains("Network") && !payment.html.contains("Destination address"), "no rail wording on a payment");
+		assert!(!payment.html.contains("Type this code"), "an outcome carries no secret");
+
+		let burn = payout_outcome(
+			"c-9",
+			"TOKEN_BURNED",
+			"",
+			"",
+			"25 000.00 USDT",
+			"five failed code attempts burned the approval token for seat u-1",
+			"service",
+			"treasury",
+			"pool",
+			"",
+		);
+		assert_eq!(burn.subject, "Payment token_burned — 25 000.00 USDT");
+		assert!(
+			!burn.html.contains(INITIATOR_NOTE_LABEL) && !burn.text.contains(INITIATOR_NOTE_LABEL),
+			"an empty reason renders no attribution block"
+		);
+
+		let payout = payout_outcome("c-1", "EXECUTED", "Ethereum", LONG_ADDRESS, "12,500.00 USDT", "Broadcast.", "", "", "", "");
+		assert_eq!(payout.subject, "Payout executed — 12,500.00 USDT on Ethereum", "the payout copy is untouched");
+		assert!(payout.html.contains("Destination address") && payout.html.contains(LONG_ADDRESS));
+	}
+
+	/// Every mail prints its link bare on a line of the text part. A newline smuggled into
+	/// the URL would end our link and start somebody else's on the next line; the relay
+	/// refuses it, and the renderer folds it anyway.
+	#[test]
+	fn a_link_cannot_be_split_into_two_in_the_text_part() {
+		let forged = "https://evinvest.ltd/approve/tok\nhttps://attacker.example/";
+		let mails = [
+			owner_removal_self_accept("ada@example.com", "reason", forged, "H7K2M9PQRS", 1_785_143_640),
+			payout_approval(
+				"c-1", "ada@example.com", "Ethereum", LONG_ADDRESS, "1 USDT", "", "hash", 3, 5, 1_785_143_640, forged, "H7K2M9PQRS",
+			),
+			payment_approval(
+				"c-9", "pay-7", "ops@evinvest.ltd", "service", "treasury", "pool", "1 USDT", "why", "hash", 3, 5, 1_785_143_640, forged, "483012",
+			),
+			payment_consent("pay-7", "ops@evinvest.ltd", "external", "fund", "bank", "1 USDT", "why", "hash", 1_785_143_640, forged, "483012"),
+		];
+		for mail in mails {
+			assert!(!mail.text.contains("\nhttps://attacker.example/"), "a foreign link must never start a line: {}", mail.subject);
+			assert!(
+				mail.text.contains("https://evinvest.ltd/approve/tok https://attacker.example/"),
+				"the fold keeps the bytes on one line"
+			);
+		}
 	}
 
 	#[test]
