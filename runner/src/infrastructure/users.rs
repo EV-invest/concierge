@@ -28,7 +28,7 @@ use crate::ports::{KycLevelChange, RoleChange, UserDirectoryRepository};
 /// than a runtime `format!` — keep this list in sync with [`UserRow`].
 macro_rules! user_columns {
 	() => {
-		"id, auth_subject, email, email_verified, status, suspended_by, hold_expires_at, token_version, kyc_level, role, \
+		"id, auth_subject, email, email_verified, status, suspended_by, hold_expires_at, hold_ended_at, token_version, kyc_level, role, \
 		legal_name, preferred_name, phone, date_of_birth, nationality, tax_residence, \
 		residential_address, language, base_currency, timezone, row_version"
 	};
@@ -205,6 +205,7 @@ struct UserRow {
 	status: String,
 	suspended_by: Option<String>,
 	hold_expires_at: Option<i64>,
+	hold_ended_at: Option<i64>,
 	token_version: i64,
 	kyc_level: i32,
 	role: String,
@@ -234,6 +235,7 @@ impl UserRow {
 			// read as `None` — see the migration: those accounts keep the one-act,
 			// never-lapsing semantics they were actually suspended under.
 			self.suspended_by.as_deref().map(|by| Suspension::parse(by, self.hold_expires_at)).transpose()?,
+			self.hold_ended_at,
 			self.token_version as u64,
 			self.kyc_level as u32,
 			Role::parse(&self.role)?,
@@ -357,24 +359,41 @@ impl UserDirectoryRepository for PgUsers {
 		.await
 	}
 
-	async fn hold_user(&self, id: UserId, action: &AdminAction, now: i64) -> Result<User, DomainError> {
-		self.mutate_audited(
-			id,
-			action,
-			now,
-			|user| user.hold(now),
-			|user| {
-				Some(serde_json::json!({
-					"hold_expires_at": user.suspension().and_then(Suspension::hold_expires_at),
-				}))
-			},
-		)
-		.await
+	/// The same transaction shape as [`Self::mutate_audited`], written out because the
+	/// aggregate needs one more fact decided under the row lock: whether the owners are
+	/// already deciding about this account. Read on a separate connection, that is a
+	/// TOCTOU window in the direction that matters — a proposal cancelled between the read
+	/// and the write would let a hold extend on the strength of a decision nobody is
+	/// making any more.
+	async fn hold_user(&self, id: UserId, action: &AdminAction, by: Role, now: i64) -> Result<User, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let mut user = load_for_update(&mut tx, id).await?;
+		// The plane's lazy-expiry convention: a proposal past its deadline is not open,
+		// whether or not a write path has got round to stamping it so.
+		let ratification_pending: bool =
+			sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM user_proposal WHERE subject_user_id = $1 AND kind = 'suspension' AND state = 'open' AND expires_at > $2)")
+				.bind(id.raw())
+				.bind(now)
+				.fetch_one(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+		user.hold(by, now, ratification_pending)?;
+		update_row(&mut tx, &user).await?;
+		drain_outbox(&mut tx, &mut user).await?;
+		let action = action.clone().with_detail(serde_json::json!({
+			"hold_expires_at": user.suspension().and_then(Suspension::hold_expires_at),
+			// Whether this press was an extension under an open proposal or a fresh brake
+			// — the one thing a reader of the log cannot otherwise tell apart.
+			"ratification_pending": ratification_pending,
+		}));
+		record_action(&mut tx, id, &action, now).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(user)
 	}
 
-	async fn enable_user(&self, id: UserId) -> Result<User, DomainError> {
+	async fn enable_user(&self, id: UserId, now: i64) -> Result<User, DomainError> {
 		self.mutate(id, |user| {
-			user.enable();
+			user.enable(now);
 			Ok(())
 		})
 		.await
@@ -394,7 +413,7 @@ impl UserDirectoryRepository for PgUsers {
 			// it — and a refusal leaves no audit row, because nothing happened to audit.
 			return Ok(Reinstatement::GovernanceHeld);
 		}
-		user.enable();
+		user.enable(now);
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
 		record_action(&mut tx, id, action, now).await?;
@@ -610,7 +629,7 @@ pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(
 		"UPDATE users SET email = $2, email_verified = $3, status = $4, token_version = $5, kyc_level = $6, \
 		legal_name = $7, preferred_name = $8, phone = $9, date_of_birth = $10, nationality = $11, \
 		tax_residence = $12, residential_address = $13, language = $14, base_currency = $15, \
-		timezone = $16, role = $17, row_version = $18, suspended_by = $19, hold_expires_at = $20, \
+		timezone = $16, role = $17, row_version = $18, suspended_by = $19, hold_expires_at = $20, hold_ended_at = $21, \
 		updated_at = now() WHERE id = $1",
 	)
 	.bind(user.id().raw())
@@ -636,6 +655,7 @@ pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(
 	// nullable independently of `suspended_by`). Writing it back as NULL rather than as
 	// the sentinel keeps the round trip stable and keeps the sweep's index useful.
 	.bind(user.suspension().and_then(Suspension::hold_expires_at).filter(|expires| *expires != i64::MAX))
+	.bind(user.hold_ended_at())
 	.execute(&mut *conn)
 	.await
 	.map_err(repo_err)?;

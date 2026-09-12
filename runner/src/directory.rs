@@ -127,6 +127,19 @@ pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Ar
 	}
 }
 
+/// A hold the aggregate would not place. Its policy refusals — the account is already
+/// held, or was until recently, or holds a seat the actor may not touch — come back as
+/// `FAILED_PRECONDITION` rather than the
+/// `PERMISSION_DENIED` a `Forbidden` maps to by default, because the BFF folds
+/// `PERMISSION_DENIED` into an opaque 404 and the whole point of these messages is that
+/// the operator reads which proposal to open instead.
+fn hold_refusal(err: DomainError) -> Status {
+	match err {
+		DomainError::Forbidden(why) => Status::failed_precondition(why),
+		other => domain_to_status(other),
+	}
+}
+
 /// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix.
 async fn require_permission<T>(directory: &Directory, request: &Request<T>, permission: Permission) -> Result<(), Status> {
 	crate::authz::require_permission(directory.users.as_ref(), &directory.break_glass, request, permission).await
@@ -230,13 +243,26 @@ impl UserDirectory for Directory {
 	/// money temporarily and never permanently.
 	async fn hold_user(&self, request: Request<HoldUserRequest>) -> Result<Response<HoldUserResponse>, Status> {
 		require_permission(self, &request, Permission::UserSuspend).await?;
-		let actor = self.acting_operator(&request).await?;
+		let caller = crate::authz::caller_gate(self.users.as_ref(), &request).await?;
+		let actor = caller.id.ok_or_else(|| Status::unauthenticated("subject is not a user id"))?;
+		// The PERSISTED role, never the elevated one — the same choice the mail relay
+		// makes: emergency access authorizes an operator, it does not seat them, and
+		// holding a seat is a seated owner's call.
+		let actor_role = caller.record.map_or(Role::Investor, |record| record.role);
 		let audit = audit_of(&request);
 		let req = request.into_inner();
 		let target = parse_target_id(&req.user_id)?;
+		if target == actor {
+			// Not a safety rule so much as a coherence one: a hold on yourself ends your
+			// session, and with it your ability to explain, lift or ratify it. The verb for
+			// stepping back is the owners' proposal, not the emergency brake.
+			return Err(Status::failed_precondition(
+				"a hold cannot be placed on your own account; ask the owners through GovernanceService.OpenUserSuspension",
+			));
+		}
 		let reason = require_reason(&req.reason)?;
 		let action = AdminAction::by(actor, "held", &audit).with_reason(&reason);
-		let user = self.users.hold_user(target, &action, now_secs()).await.map_err(domain_to_status)?;
+		let user = self.users.hold_user(target, &action, actor_role, now_secs()).await.map_err(hold_refusal)?;
 		Ok(Response::new(HoldUserResponse {
 			hold_expires_at: user.suspension().and_then(Suspension::hold_expires_at).unwrap_or_default(),
 		}))

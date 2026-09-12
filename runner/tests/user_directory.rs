@@ -129,7 +129,7 @@ async fn disable_then_enable_emits_suspended_then_reinstated() {
 	assert_eq!(suspended.kind, "SUSPENDED");
 	assert_eq!(suspended.sequence, 2);
 
-	let reinstated = repo.enable_user(user.id()).await.unwrap();
+	let reinstated = repo.enable_user(user.id(), 0).await.unwrap();
 	assert_eq!(reinstated.status(), UserStatus::Active);
 	let row = outbox_for(&pool, user.id().raw()).await.pop().expect("a row");
 	assert_eq!(row.kind, "REINSTATED");

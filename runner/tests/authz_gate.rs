@@ -153,7 +153,7 @@ async fn gate_enforces_role_status_and_revocation() {
 
 	// Reinstate, then revoke tokens (bumps token_version) → a token minted under the OLD
 	// version is rejected, while a token at the new floor is accepted.
-	users.enable_user(id).await.unwrap();
+	users.enable_user(id, 0).await.unwrap();
 	let revoked = users.revoke_tokens(id, &AdminAction::system("tokens_revoked"), 0).await.unwrap();
 	assert!(revoked.token_version() >= 1, "revoke_tokens bumps the floor");
 	let stale = require_permission(users, &closed, &request_as(access_claims(&sub, 0)), Permission::RoleGrant).await.unwrap_err();
@@ -264,7 +264,7 @@ async fn allowlisted_operator_is_still_gated_by_status_and_revocation() {
 		.unwrap_err();
 	assert_eq!(suspended.code(), Code::PermissionDenied, "a disabled allowlisted operator is denied");
 
-	users.enable_user(id).await.unwrap();
+	users.enable_user(id, 0).await.unwrap();
 	let revoked = users.revoke_tokens(id, &AdminAction::system("tokens_revoked"), 0).await.unwrap();
 	let stale = require_permission(users, &allowlist, &request_as(access_claims(&sub, revoked.token_version() - 1)), Permission::RoleGrant)
 		.await
