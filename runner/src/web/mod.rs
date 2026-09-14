@@ -20,6 +20,7 @@ mod kyc;
 mod oauth;
 mod routes;
 mod session;
+mod single_flight;
 
 // The one session-store name tests exercise the persistence invariant through.
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use axum::{
 	routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use domain::users::UserId;
 use evconcierge_auth::AuthService;
 /// Re-exported so the integration suite asserts against the cap the route actually
 /// enforces. A test that hard-coded the number would keep passing after someone raised
@@ -39,7 +41,7 @@ use time::Duration;
 
 use crate::{
 	ports::{KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
-	web::oauth::OAuthTxStore,
+	web::{oauth::OAuthTxStore, single_flight::KeyedLocks},
 };
 
 /// Cookie names + shared attributes. `__Host-` prefixed when secure (production);
@@ -106,6 +108,7 @@ impl WebState {
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
+				kyc_starts: KeyedLocks::default(),
 				notifications: kyc.notifications,
 				kyc: kyc.provider,
 				support_email: kyc.support_email,
@@ -177,6 +180,9 @@ struct Inner {
 	/// port the operator console's `SetKycLevel` does.
 	users: Arc<dyn UserDirectoryRepository>,
 	kyc_cases: Arc<dyn KycCaseRepository>,
+	/// Per-user single-flight for `/kyc/start`: the start gate is a read, and this is
+	/// what stops two simultaneous starts from both passing it (#56).
+	kyc_starts: KeyedLocks<UserId>,
 	notifications: Arc<dyn NotificationRepository>,
 	/// `None` ⇒ unconfigured; both KYC routes answer 503.
 	kyc: Option<Arc<dyn KycProvider>>,

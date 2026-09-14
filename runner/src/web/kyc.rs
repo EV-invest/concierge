@@ -177,6 +177,17 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		.map(UserId::from_raw)
 		.map_err(|_| (StatusCode::UNAUTHORIZED, "unauthenticated"))?;
 
+	// One start per user at a time, from the gate read to the row write. The gate below
+	// is a READ: two requests arriving together would both see "no live case", both
+	// dial the vendor and both insert — two billed sessions, one of which the user can
+	// never finish (#56). Held here, in process, rather than as a database lock, because
+	// what it spans is the vendor round trip, and a transaction kept open across a
+	// network call was the property #55 refused to buy. The second caller waits at most
+	// the vendor timeout, then re-reads the gate and is handed the case the first one
+	// opened — the same answer a sequential second call gets. Across replicas this does
+	// not reach, and there the window cap is still what bounds the spend.
+	let _flight = st.kyc_starts.acquire(user_id).await;
+
 	// EVERYTHING below this line happens before the vendor is dialled, and that ordering is
 	// the whole point: `POST /v3/session/` is billed, and the platform's balance is a shared
 	// resource one signed-in account could otherwise drain in a loop. What is behind that

@@ -197,8 +197,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   stored for exactly this and a second session would only buy them a duplicate row that
   later reads as an abandoned attempt — and a caller past `START_MAX_PER_WINDOW` in
   `START_WINDOW_SECS` is refused 429. Both answers happen without a vendor call; that
-  ordering is the entire point, not an optimisation. The gate is a read and not a lock:
-  two simultaneous requests can both pass it, and the window cap is what bounds that.
+  ordering is the entire point, not an optimisation. The gate is a read and not a lock,
+  so the handler single-flights starts PER USER, in process (`web::single_flight`, the
+  same helper the session refresh uses), from the gate read to the row write: a second
+  simultaneous start waits for the first and is then handed its case, exactly as a
+  sequential second call is (#56). In process and not a row lock, because what it spans
+  is the vendor round trip. It does not reach across replicas; there the window cap is
+  what bounds the race.
 - **A verdict is not handled until the level moved.** Recording the decision and
   writing the level are two transactions, so `kyc_cases` saying `approved` beside an
   account still at tier 0 is a reachable state. The webhook answers 5xx when the level

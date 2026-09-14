@@ -514,9 +514,12 @@ pub trait KycCaseRepository: Send + Sync {
 	/// degradation past that point is fail-closed, which turns one abusive user into a
 	/// verification outage for everyone. This is the read that has to happen first.
 	///
-	/// NOT a lock and not a reservation: two simultaneous requests can both read "no live
-	/// case" and both open one. Serialising them would mean holding a row across a vendor
-	/// round trip, and the window cap already bounds what that race can cost.
+	/// NOT a lock and not a reservation: it reports what the table says at the instant it
+	/// is read, and two simultaneous readers get the same answer. Serialising them is the
+	/// CALLER's job — `/kyc/start` single-flights per user, in process — because doing it
+	/// here would mean holding a row across the vendor round trip. Where that
+	/// single-flight does not reach (a second replica), the window cap is what bounds the
+	/// race.
 	async fn start_gate(&self, user_id: UserId, window_secs: i64) -> Result<StartGate, DomainError>;
 
 	/// Apply a verdict to the case it names, if it moves anything.
