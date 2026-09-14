@@ -111,18 +111,41 @@ fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -
 			&text_field(payload, "approval_url"),
 			&text_field(payload, "code"),
 		)),
-		"payout_outcome" => Some(templates::payout_outcome(
-			&text_field(payload, "consilium_id"),
-			&text_field(payload, "outcome"),
-			&text_field(payload, "network"),
-			&text_field(payload, "address"),
-			&text_field(payload, "amount"),
-			&text_field(payload, "detail"),
-			&text_field(payload, "tier"),
-			&text_field(payload, "source"),
-			&text_field(payload, "destination"),
-			&text_field(payload, "reason"),
-		)),
+		// The fee terms description was added to this row after the payout and payment
+		// ones, so a row queued before it carries neither key and renders exactly as it
+		// did. A row that names a fund, or proposes terms, is about fee terms — and like a
+		// `fee_policy_approval`, one missing either half is unrenderable rather than a
+		// payout with an empty rail or a mail proposing nothing.
+		"payout_outcome" => {
+			let fund = text_field(payload, "fund");
+			let proposed = payload.get("proposed").is_some_and(|terms| !terms.is_null());
+			if fund.is_empty() && !proposed {
+				Some(templates::payout_outcome(
+					&text_field(payload, "consilium_id"),
+					&text_field(payload, "outcome"),
+					&text_field(payload, "network"),
+					&text_field(payload, "address"),
+					&text_field(payload, "amount"),
+					&text_field(payload, "detail"),
+					&text_field(payload, "tier"),
+					&text_field(payload, "source"),
+					&text_field(payload, "destination"),
+					&text_field(payload, "reason"),
+				))
+			} else if fund.is_empty() {
+				None
+			} else {
+				Some(templates::fee_policy_outcome(
+					&text_field(payload, "consilium_id"),
+					&text_field(payload, "outcome"),
+					&fund,
+					fee_terms(payload, "current").as_ref(),
+					&fee_terms(payload, "proposed")?,
+					&text_field(payload, "detail"),
+					&text_field(payload, "reason"),
+				))
+			}
+		}
 		"payment_approval" => Some(templates::payment_approval(
 			&text_field(payload, "consilium_id"),
 			&text_field(payload, "payment_id"),
@@ -368,6 +391,50 @@ mod tests {
 			governance_mail("fee_policy_approval", &half_terms, "https://cabinet.example").is_none(),
 			"so is a payload missing half its terms"
 		);
+	}
+
+	/// One outcome row, three subjects: a row naming a fund with terms renders as fee terms,
+	/// a row queued before the fee description existed renders as the payout it always
+	/// was, and a fund with half its terms is unrenderable — like a fee approval's.
+	#[test]
+	fn an_outcome_row_naming_a_fund_renders_as_fee_terms() {
+		let fee = serde_json::json!({
+			"consilium_id": "c-12",
+			"outcome": "EXECUTED",
+			"network": "", "address": "", "amount": "", "detail": "",
+			"tier": "", "source": "", "destination": "", "reason": "",
+			"fund": "Quy Nhon Fund",
+			"current": null,
+			"proposed": {"management_bps": 250, "performance_bps": 2000, "hurdle_bps": 800, "basis": "market_value", "crystallization": "quarterly"},
+		});
+		let mail = governance_mail("payout_outcome", &fee, "https://cabinet.example").expect("renderable");
+		assert_eq!(mail.subject, "Fee terms executed — Quy Nhon Fund");
+		assert!(mail.text.contains("Management fee: none → 2.5%"));
+
+		let old_row = serde_json::json!({
+			"consilium_id": "c-1",
+			"outcome": "EXECUTED",
+			"network": "Ethereum", "address": "0xabc", "amount": "12,500.00 USDT", "detail": "Broadcast.",
+			"tier": "", "source": "", "destination": "", "reason": "",
+		});
+		let mail = governance_mail("payout_outcome", &old_row, "https://cabinet.example").expect("renderable");
+		assert_eq!(
+			mail.subject, "Payout executed — 12,500.00 USDT on Ethereum",
+			"a row from before the fee description is what it was"
+		);
+
+		let mut half_terms = fee.clone();
+		half_terms["proposed"] = serde_json::json!({"management_bps": 250});
+		assert!(governance_mail("payout_outcome", &half_terms, "https://cabinet.example").is_none(), "half the terms is no mail");
+		let mut no_terms = fee.clone();
+		no_terms["proposed"] = serde_json::Value::Null;
+		assert!(
+			governance_mail("payout_outcome", &no_terms, "https://cabinet.example").is_none(),
+			"a fund proposing nothing is no mail"
+		);
+		let mut no_fund = fee;
+		no_fund["fund"] = serde_json::Value::String(String::new());
+		assert!(governance_mail("payout_outcome", &no_fund, "https://cabinet.example").is_none(), "terms for no fund are no mail");
 	}
 
 	#[test]
