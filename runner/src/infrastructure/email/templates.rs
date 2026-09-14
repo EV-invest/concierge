@@ -554,9 +554,10 @@ pub fn fee_policy_approval(
 
 /// The money plane telling one investor the fee terms of a fund they hold are changing.
 ///
-/// Notice, not a request: no code, no decision, and the terms are shown the same way the
-/// owners saw them — now beside next — because the investor is the one actually paying
-/// the difference. `terms_url` is already absolute: the money plane supplies only a
+/// Notice, not a request: no code, no decision, and the terms are shown now beside next
+/// because the investor is the one actually paying the difference. Deliberately silent
+/// on WHO set them: within the house terms one operator does, beyond them the owners'
+/// consilium, and the same notice — with the same lead time — goes out either way. `terms_url` is already absolute: the money plane supplies only a
 /// cabinet-relative path and the dispatcher hangs it off this plane's own cabinet origin.
 pub fn fee_policy_notice(fund: &str, current: Option<&FeeTerms>, proposed: &FeeTerms, effective_at: i64, terms_url: &str) -> RenderedEmail {
 	let fund = one_line(fund);
@@ -568,7 +569,7 @@ pub fn fee_policy_notice(fund: &str, current: Option<&FeeTerms>, proposed: &FeeT
 	inner.push_str(&eyebrow("Fees"));
 	inner.push_str(&heading(&format!("The fee terms of {fund} are changing")));
 	inner.push_str(&paragraph(&format!(
-		"The fund's owners have approved new fee terms for {fund}. They take effect on {effective} and apply to your holding from then on."
+		"New fee terms have been set for {fund}. They take effect on {effective} and apply to your holding from then on."
 	)));
 	let mut rows = vec![("Fund", fund.clone()), ("Effective", effective.clone())];
 	rows.extend(terms.iter().map(|(label, value)| (*label, value.clone())));
@@ -580,7 +581,7 @@ pub fn fee_policy_notice(fund: &str, current: Option<&FeeTerms>, proposed: &FeeT
 		subject: format!("Fee terms for {fund} change on {effective}"),
 		html: shell(&format!("The fee terms of {fund} are changing"), &card(&inner), FOOTER_NOTICE, "", "Fees"),
 		text: format!(
-			"The fee terms of {fund} are changing\n\nThe fund's owners have approved new fee terms for {fund}. They take effect on {effective} and apply to your holding from then on.\n\nFund: {fund}\nEffective: {effective}\n{}\nSee the full terms: {terms_url}\n\nThis message needs no action from you. It is notice of the terms your holding will be charged under.\n\n—\n{FOOTER_NOTICE}\n",
+			"The fee terms of {fund} are changing\n\nNew fee terms have been set for {fund}. They take effect on {effective} and apply to your holding from then on.\n\nFund: {fund}\nEffective: {effective}\n{}\nSee the full terms: {terms_url}\n\nThis message needs no action from you. It is notice of the terms your holding will be charged under.\n\n—\n{FOOTER_NOTICE}\n",
 			fee_lines(&terms)
 		),
 	}
@@ -1219,6 +1220,13 @@ mod tests {
 		assert!(!mail.html.contains("owner seat") && mail.html.contains("hold a position in this fund"));
 		assert!(mail.html.contains("needs no action"));
 		assert!(!mail.html.contains(INITIATOR_NOTE_LABEL), "nobody's free text is quoted in a notice");
+		for part in [&mail.html, &mail.text] {
+			assert!(part.contains("New fee terms have been set for Quy Nhon Fund"));
+			assert!(
+				!part.contains("owners have approved"),
+				"an operator may set terms alone within the house terms; the notice must not claim a consilium"
+			);
+		}
 	}
 
 	#[test]

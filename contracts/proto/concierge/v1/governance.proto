@@ -769,8 +769,9 @@ message FeePolicyApprovalMail {
 // about. A caller that fans one investor's notice out to a second mailbox has to
 // contradict itself in the same message to do it.
 //
-// No code and no decision: the terms were approved by the owners' consilium, and this is
-// the investor being told before they take effect. `link` is a CABINET-RELATIVE path —
+// No code and no decision: the terms were set — by the operator within the house terms,
+// or by the owners' consilium beyond them — and this is the investor being told before
+// they take effect, with the same notice either way. `link` is a CABINET-RELATIVE path —
 // the money plane names no host at all; this plane hangs it off its own cabinet origin.
 message FeePolicyNoticeMail {
   // Concierge canonical id of the investor. MUST equal the request's user_id; the relay
