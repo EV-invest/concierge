@@ -20,6 +20,7 @@ mod kyc;
 mod oauth;
 mod routes;
 mod session;
+mod single_flight;
 
 // The one session-store name tests exercise the persistence invariant through.
 use std::sync::Arc;

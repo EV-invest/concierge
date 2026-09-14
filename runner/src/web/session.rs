@@ -8,7 +8,7 @@
 //! per session in the central Redis, reaped by `EXPIREAT`, surviving restarts and
 //! shared across replicas; unset ⇒ an in-process map (local/CI unaffected).
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use color_eyre::eyre::{Context, bail};
 use evconcierge_contracts::concierge::v1::{RefreshRequest, TokenResponse, UserSummary, auth_service_server::AuthService as AuthRpc};
@@ -16,7 +16,7 @@ use prost::Message;
 use tokio::sync::Mutex;
 use tonic::{Code, Request};
 
-use crate::web::{now_secs, random_token};
+use crate::web::{now_secs, random_token, single_flight::KeyedLocks};
 
 /// Refresh the access token when it has less than this long to live, so a token
 /// handed to a zone stays valid for the request that follows.
@@ -43,10 +43,9 @@ pub struct Fresh {
 pub struct WebSessions {
 	store: Store,
 	/// Per-session single-flight for the refresh path: two racing rotations of one
-	/// refresh token read as theft upstream and revoke the family.
-	/// ponytail: in-process locks — correct for one replica; going multi-replica
-	/// needs a distributed lock (SET NX) or upstream rotation grace.
-	locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+	/// refresh token read as theft upstream and revoke the family. In-process — see
+	/// `single_flight` for the one-replica caveat.
+	locks: KeyedLocks<String>,
 }
 
 impl WebSessions {
@@ -62,7 +61,7 @@ impl WebSessions {
 		};
 		Ok(Self {
 			store,
-			locks: Mutex::new(HashMap::new()),
+			locks: KeyedLocks::default(),
 		})
 	}
 
@@ -91,8 +90,7 @@ impl WebSessions {
 	/// revoked upstream, or never existed) and its cookies should be cleared; `Err` ⇒
 	/// the store itself failed and the session's fate is UNKNOWN — don't touch cookies.
 	pub async fn fresh(&self, id: &str, auth: &impl AuthRpc) -> color_eyre::Result<Option<Fresh>> {
-		let lock = self.lock_for(id).await;
-		let _flight = lock.lock().await;
+		let _flight = self.locks.acquire(id.to_string()).await;
 		let Some(mut s) = self.store.load(id).await? else { return Ok(None) };
 		let now = now_secs();
 
@@ -148,12 +146,6 @@ impl WebSessions {
 	/// Drop the session, returning its refresh token for upstream revocation.
 	pub async fn forget(&self, id: &str) -> color_eyre::Result<Option<String>> {
 		self.store.remove(id).await
-	}
-
-	async fn lock_for(&self, id: &str) -> Arc<Mutex<()>> {
-		let mut locks = self.locks.lock().await;
-		locks.retain(|_, l| Arc::strong_count(l) > 1);
-		locks.entry(id.to_string()).or_default().clone()
 	}
 }
 
