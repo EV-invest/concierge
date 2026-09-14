@@ -154,7 +154,9 @@ service OwnerRemovalApprovalService {
 // transfer of your own money has nothing to do with holding a seat. It gets its own rule,
 // narrower in the dimension that matters — the recipient must BE the payment's subject,
 // named in the typed payload — so the surface widens by exactly one person per message
-// rather than to everyone.
+// rather than to everyone. The fee policy pair follows the same split: FEE_POLICY_APPROVAL
+// is a consilium kind (a seated owner, verified address), FEE_POLICY_NOTICE is addressed by
+// identity to the one investor it is about.
 //
 // This path deliberately bypasses notification preferences. `NotificationService.Emit`
 // is opt-out on both channels, and a security mail that a subscriber can silently
@@ -554,6 +556,16 @@ enum GovernanceMailKind {
   // describes: two ends of a transfer in words, not a rail and an address. See
   // PaymentApprovalMail for why the payout template cannot carry it.
   GOVERNANCE_MAIL_KIND_PAYMENT_APPROVAL = 5;
+  // The money plane asking an owner to approve NEW FEE TERMS for a fund — the consilium
+  // over the price every investor in that fund pays. Addressed like PAYMENT_APPROVAL: a
+  // seated owner at a verified address, because the mail carries a link and the code
+  // that arms it. See FeePolicyApprovalMail.
+  GOVERNANCE_MAIL_KIND_FEE_POLICY_APPROVAL = 6;
+  // The money plane telling ONE investor that the fee terms of a fund they hold are
+  // changing. Addressed by IDENTITY like PAYMENT_CONSENT — the recipient must BE the
+  // investor the payload names — and, like a consent, it leaves an in-app trace. It asks
+  // for nothing and carries no code: it is notice. See FeePolicyNoticeMail.
+  GOVERNANCE_MAIL_KIND_FEE_POLICY_NOTICE = 7;
 }
 
 message SendGovernanceMailRequest {
@@ -568,6 +580,8 @@ message SendGovernanceMailRequest {
   PayoutOutcomeMail payout_outcome = 5;
   PaymentConsentMail payment_consent = 6;
   PaymentApprovalMail payment_approval = 7;
+  FeePolicyApprovalMail fee_policy_approval = 8;
+  FeePolicyNoticeMail fee_policy_notice = 9;
 }
 
 message PayoutApprovalMail {
@@ -694,6 +708,85 @@ message PaymentConsentMail {
   string approval_url = 11;
   // The secret code the subject types on that page.
   string code = 12;
+}
+
+// One set of fee terms, as the money plane's `FeePolicy` spells them: basis points and
+// two closed vocabularies. Rendered HERE as percentages and words — the money plane
+// never hands this plane a pre-rendered "2.5%", because a string it renders is a string
+// it can make say anything. Every `_bps` is refused above 10 000 (100%), and `basis` and
+// `crystallization` are refused outside their closed sets: an unknown word means the two
+// planes disagree about what the terms ARE, which is a rejected call, not a line of mail.
+message FeeTerms {
+  // Annual management fee, in basis points of `basis`.
+  uint32 management_bps = 1;
+  // Performance fee over the high-water mark, in basis points of the gain.
+  uint32 performance_bps = 2;
+  // Annual hurdle the gain must clear before the performance fee is due. 0 = none.
+  uint32 hurdle_bps = 3;
+  // invested_capital | market_value — what the management fee is charged on.
+  string basis = 4;
+  // monthly | quarterly | semi_annual | annual — how often the performance fee
+  // crystallizes.
+  string crystallization = 5;
+}
+
+// An owner asked to approve new fee terms for a fund.
+//
+// Shaped like PaymentApprovalMail — a seated owner, a verified address, the operator's
+// reason set apart as theirs, a link on our origin and the code that arms it — and it
+// describes what an owner must actually be able to check: the terms in force NOW beside
+// the terms PROPOSED, field by field. A fee change is a change to the price of every
+// investor in the fund, and an approval mail that showed only the new number would have
+// the owner approve a difference they cannot see.
+message FeePolicyApprovalMail {
+  string consilium_id = 1;
+  string initiator_email = 2;
+  // The fund whose terms change, in words a person recognises (not a service id).
+  string fund = 3;
+  // The terms in force today. Absent when the fund charges nothing yet — a product with
+  // no policy charges no fee, so "none" is a real current state, not a missing field.
+  FeeTerms current = 4;
+  // The terms proposed. Required.
+  FeeTerms proposed = 5;
+  // Why, in the operator's words. Required, and rendered attributed to them.
+  string reason = 6;
+  string payload_hash = 7;
+  uint32 threshold = 8;
+  uint32 owner_count = 9;
+  int64 expires_at = 10;
+  // Absolute URL of the approval page, carrying the opaque token.
+  string approval_url = 11;
+  // The secret code the owner types on that page. Held only until the mail is sent,
+  // then cleared from the delivery row.
+  string code = 12;
+}
+
+// One investor told that the fee terms of a fund they hold are changing.
+//
+// `subject_user_id` exists beside SendGovernanceMailRequest.user_id for the reason
+// PaymentConsentMail gives: no seat is involved, so the only fact this plane can hold
+// the money plane to is that the person it is writing to IS the person the notice is
+// about. A caller that fans one investor's notice out to a second mailbox has to
+// contradict itself in the same message to do it.
+//
+// No code and no decision: the terms were approved by the owners' consilium, and this is
+// the investor being told before they take effect. `link` is a CABINET-RELATIVE path —
+// the money plane names no host at all; this plane hangs it off its own cabinet origin.
+message FeePolicyNoticeMail {
+  // Concierge canonical id of the investor. MUST equal the request's user_id; the relay
+  // refuses the mail otherwise.
+  string subject_user_id = 1;
+  // The fund whose terms change, in words a person recognises.
+  string fund = 2;
+  // The terms in force until `effective_at`. Absent when the fund charged nothing.
+  FeeTerms current = 3;
+  // The terms that apply from `effective_at`. Required.
+  FeeTerms proposed = 4;
+  // Unix seconds the new terms take effect.
+  int64 effective_at = 5;
+  // Cabinet-relative path of the page showing the full terms, e.g. `/funds/qn/fees`.
+  // Must start with a single `/`; empty means the cabinet's front page.
+  string link = 6;
 }
 
 message SendGovernanceMailResponse {
