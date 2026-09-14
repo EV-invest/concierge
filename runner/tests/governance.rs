@@ -1321,6 +1321,9 @@ async fn a_consent_inbox_entry_cannot_carry_a_link_or_squat_a_key() {
 		("see http://evil.example", "a link"),
 		("1 USDT (www.evil.example)", "a bare host"),
 		("1 USDT HTTPS://x", "case does not help"),
+		// The amount keeps the coarse rule the fund line does not: an amount has no
+		// business saying `http` at all, scheme or no scheme.
+		("1 USDT http evil.example", "the bare word with no scheme"),
 	] {
 		let mut request = consent(investor, investor);
 		request.payment_consent.as_mut().unwrap().amount = amount.into();
@@ -1596,6 +1599,9 @@ async fn a_fee_policy_notice_link_is_a_cabinet_path_and_nothing_else() {
 			mutate(&|m| m.fund = "Quy Nhon Fund — see http://evil.example".into()),
 			"a link smuggled into the one field the inbox repeats",
 		),
+		(mutate(&|m| m.fund = "http://x".into()), "a fund that is nothing but a link"),
+		(mutate(&|m| m.fund = "www.x".into()), "a fund that is a bare host"),
+		(mutate(&|m| m.fund = "WWW.X".into()), "case does not help"),
 		(mutate(&|m| m.proposed = None), "no proposed terms"),
 		(mutate(&|m| m.proposed.as_mut().unwrap().basis = "aum".into()), "an unknown basis"),
 	] {
@@ -1615,6 +1621,60 @@ async fn a_fee_policy_notice_link_is_a_cabinet_path_and_nothing_else() {
 			.into_inner()
 			.enqueued
 	);
+}
+
+/// The fund line is a product slug, and `httpfund` is a legal one (banking#265): the
+/// coarse "no `http` anywhere" rule that fits an amount made every fee mail about such a
+/// fund undeliverable, so a tightening on it could never promote. What a client actually
+/// linkifies — a scheme or a `www.` host — is refused, in the notice and the approval
+/// alike, so the money plane learns one rule for the field.
+#[tokio::test]
+async fn a_fund_named_with_a_bare_http_still_gets_its_fee_mail() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let owner = fx.owner().await;
+	let notice = |fund: &str| {
+		let mut request = fee_policy_notice(investor, investor);
+		request.fee_policy_notice.as_mut().unwrap().fund = fund.into();
+		request
+	};
+	let approval = |fund: &str| {
+		let mut request = fee_policy_approval(owner);
+		request.fee_policy_approval.as_mut().unwrap().fund = fund.into();
+		request
+	};
+
+	for fund in ["httpfund", "lighthttp-arb"] {
+		for (request, kind) in [(notice(fund), "fee_policy_notice"), (approval(fund), "fee_policy_approval")] {
+			let key = request.dedupe_key.clone();
+			assert!(
+				fx.relay()
+					.send_governance_mail(relayed(request))
+					.await
+					.unwrap_or_else(|err| panic!("{kind} about {fund}: {err}"))
+					.into_inner()
+					.enqueued,
+				"{kind} about {fund} is queued"
+			);
+			assert_eq!(fx.delivery(&key).await.map(|(k, _)| k).as_deref(), Some(kind));
+			assert_eq!(fx.payload(&key).await["fund"], fund, "the slug travels verbatim");
+		}
+	}
+	let traced = fx.inbox(investor).await;
+	assert_eq!(traced.len(), 2, "each notice is traced in the inbox");
+	assert!(traced.iter().any(|(_, _, title, _)| title.contains("httpfund")), "and names the fund: {traced:?}");
+
+	for fund in ["http://x", "www.x", "WWW.X"] {
+		for (request, kind) in [(notice(fund), "fee_policy_notice"), (approval(fund), "fee_policy_approval")] {
+			let key = request.dedupe_key.clone();
+			let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+			assert_eq!(err.code(), Code::InvalidArgument, "{kind} with a fund of {fund:?}: {err}");
+			assert!(fx.delivery(&key).await.is_none(), "{kind} with a fund of {fund:?}: nothing may be queued");
+		}
+	}
+	assert_eq!(fx.inbox(investor).await.len(), 2, "a refused notice leaves no trace");
 }
 
 /// Pitfall 21/24's server half: the number the live feed emits moves on every write and

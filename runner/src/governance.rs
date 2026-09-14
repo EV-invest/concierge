@@ -889,17 +889,30 @@ fn address(value: &str, field: &str) -> Result<String, Status> {
 }
 
 /// Refuse anything that a mail client or the cabinet would turn into a link. For the
-/// one field the INBOX repeats: there it cannot be set apart as the money plane's text,
+/// fields the INBOX repeats: there they cannot be set apart as the money plane's text,
 /// and a tappable `http://…` in the platform's own sentence is a phishing line.
 ///
 /// Deliberately coarser than "contains a URL": the needles are `://`, `www.` and the
 /// bare word `http` (which also covers `https`, `http:evil` and `HTTP evil.example`,
 /// which a client may still linkify). The field this guards is an AMOUNT — a number
 /// and a currency — so the false positives that coarseness buys are strings that had no
-/// business in it anyway.
+/// business in it anyway. A field that is free text gets [`no_url`] instead.
 fn no_link(value: &str, field: &str) -> Result<String, Status> {
+	without_needles(value, &["://", "www.", "http"], field)
+}
+
+/// [`no_link`] for a field that is FREE TEXT — a fund's name, which the money plane
+/// spells as a product slug. Only `://` and `www.` are refused: those are what a client
+/// linkifies on its own, while a bare `http` with no scheme stays a word — and `httpfund`
+/// or `lighthttp-arb` is a legal slug. Refusing the word there would not stop a link;
+/// it would make every fee mail about such a fund undeliverable.
+fn no_url(value: &str, field: &str) -> Result<String, Status> {
+	without_needles(value, &["://", "www."], field)
+}
+
+fn without_needles(value: &str, needles: &[&str], field: &str) -> Result<String, Status> {
 	let lower = value.to_ascii_lowercase();
-	if ["://", "www.", "http"].iter().any(|needle| lower.contains(needle)) {
+	if needles.iter().any(|needle| lower.contains(needle)) {
 		return Err(Status::invalid_argument(format!("{field} must not contain a link")));
 	}
 	Ok(value.to_owned())
@@ -1209,7 +1222,9 @@ impl MailRelayService for MailRelay {
 				let payload = serde_json::json!({
 					"consilium_id": line(&mail.consilium_id, 64, "consilium_id")?,
 					"initiator_email": address(&mail.initiator_email, "initiator_email")?,
-					"fund": required_line(&mail.fund, 160, "fund")?,
+					// Same rule as the notice's `fund`, so the money plane learns ONE rule
+					// for the field across every fee mail, not one per kind.
+					"fund": no_url(&required_line(&mail.fund, 160, "fund")?, "fund")?,
 					"current": current_fee_terms(mail.current.as_ref())?,
 					"proposed": fee_terms(proposed, "proposed")?,
 					"reason": required_line(&mail.reason, 500, "reason")?,
@@ -1237,7 +1252,7 @@ impl MailRelayService for MailRelay {
 				// The fund's name is the one money-plane string the inbox repeats — a notice
 				// that does not say WHICH fund says nothing — so, like the consent's amount,
 				// it must not be able to carry a link.
-				let fund = no_link(&required_line(&mail.fund, 160, "fund")?, "fund")?;
+				let fund = no_url(&required_line(&mail.fund, 160, "fund")?, "fund")?;
 				// Numbers this plane formats, in the words the mail will use, so the trace
 				// and the mail cannot disagree about the change.
 				let notice = InboxNotice {
@@ -1438,6 +1453,25 @@ mod tests {
 			assert!(cabinet_path(hostile).is_err(), "must be refused: {hostile:?}");
 		}
 		assert!(cabinet_path(&format!("/{}", "a".repeat(512))).is_err(), "over the byte limit");
+	}
+
+	/// The two inbox-repeated fields are different kinds of text, so they get different
+	/// grades of the same check: an amount has no business containing the word `http`,
+	/// a fund slug legally does — and only a scheme or a `www.` host ever becomes a link.
+	#[test]
+	fn a_fund_slug_may_say_http_but_an_amount_may_not() {
+		for slug in ["httpfund", "lighthttp-arb", "Quy Nhon Fund", "HTTP Arbitrage"] {
+			assert_eq!(no_url(slug, "fund").unwrap(), slug, "a legal fund name: {slug:?}");
+		}
+		for hostile in ["http://x", "Quy Nhon — see https://evil.example", "www.x", "WWW.X", "fund (www.evil.example)"] {
+			assert!(no_url(hostile, "fund").is_err(), "a fund must not link: {hostile:?}");
+			assert!(no_link(hostile, "amount").is_err(), "and neither may an amount: {hostile:?}");
+		}
+		// The amount keeps the coarse grade: the bare word, with no scheme at all.
+		for hostile in ["1 USDT http evil.example", "http", "1 USDT HTTPS://x"] {
+			assert!(no_link(hostile, "amount").is_err(), "an amount must not say http: {hostile:?}");
+		}
+		assert_eq!(no_link("1 000.50 USDT", "amount").unwrap(), "1 000.50 USDT");
 	}
 
 	/// The terms are rendered at somebody approving or paying a price, so every field is
