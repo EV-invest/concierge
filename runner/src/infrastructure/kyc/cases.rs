@@ -61,8 +61,9 @@ impl KycCaseRepository for PgKycCases {
 	///
 	/// Not one transaction, and not one statement, because neither would buy anything: the
 	/// answer is stale the moment it is returned either way — the caller acts on it outside
-	/// any lock — and the guarantee this gate offers is a bound on volume, not mutual
-	/// exclusion. Keeping them separate keeps each one a query a reader can check by eye.
+	/// any database lock — and the guarantee this gate offers is a bound on volume. Mutual
+	/// exclusion between two starts is the caller's, held in process around this read.
+	/// Keeping them separate keeps each one a query a reader can check by eye.
 	async fn start_gate(&self, user_id: UserId, window_secs: i64) -> Result<StartGate, DomainError> {
 		let live: Option<(Uuid, Option<String>)> = sqlx::query_as("SELECT id, redirect_url FROM kyc_cases WHERE user_id = $1 AND status = ANY($2) ORDER BY created_at DESC LIMIT 1")
 			.bind(user_id.raw())

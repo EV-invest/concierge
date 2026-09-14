@@ -43,6 +43,7 @@ use domain::{
 use evconcierge_auth::AuthService;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tokio::sync::{Notify, watch};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -105,6 +106,51 @@ impl KycProvider for CountingKyc {
 	async fn start_session(&self, case_id: Uuid, requested_tier: u32) -> Result<KycSession, DomainError> {
 		self.sessions.fetch_add(1, Ordering::SeqCst);
 		self.inner.start_session(case_id, requested_tier).await
+	}
+
+	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
+		self.inner.parse_callback(headers, body, now)
+	}
+}
+
+/// [`CountingKyc`] whose vendor call can be held open by the test.
+///
+/// A race needs the first caller to still be "at the vendor" when the second arrives,
+/// and a stub that answers instantly closes that window before a test can aim at it.
+/// `entered` fires when a session is being bought; nothing completes until [`Self::release`].
+struct GatedKyc {
+	inner: CountingKyc,
+	entered: Notify,
+	open: watch::Sender<bool>,
+}
+
+impl GatedKyc {
+	fn new(sessions: Arc<AtomicUsize>) -> Self {
+		Self {
+			inner: CountingKyc::new(sessions),
+			entered: Notify::new(),
+			open: watch::channel(false).0,
+		}
+	}
+
+	/// Let every vendor call through — the ones waiting and any that arrive later.
+	fn release(&self) {
+		self.open.send_replace(true);
+	}
+}
+
+#[async_trait]
+impl KycProvider for GatedKyc {
+	fn name(&self) -> &'static str {
+		self.inner.name()
+	}
+
+	async fn start_session(&self, case_id: Uuid, requested_tier: u32) -> Result<KycSession, DomainError> {
+		// Tally first, so a start that reaches the vendor is counted even while held.
+		let session = self.inner.start_session(case_id, requested_tier).await;
+		self.entered.notify_one();
+		self.open.subscribe().wait_for(|open| *open).await.expect("the test keeps the gate alive");
+		session
 	}
 
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
@@ -769,6 +815,75 @@ async fn a_second_start_reuses_the_live_case_and_never_calls_the_vendor() {
 	assert_eq!(second["case_id"], first["case_id"], "they are sent back to the attempt they already have");
 	assert_eq!(second["redirect_url"], first["redirect_url"]);
 	assert_eq!(h.case_count(user).await, 1, "one attempt, one row — a second would read as an abandoned try");
+}
+
+/// Two starts from one user at the SAME time — the race #56 describes.
+///
+/// The gate is a read, so this cannot be shown with two sequential calls: the second
+/// must arrive while the first is still at the vendor, before its row exists. The gated
+/// provider makes that moment as long as the test needs — `start_session` announces it
+/// has been entered and then holds until released — and every call, not just the first,
+/// waits on the same release, so a build that lets both through fails on the tally
+/// instead of hanging.
+#[tokio::test]
+async fn two_simultaneous_starts_buy_one_session_and_share_the_case() {
+	let counter = Arc::new(AtomicUsize::new(0));
+	let provider = Arc::new(GatedKyc::new(counter.clone()));
+	let Some(h) = setup_with(Some(provider.clone())).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	let start = |router: Router, cookie: String, csrf: String| {
+		tokio::spawn(async move {
+			let request = Request::builder()
+				.method("POST")
+				.uri("/kyc/start")
+				.header("content-type", "application/json")
+				.header("cookie", cookie)
+				.header("x-ev-csrf", csrf)
+				.body(Body::from("{}"))
+				.unwrap();
+			let response = router.oneshot(request).await.expect("router answered");
+			let status = response.status();
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+			(status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+		})
+	};
+
+	let first = start(h.router.clone(), cookie.clone(), csrf.clone());
+	tokio::time::timeout(std::time::Duration::from_secs(10), provider.entered.notified())
+		.await
+		.expect("the first start reaches the vendor");
+
+	// Now the first start is inside the vendor call and its row does not exist yet: this
+	// is exactly where a second read of the gate would say "no live case".
+	let second = start(h.router.clone(), cookie, csrf);
+	tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+	assert!(!second.is_finished(), "the second start must wait for the first, not answer on its own read of the gate");
+	assert_eq!(counter.load(Ordering::SeqCst), 1, "and it must not have reached the vendor while waiting");
+
+	provider.release();
+	let (first_status, first) = tokio::time::timeout(std::time::Duration::from_secs(10), first)
+		.await
+		.expect("the first start completes")
+		.expect("join");
+	let (second_status, second) = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+		.await
+		.expect("the second start completes")
+		.expect("join");
+
+	assert_eq!(first_status, StatusCode::OK, "{first}");
+	assert_eq!(second_status, StatusCode::OK, "a user mid-flow is not an error: {second}");
+	assert_eq!(counter.load(Ordering::SeqCst), 1, "one session bought — the second start is handed the first one's case");
+	assert_eq!(second["case_id"], first["case_id"]);
+	assert_eq!(second["redirect_url"], first["redirect_url"]);
+	assert_eq!(h.case_count(user).await, 1, "one attempt, one row — the second would later read as an abandoned try");
 }
 
 /// The loop the issue describes: call it again and again. Once the running case is out of
