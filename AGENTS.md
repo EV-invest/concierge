@@ -37,9 +37,13 @@ never calls `banking`:
    cannot use that rule — consenting to a transfer of your own money has nothing
    to do with holding a seat — so it gets its own, narrower in the dimension that
    matters: the recipient must BE the payment's subject, named in the typed
-   payload and matched against the resolved identity record, and their address
-   must be verified. The surface widens by exactly one person per message rather
-   than to everyone. A consent also leaves an in-app trace in the subject's inbox
+   payload and matched against the resolved identity record. The surface widens
+   by exactly one person per message rather than to everyone. Every kind, under
+   either rule, is refused unless the resolved address is VERIFIED
+   (`users.email_verified`): each of these mails carries a link and the code that
+   arms it, and an address nobody has proved belongs to the person hands that
+   decision to whoever holds the mailbox (#64 closed the payout kinds' exemption).
+   A consent also leaves an in-app trace in the subject's inbox
    — written regardless of what they follow, because nobody subscribes to being
    asked about their own money and no topic is followed by default — so the
    request is findable in the cabinet when the mail is late or lost; the link and

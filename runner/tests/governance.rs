@@ -741,7 +741,7 @@ fn consent(addressee: UserId, subject: UserId) -> SendGovernanceMailRequest {
 	}
 }
 
-/// A well-formed payout approval, for the half of the relay whose rule did NOT change.
+/// A well-formed payout approval — the consilium's question about a withdrawal to a rail.
 fn payout(addressee: UserId) -> SendGovernanceMailRequest {
 	SendGovernanceMailRequest {
 		kind: GovernanceMailKind::PayoutApproval as i32,
@@ -993,10 +993,9 @@ async fn a_payment_approval_reaches_only_a_fund_owner() {
 	);
 }
 
-/// The consent's second rule, for the one consilium kind that arrived after it: an
-/// approval mail carries the link and the code that arms it, so an address nobody has
-/// proved belongs to the owner would hand their vote to whoever holds the mailbox. The
-/// payout kinds are a live contract and deliberately keep accepting such an address.
+/// The consent's second rule applies to the consilium kinds too: an approval mail
+/// carries the link and the code that arms it, so an address nobody has proved belongs
+/// to the owner would hand their vote to whoever holds the mailbox.
 #[tokio::test]
 async fn a_payment_approval_refuses_an_unverified_address() {
 	let Some(fx) = setup().await else {
@@ -1008,16 +1007,47 @@ async fn a_payment_approval_refuses_an_unverified_address() {
 	let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
 	assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
 	assert!(fx.delivery(&key).await.is_none(), "a refused call queues nothing");
+}
 
-	assert!(
-		fx.relay()
-			.send_governance_mail(relayed(payout(owner)))
-			.await
-			.expect("the payout kinds are unchanged")
-			.into_inner()
-			.enqueued,
-		"narrowing the new kind must not have narrowed the live ones"
-	);
+/// The payout kinds shipped without that rule (#64), so a seated owner at an address
+/// nobody had verified was still handed a payout vote. One rule for every consilium
+/// kind now: the approval, and both outcome kinds riding the same payload.
+#[tokio::test]
+async fn a_payout_mail_refuses_an_unverified_address() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let unverified = fx.unverified_owner().await;
+	for (request, why) in [
+		(payout(unverified), "a payout approval"),
+		(payment_outcome(unverified, GovernanceMailKind::PayoutOutcome), "a consilium outcome"),
+		(payment_outcome(unverified, GovernanceMailKind::ApprovalTokenBurned), "a burned-token notice"),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::FailedPrecondition, "{why} to an unverified address: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: a refused call queues nothing");
+	}
+
+	// The control: the rule narrows on verification, not on the kind.
+	let owner = fx.owner().await;
+	for (request, why) in [
+		(payout(owner), "a payout approval"),
+		(payment_outcome(owner, GovernanceMailKind::PayoutOutcome), "a consilium outcome"),
+		(payment_outcome(owner, GovernanceMailKind::ApprovalTokenBurned), "a burned-token notice"),
+	] {
+		let key = request.dedupe_key.clone();
+		assert!(
+			fx.relay()
+				.send_governance_mail(relayed(request))
+				.await
+				.expect("a verified owner may be asked")
+				.into_inner()
+				.enqueued,
+			"{why} to a verified owner is queued"
+		);
+		assert!(fx.delivery(&key).await.is_some(), "{why}: queued for the verified owner");
+	}
 }
 
 /// The same field rules as the consent mail: bounded in bytes, no control characters, a
