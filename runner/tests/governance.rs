@@ -42,9 +42,9 @@ use domain::{
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
-	CancelOwnerRemovalRequest, GovernanceMailKind, ListOwnersRequest, OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest, PaymentApprovalMail, PaymentConsentMail, PayoutApprovalMail,
-	PayoutOutcomeMail, RemovalVote, ResignOwnershipRequest, SendGovernanceMailRequest, SetRoleRequest, SubmitPeerVoteRequest, governance_service_server::GovernanceService,
-	mail_relay_service_server::MailRelayService, user_directory_server::UserDirectory,
+	CancelOwnerRemovalRequest, FeePolicyApprovalMail, FeePolicyNoticeMail, FeeTerms, GovernanceMailKind, ListOwnersRequest, OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest,
+	PaymentApprovalMail, PaymentConsentMail, PayoutApprovalMail, PayoutOutcomeMail, RemovalVote, ResignOwnershipRequest, SendGovernanceMailRequest, SetRoleRequest, SubmitPeerVoteRequest,
+	governance_service_server::GovernanceService, mail_relay_service_server::MailRelayService, user_directory_server::UserDirectory,
 };
 use sqlx::{Connection, PgConnection, PgPool, Row};
 use tonic::{Code, Request};
@@ -738,6 +738,8 @@ fn consent(addressee: UserId, subject: UserId) -> SendGovernanceMailRequest {
 			code: "483012".into(),
 		}),
 		payment_approval: None,
+		fee_policy_approval: None,
+		fee_policy_notice: None,
 	}
 }
 
@@ -764,6 +766,8 @@ fn payout(addressee: UserId) -> SendGovernanceMailRequest {
 		payout_outcome: None,
 		payment_consent: None,
 		payment_approval: None,
+		fee_policy_approval: None,
+		fee_policy_notice: None,
 	}
 }
 
@@ -932,6 +936,8 @@ fn payment_approval(addressee: UserId) -> SendGovernanceMailRequest {
 			approval_url: format!("{RELAY_ORIGIN}/cabinet/payment-approval/tok"),
 			code: "483012".into(),
 		}),
+		fee_policy_approval: None,
+		fee_policy_notice: None,
 	}
 }
 
@@ -957,6 +963,8 @@ fn payment_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGovernanc
 		}),
 		payment_consent: None,
 		payment_approval: None,
+		fee_policy_approval: None,
+		fee_policy_notice: None,
 	}
 }
 
@@ -1324,6 +1332,289 @@ async fn a_consent_inbox_entry_cannot_carry_a_link_or_squat_a_key() {
 	let err = fx.relay().send_governance_mail(relayed(long_key)).await.unwrap_err();
 	assert_eq!(err.code(), Code::InvalidArgument, "a key the prefix would push past the column limit: {err}");
 	assert!(fx.inbox(investor).await.is_empty(), "nothing was queued, so nothing was traced");
+}
+
+/// The house terms, as the money plane would state them.
+fn house_terms() -> FeeTerms {
+	FeeTerms {
+		management_bps: 200,
+		performance_bps: 2_000,
+		hurdle_bps: 0,
+		basis: "invested_capital".into(),
+		crystallization: "annual".into(),
+	}
+}
+
+/// A dearer set: quarterly crystallization on a market-value basis with a hurdle.
+fn proposed_terms() -> FeeTerms {
+	FeeTerms {
+		management_bps: 250,
+		performance_bps: 2_000,
+		hurdle_bps: 800,
+		basis: "market_value".into(),
+		crystallization: "quarterly".into(),
+	}
+}
+
+/// A well-formed fee policy approval — the consilium's question about a fund's price.
+fn fee_policy_approval(addressee: UserId) -> SendGovernanceMailRequest {
+	SendGovernanceMailRequest {
+		kind: GovernanceMailKind::FeePolicyApproval as i32,
+		user_id: addressee.to_string(),
+		dedupe_key: format!("fee-policy-approval:{}", Uuid::new_v4()),
+		payout_approval: None,
+		payout_outcome: None,
+		payment_consent: None,
+		payment_approval: None,
+		fee_policy_approval: Some(FeePolicyApprovalMail {
+			consilium_id: "c-12".into(),
+			initiator_email: "ops@evinvest.ltd".into(),
+			fund: "Quy Nhon Fund".into(),
+			current: Some(house_terms()),
+			proposed: Some(proposed_terms()),
+			reason: "Align with the revised prospectus".into(),
+			payload_hash: "9f2c1ab4de5607891122334455667788".into(),
+			threshold: 2,
+			owner_count: 3,
+			expires_at: T0 + 86_400,
+			approval_url: format!("{RELAY_ORIGIN}/cabinet/fee-policy-approval/tok"),
+			code: "483012".into(),
+		}),
+		fee_policy_notice: None,
+	}
+}
+
+/// A well-formed notice. `addressee` and `subject` are separate for the reason
+/// `consent`'s are: the rule under test is that they must be one person.
+fn fee_policy_notice(addressee: UserId, subject: UserId) -> SendGovernanceMailRequest {
+	SendGovernanceMailRequest {
+		kind: GovernanceMailKind::FeePolicyNotice as i32,
+		user_id: addressee.to_string(),
+		dedupe_key: format!("fee-policy-notice:{}", Uuid::new_v4()),
+		payout_approval: None,
+		payout_outcome: None,
+		payment_consent: None,
+		payment_approval: None,
+		fee_policy_approval: None,
+		fee_policy_notice: Some(FeePolicyNoticeMail {
+			subject_user_id: subject.to_string(),
+			fund: "Quy Nhon Fund".into(),
+			current: Some(house_terms()),
+			proposed: Some(proposed_terms()),
+			effective_at: T0 + 30 * 86_400,
+			link: "/funds/quy-nhon/fees".into(),
+		}),
+	}
+}
+
+/// A fee change is a consilium question, so it is addressed under the payment approval's
+/// rule: a seated owner at a verified address, and nobody else. The code rides the
+/// payload like a payment approval's, to be cleared once the mail is sent.
+#[tokio::test]
+async fn a_fee_policy_approval_reaches_only_a_verified_fund_owner() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let err = fx.relay().send_governance_mail(relayed(fee_policy_approval(investor))).await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "a non-owner has no standing in a fee consilium: {err}");
+
+	let unverified = fx.unverified_owner().await;
+	let err = fx.relay().send_governance_mail(relayed(fee_policy_approval(unverified))).await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "an address nobody proved holds the code that arms the vote: {err}");
+
+	let owner = fx.owner().await;
+	let request = fee_policy_approval(owner);
+	let key = request.dedupe_key.clone();
+	assert!(
+		fx.relay()
+			.send_governance_mail(relayed(request))
+			.await
+			.expect("a seated owner may be asked")
+			.into_inner()
+			.enqueued
+	);
+	assert_eq!(fx.delivery(&key).await.expect("queued"), ("fee_policy_approval".to_owned(), fx.email_of(owner).await));
+	let payload = fx.payload(&key).await;
+	assert_eq!(payload["fund"], "Quy Nhon Fund");
+	assert_eq!(payload["current"]["management_bps"], 200);
+	assert_eq!(payload["proposed"]["management_bps"], 250);
+	assert_eq!(payload["proposed"]["crystallization"], "quarterly");
+	assert_eq!(payload["code"], "483012", "the code travels with the row until the mail is sent");
+	assert_eq!(payload["threshold"], 2, "the bar the owner is measured against travels with the mail");
+	assert!(
+		fx.inbox(owner).await.is_empty(),
+		"an owner's approval leaves no inbox trace — the consilium surface is where they find it"
+	);
+
+	// A fund that charged nothing yet is a real current state, not a missing field.
+	let mut first_terms = fee_policy_approval(owner);
+	first_terms.fee_policy_approval.as_mut().unwrap().current = None;
+	let key = first_terms.dedupe_key.clone();
+	assert!(
+		fx.relay()
+			.send_governance_mail(relayed(first_terms))
+			.await
+			.expect("no current terms is allowed")
+			.into_inner()
+			.enqueued
+	);
+	assert!(fx.payload(&key).await["current"].is_null());
+}
+
+/// The terms are closed vocabularies and bounded numbers, because every one of them is
+/// rendered at an owner deciding a price; the rest are the payment approval's rules.
+#[tokio::test]
+async fn a_fee_policy_approval_refuses_terms_it_cannot_render() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let mutate = |edit: &dyn Fn(&mut FeePolicyApprovalMail)| {
+		let mut request = fee_policy_approval(owner);
+		edit(request.fee_policy_approval.as_mut().unwrap());
+		request
+	};
+	for (request, why) in [
+		(mutate(&|m| m.proposed = None), "no proposed terms"),
+		(mutate(&|m| m.proposed.as_mut().unwrap().management_bps = 10_001), "a management fee over 100%"),
+		(mutate(&|m| m.proposed.as_mut().unwrap().hurdle_bps = 20_000), "a hurdle over 100%"),
+		(
+			mutate(&|m| m.current.as_mut().unwrap().performance_bps = 10_001),
+			"an impossible CURRENT fee is a lie about today",
+		),
+		(mutate(&|m| m.proposed.as_mut().unwrap().basis = "aum".into()), "an unknown basis"),
+		(mutate(&|m| m.proposed.as_mut().unwrap().crystallization = "weekly".into()), "an unknown crystallization"),
+		(mutate(&|m| m.proposed.as_mut().unwrap().basis = "Market_Value".into()), "the money plane's own casing is lower"),
+		(mutate(&|m| m.fund = "   ".into()), "no fund at all"),
+		(mutate(&|m| m.fund = "QN\nAmount: 0".into()), "a forged line in the fund"),
+		(mutate(&|m| m.reason = String::new()), "no reason"),
+		(mutate(&|m| m.approval_url = "https://attacker.example/approve/tok".into()), "an off-origin link"),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
+
+	let mut without_body = fee_policy_approval(owner);
+	without_body.fee_policy_approval = None;
+	let err = fx.relay().send_governance_mail(relayed(without_body)).await.unwrap_err();
+	assert_eq!(err.code(), Code::InvalidArgument, "the kind names a payload it did not carry: {err}");
+}
+
+/// A notice is addressed by identity, like a consent: it reaches the one investor the
+/// payload names, at an address they have proved, and nobody else — an owner seat buys
+/// nothing here.
+#[tokio::test]
+async fn a_fee_policy_notice_reaches_its_subject_and_nobody_else() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let stranger = fx.user().await;
+	let owner = fx.owner().await;
+	for (request, why) in [
+		(fee_policy_notice(stranger, investor), "another user"),
+		(fee_policy_notice(owner, investor), "a seated owner who is not the subject"),
+		(fee_policy_notice(fx.unverified_user().await, investor), "an unverified stranger"),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::FailedPrecondition, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
+	let unverified = fx.unverified_user().await;
+	let err = fx.relay().send_governance_mail(relayed(fee_policy_notice(unverified, unverified))).await.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "the subject themselves, at an address nobody proved: {err}");
+
+	let request = fee_policy_notice(investor, investor);
+	let key = request.dedupe_key.clone();
+	assert!(fx.relay().send_governance_mail(relayed(request)).await.expect("the subject").into_inner().enqueued);
+	assert_eq!(fx.delivery(&key).await.expect("queued"), ("fee_policy_notice".to_owned(), fx.email_of(investor).await));
+	let payload = fx.payload(&key).await;
+	assert_eq!(payload["link"], "/funds/quy-nhon/fees", "the path is stored relative; the dispatcher hangs it off the cabinet");
+	assert!(payload.get("code").is_none(), "a notice carries no secret");
+	assert_eq!(payload["proposed"]["hurdle_bps"], 800);
+}
+
+/// The notice's in-app trace, under the consent's rules: written whether or not the
+/// investor follows anything, deduped with the mail, namespaced, and carrying the fund
+/// and the two headline percentages in the platform's own words — no link.
+#[tokio::test]
+async fn a_fee_policy_notice_leaves_a_trace_in_the_investors_inbox() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let request = fee_policy_notice(investor, investor);
+	let key = request.dedupe_key.clone();
+	assert!(fx.relay().send_governance_mail(relayed(request.clone())).await.expect("first").into_inner().enqueued);
+	assert_eq!(fx.followed_topics(investor).await, 0, "the investor never opened their notification settings");
+
+	let inbox = fx.inbox(investor).await;
+	assert_eq!(inbox.len(), 1, "one entry, regardless of subscriptions: {inbox:?}");
+	let (topic, kind, title, body) = &inbox[0];
+	assert_eq!((topic.as_str(), kind.as_str()), ("account:money-movement", "fee_policy_notice"));
+	assert!(title.contains("Quy Nhon Fund"), "the title names the fund: {title}");
+	for fact in ["2% → 2.5%", "20%"] {
+		assert!(body.contains(fact), "the entry states the headline change: {fact} in {body}");
+	}
+	assert!(!body.contains("/funds/quy-nhon/fees"), "no link in the inbox");
+	assert_eq!(fx.inbox_keys(investor).await, vec![format!("governance:{key}")]);
+
+	assert!(!fx.relay().send_governance_mail(relayed(request)).await.expect("retry").into_inner().enqueued);
+	assert_eq!(fx.inbox(investor).await.len(), 1, "a retry adds nothing");
+
+	// A refused notice leaves no trace on either side.
+	let stranger = fx.user().await;
+	fx.relay().send_governance_mail(relayed(fee_policy_notice(stranger, investor))).await.unwrap_err();
+	assert!(fx.inbox(stranger).await.is_empty());
+}
+
+/// The one emailed link the money plane spells no host for: a path under the cabinet,
+/// and nothing a browser would read as leaving it.
+#[tokio::test]
+async fn a_fee_policy_notice_link_is_a_cabinet_path_and_nothing_else() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let mutate = |edit: &dyn Fn(&mut FeePolicyNoticeMail)| {
+		let mut request = fee_policy_notice(investor, investor);
+		edit(request.fee_policy_notice.as_mut().unwrap());
+		request
+	};
+	for (request, why) in [
+		(mutate(&|m| m.link = "https://attacker.example/".into()), "an absolute URL"),
+		(mutate(&|m| m.link = "//attacker.example/".into()), "a protocol-relative URL"),
+		(mutate(&|m| m.link = "/\\attacker.example/".into()), "what a browser turns into one"),
+		(mutate(&|m| m.link = "funds/fees".into()), "a path with no leading slash"),
+		(mutate(&|m| m.link = "/funds/fees https://attacker.example/".into()), "a path that breaks the line"),
+		(mutate(&|m| m.link = "/funds/fées".into()), "non-ASCII"),
+		(
+			mutate(&|m| m.fund = "Quy Nhon Fund — see http://evil.example".into()),
+			"a link smuggled into the one field the inbox repeats",
+		),
+		(mutate(&|m| m.proposed = None), "no proposed terms"),
+		(mutate(&|m| m.proposed.as_mut().unwrap().basis = "aum".into()), "an unknown basis"),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
+	assert!(fx.inbox(investor).await.is_empty(), "nothing was queued, so nothing was traced");
+
+	let front_page = mutate(&|m| m.link = String::new());
+	assert!(
+		fx.relay()
+			.send_governance_mail(relayed(front_page))
+			.await
+			.expect("an empty path means the cabinet itself")
+			.into_inner()
+			.enqueued
+	);
 }
 
 /// Pitfall 21/24's server half: the number the live feed emits moves on every write and

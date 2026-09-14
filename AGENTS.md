@@ -47,7 +47,13 @@ never calls `banking`:
    — written regardless of what they follow, because nobody subscribes to being
    asked about their own money and no topic is followed by default — so the
    request is findable in the cabinet when the mail is late or lost; the link and
-   the code stay in the mail.
+   the code stay in the mail. The fee policy pair follows the same split:
+   `FEE_POLICY_APPROVAL` is a consilium kind (a seated owner, verified address,
+   link + code), `FEE_POLICY_NOTICE` is addressed by identity to the one investor
+   whose fund is repriced, traced in their inbox, and carries no code — its only
+   link is a cabinet-relative path the dispatcher hangs off `CABINET_URL`, so the
+   money plane names no host at all. Fee terms cross the wire as basis points and
+   closed vocabularies; the percentages are rendered here.
 
 Both seams are authenticated by the SAME shared bridge service token
 (`BRIDGE_SERVICE_TOKEN`), compared in constant time and mounted OUTSIDE the user

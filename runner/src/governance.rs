@@ -18,12 +18,12 @@
 //! is. The payload is TYPED, never rendered markup, and the recipient's address is
 //! resolved HERE from the identity record — a compromised money plane must not be able
 //! to redirect a governance mail or put arbitrary HTML in an owner's inbox. WHO may
-//! receive one is decided per KIND: the consilium kinds — the payouts and a payment
-//! approval — go to a seated owner, and a payment consent goes to the one person whose
-//! money the payment moves and to nobody else. Every kind also requires the resolved
-//! address to be VERIFIED: each of these mails carries a link and the code that arms it,
-//! and an address nobody has proved belongs to the person hands that decision to whoever
-//! holds the mailbox.
+//! receive one is decided per KIND: the consilium kinds — the payouts, a payment
+//! approval, a fee policy approval — go to a seated owner; a payment consent and a fee
+//! policy notice go to the one person they are about and to nobody else. Every kind also
+//! requires the resolved address to be VERIFIED: an approval carries a link and the code
+//! that arms it, a notice reveals a holding, and an address nobody has proved belongs to
+//! the person hands that to whoever holds the mailbox.
 //!
 //! WHAT CROSSES THE WIRE ON THE LIVE FEED. A revision, never a tally. The client
 //! refetches the authoritative snapshot when the number moves, so a stale or replayed
@@ -50,8 +50,8 @@ use domain::{
 	users::{Email, User, UserId},
 };
 use evconcierge_contracts::concierge::v1::{
-	AdmissionPeer as AdmissionPeerMsg, AdmissionVote, CancelOwnerAdmissionRequest, CancelOwnerRemovalRequest, CancelUserProposalRequest, GetOwnerAdmissionRequest, GetOwnerRemovalRequest,
-	GetRemovalInvitationRequest, GetUserProposalRequest, GovernanceMailKind, GovernanceTick, ListOwnerAdmissionsRequest, ListOwnerRemovalsRequest, ListOwnersRequest,
+	AdmissionPeer as AdmissionPeerMsg, AdmissionVote, CancelOwnerAdmissionRequest, CancelOwnerRemovalRequest, CancelUserProposalRequest, FeeTerms as FeeTermsMsg, GetOwnerAdmissionRequest,
+	GetOwnerRemovalRequest, GetRemovalInvitationRequest, GetUserProposalRequest, GovernanceMailKind, GovernanceTick, ListOwnerAdmissionsRequest, ListOwnerRemovalsRequest, ListOwnersRequest,
 	ListUserProposalsRequest, OpenAdminAdmissionRequest, OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest, OpenUserReinstatementRequest, OpenUserSuspensionRequest, Owner,
 	OwnerAdmission as OwnerAdmissionMsg, OwnerAdmissionList, OwnerAdmissionState, OwnerList, OwnerRemoval as OwnerRemovalMsg, OwnerRemovalInvitation, OwnerRemovalList, OwnerRemovalState,
 	ProposalVote as ProposalVoteMsg, RemovalPeer, RemovalVote, ResignOwnershipRequest, SendGovernanceMailRequest, SendGovernanceMailResponse, SubmitAdmissionVoteRequest,
@@ -65,7 +65,10 @@ use uuid::Uuid;
 
 use crate::{
 	authz::BreakGlass,
-	infrastructure::governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
+	infrastructure::{
+		email::templates::{fmt_ts, pct_change},
+		governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
+	},
 	notification::{RateLimiter, now_secs},
 	ports::{GovernanceRepository, NotificationRepository, UserDirectoryRepository},
 	support::{authenticate_service, domain_to_status},
@@ -932,7 +935,80 @@ fn payment_tier(value: &str) -> Result<String, Status> {
 	Ok(tier)
 }
 
-/// Where the in-app trace of a payment consent is filed.
+/// What a management fee may be charged on, as the money plane's `ManagementBasis`
+/// spells it. Closed for the reason [`PAYMENT_TIERS`] is.
+const FEE_BASES: [&str; 2] = ["invested_capital", "market_value"];
+
+/// How often a performance fee may crystallize, as the money plane's
+/// `CrystallizationPeriod` spells it.
+const CRYSTALLIZATIONS: [&str; 4] = ["monthly", "quarterly", "semi_annual", "annual"];
+
+/// 100%, in basis points. A fee above it is not a fee anybody meant to propose.
+const MAX_BPS: u32 = 10_000;
+
+/// One set of fee terms, checked field by field and re-spelled as the payload the
+/// renderer's `FeeTerms` deserialises. Numbers travel as numbers: the percentage a
+/// person reads is made at render time, never taken from the money plane.
+fn fee_terms(terms: &FeeTermsMsg, field: &str) -> Result<serde_json::Value, Status> {
+	for (name, bps) in [
+		("management_bps", terms.management_bps),
+		("performance_bps", terms.performance_bps),
+		("hurdle_bps", terms.hurdle_bps),
+	] {
+		if bps > MAX_BPS {
+			return Err(Status::invalid_argument(format!("{field}.{name} must be at most {MAX_BPS}")));
+		}
+	}
+	let basis = line(&terms.basis, 32, &format!("{field}.basis"))?;
+	if !FEE_BASES.contains(&basis.as_str()) {
+		return Err(Status::invalid_argument(format!("{field}.basis must be one of invested_capital, market_value")));
+	}
+	let crystallization = line(&terms.crystallization, 32, &format!("{field}.crystallization"))?;
+	if !CRYSTALLIZATIONS.contains(&crystallization.as_str()) {
+		return Err(Status::invalid_argument(format!(
+			"{field}.crystallization must be one of monthly, quarterly, semi_annual, annual"
+		)));
+	}
+	Ok(serde_json::json!({
+		"management_bps": terms.management_bps,
+		"performance_bps": terms.performance_bps,
+		"hurdle_bps": terms.hurdle_bps,
+		"basis": basis,
+		"crystallization": crystallization,
+	}))
+}
+
+/// The terms a fund charges NOW: absent is a real state (a fund with no policy charges
+/// nothing), so it maps to JSON `null` rather than being refused.
+fn current_fee_terms(terms: Option<&FeeTermsMsg>) -> Result<serde_json::Value, Status> {
+	terms.map_or(Ok(serde_json::Value::Null), |t| fee_terms(t, "current"))
+}
+
+/// A CABINET-RELATIVE path, for the one emailed link the money plane does not get to
+/// spell a host for. Where [`MailRelay::approval_link`] pins a URL to our origin, this
+/// admits no origin at all: one leading `/`, printable ASCII, nothing that a browser or
+/// a mail client would read as leaving the cabinet once it is hung off the cabinet's
+/// origin. `//host` is protocol-relative and `/\host` is what browsers make of it, so
+/// both are refused; the empty path means the cabinet's front page.
+fn cabinet_path(raw: &str) -> Result<String, Status> {
+	if raw.is_empty() {
+		return Ok(String::new());
+	}
+	if raw.len() > 512 {
+		return Err(Status::invalid_argument("link must be at most 512 bytes"));
+	}
+	if raw.chars().any(|c| c.is_whitespace() || !c.is_ascii_graphic()) {
+		return Err(Status::invalid_argument("link must not contain whitespace or non-printable characters"));
+	}
+	let mut chars = raw.chars();
+	if chars.next() != Some('/') || matches!(chars.next(), Some('/' | '\\')) {
+		return Err(Status::invalid_argument("link must be a cabinet-relative path starting with a single '/'"));
+	}
+	Ok(raw.to_owned())
+}
+
+/// Where the in-app trace of a mail addressed by IDENTITY — a payment consent, a fee
+/// policy notice — is filed.
 ///
 /// The mail is the security channel and cannot be muted; this is what the subject finds
 /// in the cabinet when that mail is late, filtered or lost. It is written REGARDLESS of
@@ -941,21 +1017,23 @@ fn payment_tier(value: &str) -> Result<String, Status> {
 /// follows by default — `upsert_subscriber` creates the subscriber row and nothing under
 /// it, so an `emit` here would reach only the few who had opened their notification
 /// settings. The topic still has to be a real one, so the inbox can filter on it and the
-/// catalogue test below keeps it from drifting.
-const CONSENT_TOPIC: &str = "account:money-movement";
+/// catalogue test below keeps it from drifting. A fee change is filed under money
+/// movement too: it is a change to what leaves the investor's own account.
+const SUBJECT_INBOX_TOPIC: &str = "account:money-movement";
 
 /// Prefix on the inbox entry's dedupe key. The money plane chooses its own keys, and the
 /// inbox is also written by this plane's own emitters; without a namespace a key the
 /// money plane picked could collide with — and silently suppress — an entry of ours.
 const INBOX_KEY_PREFIX: &str = "governance:";
 
-/// What a payment consent leaves in the subject's inbox. The platform's own words only —
-/// no link, no code (those live in the mail and nowhere else), and none of the money
-/// plane's free text either: the operator's `reason` obviously, but also `source` and
-/// `destination`, which an honest external destination can make look like an address
-/// or a URL and which the inbox has no way to mark as somebody else's words. The
-/// amount is the one fact repeated, and it is refused if it can carry a link.
-struct ConsentNotice {
+/// What a mail addressed by identity leaves in the subject's inbox. The platform's own
+/// words only — no link, no code (those live in the mail and nowhere else), and none of
+/// the money plane's free text either: the operator's `reason` obviously, but also
+/// `source` and `destination`, which an honest external destination can make look like
+/// an address or a URL and which the inbox has no way to mark as somebody else's words.
+/// One fact of theirs is repeated per kind — a consent's amount, a notice's fund name —
+/// and that one is refused if it can carry a link.
+struct InboxNotice {
 	title: String,
 	body: String,
 }
@@ -971,8 +1049,10 @@ enum Recipient {
 	/// proved belongs to the owner hands their vote to whoever holds the mailbox, and
 	/// there is no kind for which that is acceptable.
 	FundOwner,
-	/// A payment consent speaks to exactly one person: the one whose money moves. Role
-	/// decides nothing here, so the rule is identity.
+	/// A payment consent or a fee policy notice speaks to exactly one person: the one
+	/// whose money moves, the one whose fund is repriced. Role decides nothing here, so
+	/// the rule is identity — and the address must be verified, because an unverified
+	/// one is one nobody has proved is theirs.
 	Subject(UserId),
 }
 
@@ -1096,7 +1176,7 @@ impl MailRelayService for MailRelay {
 				// `amount` is the one payload field the inbox repeats, and the inbox cannot
 				// mark it as somebody else's text — so it must not be able to carry a link.
 				let amount = no_link(&line(&mail.amount, 64, "amount")?, "amount")?;
-				let notice = ConsentNotice {
+				let notice = InboxNotice {
 					title: "A payment needs your consent".to_owned(),
 					body: format!(
 						"{initiator_email} has opened a payment of {amount}. What it is and where it goes, and the link to consent or refuse, are in the message sent to your email address."
@@ -1120,6 +1200,64 @@ impl MailRelayService for MailRelay {
 				});
 				("payment_consent", payload, Recipient::Subject(subject), Some(notice))
 			}
+			// The consilium asked about a fund's FEE TERMS. Addressed like a payment
+			// approval — a seat, a verified address — and it carries the same link and
+			// code, so the same field rules and the same clearing of `code` once sent.
+			Ok(GovernanceMailKind::FeePolicyApproval) => {
+				let mail = req.fee_policy_approval.ok_or_else(|| Status::invalid_argument("fee_policy_approval is required for this kind"))?;
+				let proposed = mail.proposed.as_ref().ok_or_else(|| Status::invalid_argument("proposed terms are required"))?;
+				let payload = serde_json::json!({
+					"consilium_id": line(&mail.consilium_id, 64, "consilium_id")?,
+					"initiator_email": address(&mail.initiator_email, "initiator_email")?,
+					"fund": required_line(&mail.fund, 160, "fund")?,
+					"current": current_fee_terms(mail.current.as_ref())?,
+					"proposed": fee_terms(proposed, "proposed")?,
+					"reason": required_line(&mail.reason, 500, "reason")?,
+					"payload_hash": line(&mail.payload_hash, 128, "payload_hash")?,
+					"threshold": mail.threshold,
+					"owner_count": mail.owner_count,
+					"expires_at": mail.expires_at,
+					"approval_url": self.approval_link(&mail.approval_url)?,
+					"code": line(&mail.code, 64, "code")?,
+				});
+				("fee_policy_approval", payload, Recipient::FundOwner, None)
+			}
+			// One investor told their fund's terms are changing. Addressed by identity like
+			// a consent, traced in the inbox like a consent, and carrying no code at all.
+			Ok(GovernanceMailKind::FeePolicyNotice) => {
+				let mail = req.fee_policy_notice.ok_or_else(|| Status::invalid_argument("fee_policy_notice is required for this kind"))?;
+				let proposed = mail.proposed.as_ref().ok_or_else(|| Status::invalid_argument("proposed terms are required"))?;
+				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
+				if req.dedupe_key.chars().count() + INBOX_KEY_PREFIX.len() > 128 {
+					return Err(Status::invalid_argument(format!(
+						"dedupe_key must be at most {} characters for this kind",
+						128 - INBOX_KEY_PREFIX.len()
+					)));
+				}
+				// The fund's name is the one money-plane string the inbox repeats — a notice
+				// that does not say WHICH fund says nothing — so, like the consent's amount,
+				// it must not be able to carry a link.
+				let fund = no_link(&required_line(&mail.fund, 160, "fund")?, "fund")?;
+				// Numbers this plane formats, in the words the mail will use, so the trace
+				// and the mail cannot disagree about the change.
+				let notice = InboxNotice {
+					title: format!("The fee terms of {fund} are changing"),
+					body: format!(
+						"New fee terms for {fund} take effect on {}: management fee {}, performance fee {}. The full terms, now and next, are in the message sent to your email address.",
+						fmt_ts(mail.effective_at),
+						pct_change(mail.current.as_ref().map(|c| c.management_bps), proposed.management_bps),
+						pct_change(mail.current.as_ref().map(|c| c.performance_bps), proposed.performance_bps),
+					),
+				};
+				let payload = serde_json::json!({
+					"fund": fund,
+					"current": current_fee_terms(mail.current.as_ref())?,
+					"proposed": fee_terms(proposed, "proposed")?,
+					"effective_at": mail.effective_at,
+					"link": cabinet_path(&mail.link)?,
+				});
+				("fee_policy_notice", payload, Recipient::Subject(subject), Some(notice))
+			}
 			_ => return Err(Status::invalid_argument("kind must be a known governance mail kind")),
 		};
 
@@ -1132,6 +1270,9 @@ impl MailRelayService for MailRelay {
 			.map_err(domain_to_status)?
 			.ok_or_else(|| Status::not_found("recipient is not a user of this plane"))?;
 
+		// The refusals name the kind in words, so an operator reading the money plane's
+		// log sees which mail was refused and why.
+		let noun = kind.replace('_', " ");
 		match recipient_rule {
 			// A consilium mail goes to a FUND OWNER and nobody else. Those kinds are
 			// addressed to the consilium — an approval to cast, or the outcome of one — so
@@ -1155,14 +1296,14 @@ impl MailRelayService for MailRelay {
 				// platform. Identity is the narrower rule that replaces it: this mail may
 				// reach exactly the one person the payload names, and nobody else.
 				if recipient.id() != subject {
-					return Err(Status::failed_precondition("a payment consent may only be addressed to the payment's own subject"));
+					return Err(Status::failed_precondition(format!("a {noun} may only be addressed to the person it names as its subject")));
 				}
 				// An unverified address is one nobody has proved belongs to this person. For a
 				// notification that is a nuisance; for a mail carrying a consent link AND the
 				// code that arms it, it hands the decision to whoever happens to hold the
 				// mailbox — which is the entire thing consent is supposed to rule out.
 				if !recipient.email_verified() {
-					return Err(Status::failed_precondition("a payment consent may only be sent to a verified address"));
+					return Err(Status::failed_precondition(format!("a {noun} may only be sent to a verified address")));
 				}
 			}
 		}
@@ -1189,7 +1330,7 @@ impl MailRelayService for MailRelay {
 					user_id.raw(),
 					recipient.email().as_str(),
 					recipient.email_verified(),
-					CONSENT_TOPIC,
+					SUBJECT_INBOX_TOPIC,
 					kind,
 					&notice.title,
 					&notice.body,
@@ -1198,7 +1339,7 @@ impl MailRelayService for MailRelay {
 				)
 				.await
 		{
-			tracing::warn!(%err, dedupe_key = %req.dedupe_key, "mail relay: could not record the consent in the subject's inbox");
+			tracing::warn!(%err, dedupe_key = %req.dedupe_key, kind, "mail relay: could not record the trace in the subject's inbox");
 		}
 		Ok(Response::new(SendGovernanceMailResponse { enqueued }))
 	}
@@ -1269,11 +1410,68 @@ mod tests {
 		}
 	}
 
-	/// The inbox filters by topic and the catalogue is closed, so the topic a consent is
-	/// filed under has to be one the catalogue actually lists.
+	/// The inbox filters by topic and the catalogue is closed, so the topic a consent or a
+	/// notice is filed under has to be one the catalogue actually lists.
 	#[test]
-	fn the_consent_inbox_topic_is_in_the_catalogue() {
-		assert!(crate::notification::topic(CONSENT_TOPIC).is_some(), "{CONSENT_TOPIC} is not a catalogued topic");
+	fn the_subject_inbox_topic_is_in_the_catalogue() {
+		assert!(crate::notification::topic(SUBJECT_INBOX_TOPIC).is_some(), "{SUBJECT_INBOX_TOPIC} is not a catalogued topic");
+	}
+
+	/// The one emailed link the money plane spells no host for. Hung off the cabinet's
+	/// origin by the dispatcher, so what is refused is anything that would not stay
+	/// under it once it is.
+	#[test]
+	fn a_notice_link_is_a_cabinet_path_or_nothing() {
+		assert_eq!(cabinet_path("").unwrap(), "");
+		assert_eq!(cabinet_path("/funds/quy-nhon/fees?tab=terms").unwrap(), "/funds/quy-nhon/fees?tab=terms");
+		assert_eq!(cabinet_path("/").unwrap(), "/");
+		for hostile in [
+			"https://attacker.example/",
+			"//attacker.example/",
+			"/\\attacker.example/",
+			"funds/fees",
+			"/funds/fees https://attacker.example/",
+			"/funds/fees\nhttps://attacker.example/",
+			"/funds/f\u{e9}es",
+			"/funds/fees\u{7}",
+		] {
+			assert!(cabinet_path(hostile).is_err(), "must be refused: {hostile:?}");
+		}
+		assert!(cabinet_path(&format!("/{}", "a".repeat(512))).is_err(), "over the byte limit");
+	}
+
+	/// The terms are rendered at somebody approving or paying a price, so every field is
+	/// either a bounded number or a word from a closed set.
+	#[test]
+	fn fee_terms_are_bounded_numbers_and_closed_words() {
+		let house = FeeTermsMsg {
+			management_bps: 200,
+			performance_bps: 2_000,
+			hurdle_bps: 0,
+			basis: "invested_capital".into(),
+			crystallization: "annual".into(),
+		};
+		let with = |edit: &dyn Fn(&mut FeeTermsMsg)| {
+			let mut terms = house.clone();
+			edit(&mut terms);
+			terms
+		};
+		let json = fee_terms(&house, "proposed").unwrap();
+		assert_eq!(json["management_bps"], 200);
+		assert_eq!(json["crystallization"], "annual");
+		assert!(fee_terms(&with(&|t| t.management_bps = MAX_BPS), "proposed").is_ok(), "100% is the ceiling, inclusive");
+		for (bad, why) in [
+			(with(&|t| t.management_bps = MAX_BPS + 1), "a management fee over 100%"),
+			(with(&|t| t.performance_bps = u32::MAX), "a performance fee over 100%"),
+			(with(&|t| t.hurdle_bps = MAX_BPS + 1), "a hurdle over 100%"),
+			(with(&|t| t.basis = "aum".into()), "an unknown basis"),
+			(with(&|t| t.basis = String::new()), "no basis"),
+			(with(&|t| t.crystallization = "weekly".into()), "an unknown crystallization"),
+			(with(&|t| t.crystallization = "Annual".into()), "the money plane's own casing is lower"),
+		] {
+			assert!(fee_terms(&bad, "proposed").is_err(), "{why}");
+		}
+		assert!(current_fee_terms(None).unwrap().is_null(), "no current terms is a fund that charged nothing");
 	}
 
 	#[test]
