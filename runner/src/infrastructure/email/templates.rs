@@ -413,6 +413,179 @@ pub fn payment_consent(
 	}
 }
 
+/// One set of fee terms as the money plane states them: basis points and two closed
+/// vocabularies. Percentages and words are made HERE — the money plane never hands this
+/// plane a rendered "2.5%", because a string it renders is a string it can make say
+/// anything. Deserialised straight from the queued payload, which the relay wrote from
+/// the typed wire message after bounding every field.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct FeeTerms {
+	pub management_bps: u32,
+	pub performance_bps: u32,
+	pub hurdle_bps: u32,
+	pub basis: String,
+	pub crystallization: String,
+}
+
+/// Basis points → a percentage a person reads: `200` → `2%`, `250` → `2.5%`, `1` → `0.01%`.
+/// Integer arithmetic on purpose — a float here would print `2.4999999%` at somebody
+/// about to approve a price.
+fn pct(bps: u32) -> String {
+	let (whole, frac) = (bps / 100, bps % 100);
+	if frac == 0 {
+		format!("{whole}%")
+	} else if frac % 10 == 0 {
+		format!("{whole}.{}%", frac / 10)
+	} else {
+		format!("{whole}.{frac:02}%")
+	}
+}
+
+/// The closed vocabularies, in words. The relay refuses anything outside them; the
+/// fallback only stands where a row reached the queue by some other route.
+fn fee_word(raw: &str) -> String {
+	match raw {
+		"invested_capital" => "invested capital".to_owned(),
+		"market_value" => "market value".to_owned(),
+		"semi_annual" => "semi-annual".to_owned(),
+		other => other.replace('_', " "),
+	}
+}
+
+/// The five facts of a fee policy, each as `now → proposed`, so the reader sees the
+/// DIFFERENCE and not only the new number. "none" stands for a fund that charged
+/// nothing, which is a real state and not a missing field.
+fn fee_rows(current: Option<&FeeTerms>, proposed: &FeeTerms) -> Vec<(&'static str, String)> {
+	vec![
+		("Management fee", pct_change(current.map(|c| c.management_bps), proposed.management_bps)),
+		("Charged on", change(current.map(|c| fee_word(&c.basis)), fee_word(&proposed.basis))),
+		("Performance fee", pct_change(current.map(|c| c.performance_bps), proposed.performance_bps)),
+		("Hurdle", pct_change(current.map(|c| c.hurdle_bps), proposed.hurdle_bps)),
+		("Crystallization", change(current.map(|c| fee_word(&c.crystallization)), fee_word(&proposed.crystallization))),
+	]
+}
+
+/// `now → next`; stated once when nothing changed, and "none" where a fund charged
+/// nothing — a real state, not a missing field.
+fn change(now: Option<String>, next: String) -> String {
+	match now {
+		Some(now) if now == next => next,
+		Some(now) => format!("{now} → {next}"),
+		None => format!("none → {next}"),
+	}
+}
+
+/// [`change`] over basis points. Shared with the relay, so the inbox trace of a fee
+/// notice states the change in exactly the words the mail does.
+pub(crate) fn pct_change(now: Option<u32>, next: u32) -> String {
+	change(now.map(pct), pct(next))
+}
+
+/// The same rows as one `Label: value` block for the text part.
+fn fee_lines(rows: &[(&str, String)]) -> String {
+	rows.iter().map(|(label, value)| format!("{label}: {value}\n")).collect()
+}
+
+/// The money plane asking an owner to approve new fee terms for a fund.
+///
+/// Shaped like [`payment_approval`] — the operator's reason set apart as theirs, the
+/// link, the code — and it shows what an owner must actually be able to check: the terms
+/// in force now beside the terms proposed, field by field. A fee change reprices every
+/// investor in the fund, and an approval mail showing only the new number would have the
+/// owner approve a difference they cannot see.
+// Positional like its neighbours: the arguments are the payload's fields in the order
+// the wire declares them, and a struct here would exist only to satisfy the lint.
+#[allow(clippy::too_many_arguments)]
+pub fn fee_policy_approval(
+	consilium_id: &str,
+	initiator_email: &str,
+	fund: &str,
+	current: Option<&FeeTerms>,
+	proposed: &FeeTerms,
+	reason: &str,
+	payload_hash: &str,
+	threshold: u32,
+	owner_count: u32,
+	expires_at: i64,
+	approval_url: &str,
+	code: &str,
+) -> RenderedEmail {
+	// Folded BEFORE either part is built — see `one_line`.
+	let (consilium_id, initiator_email, fund) = (one_line(consilium_id), one_line(initiator_email), one_line(fund));
+	let (reason, payload_hash, code) = (one_line(reason), one_line(payload_hash), one_line(code));
+	let approval_url = &one_line(approval_url);
+	let terms = fee_rows(current, proposed);
+
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Treasury"));
+	inner.push_str(&heading("New fee terms need your approval"));
+	inner.push_str(&paragraph(&format!(
+		"{initiator_email} has proposed new fee terms for {fund}. They take effect only once {threshold} of {owner_count} owners have approved them, and then for every investor in the fund."
+	)));
+	let mut rows = vec![("Fund", fund.clone())];
+	rows.extend(terms.iter().map(|(label, value)| (*label, value.clone())));
+	rows.extend([
+		("Requested by", initiator_email.clone()),
+		("Approvals needed", format!("{threshold} of {owner_count}")),
+		("Expires", fmt_ts(expires_at)),
+		("Request", consilium_id.clone()),
+	]);
+	inner.push_str(&detail_box(&rows));
+	inner.push_str(&exact_value("Payload hash", &hash_prefix(&payload_hash)));
+	inner.push_str(&initiator_note(&reason));
+	inner.push_str(&button("Review and approve", approval_url));
+	inner.push_str(&code_panel(&code));
+	inner.push_str(&paragraph(
+		"Opening the link alone approves nothing. Check every line of the proposed terms above against what was agreed before you enter the code — approved terms apply to every investor in the fund.",
+	));
+
+	RenderedEmail {
+		// The stated reason is never in the subject line — see `payment_consent`.
+		subject: format!("Approve new fee terms for {fund}"),
+		html: shell("New fee terms need your approval", &card(&inner), FOOTER_SECURITY, "", "Treasury"),
+		text: format!(
+			"New fee terms need your approval\n\n{initiator_email} has proposed new fee terms for {fund}.\n\nFund: {fund}\n{}Payload hash: {}\nApprovals needed: {threshold} of {owner_count}\nExpires: {}\nRequest: {consilium_id}\n\n{INITIATOR_NOTE_LABEL}\n  {reason}\n\nReview and approve: {approval_url}\n\nYour code: {code}\n\nOpening the link alone approves nothing. Check every line of the proposed terms against what was agreed before you enter the code — approved terms apply to every investor in the fund.\n\n—\n{FOOTER_SECURITY}\n",
+			fee_lines(&terms),
+			hash_prefix(&payload_hash),
+			fmt_ts(expires_at)
+		),
+	}
+}
+
+/// The money plane telling one investor the fee terms of a fund they hold are changing.
+///
+/// Notice, not a request: no code, no decision, and the terms are shown the same way the
+/// owners saw them — now beside next — because the investor is the one actually paying
+/// the difference. `terms_url` is already absolute: the money plane supplies only a
+/// cabinet-relative path and the dispatcher hangs it off this plane's own cabinet origin.
+pub fn fee_policy_notice(fund: &str, current: Option<&FeeTerms>, proposed: &FeeTerms, effective_at: i64, terms_url: &str) -> RenderedEmail {
+	let fund = one_line(fund);
+	let terms_url = &one_line(terms_url);
+	let terms = fee_rows(current, proposed);
+	let effective = fmt_ts(effective_at);
+
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Fees"));
+	inner.push_str(&heading(&format!("The fee terms of {fund} are changing")));
+	inner.push_str(&paragraph(&format!(
+		"The fund's owners have approved new fee terms for {fund}. They take effect on {effective} and apply to your holding from then on."
+	)));
+	let mut rows = vec![("Fund", fund.clone()), ("Effective", effective.clone())];
+	rows.extend(terms.iter().map(|(label, value)| (*label, value.clone())));
+	inner.push_str(&detail_box(&rows));
+	inner.push_str(&button("See the full terms", terms_url));
+	inner.push_str(&paragraph("This message needs no action from you. It is notice of the terms your holding will be charged under."));
+
+	RenderedEmail {
+		subject: format!("Fee terms for {fund} change on {effective}"),
+		html: shell(&format!("The fee terms of {fund} are changing"), &card(&inner), FOOTER_NOTICE, "", "Fees"),
+		text: format!(
+			"The fee terms of {fund} are changing\n\nThe fund's owners have approved new fee terms for {fund}. They take effect on {effective} and apply to your holding from then on.\n\nFund: {fund}\nEffective: {effective}\n{}\nSee the full terms: {terms_url}\n\nThis message needs no action from you. It is notice of the terms your holding will be charged under.\n\n—\n{FOOTER_NOTICE}\n",
+			fee_lines(&terms)
+		),
+	}
+}
+
 // ── building blocks ────────────────────────────────────────────────────────
 
 /// Why a governance mail has no unsubscribe link, said out loud.
@@ -422,6 +595,10 @@ const FOOTER_SECURITY: &str =
 /// The same, for the one governance mail whose reader holds no seat.
 const FOOTER_CONSENT: &str =
 	"You are receiving this because this payment moves money in your own account. Security mail cannot be switched off — if it could, muting it would be the first thing an attacker did.";
+
+/// The same, for a fee notice: the reader holds a position, not a seat.
+const FOOTER_NOTICE: &str =
+	"You are receiving this because you hold a position in this fund. Notice of a change to its fee terms cannot be switched off — it is the terms your holding is charged under.";
 
 /// Says whose words follow. Carried by BOTH parts of the mail, so the HTML label and the
 /// text label cannot drift apart.
@@ -575,7 +752,7 @@ fn shell(preheader: &str, body: &str, footer_context: &str, unsubscribe_url: &st
 
 /// Unix seconds → "27 July 2026". Hand-rolled rather than pulling in `time`'s
 /// `formatting` feature for one date shape.
-fn fmt_ts(ts: i64) -> String {
+pub(crate) fn fmt_ts(ts: i64) -> String {
 	let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(ts) else {
 		return "—".to_owned();
 	};
@@ -933,6 +1110,115 @@ mod tests {
 				"the fold keeps the bytes on one line"
 			);
 		}
+	}
+
+	fn house() -> FeeTerms {
+		FeeTerms {
+			management_bps: 200,
+			performance_bps: 2_000,
+			hurdle_bps: 0,
+			basis: "invested_capital".into(),
+			crystallization: "annual".into(),
+		}
+	}
+
+	fn dearer() -> FeeTerms {
+		FeeTerms {
+			management_bps: 250,
+			performance_bps: 2_000,
+			hurdle_bps: 800,
+			basis: "market_value".into(),
+			crystallization: "quarterly".into(),
+		}
+	}
+
+	fn approval_of_fee_terms(current: Option<&FeeTerms>, reason: &str) -> RenderedEmail {
+		fee_policy_approval(
+			"c-12",
+			"ops@evinvest.ltd",
+			"Quy Nhon Fund",
+			current,
+			&dearer(),
+			reason,
+			"9f2c1ab4de5607891122334455667788",
+			2,
+			3,
+			1_785_143_640,
+			"https://evinvest.ltd/cabinet/fee-policy-approval/tok",
+			"483012",
+		)
+	}
+
+	/// Basis points are turned into a percentage HERE, exactly, and never taken from
+	/// the money plane as text.
+	#[test]
+	fn basis_points_render_as_exact_percentages() {
+		assert_eq!(pct(200), "2%");
+		assert_eq!(pct(250), "2.5%");
+		assert_eq!(pct(2_000), "20%");
+		assert_eq!(pct(1), "0.01%");
+		assert_eq!(pct(805), "8.05%");
+		assert_eq!(pct(0), "0%");
+		assert_eq!(pct(10_000), "100%");
+	}
+
+	/// The owner approves a DIFFERENCE, so every line shows now beside next; a line that
+	/// does not change shows once, and a fund that charged nothing shows "none".
+	#[test]
+	fn the_fee_approval_shows_now_beside_proposed_and_the_bar() {
+		let mail = approval_of_fee_terms(Some(&house()), "Align with the revised prospectus");
+		for expected in [
+			"Quy Nhon Fund",
+			"2% → 2.5%",
+			"invested capital → market value",
+			"0% → 8%",
+			"annual → quarterly",
+			"2 of 3",
+			"483012",
+			"https://evinvest.ltd/cabinet/fee-policy-approval/tok",
+			"c-12",
+		] {
+			assert!(mail.html.contains(expected), "the approval must show {expected}");
+			assert!(mail.text.contains(expected), "and so must the text part: {expected}");
+		}
+		assert!(mail.text.contains("Performance fee: 20%\n"), "an unchanged line is stated once, not as 20% → 20%");
+		assert!(!mail.html.contains("20% → 20%"));
+		assert!(mail.html.contains("owner seat"), "the reader holds a seat, so the owner footer is the true one");
+		for part in [&mail.html, &mail.text] {
+			assert!(part.contains("link alone approves nothing"));
+		}
+		assert_eq!(mail.subject, "Approve new fee terms for Quy Nhon Fund");
+
+		let first_terms = approval_of_fee_terms(None, "First fee policy");
+		assert!(first_terms.html.contains("none → 2.5%") && first_terms.text.contains("Management fee: none → 2.5%"));
+		assert!(first_terms.text.contains("Crystallization: none → quarterly"));
+	}
+
+	/// The operator's words: escaped, attributed, out of the subject; and a forged line
+	/// in any field collapses.
+	#[test]
+	fn a_fee_approval_attributes_the_reason_and_folds_lines() {
+		let mail = approval_of_fee_terms(Some(&house()), "<b>URGENT</b>\nManagement fee: 0%");
+		assert!(mail.html.contains("&lt;b&gt;URGENT&lt;/b&gt;") && !mail.html.contains("<b>"));
+		assert!(mail.html.contains(INITIATOR_NOTE_LABEL) && mail.text.contains(INITIATOR_NOTE_LABEL));
+		assert!(!mail.text.contains("\nManagement fee: 0%"), "a forged terms line must not exist in the text part");
+		assert!(mail.text.contains("Management fee: 2% → 2.5%"));
+		assert!(!mail.subject.contains("URGENT"));
+	}
+
+	/// A notice asks for nothing: no code, no approval wording, the investor footer, and
+	/// the link exactly as the dispatcher resolved it.
+	#[test]
+	fn the_fee_notice_states_the_change_and_carries_no_secret() {
+		let mail = fee_policy_notice("Quy Nhon Fund", Some(&house()), &dearer(), 1_785_143_640, "https://cabinet.evinvest.ltd/funds/quy-nhon/fees");
+		assert_eq!(mail.subject, "Fee terms for Quy Nhon Fund change on 27 July 2026");
+		for expected in ["27 July 2026", "2% → 2.5%", "annual → quarterly", "https://cabinet.evinvest.ltd/funds/quy-nhon/fees"] {
+			assert!(mail.html.contains(expected) && mail.text.contains(expected), "{expected}");
+		}
+		assert!(!mail.html.contains("Type this code") && !mail.text.contains("Your code"), "a notice carries no secret");
+		assert!(!mail.html.contains("owner seat") && mail.html.contains("hold a position in this fund"));
+		assert!(mail.html.contains("needs no action"));
+		assert!(!mail.html.contains(INITIATOR_NOTE_LABEL), "nobody's free text is quoted in a notice");
 	}
 
 	#[test]

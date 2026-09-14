@@ -65,9 +65,17 @@ fn int_field(payload: &serde_json::Value, key: &str) -> i64 {
 	payload.get(key).and_then(serde_json::Value::as_i64).unwrap_or_default()
 }
 
+/// The fee terms under `key`, as the relay wrote them. `None` for JSON `null` — a fund
+/// that charged nothing — and for anything that does not parse, which the caller treats
+/// as unrenderable.
+fn fee_terms(payload: &serde_json::Value, key: &str) -> Option<templates::FeeTerms> {
+	serde_json::from_value(payload.get(key)?.clone()).ok()
+}
+
 /// Render one of the typed governance mails from its stored payload. `None` for a kind
 /// this dispatcher does not know — permanent, so the caller parks rather than retries.
-fn governance_mail(kind: &str, payload: &serde_json::Value) -> Option<templates::RenderedEmail> {
+/// `cabinet_url` is the origin a fee notice's cabinet-relative link hangs off.
+fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -> Option<templates::RenderedEmail> {
 	match kind {
 		"owner_removal_self_accept" => Some(templates::owner_removal_self_accept(
 			&text_field(payload, "initiator_email"),
@@ -131,6 +139,31 @@ fn governance_mail(kind: &str, payload: &serde_json::Value) -> Option<templates:
 			&text_field(payload, "approval_url"),
 			&text_field(payload, "code"),
 		)),
+		// `current` may be null (a fund that charged nothing); `proposed` may not, and a
+		// row without one is unrenderable rather than a mail proposing nothing.
+		"fee_policy_approval" => Some(templates::fee_policy_approval(
+			&text_field(payload, "consilium_id"),
+			&text_field(payload, "initiator_email"),
+			&text_field(payload, "fund"),
+			fee_terms(payload, "current").as_ref(),
+			&fee_terms(payload, "proposed")?,
+			&text_field(payload, "reason"),
+			&text_field(payload, "payload_hash"),
+			int_field(payload, "threshold") as u32,
+			int_field(payload, "owner_count") as u32,
+			int_field(payload, "expires_at"),
+			&text_field(payload, "approval_url"),
+			&text_field(payload, "code"),
+		)),
+		"fee_policy_notice" => Some(templates::fee_policy_notice(
+			&text_field(payload, "fund"),
+			fee_terms(payload, "current").as_ref(),
+			&fee_terms(payload, "proposed")?,
+			int_field(payload, "effective_at"),
+			// The relay admitted only a path starting with a single `/` (or nothing), so
+			// joining onto the origin cannot leave it.
+			&format!("{}{}", cabinet_url.trim_end_matches('/'), text_field(payload, "link")),
+		)),
 		_ => None,
 	}
 }
@@ -144,7 +177,7 @@ fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &Dispatc
 	// Governance mail carries NO unsubscribe target, so the transport sets no
 	// List-Unsubscribe header: a security mail a recipient can switch off is not one.
 	if let Some(payload) = job.payload.as_ref()
-		&& let Some(rendered) = governance_mail(&job.kind, payload)
+		&& let Some(rendered) = governance_mail(&job.kind, payload, &cfg.cabinet_url)
 	{
 		return Some(OutgoingEmail {
 			to: job.recipient.clone(),
@@ -306,6 +339,35 @@ mod tests {
 		assert_eq!(backoff_secs(99), 6 * 60 * 60, "the six-hour cap binds for absurd attempt counts, and the shift never overflows");
 		assert_eq!(backoff_secs(9), 15_360, "growth is still exponential below the cap");
 		assert_eq!(backoff_secs(0), 60, "a zero attempt count clamps rather than shifting by -1");
+	}
+
+	/// A fee notice's link is stored as a cabinet path and resolved here — against the
+	/// origin this plane is configured with, never one the money plane named.
+	#[test]
+	fn a_fee_notice_link_hangs_off_the_configured_cabinet() {
+		let payload = serde_json::json!({
+			"fund": "Quy Nhon Fund",
+			"current": null,
+			"proposed": {"management_bps": 200, "performance_bps": 2000, "hurdle_bps": 0, "basis": "invested_capital", "crystallization": "annual"},
+			"effective_at": 1_785_143_640,
+			"link": "/funds/quy-nhon/fees",
+		});
+		let mail = governance_mail("fee_policy_notice", &payload, "https://cabinet.example/").expect("renderable");
+		assert!(mail.html.contains("https://cabinet.example/funds/quy-nhon/fees"), "one slash between origin and path");
+		assert!(mail.text.contains("none → 2%"));
+
+		let mut no_terms = payload.clone();
+		no_terms["proposed"] = serde_json::Value::Null;
+		assert!(
+			governance_mail("fee_policy_notice", &no_terms, "https://cabinet.example").is_none(),
+			"a notice proposing nothing is unrenderable"
+		);
+		let mut half_terms = payload;
+		half_terms["proposed"] = serde_json::json!({"management_bps": 200});
+		assert!(
+			governance_mail("fee_policy_approval", &half_terms, "https://cabinet.example").is_none(),
+			"so is a payload missing half its terms"
+		);
 	}
 
 	#[test]
