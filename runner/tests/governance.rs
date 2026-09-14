@@ -971,6 +971,36 @@ fn payment_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGovernanc
 	}
 }
 
+/// The outcome of a FEE POLICY consilium, riding the outcome payload with the fee terms
+/// description filled and both the rail pair and the payment tuple empty.
+fn fee_policy_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGovernanceMailRequest {
+	SendGovernanceMailRequest {
+		kind: kind as i32,
+		user_id: addressee.to_string(),
+		dedupe_key: format!("fee-policy-outcome:{}", Uuid::new_v4()),
+		payout_approval: None,
+		payout_outcome: Some(PayoutOutcomeMail {
+			consilium_id: "c-12".into(),
+			outcome: "EXECUTED".into(),
+			network: String::new(),
+			address: String::new(),
+			amount: String::new(),
+			detail: "The new terms apply from the next crystallization.".into(),
+			tier: String::new(),
+			source: String::new(),
+			destination: String::new(),
+			reason: "Align with the revised prospectus".into(),
+			fund: "Quy Nhon Fund".into(),
+			current: Some(house_terms()),
+			proposed: Some(proposed_terms()),
+		}),
+		payment_consent: None,
+		payment_approval: None,
+		fee_policy_approval: None,
+		fee_policy_notice: None,
+	}
+}
+
 /// The new consilium kind is addressed under the payout rule, not the consent one: a
 /// seated owner, and nobody else. What changed is only what the mail describes.
 #[tokio::test]
@@ -1170,6 +1200,20 @@ async fn an_outcome_names_one_whole_subject_and_a_known_ending() {
 		(mutate(&|m| m.outcome = "WHATEVER".into()), "an ending the consilium cannot reach"),
 		(mutate(&|m| m.outcome = "executed".into()), "the money plane's own casing is upper"),
 		(mutate(&|m| m.outcome = String::new()), "no ending at all"),
+		(mutate(&|m| m.fund = "Quy Nhon Fund".into()), "a fund on a payment"),
+		(mutate(&|m| m.proposed = Some(proposed_terms())), "terms on a payment"),
+		(
+			mutate(&|m| {
+				m.tier = String::new();
+				m.source = String::new();
+				m.destination = String::new();
+				m.network = "TRON".into();
+				m.address = "TJRabc".into();
+				m.fund = "Quy Nhon Fund".into();
+				m.proposed = Some(proposed_terms());
+			}),
+			"a rail on fee terms",
+		),
 	] {
 		let key = request.dedupe_key.clone();
 		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
@@ -1196,6 +1240,102 @@ async fn an_outcome_names_one_whole_subject_and_a_known_ending() {
 				.into_inner()
 				.enqueued
 		);
+	}
+}
+
+/// A fee-policy consilium's outcome — and its burn notice — ride the outcome payload with
+/// the fee terms description filled, under the owner rule and the fee approval's field
+/// rules: one rule per field across every kind that carries it.
+#[tokio::test]
+async fn a_fee_policy_outcome_rides_the_outcome_payload() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	for kind in [GovernanceMailKind::PayoutOutcome, GovernanceMailKind::ApprovalTokenBurned] {
+		let request = fee_policy_outcome(owner, kind);
+		let key = request.dedupe_key.clone();
+		assert!(
+			fx.relay()
+				.send_governance_mail(relayed(request))
+				.await
+				.expect("an owner is told how it ended")
+				.into_inner()
+				.enqueued
+		);
+		assert_eq!(fx.delivery(&key).await.expect("queued"), ("payout_outcome".to_owned(), fx.email_of(owner).await));
+		let payload = fx.payload(&key).await;
+		assert_eq!(payload["fund"], "Quy Nhon Fund", "the fund travels verbatim");
+		assert_eq!(payload["proposed"]["management_bps"], 250, "numbers travel as numbers; the percentage is made at render");
+		assert_eq!(payload["current"]["management_bps"], 200);
+		assert_eq!(payload["network"], "", "the rail pair stays empty");
+		assert_eq!(payload["tier"], "", "and so does the payment tuple, which is how the dispatcher tells the three apart");
+	}
+
+	// A fund that charged nothing yet is a real current state, not a missing field.
+	let mut first_terms = fee_policy_outcome(owner, GovernanceMailKind::PayoutOutcome);
+	first_terms.payout_outcome.as_mut().unwrap().current = None;
+	let key = first_terms.dedupe_key.clone();
+	assert!(
+		fx.relay()
+			.send_governance_mail(relayed(first_terms))
+			.await
+			.expect("no current terms is allowed")
+			.into_inner()
+			.enqueued
+	);
+	assert!(fx.payload(&key).await["current"].is_null());
+
+	// A bare `http` is a word, not a link, in a fund's name — the rule the fee mails share.
+	let mut slug = fee_policy_outcome(owner, GovernanceMailKind::PayoutOutcome);
+	slug.payout_outcome.as_mut().unwrap().fund = "httpfund".into();
+	let key = slug.dedupe_key.clone();
+	assert!(fx.relay().send_governance_mail(relayed(slug)).await.expect("a slug with http in it").into_inner().enqueued);
+	assert_eq!(fx.payload(&key).await["fund"], "httpfund");
+
+	let investor = fx.user().await;
+	let err = fx
+		.relay()
+		.send_governance_mail(relayed(fee_policy_outcome(investor, GovernanceMailKind::PayoutOutcome)))
+		.await
+		.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "still a consilium mail: {err}");
+
+	let mutate = |edit: &dyn Fn(&mut PayoutOutcomeMail)| {
+		let mut request = fee_policy_outcome(owner, GovernanceMailKind::PayoutOutcome);
+		edit(request.payout_outcome.as_mut().unwrap());
+		request
+	};
+	for (request, why) in [
+		(mutate(&|m| m.network = "TRON".into()), "a rail on fee terms"),
+		(mutate(&|m| m.address = "TJRabc".into()), "an address on fee terms"),
+		(mutate(&|m| m.source = "treasury".into()), "a payment source on fee terms"),
+		(mutate(&|m| m.destination = "pool".into()), "a payment destination on fee terms"),
+		(mutate(&|m| m.tier = "service".into()), "a payment tier on fee terms"),
+		(mutate(&|m| m.proposed = None), "a fund with no proposed terms"),
+		(mutate(&|m| m.fund = String::new()), "proposed terms for no fund"),
+		(
+			mutate(&|m| {
+				m.fund = String::new();
+				m.proposed = None;
+			}),
+			"current terms alone name no subject whole",
+		),
+		(mutate(&|m| m.fund = "   ".into()), "a fund that says nothing"),
+		(mutate(&|m| m.fund = "http://x".into()), "a linkable fund"),
+		(mutate(&|m| m.fund = "www.x".into()), "a host for a fund"),
+		(mutate(&|m| m.fund = "QN\nAmount: 0".into()), "a forged line in the fund"),
+		(mutate(&|m| m.proposed.as_mut().unwrap().basis = "aum".into()), "an unknown basis"),
+		(mutate(&|m| m.proposed.as_mut().unwrap().management_bps = 10_001), "a management fee over 100%"),
+		(
+			mutate(&|m| m.current.as_mut().unwrap().performance_bps = 10_001),
+			"an impossible CURRENT fee is a lie about today",
+		),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
 	}
 }
 
