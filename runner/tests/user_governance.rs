@@ -413,10 +413,12 @@ async fn a_lapsed_hold_starts_a_cooldown() {
 	fx.hold_at(owner, target, T_FAR).await.expect("hold");
 	// Lifted by one act rather than swept: the sweep is global (see `T_FAR`), and the
 	// aggregate records the end the same way for both — the lapse path is proved in
-	// `a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge`.
+	// `a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge`. Lifted three
+	// hours AFTER the deadline, as an operator beating a stalled sweep would: the end
+	// is still the deadline, or the cooldown would stretch by however late they were.
 	let ended = T_FAR + HOLD_TTL_SECS;
-	fx.users.enable_user(target, ended).await.expect("lifted");
-	assert_eq!(fx.reload(target).await.hold_ended_at(), Some(ended));
+	fx.users.enable_user(target, ended + 3 * 3_600).await.expect("lifted");
+	assert_eq!(fx.reload(target).await.hold_ended_at(), Some(ended), "dated at the deadline, not at the lift");
 
 	let err = fx.hold_at(owner, target, ended + HOLD_COOLDOWN_SECS - 1).await.unwrap_err();
 	assert!(matches!(err, domain::error::DomainError::Forbidden(_)), "inside the cooldown: {err}");

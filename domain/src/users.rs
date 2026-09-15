@@ -429,12 +429,16 @@ impl User {
 	/// active. Unqualified: the decision about WHO may lift a given suspension is taken
 	/// from [`Self::suspension`] by the caller, not here.
 	///
-	/// `ended_at` is remembered only when what ends is an admin hold — that is the
-	/// instant [`Self::hold`] measures its cooldown from. Lifting the owners' verdict,
-	/// or a pre-column suspension, starts no cooldown: neither was one actor's brake.
-	pub fn enable(&mut self, ended_at: i64) {
-		if matches!(self.suspension, Some(Suspension::AdminHold { .. })) {
-			self.hold_ended_at = Some(ended_at);
+	/// `now` is remembered only when what ends is an admin hold — that is the instant
+	/// [`Self::hold`] measures its cooldown from. Lifting the owners' verdict, or a
+	/// pre-column suspension, starts no cooldown: neither was one actor's brake.
+	pub fn enable(&mut self, now: i64) {
+		if let Some(Suspension::AdminHold { expires_at }) = self.suspension {
+			// A hold past its deadline ended AT the deadline, whoever noticed first: the
+			// sweep runs on an interval and an operator lifting it by hand comes later
+			// still, and the cooldown is a promise about the deadline, not about who got
+			// round to it. Dating it from the act would stretch the cooldown by that lag.
+			self.hold_ended_at = Some(now.min(expires_at));
 		}
 		self.suspension = None;
 		if self.status == UserStatus::Active {
@@ -457,10 +461,7 @@ impl User {
 		if now < expires_at {
 			return false;
 		}
-		// The hold ended at its deadline, not when the sweep got round to it: the
-		// cooldown is a promise about the DEADLINE, and dating it from the sweep would
-		// stretch it by up to one sweep interval for nobody's benefit.
-		self.enable(expires_at);
+		self.enable(now);
 		true
 	}
 
@@ -1274,6 +1275,21 @@ mod tests {
 		user.enable(5_000);
 		assert_eq!(user.hold_ended_at(), Some(5_000));
 		assert!(matches!(user.hold(Role::Admin, 6_000, false), Err(DomainError::Forbidden(_))));
+	}
+
+	/// The sweep may not have reached a due hold when an operator lifts it by hand.
+	/// That lift ends a hold that was already over, so the cooldown counts from the
+	/// deadline — the same instant the sweep would have recorded.
+	#[test]
+	fn lifting_an_overdue_hold_by_hand_dates_its_end_at_the_deadline() {
+		let mut user = fixture();
+		user.hold(Role::Admin, 1_000, false).expect("hold");
+		let deadline = 1_000 + HOLD_TTL_SECS;
+		user.enable(deadline + 3 * 3_600);
+		assert_eq!(user.hold_ended_at(), Some(deadline), "not the lift, the deadline");
+		user.drain_events();
+		user.hold(Role::Admin, deadline + HOLD_COOLDOWN_SECS, false)
+			.expect("the cooldown ran from the deadline and is over");
 	}
 
 	/// A hold the owners ratified ended as THEIR verdict, not as a hold; lifting the

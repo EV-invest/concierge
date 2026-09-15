@@ -118,7 +118,7 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 
 	/// Re-enable a disabled user UNQUALIFIED; emits REINSTATED. The raw writer beneath
 	/// [`Self::reinstate_outside_governance`]. `now` is when a lifted hold is recorded as
-	/// having ended.
+	/// having ended — capped at its deadline, if that came first.
 	async fn enable_user(&self, id: UserId, now: i64) -> Result<User, DomainError>;
 
 	/// Re-enable a user, refusing to lift what the OWNERS imposed, with the decision taken
