@@ -249,6 +249,18 @@ impl Harness {
 		(status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 	}
 
+	/// `GET /kyc/status` as the cabinet reaches it. `None` is the signed-out caller.
+	async fn status(&self, cookie: Option<&str>) -> (StatusCode, Value) {
+		let mut request = Request::builder().method("GET").uri("/kyc/status");
+		if let Some(cookie) = cookie {
+			request = request.header("cookie", cookie);
+		}
+		let response = self.router.clone().oneshot(request.body(Body::empty()).unwrap()).await.expect("router answered");
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+		(status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+	}
+
 	async fn post(&self, body: Vec<u8>, signature: String, timestamp: i64) -> (StatusCode, Value) {
 		self.post_with(body, Some(signature), None, timestamp).await
 	}
@@ -1282,4 +1294,97 @@ async fn a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery() {
 	assert_eq!(answer["duplicate"], true, "it is still a duplicate, and still answered 2xx");
 	assert_eq!(h.kyc_level(user).await, 1, "the retry is what repairs a verdict whose level never landed");
 	assert_eq!(h.kyc_changed_count(user).await, 1, "and it emits the ONE event the original attempt owed the money plane");
+}
+
+/// THE CONTRACT of `GET /kyc/status`, asserted as whole JSON documents rather than field
+/// by field.
+///
+/// The cabinet stops guessing here. Until this route existed its only signal was
+/// `kyc_level === 0`, which cannot tell "never started" from "waiting on the vendor" —
+/// so the screen offered Start to a user already mid-flow and bought a second BILLED
+/// session for the attempt they were in (#190). Everything that replaces that inference
+/// is a name in these documents, which is why the assertions compare the whole body: a
+/// field quietly renamed, added or dropped is a cabinet that silently reverts to
+/// guessing, and the failure would otherwise surface as a user being charged for a
+/// duplicate case rather than as a red test.
+#[tokio::test]
+async fn the_status_route_publishes_the_pinned_shape() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, _csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	// Nobody signed in: one machine-readable code, no prose. This route answers JSON for
+	// every outcome — the cabinet parses one shape inside one feature.
+	let (status, answer) = h.status(None).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(answer, json!({ "error": "unauthenticated" }));
+
+	// A signed-in user who has never started. `case: null` is the whole difference from
+	// tier 0 alone, and it is what makes offering Start correct.
+	let (status, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer, json!({ "level": 0, "case": null }), "the never-started shape, verbatim");
+
+	// Mid-flow. `resumable` is what sends the browser back into the session already paid
+	// for instead of opening a second one.
+	let (case_id, session_id) = h.case(user, 1).await;
+	let (status, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK);
+	let created_at = answer["case"]["created_at"].as_i64().expect("created_at is a number");
+	assert!((created_at - now()).abs() < 300, "created_at is unix seconds, not milliseconds or a string: {created_at}");
+	assert_eq!(
+		answer,
+		json!({ "level": 0, "case": { "status": "pending", "requested_tier": 1, "created_at": created_at, "resumable": true } }),
+		"the running-case shape, verbatim — keys, nesting and the persisted status vocabulary"
+	);
+
+	// A case opened before `kyc_cases.redirect_url` existed still holds the start gate,
+	// but there is nowhere to send the browser back to, and the cabinet must be told so
+	// rather than rendering a dead link.
+	sqlx::query("UPDATE kyc_cases SET redirect_url = NULL WHERE id = $1")
+		.bind(case_id)
+		.execute(&h.pool)
+		.await
+		.expect("clear redirect_url");
+	let (_, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(answer["case"]["resumable"], false, "a case with no vendor URL is live but not resumable");
+
+	// The verdict lands. The level moves and the case leaves the answer entirely: a
+	// decided case is history, and history is not what this route reports.
+	let at = now();
+	let raw = body(&session_id, "Approved", &case_id.to_string(), at, json!({}));
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	let (status, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer, json!({ "level": 1, "case": null }), "the verified shape, verbatim");
+}
+
+/// The status route must not depend on the vendor being configured.
+///
+/// With `DIDIT_*` unset `/kyc/start` answers 503, and a cabinet that could not read the
+/// level or the running case in that state would fall back to exactly the guesswork this
+/// route removes — on the day verification is already broken.
+#[tokio::test]
+async fn status_answers_while_verification_itself_is_unavailable() {
+	let Some(h) = setup_with(None).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	let (start_status, start_answer) = h.start(&cookie, Some(&csrf), "").await;
+	assert_eq!(start_status, StatusCode::SERVICE_UNAVAILABLE);
+	assert_eq!(start_answer, unavailable_body());
+
+	let (status, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK, "the level is a fact of this plane, not of the vendor's");
+	assert_eq!(answer, json!({ "level": 0, "case": null }));
 }
