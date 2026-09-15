@@ -24,16 +24,16 @@ use domain::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// The suite's preconditions, or `None` with a line saying so.
+mod common;
+
+/// The suite's preconditions, or `None` when there is no database to assert against.
 ///
-/// Without the marker a skipped run prints exactly the "N passed" a real one does, and
-/// the only tell is the wall time — so a count quoted as evidence that these assertions
-/// ran is evidence of nothing.
+/// A skipped run prints exactly the "N passed" a real one does, and the only tell is the
+/// wall time — so a count quoted as evidence that these assertions ran is evidence of
+/// nothing. [`common::database_url`] answers that where it matters: it panics under CI,
+/// and prints a SKIPPED line a local `--nocapture` run shows.
 async fn setup() -> Option<(PgUsers, PgPool)> {
-	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
-		eprintln!("SKIPPED: DATABASE_URL unset — this test asserted nothing");
-		return None;
-	};
+	let url = common::database_url()?;
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	Some((PgUsers::new(pool.clone()), pool))
