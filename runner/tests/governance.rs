@@ -32,7 +32,7 @@ use concierge::{
 		users::PgUsers,
 	},
 	notification::RateLimiter,
-	ports::{GovernanceRepository, UserDirectoryRepository},
+	ports::{GovernanceRepository, NotificationDispatchRepository, UserDirectoryRepository},
 };
 use domain::{
 	authz::Role,
@@ -704,6 +704,60 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 			.unwrap(),
 		2
 	);
+}
+
+/// A delivery the dispatcher gives up on loses its link and code, exactly as one it
+/// sends does; a delivery it will retry keeps them, because the retry renders from them.
+/// Anyone holding a dump of the table must not be able to act on a still-pending seat
+/// through a mail that was never sent (#66).
+#[tokio::test]
+async fn a_parked_delivery_is_redacted_but_a_retried_one_is_not() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let key = format!("payout-approval:{}", Uuid::new_v4());
+	let payload = serde_json::json!({
+		"consilium_id": "c-66", "initiator_email": "init@example.com", "amount": "1 USDT",
+		"approval_url": "https://example.test/governance/consilium/c-66", "code": "ABCDEFGH",
+	});
+	assert!(
+		fx.governance
+			.enqueue_mail(owner.raw(), "relay@example.com", "payout_approval", &key, &payload)
+			.await
+			.expect("queued")
+	);
+	let delivery_id: i64 = sqlx::query_scalar("SELECT id FROM notification_deliveries WHERE dedupe_key = $1")
+		.bind(&key)
+		.fetch_one(&fx.pool)
+		.await
+		.expect("the queued row");
+	let dispatch = PgNotifications::new(fx.pool.clone());
+
+	// Attempts left ⇒ rescheduled, and the payload is what the next attempt sends.
+	dispatch.mark_failed(delivery_id, "smtp down", 60, 6).await.expect("reschedule");
+	let (status, payload_after): (String, serde_json::Value) = sqlx::query_as("SELECT status, payload FROM notification_deliveries WHERE id = $1")
+		.bind(delivery_id)
+		.fetch_one(&fx.pool)
+		.await
+		.expect("the row");
+	assert_eq!(status, "pending");
+	assert_eq!(payload_after, payload, "a retry keeps everything, secrets included");
+
+	// Out of attempts ⇒ parked. The secrets go; what an operator reads stays.
+	dispatch.mark_failed(delivery_id, "smtp down", 60, 0).await.expect("park");
+	let (status, payload_after): (String, serde_json::Value) = sqlx::query_as("SELECT status, payload FROM notification_deliveries WHERE id = $1")
+		.bind(delivery_id)
+		.fetch_one(&fx.pool)
+		.await
+		.expect("the row");
+	assert_eq!(status, "failed");
+	assert!(payload_after.get("approval_url").is_none(), "the link is gone");
+	assert!(payload_after.get("code").is_none(), "and the code that arms it");
+	assert_eq!(payload_after["consilium_id"], "c-66", "the rest is kept for the operator who looks at the parked row");
+	assert_eq!(payload_after["amount"], "1 USDT");
+	let dumped = payload_after.to_string();
+	assert!(!dumped.contains("ABCDEFGH") && !dumped.contains("consilium/c-66"), "nothing secret survives in any form");
 }
 
 /// A relay call as banking makes it: the shared service token in `authorization`.
