@@ -68,14 +68,19 @@ impl PgUsers {
 	/// a change, and no change without a row.
 	///
 	/// `detail` is computed from the aggregate AFTER the command, so it records what the
-	/// action actually did rather than what the caller asked for.
+	/// action actually did rather than what the caller asked for, and it is handed the
+	/// caller's own `detail` to write over rather than being skipped when the caller
+	/// supplied one. That distinction is not academic: `kyc_level_set` is written by two
+	/// paths, the `from`/`to` delta is the point of the row (#48), and under a
+	/// "only when the caller left it empty" rule the first caller to attach a detail of
+	/// their own would silently cost the log that delta, with every test still green.
 	async fn mutate_audited(
 		&self,
 		id: UserId,
 		action: &AdminAction,
 		now: i64,
 		command: impl FnOnce(&mut User) -> Result<(), DomainError>,
-		detail: impl FnOnce(&User) -> Option<serde_json::Value>,
+		detail: impl FnOnce(&User, Option<serde_json::Value>) -> Option<serde_json::Value>,
 	) -> Result<User, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let mut user = load_for_update(&mut tx, id).await?;
@@ -83,9 +88,7 @@ impl PgUsers {
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
 		let mut action = action.clone();
-		if action.detail.is_none() {
-			action.detail = detail(&user);
-		}
+		action.detail = detail(&user, action.detail.take());
 		record_action(&mut tx, id, &action, now).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(user)
@@ -124,9 +127,12 @@ pub struct AdminUserRow {
 /// transaction as the mutation.
 #[derive(Clone, Default)]
 pub struct AdminAction {
-	/// Who acted. `None` when nobody did — the hold sweep is the only such writer today,
-	/// and recording it as though an operator had pressed a button would be worse than
-	/// recording nothing.
+	/// Who acted. `None` when no human did, and recording it as though an operator had
+	/// pressed a button would be worse than recording nothing. Two writers today: the
+	/// hold sweep, where nobody acted at all, and the vendor's verdict
+	/// ([`UserDirectoryRepository::raise_kyc_level_to`]), where something did act but is
+	/// not a row in `users` — that one puts its provenance in [`Self::detail`] instead
+	/// (`source`, `case_id`), so a NULL actor is not the end of the question (#48).
 	pub actor: Option<UserId>,
 	/// The verb, in the log's own vocabulary (`held`, `reinstated`, `kyc_level_set`, …).
 	pub action: &'static str,
@@ -346,7 +352,7 @@ impl UserDirectoryRepository for PgUsers {
 				user.revoke_tokens();
 				Ok(())
 			},
-			|user| Some(serde_json::json!({ "token_version": user.token_version() })),
+			|user, caller| Some(detail_with(caller, serde_json::json!({ "token_version": user.token_version() }))),
 		)
 		.await
 	}
@@ -477,14 +483,23 @@ impl UserDirectoryRepository for PgUsers {
 		if action.actor == Some(id) {
 			return Err(DomainError::Forbidden("a KYC level cannot be set on your own account".to_owned()));
 		}
+		// Captured before the command, because the audit row's whole value is the DELTA.
+		// "kyc_level: 3" tells a reader where the account ended up, which they can also
+		// see by looking at the account; it does not tell them whether an operator raised
+		// somebody to 3 or quietly took them down to it (#48).
+		// An atomic rather than a `Cell` only because the future crosses a `Send` bound.
+		let from = std::sync::atomic::AtomicU32::new(0);
 		// The level reaches here straight from a request, so the aggregate's refusal is
 		// the caller's bad input and travels back as `Validation` -> `INVALID_ARGUMENT`.
 		self.mutate_audited(
 			id,
 			action,
 			now,
-			|user| user.set_kyc_level(level),
-			|user| Some(serde_json::json!({ "kyc_level": user.kyc_level() })),
+			|user| {
+				from.store(user.kyc_level(), std::sync::atomic::Ordering::Relaxed);
+				user.set_kyc_level(level)
+			},
+			|user, caller| Some(kyc_level_detail(from.load(std::sync::atomic::Ordering::Relaxed), user.kyc_level(), caller)),
 		)
 		.await
 	}
@@ -492,7 +507,7 @@ impl UserDirectoryRepository for PgUsers {
 	/// One transaction: read the target `FOR UPDATE`, compare from THAT read, and either
 	/// raise or roll back. Same shape as [`Self::set_role_outside_ownership`] and for the
 	/// same reason — the comparison that decides the write must not be a separate read.
-	async fn raise_kyc_level_to(&self, id: UserId, target: u32) -> Result<KycLevelChange, DomainError> {
+	async fn raise_kyc_level_to(&self, id: UserId, target: u32, action: &AdminAction, now: i64) -> Result<KycLevelChange, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let mut user = load_for_update(&mut tx, id).await?;
 		let current = user.kyc_level();
@@ -511,6 +526,19 @@ impl UserDirectoryRepository for PgUsers {
 			.map_err(|e| DomainError::Repository(format!("kyc level {target} is not writable: {e}")))?;
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
+		// In the SAME transaction as the level, like every other writer of this log. A
+		// vendor decision used to write nothing here, so "who set this level, and when"
+		// was answerable for the manual half and not the automatic one — an operator
+		// opening a user's history saw the admin decisions and had to infer the rest from
+		// `kyc_cases`, a table keyed by the vendor's session id and shaped around its
+		// verdicts (#48). Same log, same question, both halves.
+		//
+		// `actor_user_id` stays NULL: no human pressed this. Who decided is in the detail
+		// the caller supplies — the provider and the case — because a vendor is not a row
+		// in `users` and inventing one would be a worse answer than none.
+		let mut action = action.clone();
+		action.detail = Some(kyc_level_detail(current, target, action.detail.take()));
+		record_action(&mut tx, id, &action, now).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(KycLevelChange::Raised { from: current, to: target })
 	}
@@ -673,6 +701,33 @@ pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(
 	.await
 	.map_err(repo_err)?;
 	Ok(())
+}
+
+/// The `detail` both KYC writers record, so the two halves of the history read alike.
+///
+/// `kyc_level` is kept beside `to` and is the same number. Rows written before this
+/// carried only `kyc_level`, and an audit log whose shape silently forked in the middle
+/// is one whose readers quietly get half the answer; one redundant key is the cheaper
+/// side of that trade.
+fn kyc_level_detail(from: u32, to: u32, base: Option<serde_json::Value>) -> serde_json::Value {
+	detail_with(base, serde_json::json!({ "from": from, "to": to, "kyc_level": to }))
+}
+
+/// The caller's `detail`, with the keys the adapter itself knows written over it.
+///
+/// One direction, for every writer of this log: what the write DID wins over what the
+/// caller said about it. The caller describes an intention and cannot see the row it
+/// landed on — the level before it, the token version after it — so a collision between
+/// the two is the adapter's to settle.
+fn detail_with(base: Option<serde_json::Value>, keys: serde_json::Value) -> serde_json::Value {
+	let mut merged = match base {
+		Some(object @ serde_json::Value::Object(_)) => object,
+		_ => serde_json::json!({}),
+	};
+	if let (Some(target), serde_json::Value::Object(keys)) = (merged.as_object_mut(), keys) {
+		target.extend(keys);
+	}
+	merged
 }
 
 /// Append one operator decision to `admin_action` on the OPEN transaction, so the row and

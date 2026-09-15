@@ -203,7 +203,7 @@ async fn an_operator_cannot_set_their_own_kyc_level() {
 	// The operator starts at 1, through the front door they are still allowed. A run that
 	// started them at 0 could not tell a refusal apart from a write: the levels asked for
 	// below include 0, and `admin()` provisions at 0.
-	users.raise_kyc_level_to(actor, 1).await.unwrap();
+	users.raise_kyc_level_to(actor, 1, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
 	let before = traces_of(&pool, actor).await;
 	let directory = Directory::new(users.clone(), break_glass);
 

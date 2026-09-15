@@ -168,7 +168,12 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// Taking only the target's row cannot deadlock against the consilium path: that one
 	/// acquires the governance revision row, then the owner rows, then the target's, then
 	/// the outbox advisory lock — this acquires a suffix of the same order.
-	async fn raise_kyc_level_to(&self, id: UserId, target: u32) -> Result<KycLevelChange, DomainError>;
+	/// `action` carries no actor: no human decided this. Its `detail` is where the
+	/// decision's provenance goes — which provider, which case — so the vendor half of a
+	/// user's KYC history lands in the same log the manual half does, answering the same
+	/// question in the same shape (#48). `from` and `to` are filled in by the adapter,
+	/// which is the only place that knows what the level was under the row lock.
+	async fn raise_kyc_level_to(&self, id: UserId, target: u32, action: &AdminAction, now: i64) -> Result<KycLevelChange, DomainError>;
 
 	/// Set a user's platform access role UNCONDITIONALLY; emits ROLE_CHANGED across the
 	/// bridge.
