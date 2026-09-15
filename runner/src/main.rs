@@ -263,6 +263,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			users: users.clone(),
 			cases: kyc_cases,
 			notifications: notification_repo.clone(),
+			session_host: kyc_provider.as_ref().and(kyc_session_host(&config)),
 			provider: kyc_provider,
 			support_email: config.support_email.clone(),
 		},
@@ -336,6 +337,21 @@ async fn run(config: config::AppConfig) -> Result<()> {
 ///
 /// `KYC_STUB` swaps in the no-network provider so the whole flow runs on a laptop. It is
 /// refused in production, where it would be a way to hand out KYC levels.
+/// The host the mounted provider serves its verification session URLs from.
+///
+/// Read from the SAME configuration `build_kyc_provider` builds that provider out of —
+/// Didit's API base for the live adapter, the cabinet URL the stub composes its fake
+/// redirect from — so the expectation cannot drift from what is actually running.
+///
+/// ⚠️ For the live adapter this is `DIDIT_BASE_URL`'s host. If the vendor ever serves
+/// session URLs from a host other than the one its API answers on, that value is what
+/// has to change; the refusal in `/kyc/start` names both hosts in its `error!` so the
+/// first refused start says exactly what to set.
+fn kyc_session_host(config: &config::AppConfig) -> Option<String> {
+	let base = if config.kyc_stub { &config.cabinet_url } else { &config.didit_base_url };
+	reqwest::Url::parse(base).ok().and_then(|u| u.host_str().map(str::to_owned))
+}
+
 fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn concierge::ports::KycProvider>>> {
 	use infrastructure::kyc::{didit, stub};
 

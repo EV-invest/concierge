@@ -54,16 +54,23 @@ use crate::{
 /// has not subscribed, so this never becomes unsolicited mail.
 const TOPIC: &str = "account:verification";
 
-/// The one error code `/kyc/start` publishes. The cabinet switches on THIS, never on the
-/// prose beside it, so the wording can change without breaking a screen.
+/// The machine-readable vocabulary BOTH KYC routes refuse in. The cabinet switches on
+/// these, never on the prose beside them, so the wording can change without breaking a
+/// screen.
+///
+/// `/kyc/start` used to answer four different body FORMATS: JSON for 503 and bare
+/// plain text for 401, 403 and 429. The cabinet therefore classified those three by
+/// status code alone and by probing for an absent body — `403 with no code` meant
+/// "stale CSRF, retry", `403 with a code` meant "failed" — which is a client reading
+/// tea leaves about which half of a refusal it is in (banking#193). One format, one
+/// key, one closed vocabulary.
 const KYC_UNAVAILABLE: &str = "kyc_unavailable";
+const UNAUTHENTICATED: &str = "unauthenticated";
+const CSRF: &str = "csrf";
+const THROTTLED: &str = "throttled";
+const INTERNAL: &str = "internal";
 
 /// What `/kyc/start` can answer with.
-///
-/// Everything except [`StartError::Unavailable`] keeps the plain-text
-/// `(StatusCode, &'static str)` shape the rest of this surface answers in — a `From`
-/// impl lets `?` carry those through untouched, so `/kyc/start` refuses a bad CSRF token
-/// or an absent session exactly the way `/auth/logout` does.
 pub(super) enum StartError {
 	/// Verification cannot be run right now — and the caller is told no more than that.
 	///
@@ -78,21 +85,16 @@ pub(super) enum StartError {
 	/// on 402/403/429 would be at its most brittle exactly where being wrong costs the
 	/// most: the arm that decides whether a user sees a support address or a stack of
 	/// technical noise.
-	Unavailable {
-		contact: String,
-	},
-	Plain(StatusCode, &'static str),
+	Unavailable { contact: String },
+	/// A refusal that is about the REQUEST, not about us: no session, no CSRF token, too
+	/// many attempts today — plus the one internal failure that is nobody's fault. The
+	/// code is the contract; the status code alone was never enough to tell them apart.
+	Refused(StatusCode, &'static str),
 }
 
 impl StartError {
 	fn unavailable(st: &super::Inner) -> Self {
 		Self::Unavailable { contact: st.support_email.clone() }
-	}
-}
-
-impl From<(StatusCode, &'static str)> for StartError {
-	fn from((status, message): (StatusCode, &'static str)) -> Self {
-		Self::Plain(status, message)
 	}
 }
 
@@ -103,7 +105,7 @@ pub(super) struct SessionStoreDown;
 
 impl From<SessionStoreDown> for StartError {
 	fn from(_: SessionStoreDown) -> Self {
-		Self::Plain(StatusCode::INTERNAL_SERVER_ERROR, "session store unavailable")
+		Self::Refused(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL)
 	}
 }
 
@@ -134,7 +136,7 @@ impl IntoResponse for StartError {
 			// reach it: "insufficient balance on the Didit account" is a fact about our
 			// business, and it belongs in the log line, not in a browser.
 			Self::Unavailable { contact } => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": KYC_UNAVAILABLE, "contact": contact }))).into_response(),
-			Self::Plain(status, message) => (status, message).into_response(),
+			Self::Refused(status, code) => (status, Json(json!({ "error": code }))).into_response(),
 		}
 	}
 }
@@ -190,12 +192,15 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	};
 	// State-changing POST behind a cookie ⇒ the same double-submit check `/auth/logout`
 	// and `DELETE /auth/sessions` run.
-	if !verify_csrf(st, &jar, &headers).await? {
-		return Err((StatusCode::FORBIDDEN, "csrf check failed").into());
+	if !verify_csrf(st, &jar, &headers)
+		.await
+		.map_err(|_| StartError::Refused(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL))?
+	{
+		return Err(StartError::Refused(StatusCode::FORBIDDEN, CSRF));
 	}
 
 	let Some(user_id) = session_user(st, &jar).await? else {
-		return Err((StatusCode::UNAUTHORIZED, "unauthenticated").into());
+		return Err(StartError::Refused(StatusCode::UNAUTHORIZED, UNAUTHENTICATED));
 	};
 
 	// One start per user at a time, from the gate read to the row write. The gate below
@@ -243,12 +248,9 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 
 	if gate.recent >= START_MAX_PER_WINDOW {
 		// 429 and not the `Unavailable` 503: this one IS about the caller, it is not a
-		// failure on our side, and telling them so is honest. Plain text like every other
-		// refusal on this route — the cabinet has no screen keyed to this and adding a
-		// second machine-readable code for a state honest use does not reach would be
-		// contract surface bought for nothing.
+		// failure on our side, and telling them so is honest.
 		tracing::warn!(%user_id, opened = gate.recent, "kyc: start refused — the caller is over the per-user window cap");
-		return Err((StatusCode::TOO_MANY_REQUESTS, "too many verification attempts today").into());
+		return Err(StartError::Refused(StatusCode::TOO_MANY_REQUESTS, THROTTLED));
 	}
 
 	// The vendor is called BEFORE the row is written, because the row's identity key is
@@ -273,6 +275,24 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		tracing::error!(error = %e, provider = provider.name(), %case_id, tier = ENTRY_TIER, "kyc: the provider would not open a session — verification is unavailable to users");
 		StartError::unavailable(st)
 	})?;
+
+	// BEFORE the row is written, so a redirect we would not follow is never stored and
+	// never handed back by the live-case reuse path either.
+	if !redirect_is_trustworthy(&session.redirect_url, st.kyc_session_host.as_deref()) {
+		// `error!` for the same reason the vendor-refusal arm above uses one: the user
+		// sees a polite "try later" and reports nothing, so this line is the only thing
+		// that wakes a human. Both hosts are named because the fix is almost always a
+		// configuration one — the expected host is derived from `DIDIT_BASE_URL`.
+		tracing::error!(
+			%case_id,
+			provider = provider.name(),
+			redirect_url = %session.redirect_url,
+			expected_host = ?st.kyc_session_host,
+			"kyc: the provider answered with a redirect this plane will not send a browser to"
+		);
+		return Err(StartError::unavailable(st));
+	}
+
 	st.kyc_cases
 		.open_case(case_id, user_id, provider.name(), &session.provider_ref, ENTRY_TIER, &session.redirect_url)
 		.await
@@ -288,6 +308,35 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		redirect_url: session.redirect_url,
 		case_id: case_id.to_string(),
 	}))
+}
+
+/// Whether the vendor's answer is somewhere we may send a signed-in browser.
+///
+/// The cabinet already refuses a non-`https` redirect, and that is the whole of the
+/// check it can make: it is browser code, the allowlist would be shipped to the
+/// attacker, and "any `https:` URL" is not a bound — a compromised or confused provider
+/// does not need a `javascript:` URL to send a user somewhere they were told to trust
+/// (banking#193b). The decision belongs on this side, where the host the vendor is
+/// configured at is known and not guessable.
+///
+/// `expected_host` is `None` only when the configured base URL has no host to compare
+/// against; the scheme check still applies, because a plane that cannot say where its
+/// vendor lives must still refuse to hand a browser a `javascript:` or `data:` URL.
+fn redirect_is_trustworthy(raw: &str, expected_host: Option<&str>) -> bool {
+	let Ok(url) = reqwest::Url::parse(raw) else {
+		return false;
+	};
+	if url.scheme() != "https" {
+		return false;
+	}
+	match (url.host_str(), expected_host) {
+		// Host comparison is ASCII-case-insensitive because DNS is, and `Url` already
+		// lower-cases and punycodes what it parsed — so a look-alike written in another
+		// script cannot slip through as an equal string.
+		(Some(host), Some(expected)) => host.eq_ignore_ascii_case(expected),
+		(Some(_), None) => true,
+		(None, _) => false,
+	}
 }
 
 /// What `GET /kyc/status` publishes.
@@ -346,8 +395,8 @@ impl From<SessionStoreDown> for StatusError {
 impl IntoResponse for StatusError {
 	fn into_response(self) -> Response {
 		let (status, code) = match self {
-			Self::Unauthenticated => (StatusCode::UNAUTHORIZED, "unauthenticated"),
-			Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+			Self::Unauthenticated => (StatusCode::UNAUTHORIZED, UNAUTHENTICATED),
+			Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL),
 		};
 		(status, Json(json!({ "error": code }))).into_response()
 	}

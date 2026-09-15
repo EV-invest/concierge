@@ -78,6 +78,31 @@ impl KycProvider for RefusingKyc {
 	}
 }
 
+/// A configured, reachable vendor that answers with a session URL somewhere else.
+///
+/// The shape of a swapped vendor domain, a misconfigured base URL, or a provider whose
+/// account has been taken over: the call succeeds, so nothing upstream notices — the only
+/// thing that can is a check on the answer.
+struct RogueRedirectKyc(&'static str);
+
+#[async_trait]
+impl KycProvider for RogueRedirectKyc {
+	fn name(&self) -> &'static str {
+		PROVIDER
+	}
+
+	async fn start_session(&self, case_id: Uuid, _requested_tier: u32) -> Result<KycSession, DomainError> {
+		Ok(KycSession {
+			provider_ref: format!("stub-{case_id}"),
+			redirect_url: self.0.to_string(),
+		})
+	}
+
+	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
+		StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()).parse_callback(headers, body, now)
+	}
+}
+
 /// The stub, plus a tally of how many times a session was actually bought.
 ///
 /// The gate this counts is in front of a BILLABLE call, and "did we skip the vendor?" is
@@ -191,6 +216,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 			users: users.clone(),
 			cases: cases.clone(),
 			notifications: Arc::new(PgNotifications::new(pool.clone())),
+			session_host: provider.as_ref().map(|_| "evinvest.test".to_string()),
 			provider,
 			support_email: SUPPORT.to_string(),
 		},
@@ -653,6 +679,12 @@ async fn the_webhook_needs_no_cookie_and_no_csrf_token() {
 /// `None` when Redis is absent: the in-process fallback is per-instance by design (see
 /// `web_sessions.rs`), so a session opened here would be invisible to the router.
 async fn signed_in(user: UserId) -> Option<(String, String)> {
+	signed_in_as(&user.to_string()).await
+}
+
+/// The same, with the stored user id written verbatim — so a test can open a session the
+/// CSRF check accepts and the user lookup then cannot resolve.
+async fn signed_in_as(user_id: &str) -> Option<(String, String)> {
 	std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
 	let sessions = web::WebSessions::from_env().await.expect("session store");
 	let now_s = now();
@@ -663,7 +695,7 @@ async fn signed_in(user: UserId) -> Option<(String, String)> {
 			refresh_token: "family.secret".into(),
 			refresh_expires_at: now_s + 3600,
 			user: Some(evconcierge_contracts::concierge::v1::UserSummary {
-				user_id: user.to_string(),
+				user_id: user_id.to_string(),
 				email: "kyc@example.com".into(),
 				status: "active".into(),
 				token_version: 0,
@@ -1294,6 +1326,105 @@ async fn a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery() {
 	assert_eq!(answer["duplicate"], true, "it is still a duplicate, and still answered 2xx");
 	assert_eq!(h.kyc_level(user).await, 1, "the retry is what repairs a verdict whose level never landed");
 	assert_eq!(h.kyc_changed_count(user).await, 1, "and it emits the ONE event the original attempt owed the money plane");
+}
+
+/// EVERY refusal `/kyc/start` publishes, as whole JSON documents.
+///
+/// Three of these four used to be bare plain text, so the cabinet classified them by
+/// status code and by probing for an absent body: `403` with no code meant "your CSRF
+/// token went stale, retry", `403` WITH a code meant "this failed" (banking#193a). That
+/// is a client inferring which half of a refusal it is in from the shape of the silence.
+/// One format, one key, one closed vocabulary — and a rename fails here rather than
+/// showing a user "please try again" over a healthy provider.
+#[tokio::test]
+async fn every_start_refusal_carries_a_machine_readable_code() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	// No double-submit header. Reached before the session is reachanything, so it is also what
+	// a caller with no cookies at all gets.
+	let (status, answer) = h.start(&cookie, None, "").await;
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	assert_eq!(answer, json!({ "error": "csrf" }));
+
+	// A session the CSRF check accepts and the directory cannot resolve to anybody.
+	let Some((orphan_cookie, orphan_csrf)) = signed_in_as("not-a-uuid").await else {
+		eprintln!("skipped: REDIS_URL unset");
+		return;
+	};
+	let (status, answer) = h.start(&orphan_cookie, Some(&orphan_csrf), "").await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(answer, json!({ "error": "unauthenticated" }));
+
+	// Over the per-user window cap. Still the caller's doing, so still a 4xx — and now
+	// one the cabinet can key a screen to instead of matching prose.
+	for _ in 0..START_MAX_PER_WINDOW {
+		h.case(user, 1).await;
+	}
+	h.close_open_cases(user).await;
+	let (status, answer) = h.start(&cookie, Some(&csrf), "").await;
+	assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+	assert_eq!(answer, json!({ "error": "throttled" }));
+
+	// And the one body that was ALREADY a contract is untouched: it carries a second
+	// field the cabinet renders, and widening the others must not have narrowed it.
+	let (status, answer) = h.start("", None, "").await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "no cookies at all is still the CSRF refusal");
+	assert_eq!(answer, json!({ "error": "csrf" }));
+}
+
+/// The 503 body keeps its `contact` field, which the other refusals deliberately lack.
+#[tokio::test]
+async fn the_unavailable_body_is_not_flattened_into_the_new_vocabulary() {
+	let Some(h) = setup_with(None).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset");
+		return;
+	};
+
+	let (status, answer) = h.start(&cookie, Some(&csrf), "").await;
+	assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	assert_eq!(answer, unavailable_body(), "still two fields, still the support address");
+}
+
+/// A vendor that answers with a redirect we would not follow is an OUTAGE, not a link.
+///
+/// The cabinet's own check is `new URL(raw).protocol === "https:"`, and that is the whole
+/// of what browser code can do: the allowlist would be shipped to the attacker
+/// (banking#193b). A compromised or merely misconfigured provider does not need a
+/// `javascript:` URL — any `https:` URL sends the user off the cabinet on a click they
+/// were told to trust. The host is knowable here and nowhere else, so the refusal lives
+/// here.
+#[tokio::test]
+async fn a_redirect_the_vendor_should_not_have_sent_is_refused_like_an_outage() {
+	for rogue in ["https://evil.example/session/abc", "http://evinvest.test/cabinet", "javascript:alert(1)", "not a url at all"] {
+		let Some(h) = setup_with(Some(Arc::new(RogueRedirectKyc(rogue)))).await else {
+			eprintln!("DATABASE_URL unset — skipping real-DB test");
+			return;
+		};
+		let user = h.user().await;
+		let Some((cookie, csrf)) = signed_in(user).await else {
+			eprintln!("skipped: REDIS_URL unset");
+			return;
+		};
+
+		let (status, answer) = h.start(&cookie, Some(&csrf), "").await;
+		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{rogue} must not reach a browser");
+		assert_eq!(answer, unavailable_body(), "and the user meets the SAME screen a vendor outage produces: {rogue}");
+		assert!(!answer.to_string().contains(rogue), "the vendor's URL never reaches the browser: {rogue}");
+
+		// Refused BEFORE the row is written, so the bad URL is not stored and cannot be
+		// handed back later by the live-case reuse path.
+		assert_eq!(h.case_count(user).await, 0, "no case row survives a refused redirect: {rogue}");
+	}
 }
 
 /// THE CONTRACT of `GET /kyc/status`, asserted as whole JSON documents rather than field
