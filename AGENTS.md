@@ -244,6 +244,25 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   vendor's retry is the only thing that ever revisits a decided case, and answering
   200 to it makes that split state permanent. Re-applying is free: the monotonic
   writer compares under the row lock and emits nothing when the level is already held.
+- **A terminal verdict reaches the person it is about, and a CONTRADICTING one reaches
+  a human who can act.** Not moving the level was always right — a downgrade is a human
+  act under `KycManage` and a vendor must never take a level away — but telling nobody
+  was not: a declined or lapsed verification existed only as a row in a table nobody
+  watches, so "a human decides" meant "nobody decides" (#49). The user is told over
+  `account:verification`, which they may switch off; the owners' copy is operational and
+  goes through the governance queue, which has no unsubscribe target, no link and no
+  code — nobody lowers a level from a mailbox.
+  **What counts as a contradiction is narrow on purpose**, because a mail that cries wolf
+  costs exactly the signal it exists to carry. Only `declined` and `kyc_expired` qualify
+  (an abandoned session says a tab was closed, not that an identity is in doubt); the
+  comparison is against what the case would GRANT — `KycStatus::grants_tier`, capped at
+  `PROVIDER_MAX_TIER` — and never against `requested_tier`, or the legacy rows asking for
+  2 that `0014` deliberately leaves standing could never contradict anything; and a level
+  another still-`approved` case covers is not a contradiction at all, because verified
+  twice and then told the first session lapsed is routine. The page (`error!` → Sentry)
+  is raised only on the FIRST delivery: the mail is deduplicated per case, per verdict
+  and per owner, and Didit retries at roughly one and four minutes, so paging on every
+  delivery would turn one contradiction into three incidents.
 - **Verdicts are ordered by the SIGNED timestamp, never by arrival.** Didit retries at
   ~1 min and ~4 min, so a superseded `in_review` landing after the `approved` that
   replaced it is routine. `kyc_cases.event_at` holds the signed instant of the stored
@@ -267,6 +286,40 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   while here as `"KYC Expired"`, silently unclassifiable. An unknown word is answered
   200-and-ignored (a growing vocabulary must not break the endpoint) with an `error!` so
   a human adds the arm.
+- **Every `/kyc/start` refusal is JSON with one `error` code, and the redirect is
+  checked here.** The route used to answer FOUR body formats — JSON for 503, bare plain
+  text for 401, 403 and 429 — so the cabinet classified refusals by status code and by
+  probing for an ABSENT body (`403` with no code meant "stale token, reload"; `403` with
+  one meant "failed"), which is a client reading tea leaves about which half of a refusal
+  it is in (banking#193). One format now, one key, one closed vocabulary:
+  `unauthenticated` · `csrf` · `throttled` · `internal`, plus the pre-existing
+  `kyc_unavailable`, which keeps its second `contact` field and is the only one that has
+  one. `unauthenticated` has to stay REACHABLE: the CSRF check still runs before any
+  session state is touched, but it answers "nobody is signed in" for an absent or lapsed
+  session and keeps `csrf` for a signed-in caller whose token does not match — collapsing
+  the two made `csrf` the only refusal a signed-out caller could get and left the code
+  the cabinet keys "sign in again" off unreachable. ⚠️ THIS IS A WIRE BREAK: the deployed
+  cabinet renders an unknown code verbatim and keys "reload the page" off a bodyless 403,
+  so the banking half (its zod schema in `features/kyc` plus `throttled`/`internal` in
+  `shared/lib/api-client.ts`) ships FIRST. Deploy order is a condition of correctness
+  here, not a detail.
+  **The redirect is decided on this side.** The cabinet can only check
+  `protocol === "https:"` — it is browser code, the allowlist would be shipped to the
+  attacker — and any `https:` URL sends a user off the cabinet on a click this plane
+  vouched for. `/kyc/start` refuses a `redirect_url` whose ORIGIN is not one the mounted
+  adapter declares (`KycProvider::session_origins`), and answers it as the same 503 a
+  vendor outage produces. Origins and not hosts, so a port and a `user@host` prefix are
+  settled by the same comparison. The adapter is asked rather than the configuration read
+  beside it, because the two are one fact and Didit is why: `DIDIT_BASE_URL` is the API
+  host (`verification.didit.me`) while session pages are served from `verify.didit.me`,
+  so the obvious derivation refuses every real start and takes verification down for
+  everyone, arriving as silence. An adapter that declares NOTHING refuses everything and
+  the boot refuses to mount it — the shape this must never take is degrading to "any
+  `https:` will do", which is indistinguishable from working. The check runs on the
+  stored URL too, in the live-case reuse branch: rows outlive the check, a rolling deploy
+  writes them from the old binary by design (`0012`), and a case lives until a verdict.
+  `GET /kyc/status` computes `resumable` with the same predicate so the cabinet never
+  offers Continue for a link `/kyc/start` will not hand over.
 - **A user never meets a vendor failure.** `/kyc/start` collapses "no vendor configured"
   and "vendor would not open a session" (balance, quota, outage, timeout, nonsense) into
   one 503 with one stable body — `{"error":"kyc_unavailable","contact":"<SUPPORT_EMAIL>"}`

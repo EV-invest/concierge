@@ -97,6 +97,13 @@ impl PgGovernance {
 pub struct OwnerRow {
 	pub id: Uuid,
 	pub email: Option<String>,
+	/// Whether that address has been PROVEN to belong to them.
+	///
+	/// Carried on the roster rather than looked up per owner, because every caller that
+	/// mails a roster has to know it — governance mail is refused to an unverified
+	/// address, and `web::kyc`'s verdict alert was resolving each owner's record again
+	/// solely to ask this one question, on a webhook whose vendor budget is 5 seconds.
+	pub email_verified: bool,
 	pub display_name: Option<String>,
 	pub owner_since: i64,
 }
@@ -899,7 +906,7 @@ impl GovernanceRepository for PgGovernance {
 		// the outbox is the only record of when a role changed — falling back to the
 		// account's own creation for seats granted before the bridge carried roles.
 		sqlx::query_as::<_, OwnerRow>(
-			"SELECT u.id, u.email, COALESCE(NULLIF(u.preferred_name, ''), u.legal_name) AS display_name, \
+			"SELECT u.id, u.email, u.email_verified, COALESCE(NULLIF(u.preferred_name, ''), u.legal_name) AS display_name, \
 			        COALESCE((SELECT max(o.occurred_at) FROM user_outbox o \
 			                  WHERE o.user_id = u.id AND o.kind = 'ROLE_CHANGED' AND o.role = 'owner'), \
 			                 EXTRACT(EPOCH FROM u.created_at)::BIGINT) AS owner_since \

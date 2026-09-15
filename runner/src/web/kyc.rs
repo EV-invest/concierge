@@ -48,16 +48,31 @@ use uuid::Uuid;
 use crate::{
 	infrastructure::users::AdminAction,
 	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus},
-	web::{WebState, now_secs, routes::verify_csrf},
+	web::{
+		WebState, now_secs,
+		routes::{CsrfOutcome, csrf_outcome},
+	},
 };
 
 /// The topic a verification decision is announced on. Emitting is a no-op for anyone who
 /// has not subscribed, so this never becomes unsolicited mail.
 const TOPIC: &str = "account:verification";
 
-/// The one error code `/kyc/start` publishes. The cabinet switches on THIS, never on the
-/// prose beside it, so the wording can change without breaking a screen.
+/// The machine-readable vocabulary BOTH KYC routes refuse in. The cabinet switches on
+/// these, never on the prose beside them, so the wording can change without breaking a
+/// screen.
+///
+/// `/kyc/start` used to answer four different body FORMATS: JSON for 503 and bare
+/// plain text for 401, 403 and 429. The cabinet therefore classified those three by
+/// status code alone and by probing for an absent body — `403 with no code` meant
+/// "stale CSRF, retry", `403 with a code` meant "failed" — which is a client reading
+/// tea leaves about which half of a refusal it is in (banking#193). One format, one
+/// key, one closed vocabulary.
 const KYC_UNAVAILABLE: &str = "kyc_unavailable";
+const UNAUTHENTICATED: &str = "unauthenticated";
+const CSRF: &str = "csrf";
+const THROTTLED: &str = "throttled";
+const INTERNAL: &str = "internal";
 
 /// What every answer from `GET /kyc/status` carries, hit or refusal.
 ///
@@ -67,11 +82,6 @@ const KYC_UNAVAILABLE: &str = "kyc_unavailable";
 const NO_STORE: [(HeaderName, &str); 2] = [(header::CACHE_CONTROL, "no-store"), (header::VARY, "Cookie")];
 
 /// What `/kyc/start` can answer with.
-///
-/// Everything except [`StartError::Unavailable`] keeps the plain-text
-/// `(StatusCode, &'static str)` shape the rest of this surface answers in — a `From`
-/// impl lets `?` carry those through untouched, so `/kyc/start` refuses a bad CSRF token
-/// or an absent session exactly the way `/auth/logout` does.
 pub(super) enum StartError {
 	/// Verification cannot be run right now — and the caller is told no more than that.
 	///
@@ -86,21 +96,16 @@ pub(super) enum StartError {
 	/// on 402/403/429 would be at its most brittle exactly where being wrong costs the
 	/// most: the arm that decides whether a user sees a support address or a stack of
 	/// technical noise.
-	Unavailable {
-		contact: String,
-	},
-	Plain(StatusCode, &'static str),
+	Unavailable { contact: String },
+	/// A refusal that is about the REQUEST, not about us: no session, no CSRF token, too
+	/// many attempts today — plus the one internal failure that is nobody's fault. The
+	/// code is the contract; the status code alone was never enough to tell them apart.
+	Refused(StatusCode, &'static str),
 }
 
 impl StartError {
 	fn unavailable(st: &super::Inner) -> Self {
 		Self::Unavailable { contact: st.support_email.clone() }
-	}
-}
-
-impl From<(StatusCode, &'static str)> for StartError {
-	fn from((status, message): (StatusCode, &'static str)) -> Self {
-		Self::Plain(status, message)
 	}
 }
 
@@ -111,7 +116,7 @@ pub(super) struct SessionStoreDown;
 
 impl From<SessionStoreDown> for StartError {
 	fn from(_: SessionStoreDown) -> Self {
-		Self::Plain(StatusCode::INTERNAL_SERVER_ERROR, "session store unavailable")
+		Self::Refused(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL)
 	}
 }
 
@@ -174,7 +179,7 @@ impl IntoResponse for StartError {
 			// reach it: "insufficient balance on the Didit account" is a fact about our
 			// business, and it belongs in the log line, not in a browser.
 			Self::Unavailable { contact } => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": KYC_UNAVAILABLE, "contact": contact }))).into_response(),
-			Self::Plain(status, message) => (status, message).into_response(),
+			Self::Refused(status, code) => (status, Json(json!({ "error": code }))).into_response(),
 		}
 	}
 }
@@ -229,13 +234,26 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		return Err(StartError::unavailable(st));
 	};
 	// State-changing POST behind a cookie ⇒ the same double-submit check `/auth/logout`
-	// and `DELETE /auth/sessions` run.
-	if !verify_csrf(st, &jar, &headers).await? {
-		return Err((StatusCode::FORBIDDEN, "csrf check failed").into());
+	// and `DELETE /auth/sessions` run, and it still runs FIRST — a request that fails it
+	// never reaches session state.
+	//
+	// It is read for two answers rather than one, because collapsing them made `csrf` the
+	// only refusal this route could ever produce for a signed-out caller and left
+	// `unauthenticated` unreachable in production. The cabinet keys "your token is stale,
+	// reload" off the 403 and "sign in again" off the 401, so a lapsed session answered
+	// `csrf` sent people to reload a page that would lapse again. `/kyc/status`, which
+	// has no CSRF check, already answered `unauthenticated` to the very same caller.
+	match csrf_outcome(st, &jar, &headers)
+		.await
+		.map_err(|_| StartError::Refused(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL))?
+	{
+		CsrfOutcome::Ok => {}
+		CsrfOutcome::NoSession => return Err(StartError::Refused(StatusCode::UNAUTHORIZED, UNAUTHENTICATED)),
+		CsrfOutcome::Mismatch => return Err(StartError::Refused(StatusCode::FORBIDDEN, CSRF)),
 	}
 
 	let Some(caller) = session_user(st, &jar).await? else {
-		return Err((StatusCode::UNAUTHORIZED, "unauthenticated").into());
+		return Err(StartError::Refused(StatusCode::UNAUTHORIZED, UNAUTHENTICATED));
 	};
 	let user_id = caller.id;
 	// Same rotation as on `/kyc/status`, and the same obligation: this read may have
@@ -271,31 +289,53 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	// session would charge us to give them a worse version of what they have: two open
 	// cases, one of which they will abandon and which will then read as a user who gave up.
 	if let Some(live) = &gate.live {
-		if let Some(redirect_url) = &live.redirect_url {
-			tracing::debug!(case_id = %live.id, "kyc: start reused the caller's running case");
-			return Ok((
-				jar,
-				Json(StartResponse {
-					redirect_url: redirect_url.clone(),
-					case_id: live.id.to_string(),
-				}),
-			));
+		// The STORED url is checked exactly as a fresh one is, and that is the point: the
+		// check at the bottom of this handler only ever saw rows written after it shipped.
+		// A row can predate it (KYC has been in production since v0.7.0), it can be
+		// written by the other replica mid-rollout — `0012_kyc_case_redirect_url.sql`
+		// designs for exactly that mix — or it can predate an operator changing which
+		// vendor origin is configured. A case lives until a verdict, so the window is
+		// days, and what is on the other side of it is a user handing their documents and
+		// a selfie to somebody else's host, under a button this plane vouched for.
+		match live.redirect_url.as_deref().filter(|u| redirect_is_trustworthy(u, &provider.session_origins())) {
+			Some(redirect_url) => {
+				tracing::debug!(case_id = %live.id, "kyc: start reused the caller's running case");
+				return Ok((
+					jar,
+					Json(StartResponse {
+						redirect_url: redirect_url.to_owned(),
+						case_id: live.id.to_string(),
+					}),
+				));
+			}
+			// Two causes, one answer: a case opened before `kyc_cases.redirect_url`
+			// existed, and a stored URL this plane will not send a browser to. Both leave
+			// nothing to resume, and the choice is then a new session or a dead end —
+			// stranding a user who did nothing wrong is the worse of the two. The window
+			// cap below still applies, so this cannot be looped.
+			None if live.redirect_url.is_some() => {
+				// `error!`, unlike the sibling arm: a row we refuse to hand back is not a
+				// fact of life, it is either an old vendor answer nobody checked or a
+				// configuration that moved under live cases, and both want a human.
+				tracing::error!(
+					case_id = %live.id,
+					provider = provider.name(),
+					stored_origin = ?live.redirect_url.as_deref().and_then(crate::infrastructure::kyc::origin_of),
+					expected_origins = ?provider.session_origins(),
+					"kyc: the caller's running case holds a redirect this plane will not send a browser to — opening a fresh session"
+				);
+			}
+			None => {
+				tracing::info!(case_id = %live.id, "kyc: the caller's running case predates redirect_url — opening a fresh session");
+			}
 		}
-		// A case opened before `kyc_cases.redirect_url` existed. There is no URL to hand
-		// back and no way to fetch one, so the choice is a new session or a dead end — and
-		// stranding a user who did nothing wrong is the worse of the two. The window cap
-		// below still applies, so this cannot be looped.
-		tracing::info!(case_id = %live.id, "kyc: the caller's running case predates redirect_url — opening a fresh session");
 	}
 
 	if gate.recent >= START_MAX_PER_WINDOW {
 		// 429 and not the `Unavailable` 503: this one IS about the caller, it is not a
-		// failure on our side, and telling them so is honest. Plain text like every other
-		// refusal on this route — the cabinet has no screen keyed to this and adding a
-		// second machine-readable code for a state honest use does not reach would be
-		// contract surface bought for nothing.
+		// failure on our side, and telling them so is honest.
 		tracing::warn!(%user_id, opened = gate.recent, "kyc: start refused — the caller is over the per-user window cap");
-		return Err((StatusCode::TOO_MANY_REQUESTS, "too many verification attempts today").into());
+		return Err(StartError::Refused(StatusCode::TOO_MANY_REQUESTS, THROTTLED));
 	}
 
 	// The vendor is called BEFORE the row is written, because the row's identity key is
@@ -320,6 +360,33 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		tracing::error!(error = %e, provider = provider.name(), %case_id, tier = ENTRY_TIER, "kyc: the provider would not open a session — verification is unavailable to users");
 		StartError::unavailable(st)
 	})?;
+
+	// BEFORE the row is written, so a redirect we would not follow is never stored. The
+	// reuse branch above re-checks what IS stored, because rows outlive this check.
+	let allowed = provider.session_origins();
+	if !redirect_is_trustworthy(&session.redirect_url, &allowed) {
+		// `error!` for the same reason the vendor-refusal arm above uses one: the user
+		// sees a polite "try later" and reports nothing, so this line is the only thing
+		// that wakes a human. Both sides are named because the fix is almost always a
+		// configuration one.
+		//
+		// The ORIGIN and never the URL. `0012_kyc_case_redirect_url.sql` calls this
+		// string a capability — whoever holds it can walk that session's flow — and the
+		// reason it is not treated as a secret is that we hand it to its own user's
+		// browser. That reason stops applying the moment it is copied to Sentry, whose
+		// readers and retention are somebody else's. The origin is the whole diagnosis
+		// anyway; for a string that does not parse it is absent, which is also the
+		// diagnosis.
+		tracing::error!(
+			%case_id,
+			provider = provider.name(),
+			answered_origin = ?crate::infrastructure::kyc::origin_of(&session.redirect_url),
+			expected_origins = ?allowed,
+			"kyc: the provider answered with a redirect this plane will not send a browser to"
+		);
+		return Err(StartError::unavailable(st));
+	}
+
 	st.kyc_cases
 		.open_case(case_id, user_id, provider.name(), &session.provider_ref, ENTRY_TIER, &session.redirect_url)
 		.await
@@ -338,6 +405,32 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 			case_id: case_id.to_string(),
 		}),
 	))
+}
+
+/// Whether the vendor's answer is somewhere we may send a signed-in browser.
+///
+/// The cabinet already refuses a non-`https` redirect, and that is the whole of the
+/// check it can make: it is browser code, the allowlist would be shipped to the
+/// attacker, and "any `https:` URL" is not a bound — a compromised or confused provider
+/// does not need a `javascript:` URL to send a user somewhere they were told to trust
+/// (banking#193b). The decision belongs on this side, where the host the vendor is
+/// configured at is known and not guessable.
+///
+/// `allowed` is [`KycProvider::session_origins`] — the origins the MOUNTED adapter says
+/// its own session URLs live on. An empty set refuses everything: an adapter that cannot
+/// name its vendor's origin has lost this control, and the shape that failure must NOT
+/// take is "accept any `https:` URL", which is indistinguishable from working.
+///
+/// Origins and not hosts, so the comparison settles the port
+/// (`https://verification.didit.me:8443/` is not the vendor) and the userinfo trick
+/// (`https://verification.didit.me@evil.example/` has origin `https://evil.example`) at
+/// the same time as the scheme. `Url::origin` lower-cases and punycodes what it parsed,
+/// so a look-alike written in another script cannot slip through as an equal string.
+fn redirect_is_trustworthy(raw: &str, allowed: &[String]) -> bool {
+	let Some(origin) = crate::infrastructure::kyc::origin_of(raw) else {
+		return false;
+	};
+	allowed.contains(&origin)
 }
 
 /// What `GET /kyc/status` publishes.
@@ -402,8 +495,8 @@ impl From<SessionStoreDown> for StatusError {
 impl IntoResponse for StatusError {
 	fn into_response(self) -> Response {
 		let (status, code) = match self {
-			Self::Unauthenticated => (StatusCode::UNAUTHORIZED, "unauthenticated"),
-			Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+			Self::Unauthenticated => (StatusCode::UNAUTHORIZED, UNAUTHENTICATED),
+			Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL),
 		};
 		// A refusal is as personal as a hit: "you are not signed in" cached and replayed
 		// to somebody who is would be the same mistake wearing a different status code.
@@ -458,12 +551,16 @@ pub async fn status(State(st): State<WebState>, jar: CookieJar) -> Result<(Cooki
 	let body = Json(StatusResponse {
 		level: user.kyc_level(),
 		case: live.map(|c| CaseView {
-			// A stored URL is only resumable if the route that hands it back can run at
-			// all. With no vendor configured `/kyc/start` is 503 BEFORE it reaches the
-			// reuse branch, so `true` here would put a Continue button on screen whose
-			// every click is an outage — on the exact day this route exists to be honest
-			// about.
-			resumable: st.kyc.is_some() && c.redirect_url.is_some(),
+			// Exactly the question `/kyc/start` asks on its reuse branch, asked here in
+			// the same words. With no vendor configured that route refuses 503 before it
+			// reaches the branch at all, and a stored URL it would not hand back is not
+			// one the cabinet may offer either — `true` in either case is a Continue
+			// button whose every click is an outage, on the exact day this route exists
+			// to be honest about.
+			resumable: st
+				.kyc
+				.as_ref()
+				.is_some_and(|p| c.redirect_url.as_deref().is_some_and(|u| redirect_is_trustworthy(u, &p.session_origins()))),
 			status: c.status.as_str().to_owned(),
 			requested_tier: c.requested_tier,
 			created_at: c.created_at,
@@ -580,7 +677,7 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 		}
 	};
 
-	apply(st, &case, provider.name()).await?;
+	apply(st, &case, provider.name(), duplicate).await?;
 	Ok(Json(json!({ "ok": true, "status": case.status.as_str(), "duplicate": duplicate })))
 }
 
@@ -596,22 +693,21 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 /// A notification failure is NOT one of those errors and stays best-effort below: the
 /// level is already written by then, and retrying a delivery to re-send an email would
 /// re-run this whole path for a decision that has fully landed.
-async fn apply(st: &super::Inner, case: &KycCase, provider: &str) -> Result<(), (StatusCode, &'static str)> {
+async fn apply(st: &super::Inner, case: &KycCase, provider: &str, redelivered: bool) -> Result<(), (StatusCode, &'static str)> {
 	let Some(target) = case.status.grants_tier(case.requested_tier) else {
 		// Declined, abandoned, expired, unfinished, aged-out, still running: the case row
 		// now says so and the level is untouched. Someone who holds tier 2 and fails an
 		// attempt at 3 keeps their 2 — a downgrade is a human act under `KycManage`, and
 		// there is no path to one from here.
-		if case.status == KycStatus::InReview {
-			notify(
-				st,
-				case,
-				"kyc_in_review",
-				"Your verification is being reviewed",
-				"A reviewer is looking at the documents you submitted. We will let you know as soon as there is a decision.",
-			)
-			.await;
+		//
+		// Not moving the level was always right. Telling NOBODY was not: until this arm
+		// grew, every verdict but `in_review` produced not even a log line, so a user
+		// whose verification was declined learned nothing and an expiry that contradicted
+		// a held level existed only as a row in a table nobody watches (#49).
+		if let Some((kind, title, body)) = terminal_notice(case.status) {
+			notify(st, case, kind, title, body).await;
 		}
+		alert_owners_if_contradicted(st, case, redelivered).await;
 		return Ok(());
 	};
 
@@ -673,6 +769,185 @@ async fn apply(st: &super::Inner, case: &KycCase, provider: &str) -> Result<(), 
 	}
 }
 
+/// The user-facing copy for a verdict that does not move the level, or `None` where
+/// silence is correct.
+///
+/// `None` for the RUNNING states. `pending`, `in_progress` and `resubmitted` are steps
+/// inside an attempt the user is currently making — mailing somebody about their own
+/// click is noise, and `resubmitted` in particular already reaches them as the vendor's
+/// own "here is what to fix". `CaseDecision::Ignored` never gets this far: a superseded
+/// delivery returns before `apply`, and announcing a verdict the vendor has already
+/// replaced would be worse than announcing nothing.
+///
+/// Two KINDS across four terminal verdicts, because a kind is what a subscriber's
+/// preferences key on and "my attempt ended" is one thing to care about. The copy still
+/// differs per verdict: an attempt that timed out and a completed verification that has
+/// since lapsed are not the same news, and a reader must not have to guess which they
+/// got.
+fn terminal_notice(status: KycStatus) -> Option<(&'static str, &'static str, &'static str)> {
+	match status {
+		KycStatus::InReview => Some((
+			"kyc_in_review",
+			"Your verification is being reviewed",
+			"A reviewer is looking at the documents you submitted. We will let you know as soon as there is a decision.",
+		)),
+		KycStatus::Declined => Some((
+			"kyc_declined",
+			"Your verification was not approved",
+			"The documents you submitted were not accepted, and your account level is unchanged. You can start a new attempt from your profile, or write to us if you believe this is a mistake.",
+		)),
+		KycStatus::Abandoned | KycStatus::Expired => Some((
+			"kyc_expired",
+			"Your verification attempt has closed",
+			"The verification you started was not completed and the session has closed. Your account level is unchanged. You can start a new attempt from your profile whenever you are ready.",
+		)),
+		KycStatus::KycExpired => Some((
+			"kyc_expired",
+			"Your verification has lapsed",
+			"A verification you completed earlier has expired at our provider. Your account level is unchanged for now, and we will let you know if you need to verify again.",
+		)),
+		// Reached only from the arm where `grants_tier` said `None`, so an approval never
+		// gets here — but the arm is spelled out rather than wildcarded, because a new
+		// variant must break THIS compile and not quietly inherit somebody else's copy.
+		KycStatus::Pending | KycStatus::InProgress | KycStatus::Resubmitted | KycStatus::Approved => None,
+	}
+}
+
+/// Put a verdict that CONTRADICTS the level an account holds in front of a human.
+///
+/// The level stays where it is — that is the policy and it is not in question here. What
+/// #49 is about is that nothing followed. Consider a user holding tier 1 for whom the
+/// vendor later reports "Kyc Expired": `grants_tier` returns `None`, the level stays,
+/// and the only record is a row in `kyc_cases`. "A human decides" then means "nobody
+/// decides", indefinitely.
+///
+/// Only `declined` and `kyc_expired` qualify. An abandoned or timed-out session says
+/// nothing about the person's identity — it says they closed a tab — so treating it as a
+/// contradiction would train the owners to ignore this mail, which costs exactly the
+/// signal it exists to carry.
+///
+/// BEST EFFORT, like `notify`: the verdict is already recorded, and failing to raise the
+/// alarm must not turn a landed decision into a vendor retry that re-lands it.
+async fn alert_owners_if_contradicted(st: &super::Inner, case: &KycCase, redelivered: bool) {
+	if !matches!(case.status, KycStatus::Declined | KycStatus::KycExpired) {
+		return;
+	}
+	// ONE read of the subject, used for both the level and the address. It used to be two,
+	// and the second one swallowed its failure into `String::new()` — so a transient
+	// database blip between them mailed the owners "a verdict contradicts an account's
+	// level" with no account named. This mail carries no link and no code by design, so
+	// the address is the only way to find the person; without it the alert is not
+	// degraded, it is unactionable, and nothing in the log would say why.
+	let subject = match st.users.find_by_id(case.user_id).await {
+		Ok(Some(user)) => user,
+		Ok(None) => return,
+		Err(e) => {
+			tracing::warn!(error = %e, case_id = %case.id, "kyc callback: could not read the level a terminal verdict is judged against");
+			return;
+		}
+	};
+	let held = subject.kyc_level();
+
+	// What this case would GRANT, not what it asked for. `requested_tier` is the tier a
+	// provider may be ASKED for and rows asking for 2 are already in the table
+	// (`0014_kyc_requested_tier_intent.sql`); what an approval actually confers is capped
+	// at `PROVIDER_MAX_TIER`. Comparing against the request meant a legacy case with
+	// `requested_tier = 2` — approved, so the account holds 1 — could never contradict
+	// anything, because 1 < 2 returns here. That is exactly the #49 scenario, silently
+	// skipped for exactly the rows AGENTS.md warns are still standing.
+	let granted = KycStatus::Approved.grants_tier(case.requested_tier).unwrap_or(0);
+	if held == 0 || held < granted {
+		return;
+	}
+
+	// And a level covered by ANOTHER still-approved case is not a contradiction at all.
+	// Verified once, verified again, then the vendor reports the first session as lapsed
+	// is routine — not an incident — and `ENTRY_TIER` being 1 makes the test above
+	// degenerate to "holds any level", so without this every decline for an
+	// already-verified user would page the owners too. A false page costs the signal
+	// itself: owners who learn to ignore this mail are the state #49 is already in.
+	match st.kyc_cases.approved_cover(case.user_id, case.id).await {
+		Ok(cover) =>
+			if cover.and_then(|tier| KycStatus::Approved.grants_tier(tier)).is_some_and(|covered| covered >= held) {
+				tracing::info!(case_id = %case.id, verdict = case.status.as_str(), held, "kyc callback: a terminal verdict leaves a level another approved case still covers");
+				return;
+			},
+		// Fail LOUD: an unreadable cover means we cannot tell an incident from a routine
+		// lapse, and the direction that loses information is the one that stays quiet.
+		Err(e) => tracing::warn!(error = %e, case_id = %case.id, "kyc callback: could not check for another approved case — alerting anyway"),
+	}
+
+	if redelivered {
+		// The mail is deduplicated on `dedupe_key`, the page is not. Didit retries at
+		// roughly one and four minutes, so paging on every delivery turns one
+		// contradiction into three Sentry events that look like three incidents.
+		tracing::info!(case_id = %case.id, verdict = case.status.as_str(), held, "kyc callback: redelivery of a contradicting verdict — already raised");
+	} else {
+		// `error!` and not `warn!`: `error_monitoring::tracing_layer()` forwards this to
+		// Sentry, and Sentry is the only channel here that pages rather than accumulates.
+		tracing::error!(
+			case_id = %case.id,
+			user_id = %case.user_id,
+			verdict = case.status.as_str(),
+			held,
+			granted,
+			requested_tier = case.requested_tier,
+			"kyc callback: a terminal verdict contradicts a level this account already holds — the level was NOT changed and a human must decide"
+		);
+	}
+
+	let owners = match st.governance.owners().await {
+		Ok(owners) => owners,
+		Err(e) => {
+			tracing::warn!(error = %e, case_id = %case.id, "kyc callback: could not read the owner roster to alert");
+			return;
+		}
+	};
+	let payload = verdict_alert_payload(subject.email().as_str(), case, held, now_secs());
+
+	for owner in owners {
+		// The address comes from the IDENTITY RECORD — the roster read above IS that
+		// record — and must be VERIFIED, the same rule the mail relay applies to every
+		// governance kind: an address nobody has proved belongs to the person is not
+		// where an operational alert about somebody else's account should land. Read off
+		// the roster rather than by a lookup per owner, because this handler answers a
+		// webhook with a 5-second vendor budget and a round trip each is the shape that
+		// turns a verdict into a retry.
+		let (Some(address), true) = (owner.email.as_deref(), owner.email_verified) else {
+			continue;
+		};
+		// One row per OWNER per case per verdict. The owner id is part of the key and not
+		// a detail: `enqueue_governance_mail` deduplicates on `dedupe_key` alone, across
+		// the whole queue, so a key naming only the case would deliver to whichever owner
+		// happened to be first in the roster and silently drop everyone else — a roster
+		// alert that reaches one owner is exactly the "nobody is watching" this change
+		// exists to end. A redelivery of the same verdict still re-mails nobody.
+		let dedupe_key = format!("kyc-contradiction:{}:{}:{}", case.id, case.status.as_str(), owner.id);
+		if let Err(e) = st.governance.enqueue_mail(owner.id, address, "kyc_verdict_alert", &dedupe_key, &payload).await {
+			tracing::warn!(error = %e, case_id = %case.id, owner = %owner.id, "kyc callback: could not queue the owners' verdict alert");
+		}
+	}
+}
+
+/// The owners' alert as the queue carries it.
+///
+/// Its own function so that the six keys written here are the six keys a test can hand
+/// to `dispatch::governance_mail`. Producer and renderer agree by convention and by
+/// nothing else: `text_field`/`int_field` answer `""` and `0` for a key that is not
+/// there, so renaming one on either side renders a mail addressed to nobody, holding
+/// level 0, and every integration test still passes — they count rows in the queue and
+/// never render one. Migration 0020 names that exact failure as the risk it is guarding.
+pub(crate) fn verdict_alert_payload(subject_email: &str, case: &KycCase, held: u32, decided_at: i64) -> Value {
+	json!({
+		"subject_email": subject_email,
+		"case_id": case.id.to_string(),
+		"verdict": case.status.as_str(),
+		"held_level": held,
+		"requested_tier": case.requested_tier,
+		"decided_at": decided_at,
+	})
+}
+
 /// Best-effort in-app/e-mail notice. A user who never subscribed to the topic gets
 /// nothing (that is `emit`'s contract), and a notification failure must not turn a
 /// successfully applied decision into a retry the provider will resend.
@@ -685,4 +960,51 @@ async fn notify(st: &super::Inner, case: &KycCase, kind: &str, title: &str, body
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 	headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The ONE place the producer's keys meet the renderer's, exercised with the
+	/// producer's own writer.
+	///
+	/// The integration suite counts rows in `notification_deliveries` and never renders
+	/// one, so a key renamed on either side would leave every one of those tests green
+	/// while the owners received a mail addressed to nobody, holding "level 0" — or, if
+	/// the kind stopped being renderable at all, a row PARKED as unrenderable and no mail
+	/// whatsoever. Migration 0020 names that failure as the risk the `kind` CHECK exists
+	/// to guard, so it is the one that has to be nailed down here.
+	#[test]
+	fn the_verdict_alert_renders_what_the_webhook_writes() {
+		let case = KycCase {
+			id: uuid::Uuid::nil(),
+			user_id: domain::users::UserId::from_raw(uuid::Uuid::nil()),
+			requested_tier: 1,
+			status: KycStatus::KycExpired,
+		};
+		let payload = verdict_alert_payload("subject@example.com", &case, 1, 1_785_143_640);
+		let mail = crate::dispatch::governance_mail("kyc_verdict_alert", &payload, "https://cabinet.example/").expect("renderable");
+
+		// The address is how an operator finds the person: this mail carries no link and
+		// no code on purpose, so losing it makes the alert unactionable rather than ugly.
+		assert!(mail.text.contains("subject@example.com"), "the subject's address survives the payload round trip: {}", mail.text);
+		assert!(mail.text.contains("kyc_expired"), "and the vendor's verdict: {}", mail.text);
+		assert!(mail.text.contains('1'), "and the level being held");
+		assert!(!mail.subject.is_empty());
+
+		// Nobody unsubscribes from an operational alert about somebody else's account.
+		assert!(!mail.html.contains("Unsubscribe"), "governance mail carries no unsubscribe target");
+		// No link and no code: lowering a level from a mailbox is not a thing anyone does.
+		assert!(!mail.html.contains("https://cabinet.example"), "this alert deliberately links nowhere: {}", mail.html);
+
+		// A key the producer stopped writing must not render as a plausible mail.
+		let mut renamed = payload.clone();
+		renamed["subject"] = renamed["subject_email"].take();
+		let drifted = crate::dispatch::governance_mail("kyc_verdict_alert", &renamed, "https://cabinet.example/").expect("still renderable");
+		assert!(
+			!drifted.text.contains("subject@example.com"),
+			"a renamed key silently empties the field — which is why the assertions above exist"
+		);
+	}
 }
