@@ -200,24 +200,144 @@ impl KycCaseRepository for PgKycCases {
 			return Ok(CaseDecision::Ignored(case(stored)));
 		}
 
+		// ONE PERSON, N ACCOUNTS (#51). Asked here — inside the transaction that holds
+		// this case, and BEFORE the status that would grant a level is written — because
+		// it is the last point at which the answer can still change what happens. The
+		// scenario needs no forgery: somebody registers several accounts and honestly
+		// verifies each with their own real passport, so every check the vendor runs
+		// passes and every account reaches level >= 1.
+		//
+		// The duplicate is not REFUSED. The honest explanations are real — a person who
+		// lost an account and made another, a shared device, a family — and an automatic
+		// rejection would lock those people out with no recourse and no human involved.
+		// So the verdict is recorded as `held_duplicate`: no level moves, an operator is
+		// alarmed, and the user is told the attempt needs a look.
+		//
+		// `held_duplicate` and NOT `in_review`, which is what this started as. `in_review`
+		// is a RUNNING status, and writing one here broke two things at once. It cleared
+		// `decision_at` on a case the vendor had already decided — a `declined` case
+		// re-delivered as `approved` came out of this branch running again, contradicting
+		// the guard twenty lines above that exists to stop exactly that. And a running
+		// case is a case `start_gate` keeps handing back, so `/kyc/start` would return the
+		// spent vendor session for ever: no new attempt, no vendor event that could move
+		// the row, and no operator handle in this plane that closes a case. A decided hold
+		// leaves the user free to start again and the operator free to raise the level
+		// with `SetKycLevel` once they have looked.
+		//
+		// Skipped entirely when no digest was computed (no `KYC_IDENTITY_PEPPER`, or a
+		// verdict carrying no document number). Detection degrades; the decision does not.
+		let mut status = decision.status;
+		if status == KycStatus::Approved
+			&& let Some(digest) = decision.identity_digest.as_deref()
+		{
+			// Serialised per DOCUMENT, and without it the question below is worth little.
+			// The row lock taken at the top covers THIS case and nothing else, so two
+			// verdicts on two accounts presenting the same document do not exclude each
+			// other: under READ COMMITTED neither sees the other's uncommitted row, both
+			// find no twin and both grant a level — and since the check only ever runs on
+			// a status transition, nothing looks again afterwards. There is no unique
+			// index to fall back on, deliberately (0021 says why), so this lock is the
+			// mutual exclusion.
+			//
+			// Every transaction that takes both locks takes the case row first and this
+			// one second, so the acquisition order is the same everywhere and no wait
+			// cycle can form. `_xact_` — it is released by the COMMIT below, or by the
+			// rollback, and never outlives a connection returned to the pool.
+			sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+				.bind(digest)
+				.execute(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+
+			// "Has this document already BOUGHT somebody else a level" — asked as TWO
+			// facts OR-ed together, and the pair is the whole point.
+			//
+			// `u.kyc_level >= 1` alone is not enough, and that is not a refinement: it is
+			// the hole this branch exists to close, left open. The level is written by a
+			// DIFFERENT transaction on a different connection — `web::kyc::apply` →
+			// `UserDirectoryRepository::raise_kyc_level_to` — which only begins once THIS
+			// one has committed. The advisory lock above is released by that same commit,
+			// so the twin waiting on it wakes precisely inside the window where the first
+			// account's case says `approved` and its account still says 0, reads the
+			// level, finds nothing, and is approved too. The lock does not close that; it
+			// aims the second verdict straight at it.
+			//
+			// The same gap without any concurrency, and permanent: `apply` failing
+			// between the two writes (a 5xx, a pod rolled) leaves an `approved` case at
+			// level 0 — a state this plane treats as ordinary and repairs on redelivery —
+			// and Didit retries twice before giving up. For as long as it lasted, a
+			// level-only question would have protected that document from nothing.
+			//
+			// `c.status = approved` alone is not enough either, for the reason the level
+			// was asked about in the first place: a case LEAVES `approved` by routes the
+			// vendor drives on its own — `approved` → `kyc_expired` when a verification
+			// ages out, `approved` → `declined` on a post-hoc review — and neither takes
+			// the level back down, because only a human under `KycManage` ever lowers
+			// one. So the status arm covers the verdict this plane has already recorded,
+			// committed but not yet applied included, and the level arm covers the grant
+			// that outlived the verdict which bought it.
+			//
+			// A level an OPERATOR granted counts too: the join asks what the account
+			// holds, not where it came from. That errs towards a human looking at a case,
+			// which is the direction this whole branch errs in.
+			let twin: Option<Uuid> = sqlx::query_scalar(
+				"SELECT c.user_id FROM kyc_cases c JOIN users u ON u.id = c.user_id \
+				 WHERE c.identity_digest = $1 AND c.user_id <> $2 AND c.decision_at IS NOT NULL \
+				 AND (c.status = $3 OR u.kyc_level >= 1) LIMIT 1",
+			)
+			.bind(digest)
+			.bind(user_id)
+			.bind(KycStatus::Approved.as_str())
+			.fetch_optional(&mut *tx)
+			.await
+			.map_err(repo_err)?;
+			if let Some(twin) = twin {
+				status = KycStatus::HeldDuplicate;
+				// A redelivery of the verdict we already held. Didit retries at roughly
+				// one and four minutes, and each retry re-enters this branch: without
+				// this it would rewrite the same row and raise the same alarm again for a
+				// decision already taken.
+				if stored == status {
+					return Ok(CaseDecision::Redelivered(case(status)));
+				}
+				// `error!` because `error_monitoring::tracing_layer()` forwards it to
+				// Sentry, which is the only channel here that reaches a person rather
+				// than a log nobody reads. The digest is NOT logged: it is the one
+				// cross-account handle this plane holds, and a log aggregator is not
+				// where it belongs.
+				tracing::error!(
+					case_id = %id,
+					%user_id,
+					twin_user_id = %twin,
+					"kyc: this document has already raised the level of a different account — the verdict is held and no level was raised"
+				);
+			}
+		}
+
 		// `decision_at` follows `is_decided` exactly, which is what the
 		// `kyc_cases_decision_at` CHECK asserts — a disagreement fails the write rather
 		// than leaving a row whose "still running?" has two answers.
+		//
+		// `identity_digest` is written with COALESCE so a later verdict that carries no
+		// document number — or one recorded after the pepper was unset — cannot erase the
+		// fingerprint an earlier verdict on the same case established.
 		sqlx::query(
 			"UPDATE kyc_cases SET status = $2, payload = $3, \
-			 decision_at = CASE WHEN $4 THEN now() ELSE NULL END, event_at = $5, updated_at = now() \
+			 decision_at = CASE WHEN $4 THEN now() ELSE NULL END, event_at = $5, \
+			 identity_digest = COALESCE($6, identity_digest), updated_at = now() \
 			 WHERE id = $1",
 		)
 		.bind(id)
-		.bind(decision.status.as_str())
+		.bind(status.as_str())
 		.bind(&decision.metadata)
-		.bind(decision.status.is_decided())
+		.bind(status.is_decided())
 		.bind(decision.signed_at)
+		.bind(decision.identity_digest.as_deref())
 		.execute(&mut *tx)
 		.await
 		.map_err(repo_err)?;
 
 		tx.commit().await.map_err(repo_err)?;
-		Ok(CaseDecision::Recorded(case(decision.status)))
+		Ok(CaseDecision::Recorded(case(status)))
 	}
 }

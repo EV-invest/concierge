@@ -125,6 +125,23 @@ ev::settings! {
 		/// vendor account. Refused in production by the composition root — a stub that could
 		/// be switched on there would be a way to hand out KYC levels.
 		kyc_stub: bool = "false",
+		/// HMAC key for `kyc_cases.identity_digest` — the keyed fingerprint that lets two
+		/// accounts verified on the SAME document be detected (#51).
+		///
+		/// Deliberately NOT `#[required_in("production")]`, and not merely by analogy with
+		/// the `DIDIT_*` keys above. Those are a feature switch; this is a DETECTION, and a
+		/// detection whose absence refuses to boot takes sign-in down for the whole
+		/// platform to protect against a risk that existed anyway before the column did.
+		/// Absent it, no digest is computed and the duplicate check is skipped -- exactly
+		/// the behaviour of every release before this one. The boot logs say so once, at
+		/// `warn!`, whenever a vendor IS configured and this is not, so the gap is loud
+		/// without being fatal.
+		///
+		/// Rotating it invalidates every stored digest: the same document hashes to a new
+		/// value, and detection silently restarts from empty. That is the cost of the
+		/// property that makes the column safe to store at all.
+		#[secret]
+		kyc_identity_pepper: Option<String>,
 	}
 }
 

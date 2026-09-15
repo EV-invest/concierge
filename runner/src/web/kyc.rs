@@ -806,6 +806,19 @@ fn terminal_notice(status: KycStatus) -> Option<(&'static str, &'static str, &'s
 			"Your verification has lapsed",
 			"A verification you completed earlier has expired at our provider. Your account level is unchanged for now, and we will let you know if you need to verify again.",
 		)),
+		// The duplicate-document hold (#51), and the one verdict here this plane wrote
+		// itself. What the copy does NOT say is which signal fired: "this document
+		// already verified another account" would confirm to whoever is trying that the
+		// other account exists, and would tell the one person this check is aimed at
+		// exactly what to change. The honest cases — a lost account remade, a family —
+		// reach a human either way, which is the whole reason this is a hold and not a
+		// refusal. Its own kind rather than `kyc_declined`: nothing was declined, and a
+		// reader told so would start a new attempt that lands in the same hold.
+		KycStatus::HeldDuplicate => Some((
+			"kyc_held",
+			"Your verification needs a closer look",
+			"We could not finish this verification automatically. Someone from our team is looking at it, and we will let you know as soon as there is a decision.",
+		)),
 		// Reached only from the arm where `grants_tier` said `None`, so an approval never
 		// gets here — but the arm is spelled out rather than wildcarded, because a new
 		// variant must break THIS compile and not quietly inherit somebody else's copy.
@@ -825,6 +838,16 @@ fn terminal_notice(status: KycStatus) -> Option<(&'static str, &'static str, &'s
 /// nothing about the person's identity — it says they closed a tab — so treating it as a
 /// contradiction would train the owners to ignore this mail, which costs exactly the
 /// signal it exists to carry.
+///
+/// `held_duplicate` (#51) does NOT qualify either, and adding it to the list above would
+/// not make it work: the guard below returns for an account at level 0, which is where a
+/// duplicate hold almost always lands — the twin is a SECOND account, so the level the
+/// hold refused to grant was never held. The mail would also say the wrong thing; the
+/// `kyc_verdict_alert` copy is "a verdict contradicts a level this account holds" and
+/// ends by offering to lower it, and there is nothing to lower. A duplicate reaches its
+/// operator from `record_decision`'s `error!` → Sentry, at the instant the hold is
+/// written. Mailing the owners about one is a SEPARATE kind with its own copy and its own
+/// `notification_deliveries.kind` migration, not a variant appended here.
 ///
 /// BEST EFFORT, like `notify`: the verdict is already recorded, and failing to raise the
 /// alarm must not turn a landed decision into a vendor retry that re-lands it.
