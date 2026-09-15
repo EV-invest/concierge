@@ -369,20 +369,29 @@ pub fn valuation_outcome(consilium_id: &str, outcome: &str, fund: &str, mark: &s
 	if !detail.is_empty() {
 		inner.push_str(&paragraph(&detail));
 	}
-	inner.push_str(&paragraph(MARK_NOTE));
+	let mark_note = mark_note(&outcome);
+	inner.push_str(&paragraph(mark_note));
 	inner.push_str(&paragraph("This message needs no action from you. It is the record of what the consilium decided."));
 
 	RenderedEmail {
 		// The stated reason is never in the subject line — see `payment_consent`.
 		subject: format!("{headline} — {fund}"),
 		html: shell(&headline, &card(&inner), FOOTER_SECURITY, "", "Treasury"),
-		text: format!("{headline}\n\nOutcome: {outcome}\nFund: {fund}\nMark: {mark}\nRequest: {consilium_id}\n\n{note}{detail}\n\n{MARK_NOTE}\n\n—\n{FOOTER_SECURITY}\n"),
+		text: format!("{headline}\n\nOutcome: {outcome}\nFund: {fund}\nMark: {mark}\nRequest: {consilium_id}\n\n{note}{detail}\n\n{mark_note}\n\n—\n{FOOTER_SECURITY}\n"),
 	}
 }
 
 /// What a mark IS, in the approval page's words, so the outcome and the page an owner
-/// decided on cannot disagree about whether money moved.
-const MARK_NOTE: &str = "A mark past the NAV-move guard needs more than half of the owners to agree. It moves no money: it records the value the fund is held at.";
+/// decided on cannot disagree about whether money moved — and what became of it, so the
+/// body cannot contradict the headline: only an EXECUTED consilium recorded anything;
+/// under every other ending the fund keeps the mark it had.
+fn mark_note(outcome: &str) -> &'static str {
+	if outcome == "EXECUTED" {
+		"A mark past the NAV-move guard needs more than half of the owners to agree. It moved no money: it recorded the value the fund is held at."
+	} else {
+		"A mark past the NAV-move guard needs more than half of the owners to agree. Nothing was recorded and no money moved: the fund keeps its previous mark."
+	}
+}
 
 /// The money plane's spelling of how a consilium ended, as a headline reads it.
 ///
@@ -1422,7 +1431,7 @@ mod tests {
 			"c-15",
 			"Recorded as the fund's mark.",
 			"more than half of the owners",
-			"moves no money",
+			"it recorded the value",
 		] {
 			assert!(executed.html.contains(expected) && executed.text.contains(expected), "{expected}");
 		}
@@ -1447,6 +1456,19 @@ mod tests {
 		);
 		assert_eq!(burn.subject, "NAV mark invitation burned — Quy Nhon Fund");
 		assert!(burn.html.contains("NAV mark invitation burned"), "the heading reads like the subject");
+		// Only an executed consilium recorded anything; every other ending must not have
+		// a body that says the value was recorded under a headline that says it was not.
+		for ending in ["REJECTED", "EXPIRED", "CANCELLED", "EXECUTION_FAILED", "TOKEN_BURNED"] {
+			let mail = valuation_outcome("c-15", ending, "Quy Nhon Fund", "5 000.00 USDT", "", "");
+			for part in [&mail.html, &mail.text] {
+				assert!(
+					!part.contains("recorded the value") && !part.contains("records the value"),
+					"{ending}: the body claims a mark was recorded"
+				);
+				assert!(part.contains("keeps its previous mark"), "{ending}: the body says what became of the fund's mark");
+			}
+		}
+		assert!(!executed.text.contains("keeps its previous mark"));
 		assert!(
 			!burn.html.contains(INITIATOR_NOTE_LABEL) && !burn.text.contains(INITIATOR_NOTE_LABEL),
 			"an empty reason renders no attribution block"
