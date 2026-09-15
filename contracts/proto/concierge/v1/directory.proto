@@ -50,6 +50,15 @@ service UserDirectory {
   // Admin (allowlist): set a user's KYC level. Emits KYC_CHANGED across the
   // cross-plane bridge (so the money plane learns the new level). Echoes the
   // level now in effect.
+  //
+  // Refuses with PERMISSION_DENIED when user_id is the CALLER's own account.
+  // KycManage is held by Admin as well as Owner, and tier 1 is the floor for
+  // withdrawals on the money plane, so without this an operator could lift their
+  // own money gate. A console must not offer this control on the operator's own
+  // row: the refusal is decided from the session alone and belongs in front of
+  // the call. Raising your own level goes through the verification front door,
+  // which reaches tier 1; above that, and for any downgrade, another holder of
+  // KycManage acts.
   rpc SetKycLevel(SetKycLevelRequest) returns (SetKycLevelResponse);
 
   // Admin (UserRead): list/search users for the operator console — paginated, with a

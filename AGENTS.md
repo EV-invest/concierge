@@ -145,10 +145,20 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   layers are placeholders to grow into. Health returns `"ok"`.
 - **KYC has exactly one writer**: the `User` aggregate's `set_kyc_level` and the
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
-  banking's mirror). Two ENTRY POINTS reach it, and they differ only in what they
-  are allowed to decide. `users.set_kyc_level` is unconditional in DIRECTION and belongs
-  to the human path (`Permission::KycManage`), because a human is precisely who may move
-  a level DOWN. It is NOT unconditional in RANGE: the aggregate refuses anything above
+  banking's mirror). Two ENTRY POINTS reach it, and they differ in what they
+  are allowed to decide and over whom. `users.set_kyc_level` is unconditional in
+  DIRECTION and belongs to the human path (`Permission::KycManage`), because a human is
+  precisely who may move a level DOWN. It is NOT unconditional in TARGET: nobody sets
+  their own level, the same rule `HoldUser` carries below, and for the same reason —
+  `KycManage` is held by `Admin` as well as `Owner`, and tier 1 is the floor for
+  withdrawals on the MONEY plane, where an operator holds no permissions at all (#47).
+  The refusal is `PERMISSION_DENIED`, not the hold's `FAILED_PRECONDITION`: this one is
+  not a state that could change, and banking's cabinet BFF relays the message under a
+  403. It is checked BEFORE the range, so "level 4 on myself" is denied rather than
+  called out of range — an operator must not learn which rule they tripped by picking a
+  legal number. The verification front door stops at `PROVIDER_MAX_TIER`, so an
+  operator's own account reaches tier 1 by itself and no further; tiers 2-3 and every
+  downgrade of it need a second seated holder. It is NOT unconditional in RANGE: the aggregate refuses anything above
   `domain::users::MAX_KYC_LEVEL` (3), and the `users_kyc_level_range` CHECK refuses it
   again at the column — the range belongs to the record, not to the one handler that
   happened to check it. `user_outbox.kyc_level` carries the same CHECK, `NOT VALID` on
@@ -163,7 +173,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   public, HMAC over the raw body, 300s replay window) lands in that same aggregate
   call, so banking never learns a vendor exists. A provider may only RAISE a level and
   never past `PROVIDER_MAX_TIER`; every tier above it and every downgrade are human
-  decisions under `Permission::KycManage`. The identity a callback acts on comes from the
+  decisions under `Permission::KycManage` — somebody else's, when the account is the
+  operator's own. The identity a callback acts on comes from the
   stored `kyc_cases` row, NEVER from the request body; the body's echoed `vendor_data` is
   a CROSS-CHECK against that row and is decided inside the recording transaction, because
   a refusal reached after the commit is not a refusal — it used to answer 400 over a row
