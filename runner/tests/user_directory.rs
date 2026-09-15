@@ -24,8 +24,16 @@ use domain::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// The suite's preconditions, or `None` with a line saying so.
+///
+/// Without the marker a skipped run prints exactly the "N passed" a real one does, and
+/// the only tell is the wall time — so a count quoted as evidence that these assertions
+/// ran is evidence of nothing.
 async fn setup() -> Option<(PgUsers, PgPool)> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+		eprintln!("SKIPPED: DATABASE_URL unset — this test asserted nothing");
+		return None;
+	};
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	Some((PgUsers::new(pool.clone()), pool))
@@ -214,7 +222,12 @@ async fn both_kyc_writers_land_in_one_audit_log_with_the_delta() {
 	// The MANUAL half, moving the level DOWN — the direction only a human may take, and
 	// precisely the one a row saying "kyc_level: 0" cannot be told apart from a fresh
 	// account that was never raised at all.
-	let manual = AdminAction::by(operator.id(), "kyc_level_set", &Default::default()).with_reason("documents withdrawn");
+	// WITH a detail of its own, which is the half that used to be fragile: the manual path
+	// filled `from`/`to` in only while every caller left `detail` empty, so the first
+	// caller to attach anything would have dropped the delta with every test still green.
+	let manual = AdminAction::by(operator.id(), "kyc_level_set", &Default::default())
+		.with_reason("documents withdrawn")
+		.with_detail(serde_json::json!({ "ticket": "OPS-1204" }));
 	repo.set_kyc_level(user.id(), 0, &manual, 1_700_000_100).await.unwrap();
 
 	let rows = actions_for(&pool, user.id().raw()).await;
@@ -233,6 +246,7 @@ async fn both_kyc_writers_land_in_one_audit_log_with_the_delta() {
 	assert_eq!(human["from"], 1, "the DOWNGRADE is legible — this is the direction no vendor may take");
 	assert_eq!(human["to"], 0);
 	assert_eq!(human["kyc_level"], 0, "kept beside `to` so rows written before this still read alike");
+	assert_eq!(human["ticket"], "OPS-1204", "and the caller's own keys survive the merge rather than replacing it");
 }
 
 /// A vendor verdict that raises nothing writes nothing.
