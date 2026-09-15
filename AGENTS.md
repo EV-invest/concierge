@@ -330,6 +330,12 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
+- A DB-backed suite takes its URL from `common::database_url()`, never from
+  `std::env::var("DATABASE_URL")` directly. Without `DATABASE_URL` a suite skips
+  and still reports "N passed" — libtest prints nothing for a passing test — so
+  the count alone never says whether anything ran. That helper panics when `CI`
+  is set, and prints a SKIPPED line a local `cargo test -- --nocapture` shows.
+  Quote per-suite counts AND wall time when a PR offers a run as evidence.
 - No extra deps, abstraction layers, or unasked-for features.
 - No comments explaining _what_; only _why_ if non-obvious.
 - No `.env*`, secrets, or large binaries committed.
