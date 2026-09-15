@@ -215,7 +215,7 @@ pub fn payout_outcome(
 		return payout_outcome_on_a_rail(&consilium_id, &outcome, &network, &address, &amount, &detail);
 	}
 
-	let headline = format!("Payment {}", outcome.to_lowercase());
+	let headline = format!("Payment {}", outcome_word(&outcome));
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Treasury"));
 	inner.push_str(&heading(&headline));
@@ -252,9 +252,11 @@ pub fn payout_outcome(
 	}
 }
 
-/// The payout half of [`payout_outcome`], unchanged from before payments existed.
+/// The payout half of [`payout_outcome`], unchanged from before payments existed but
+/// for the headline's ending, which every outcome mail now spells through
+/// [`outcome_word`].
 fn payout_outcome_on_a_rail(consilium_id: &str, outcome: &str, network: &str, address: &str, amount: &str, detail: &str) -> RenderedEmail {
-	let headline = format!("Payout {}", outcome.to_lowercase());
+	let headline = format!("Payout {}", outcome_word(outcome));
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Treasury"));
 	inner.push_str(&heading(&headline));
@@ -295,7 +297,7 @@ pub fn fee_policy_outcome(consilium_id: &str, outcome: &str, fund: &str, current
 	let (detail, reason) = (one_line(detail), one_line(reason));
 	let terms = fee_rows(current, proposed);
 
-	let headline = format!("Fee terms {}", outcome.to_lowercase());
+	let headline = format!("Fee terms {}", outcome_word(&outcome));
 	let mut inner = String::new();
 	inner.push_str(&eyebrow("Treasury"));
 	inner.push_str(&heading(&headline));
@@ -326,6 +328,73 @@ pub fn fee_policy_outcome(consilium_id: &str, outcome: &str, fund: &str, current
 			"{headline}\n\nOutcome: {outcome}\nFund: {fund}\n{}Request: {consilium_id}\n\n{note}{detail}\n\n—\n{FOOTER_SECURITY}\n",
 			fee_lines(&terms)
 		),
+	}
+}
+
+/// The fourth subject of the outcome payload: how a consilium over a fund's NAV MARK
+/// ended, and the burn notice that rides the same row.
+///
+/// A mark past the NAV-move guard used to ride the payment description — "Payment
+/// executed", `Amount: 5000`, `To: AUM 5000 USDT`, `Type: service` — which told the
+/// owners money had moved when nothing had (#82). Like [`fee_policy_outcome`], it names
+/// no money: the consilium decided a VALUE the fund is held at, so the rows are the fund
+/// and the mark, in the words the approval page used ("more than half of the owners must
+/// approve before the fund is marked"), and nothing reads as an amount, a rail or a
+/// transfer.
+pub fn valuation_outcome(consilium_id: &str, outcome: &str, fund: &str, mark: &str, detail: &str, reason: &str) -> RenderedEmail {
+	// Folded BEFORE either part is built — see `one_line`.
+	let (consilium_id, outcome, fund, mark) = (one_line(consilium_id), one_line(outcome), one_line(fund), one_line(mark));
+	let (detail, reason) = (one_line(detail), one_line(reason));
+
+	let headline = format!("NAV mark {}", outcome_word(&outcome));
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Treasury"));
+	inner.push_str(&heading(&headline));
+	inner.push_str(&detail_box(&[
+		("Outcome", outcome.clone()),
+		("Fund", fund.clone()),
+		("Mark", mark.clone()),
+		("Request", consilium_id.clone()),
+	]));
+	// The burn notice rides this payload with no reason of its own; an empty one gets
+	// no attribution block rather than a label over nothing.
+	let note = if reason.is_empty() {
+		String::new()
+	} else {
+		format!("{INITIATOR_NOTE_LABEL}\n  {reason}\n\n")
+	};
+	if !reason.is_empty() {
+		inner.push_str(&initiator_note(&reason));
+	}
+	if !detail.is_empty() {
+		inner.push_str(&paragraph(&detail));
+	}
+	inner.push_str(&paragraph(MARK_NOTE));
+	inner.push_str(&paragraph("This message needs no action from you. It is the record of what the consilium decided."));
+
+	RenderedEmail {
+		// The stated reason is never in the subject line — see `payment_consent`.
+		subject: format!("{headline} — {fund}"),
+		html: shell(&headline, &card(&inner), FOOTER_SECURITY, "", "Treasury"),
+		text: format!("{headline}\n\nOutcome: {outcome}\nFund: {fund}\nMark: {mark}\nRequest: {consilium_id}\n\n{note}{detail}\n\n{MARK_NOTE}\n\n—\n{FOOTER_SECURITY}\n"),
+	}
+}
+
+/// What a mark IS, in the approval page's words, so the outcome and the page an owner
+/// decided on cannot disagree about whether money moved.
+const MARK_NOTE: &str = "A mark past the NAV-move guard needs more than half of the owners to agree. It moves no money: it records the value the fund is held at.";
+
+/// The money plane's spelling of how a consilium ended, as a headline reads it.
+///
+/// The wire carries `ConsiliumState::as_str()` upper-cased — a closed set the relay
+/// checks — and lower-casing it was enough while every word was one word. It is not for
+/// `TOKEN_BURNED`, which headlined "Fee terms token_burned — Quy Nhon Fund" (#82), nor
+/// for `EXECUTION_FAILED`. A burn is not an outcome of the consilium at all but of one
+/// seat's invitation, so it is named as that; the rest are the token's own words.
+fn outcome_word(outcome: &str) -> String {
+	match outcome {
+		"TOKEN_BURNED" => "invitation burned".to_owned(),
+		other => other.to_lowercase().replace('_', " "),
 	}
 }
 
@@ -1129,7 +1198,7 @@ mod tests {
 			"pool",
 			"",
 		);
-		assert_eq!(burn.subject, "Payment token_burned — 25 000.00 USDT");
+		assert_eq!(burn.subject, "Payment invitation burned — 25 000.00 USDT");
 		assert!(
 			!burn.html.contains(INITIATOR_NOTE_LABEL) && !burn.text.contains(INITIATOR_NOTE_LABEL),
 			"an empty reason renders no attribution block"
@@ -1322,7 +1391,7 @@ mod tests {
 			"five failed code attempts burned the approval token for seat u-1",
 			"",
 		);
-		assert_eq!(burn.subject, "Fee terms token_burned — Quy Nhon Fund");
+		assert_eq!(burn.subject, "Fee terms invitation burned — Quy Nhon Fund");
 		assert!(
 			!burn.html.contains(INITIATOR_NOTE_LABEL) && !burn.text.contains(INITIATOR_NOTE_LABEL),
 			"an empty reason renders no attribution block"
@@ -1338,6 +1407,71 @@ mod tests {
 		assert_eq!(payment.subject, "Payment executed — 25 000.00 USDT");
 		let payout = payout_outcome("c-1", "EXECUTED", "Ethereum", LONG_ADDRESS, "12,500.00 USDT", "Broadcast.", "", "", "", "");
 		assert_eq!(payout.subject, "Payout executed — 12,500.00 USDT on Ethereum");
+	}
+
+	/// A mark is a value, not a transfer: the mail names the fund and the mark, says in the
+	/// approval page's words that no money moved, and — burn notice included — headlines
+	/// the ending as a person would say it.
+	#[test]
+	fn a_valuation_outcome_describes_a_mark_and_no_money() {
+		let executed = valuation_outcome("c-15", "EXECUTED", "Quy Nhon Fund", "5 000.00 USDT", "Recorded as the fund's mark.", "");
+		assert_eq!(executed.subject, "NAV mark executed — Quy Nhon Fund");
+		for expected in [
+			"Quy Nhon Fund",
+			"5 000.00 USDT",
+			"c-15",
+			"Recorded as the fund's mark.",
+			"more than half of the owners",
+			"moves no money",
+		] {
+			assert!(executed.html.contains(expected) && executed.text.contains(expected), "{expected}");
+		}
+		assert!(executed.text.contains("Mark: 5 000.00 USDT"), "the mark is labelled as a mark");
+		assert!(executed.html.contains("needs no action"), "nobody should hunt for a button that is not there");
+		assert!(!executed.subject.contains("5 000.00"), "the subject names the fund, not a sum that could read as a payment");
+		for part in [&executed.html, &executed.text] {
+			for money in ["Amount", "Network", "Destination address", "Payment", "Payout", "From:", "To:", "Type:"] {
+				assert!(!part.contains(money), "a mark names no money: {money}");
+			}
+			assert!(!part.contains("Type this code") && !part.contains("Your code"), "an outcome carries no secret");
+		}
+		assert!(executed.html.contains("owner seat"), "the reader holds a seat, so the owner footer is the true one");
+
+		let burn = valuation_outcome(
+			"c-15",
+			"TOKEN_BURNED",
+			"Quy Nhon Fund",
+			"5 000.00 USDT",
+			"five failed code attempts burned the approval token for seat u-1",
+			"",
+		);
+		assert_eq!(burn.subject, "NAV mark invitation burned — Quy Nhon Fund");
+		assert!(burn.html.contains("NAV mark invitation burned"), "the heading reads like the subject");
+		assert!(
+			!burn.html.contains(INITIATOR_NOTE_LABEL) && !burn.text.contains(INITIATOR_NOTE_LABEL),
+			"an empty reason renders no attribution block"
+		);
+
+		let forged = valuation_outcome("c-15", "EXECUTED", "QN\nAmount: 0", "1\nTo: attacker", "", "");
+		assert!(!forged.text.contains("\nAmount: 0") && !forged.text.contains("\nTo: attacker"), "a forged line collapses");
+		assert!(forged.text.contains("Fund: QN Amount: 0") && forged.text.contains("Mark: 1 To: attacker"));
+	}
+
+	/// The ending is the money plane's closed token; a headline spells it as a person would,
+	/// on every subject alike, so no mail ever says `token_burned` or `execution_failed`.
+	#[test]
+	fn an_ending_is_headlined_in_words_on_every_subject() {
+		assert_eq!(outcome_word("EXECUTED"), "executed");
+		assert_eq!(outcome_word("EXECUTION_FAILED"), "execution failed");
+		assert_eq!(outcome_word("TOKEN_BURNED"), "invitation burned");
+		let payout = payout_outcome("c-1", "TOKEN_BURNED", "Ethereum", LONG_ADDRESS, "12,500.00 USDT", "", "", "", "", "");
+		assert_eq!(payout.subject, "Payout invitation burned — 12,500.00 USDT on Ethereum");
+		let failed = payout_outcome("c-9", "EXECUTION_FAILED", "", "", "25 000.00 USDT", "", "service", "treasury", "pool", "");
+		assert_eq!(failed.subject, "Payment execution failed — 25 000.00 USDT");
+		for mail in [payout, failed] {
+			assert!(!mail.subject.contains('_') && !mail.html.contains("token_burned"), "{}", mail.subject);
+			assert!(mail.text.contains("Outcome: "), "the row still carries the plane's own token as the record");
+		}
 	}
 
 	#[test]

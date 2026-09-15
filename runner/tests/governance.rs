@@ -963,6 +963,7 @@ fn payment_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGovernanc
 			fund: String::new(),
 			current: None,
 			proposed: None,
+			mark: String::new(),
 		}),
 		payment_consent: None,
 		payment_approval: None,
@@ -993,6 +994,38 @@ fn fee_policy_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGovern
 			fund: "Quy Nhon Fund".into(),
 			current: Some(house_terms()),
 			proposed: Some(proposed_terms()),
+			mark: String::new(),
+		}),
+		payment_consent: None,
+		payment_approval: None,
+		fee_policy_approval: None,
+		fee_policy_notice: None,
+	}
+}
+
+/// The outcome of a VALUATION OVERRIDE consilium, riding the outcome payload with the
+/// mark description filled and every other description empty.
+fn valuation_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGovernanceMailRequest {
+	SendGovernanceMailRequest {
+		kind: kind as i32,
+		user_id: addressee.to_string(),
+		dedupe_key: format!("valuation-outcome:{}", Uuid::new_v4()),
+		payout_approval: None,
+		payout_outcome: Some(PayoutOutcomeMail {
+			consilium_id: "c-15".into(),
+			outcome: "EXECUTED".into(),
+			network: String::new(),
+			address: String::new(),
+			amount: String::new(),
+			detail: "Recorded as the fund's mark.".into(),
+			tier: String::new(),
+			source: String::new(),
+			destination: String::new(),
+			reason: String::new(),
+			fund: "Quy Nhon Fund".into(),
+			current: None,
+			proposed: None,
+			mark: "5 000.00 USDT".into(),
 		}),
 		payment_consent: None,
 		payment_approval: None,
@@ -1331,6 +1364,65 @@ async fn a_fee_policy_outcome_rides_the_outcome_payload() {
 			mutate(&|m| m.current.as_mut().unwrap().performance_bps = 10_001),
 			"an impossible CURRENT fee is a lie about today",
 		),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
+}
+
+/// A valuation override's outcome — and its burn notice — ride the outcome payload with
+/// the mark description filled: the fund under the fee mails' rule, the mark under the
+/// amount's. It used to ride the payment tuple and was mailed as a payment (#82).
+#[tokio::test]
+async fn a_valuation_outcome_rides_the_outcome_payload() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	for kind in [GovernanceMailKind::PayoutOutcome, GovernanceMailKind::ApprovalTokenBurned] {
+		let request = valuation_outcome(owner, kind);
+		let key = request.dedupe_key.clone();
+		assert!(
+			fx.relay()
+				.send_governance_mail(relayed(request))
+				.await
+				.expect("an owner is told how it ended")
+				.into_inner()
+				.enqueued
+		);
+		assert_eq!(fx.delivery(&key).await.expect("queued"), ("payout_outcome".to_owned(), fx.email_of(owner).await));
+		let payload = fx.payload(&key).await;
+		assert_eq!(payload["fund"], "Quy Nhon Fund", "the fund travels verbatim");
+		assert_eq!(payload["mark"], "5 000.00 USDT", "and so does the mark, which is how the dispatcher tells it from fee terms");
+		assert!(payload["proposed"].is_null() && payload["current"].is_null(), "no terms on a mark");
+		assert_eq!(payload["tier"], "", "the payment tuple stays empty");
+	}
+
+	let investor = fx.user().await;
+	let err = fx
+		.relay()
+		.send_governance_mail(relayed(valuation_outcome(investor, GovernanceMailKind::PayoutOutcome)))
+		.await
+		.unwrap_err();
+	assert_eq!(err.code(), Code::FailedPrecondition, "still a consilium mail: {err}");
+
+	let mutate = |edit: &dyn Fn(&mut PayoutOutcomeMail)| {
+		let mut request = valuation_outcome(owner, GovernanceMailKind::PayoutOutcome);
+		edit(request.payout_outcome.as_mut().unwrap());
+		request
+	};
+	for (request, why) in [
+		(mutate(&|m| m.network = "TRON".into()), "a rail on a mark"),
+		(mutate(&|m| m.destination = "AUM 5000 USDT".into()), "the payment tuple on a mark"),
+		(mutate(&|m| m.proposed = Some(proposed_terms())), "fee terms on a mark"),
+		(mutate(&|m| m.current = Some(house_terms())), "current terms on a mark"),
+		(mutate(&|m| m.fund = String::new()), "a mark on no fund"),
+		(mutate(&|m| m.mark = "   ".into()), "a mark that says nothing"),
+		(mutate(&|m| m.mark = "5 000.00 USDT https://x".into()), "a linkable mark"),
+		(mutate(&|m| m.mark = "1\nTo: attacker".into()), "a forged line in the mark"),
+		(mutate(&|m| m.fund = "www.x".into()), "a host for a fund"),
 	] {
 		let key = request.dedupe_key.clone();
 		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
