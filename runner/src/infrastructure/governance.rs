@@ -1523,9 +1523,12 @@ impl GovernanceRepository for PgGovernance {
 		Ok(value.max(0) as u64)
 	}
 
-	async fn enqueue_mail(&self, user_id: Uuid, recipient: &str, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<bool, DomainError> {
+	async fn enqueue_mail(&self, user_id: Uuid, recipient: &str, email_verified: bool, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<bool, DomainError> {
 		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
-		let subscriber = notifications::upsert_subscriber(&mut conn, user_id, recipient, true).await?;
+		// The upsert OVERWRITES `email_verified`, and `emit` reads it back as "may this
+		// address be mailed". Hard-coding `true` here made every governance recipient
+		// eligible for ordinary email notifications, verified or not (#65).
+		let subscriber = notifications::upsert_subscriber(&mut conn, user_id, recipient, email_verified).await?;
 		notifications::enqueue_governance_mail(&mut conn, subscriber.id, recipient, kind, dedupe_key, payload).await
 	}
 }

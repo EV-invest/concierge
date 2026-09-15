@@ -787,7 +787,13 @@ pub trait GovernanceRepository: Send + Sync {
 
 	/// Queue one governance mail to a resolved recipient, bypassing notification
 	/// preferences. False when `dedupe_key` had already been accepted.
-	async fn enqueue_mail(&self, user_id: Uuid, recipient: &str, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<bool, DomainError>;
+	///
+	/// `recipient` and `email_verified` are the identity record's, read together: the
+	/// subscriber row this refreshes is what `emit` later consults before mailing, so
+	/// the flag written here decides whether ordinary notifications may go to the
+	/// address — it must be the record's, never assumed from the fact that a governance
+	/// mail was addressed to it.
+	async fn enqueue_mail(&self, user_id: Uuid, recipient: &str, email_verified: bool, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<bool, DomainError>;
 }
 
 /// Port for the one-shot genesis seeding of the owner registry.
