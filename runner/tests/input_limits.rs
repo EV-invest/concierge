@@ -22,20 +22,46 @@ use concierge::{
 };
 use domain::{
 	authz::Role,
-	users::{AuthSubject, Email, MAX_KYC_LEVEL},
+	users::{AuthSubject, Email, MAX_KYC_LEVEL, UserId},
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
 	ListUsersRequest, SetAnnouncementRequest, SetFeatureFlagRequest, SetKycLevelRequest, UpdateProfileRequest, platform_service_server::PlatformService, user_directory_server::UserDirectory,
 };
+use sqlx::PgPool;
 use tonic::{Code, Request};
 use uuid::Uuid;
 
-async fn setup() -> Option<(Arc<dyn UserDirectoryRepository>, Arc<dyn PlatformConfigRepository>)> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+/// The suite's preconditions, or `None` with a line saying so.
+///
+/// The marker is not cosmetic. Every test here returns early when it is missing, and a
+/// skipped run prints exactly the same "N passed" a real one does — so "7 passed" was
+/// evidence of nothing, including for the refusal in `#47` this suite is the only pin
+/// for. The wall time gives it away (0.00s), and a reader should not have to notice that.
+async fn setup() -> Option<(Arc<dyn UserDirectoryRepository>, Arc<dyn PlatformConfigRepository>, PgPool)> {
+	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+		eprintln!("SKIPPED: DATABASE_URL unset — this test asserted nothing");
+		return None;
+	};
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
-	Some((Arc::new(PgUsers::new(pool.clone())), Arc::new(PgPlatform::new(pool))))
+	Some((Arc::new(PgUsers::new(pool.clone())), Arc::new(PgPlatform::new(pool.clone())), pool))
+}
+
+/// Rows `admin_action` holds about this person, and `KYC_CHANGED` rows on the outbox the
+/// money plane mirrors. A refusal must move neither.
+async fn traces_of(pool: &PgPool, user: UserId) -> (i64, i64) {
+	let audit = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM admin_action WHERE subject_user_id = $1")
+		.bind(user.raw())
+		.fetch_one(pool)
+		.await
+		.expect("count admin_action");
+	let outbox = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM user_outbox WHERE user_id = $1 AND kind = 'KYC_CHANGED'")
+		.bind(user.raw())
+		.fetch_one(pool)
+		.await
+		.expect("count outbox rows");
+	(audit, outbox)
 }
 
 fn access_claims(sub: &str) -> Claims {
@@ -57,9 +83,13 @@ fn request_with<T>(sub: &str, inner: T) -> Request<T> {
 	req
 }
 
-/// An ordinary user for an admin verb to act ON. Every one of these handlers now
-/// distinguishes the caller from the target, so a suite that reused the caller's own
-/// subject as the target was testing a path the handler refuses.
+/// An ordinary user for an admin verb to act ON.
+///
+/// `set_kyc_level` (#47) and `hold_user` are the two verbs that distinguish the caller
+/// from the target and refuse when they are the same, so a bounds check that reused the
+/// caller's own subject was testing a path the handler no longer reaches. It is NOT a
+/// rule of the module: `revoke_tokens`, `reinstate_user` and `get_user` compare nothing,
+/// and `update_profile`/`list_users` below are self-service and must stay that way.
 async fn subject_of(users: &Arc<dyn UserDirectoryRepository>, tag: &str) -> String {
 	let subject = AuthSubject::parse(&format!("{tag}-{}", Uuid::new_v4())).unwrap();
 	users.provision(subject, Email::parse("limits-target@example.com").unwrap(), true).await.unwrap().id().to_string()
@@ -87,8 +117,7 @@ fn profile(phone: &str, base_currency: &str) -> UpdateProfileRequest {
 
 #[tokio::test]
 async fn update_profile_rejects_junk_with_invalid_argument() {
-	let Some((users, _)) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
+	let Some((users, _, _)) = setup().await else {
 		return;
 	};
 	let (sub, break_glass) = admin(&users).await;
@@ -113,7 +142,7 @@ async fn update_profile_rejects_junk_with_invalid_argument() {
 
 #[tokio::test]
 async fn set_kyc_level_is_bounded() {
-	let Some((users, _)) = setup().await else {
+	let Some((users, _, _)) = setup().await else {
 		return;
 	};
 	let (sub, break_glass) = admin(&users).await;
@@ -166,10 +195,16 @@ async fn set_kyc_level_is_bounded() {
 /// tripped by picking a legal number.
 #[tokio::test]
 async fn an_operator_cannot_set_their_own_kyc_level() {
-	let Some((users, _)) = setup().await else {
+	let Some((users, _, pool)) = setup().await else {
 		return;
 	};
 	let (sub, break_glass) = admin(&users).await;
+	let actor = sub.parse::<Uuid>().map(UserId::from_raw).unwrap();
+	// The operator starts at 1, through the front door they are still allowed. A run that
+	// started them at 0 could not tell a refusal apart from a write: the levels asked for
+	// below include 0, and `admin()` provisions at 0.
+	users.raise_kyc_level_to(actor, 1).await.unwrap();
+	let before = traces_of(&pool, actor).await;
 	let directory = Directory::new(users.clone(), break_glass);
 
 	for level in [1, 3, 0, 4] {
@@ -187,12 +222,13 @@ async fn an_operator_cannot_set_their_own_kyc_level() {
 		assert_eq!(err.code(), Code::PermissionDenied, "setting level {level} on yourself must be refused");
 	}
 
-	let me = users
-		.find_by_id(sub.parse::<Uuid>().map(domain::users::UserId::from_raw).unwrap())
-		.await
-		.unwrap()
-		.expect("the operator still exists");
-	assert_eq!(me.kyc_level(), 0, "a refused write leaves the level where it was");
+	let me = users.find_by_id(actor).await.unwrap().expect("the operator still exists");
+	assert_eq!(me.kyc_level(), 1, "a refused write leaves the level where it was");
+	// A refusal that moved nothing but appended a `KYC_CHANGED` would lift the money gate
+	// in the OTHER plane, which mirrors the outbox and never re-reads this one. That is
+	// the assertion `user_governance.rs` makes about every refused command, and the level
+	// alone does not make it.
+	assert_eq!(traces_of(&pool, actor).await, before, "a refused write leaves no audit row and no outbox event");
 
 	// And the verb still works — the refusal is about the TARGET, not about the caller.
 	let target = subject_of(&users, "kyc-other").await;
@@ -211,12 +247,39 @@ async fn an_operator_cannot_set_their_own_kyc_level() {
 	assert_eq!(ok.kyc_level, 2);
 }
 
+/// #47, on the line #45 draws: the handler guard is a fast path, not the boundary.
+///
+/// Skip the RPC and call the repository port the way the next writer of a level would —
+/// an admin HTTP route, a batch import, a consilium outcome — and the rule must still
+/// hold, because a rule that lives in one handler is a rule until somebody adds a second
+/// handler.
+#[tokio::test]
+async fn a_self_targeted_kyc_write_is_refused_beneath_the_handler() {
+	let Some((users, _, _)) = setup().await else {
+		return;
+	};
+	let subject = AuthSubject::parse(&format!("kyc-self-{}", Uuid::new_v4())).unwrap();
+	let user = users.provision(subject, Email::parse("kyc-self@example.com").unwrap(), true).await.unwrap();
+	let other = subject_of(&users, "kyc-writer").await.parse::<Uuid>().map(UserId::from_raw).unwrap();
+
+	let err = users
+		.set_kyc_level(user.id(), 1, &AdminAction::by(user.id(), "kyc_level_set", &Default::default()), 0)
+		.await
+		.unwrap_err();
+	assert_eq!(domain_to_status(err).code(), Code::PermissionDenied, "the actor is the subject, whatever surface asked");
+	assert_eq!(users.find_by_id(user.id()).await.unwrap().expect("the user survives").kyc_level(), 0);
+
+	// Somebody ELSE writing the same level is the whole point of the verb.
+	users.set_kyc_level(user.id(), 1, &AdminAction::by(other, "kyc_level_set", &Default::default()), 0).await.unwrap();
+	assert_eq!(users.find_by_id(user.id()).await.unwrap().expect("the user survives").kyc_level(), 1);
+}
+
 /// #45: the handler guard above is a fast path, not the boundary. Skip it — call the
 /// repository port the way any other writer in this plane would — and the aggregate must
 /// still refuse, mapping to `INVALID_ARGUMENT` because the level came from outside.
 #[tokio::test]
 async fn kyc_level_is_bounded_beneath_the_handler() {
-	let Some((users, _)) = setup().await else {
+	let Some((users, _, _)) = setup().await else {
 		return;
 	};
 	let subject = AuthSubject::parse(&format!("kyc-bound-{}", Uuid::new_v4())).unwrap();
@@ -238,6 +301,7 @@ async fn kyc_level_is_bounded_beneath_the_handler() {
 #[tokio::test]
 async fn kyc_level_out_of_range_is_refused_by_the_store() {
 	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+		eprintln!("SKIPPED: DATABASE_URL unset — this test asserted nothing");
 		return;
 	};
 	let pool = db::connect_sized(&url, 2).await.expect("connect to Postgres");
@@ -272,7 +336,7 @@ async fn kyc_level_out_of_range_is_refused_by_the_store() {
 
 #[tokio::test]
 async fn list_users_validates_filters_and_truncates_query() {
-	let Some((users, _)) = setup().await else {
+	let Some((users, _, _)) = setup().await else {
 		return;
 	};
 	let (sub, break_glass) = admin(&users).await;
@@ -297,7 +361,7 @@ async fn list_users_validates_filters_and_truncates_query() {
 
 #[tokio::test]
 async fn announcement_and_flag_writes_enforce_caps() {
-	let Some((users, config)) = setup().await else {
+	let Some((users, config, _)) = setup().await else {
 		return;
 	};
 	let (sub, break_glass) = admin(&users).await;
