@@ -145,10 +145,20 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   layers are placeholders to grow into. Health returns `"ok"`.
 - **KYC has exactly one writer**: the `User` aggregate's `set_kyc_level` and the
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
-  banking's mirror). Two ENTRY POINTS reach it, and they differ only in what they
-  are allowed to decide. `users.set_kyc_level` is unconditional in DIRECTION and belongs
-  to the human path (`Permission::KycManage`), because a human is precisely who may move
-  a level DOWN. It is NOT unconditional in RANGE: the aggregate refuses anything above
+  banking's mirror). Two ENTRY POINTS reach it, and they differ in what they
+  are allowed to decide and over whom. `users.set_kyc_level` is unconditional in
+  DIRECTION and belongs to the human path (`Permission::KycManage`), because a human is
+  precisely who may move a level DOWN. It is NOT unconditional in TARGET: nobody sets
+  their own level, the same rule `HoldUser` carries below, and for the same reason —
+  `KycManage` is held by `Admin` as well as `Owner`, and tier 1 is the floor for
+  withdrawals on the MONEY plane, where an operator holds no permissions at all (#47).
+  The refusal is `PERMISSION_DENIED`, not the hold's `FAILED_PRECONDITION`: this one is
+  not a state that could change, and banking's cabinet BFF relays the message under a
+  403. It is checked BEFORE the range, so "level 4 on myself" is denied rather than
+  called out of range — an operator must not learn which rule they tripped by picking a
+  legal number. The verification front door stops at `PROVIDER_MAX_TIER`, so an
+  operator's own account reaches tier 1 by itself and no further; tiers 2-3 and every
+  downgrade of it need a second seated holder. It is NOT unconditional in RANGE: the aggregate refuses anything above
   `domain::users::MAX_KYC_LEVEL` (3), and the `users_kyc_level_range` CHECK refuses it
   again at the column — the range belongs to the record, not to the one handler that
   happened to check it. `user_outbox.kyc_level` carries the same CHECK, `NOT VALID` on
@@ -163,7 +173,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   public, HMAC over the raw body, 300s replay window) lands in that same aggregate
   call, so banking never learns a vendor exists. A provider may only RAISE a level and
   never past `PROVIDER_MAX_TIER`; every tier above it and every downgrade are human
-  decisions under `Permission::KycManage`. The identity a callback acts on comes from the
+  decisions under `Permission::KycManage` — somebody else's, when the account is the
+  operator's own. The identity a callback acts on comes from the
   stored `kyc_cases` row, NEVER from the request body; the body's echoed `vendor_data` is
   a CROSS-CHECK against that row and is decided inside the recording transaction, because
   a refusal reached after the commit is not a refusal — it used to answer 400 over a row
@@ -233,6 +244,31 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   vendor's retry is the only thing that ever revisits a decided case, and answering
   200 to it makes that split state permanent. Re-applying is free: the monotonic
   writer compares under the row lock and emits nothing when the level is already held.
+- **A terminal verdict reaches the person it is about, and a CONTRADICTING one reaches
+  a human who can act.** Not moving the level was always right — a downgrade is a human
+  act under `KycManage` and a vendor must never take a level away — but telling nobody
+  was not: a declined or lapsed verification existed only as a row in a table nobody
+  watches, so "a human decides" meant "nobody decides" (#49). The user is told over
+  `account:verification`, which they may switch off; the owners' copy is operational and
+  goes through the governance queue, which has no unsubscribe target, no link and no
+  code — nobody lowers a level from a mailbox.
+  **What counts as a contradiction is narrow on purpose**, because a mail that cries wolf
+  costs exactly the signal it exists to carry. Only `declined` and `kyc_expired` qualify
+  (an abandoned session says a tab was closed, not that an identity is in doubt);
+  `held_duplicate` does not qualify and could not be made to by listing it — the twin is a
+  SECOND account, so the level the hold refused to grant was never held and the comparison
+  below returns, and `kyc_verdict_alert`'s copy offers to lower a level there is none of.
+  Its operator is reached instead by `record_decision`'s `error!` → Sentry, at the instant
+  the hold is written; mailing the owners about one is a separate kind with its own copy
+  and its own `notification_deliveries.kind` migration. The
+  comparison is against what the case would GRANT — `KycStatus::grants_tier`, capped at
+  `PROVIDER_MAX_TIER` — and never against `requested_tier`, or the legacy rows asking for
+  2 that `0014` deliberately leaves standing could never contradict anything; and a level
+  another still-`approved` case covers is not a contradiction at all, because verified
+  twice and then told the first session lapsed is routine. The page (`error!` → Sentry)
+  is raised only on the FIRST delivery: the mail is deduplicated per case, per verdict
+  and per owner, and Didit retries at roughly one and four minutes, so paging on every
+  delivery would turn one contradiction into three incidents.
 - **Verdicts are ordered by the SIGNED timestamp, never by arrival.** Didit retries at
   ~1 min and ~4 min, so a superseded `in_review` landing after the `approved` that
   replaced it is routine. `kyc_cases.event_at` holds the signed instant of the stored
@@ -251,11 +287,90 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   min), which is what resolves the webhook-overtakes-the-insert race. Do not "fix" it to
   200. The handler must answer inside 5s, so nothing on that path may wait on a network
   hop.
+- **One document, one account -- detected, never refused.** Nothing linked two accounts
+  verified by the same physical person, and by construction nothing could (#51): the
+  `kyc_cases.payload` allowlist stores document type, issuing country and check outcomes,
+  and identifying fields reach the database in no form at all. The scenario needs no
+  forgery -- one person registers N accounts through Google OAuth and honestly verifies
+  each with their own real passport, so liveness and face-match pass and every account
+  reaches level >= 1. `kyc_cases.identity_digest` is the one cross-account handle this
+  plane holds: `HMAC-SHA256(KYC_IDENTITY_PEPPER, issuing_state || ':' || document_number)`,
+  computed in `didit::identity_digest_of` beside `metadata_of` -- the one scope a document
+  number is ever visible in -- and dropped with the payload at the end of it. HMAC and not
+  a bare hash because a document number is low-entropy and enumerable; the issuing state
+  is part of the message because "AB123456" is not the same person in two countries. The
+  discipline 0010 states is unchanged, and the test asserting `document_number` never
+  appears in `payload` still holds -- this is a COLUMN precisely so it does not become one
+  more key in a blob whose rule is "copy nothing unless named". `record_decision` asks,
+  inside the transaction holding the case and BEFORE the status that would grant a level
+  is written, whether that digest has already bought a DIFFERENT user a level. Two facts
+  OR-ed, and both are load-bearing: a recorded `approved` case, because the level itself is
+  written by a LATER transaction (`apply` -> `raise_kyc_level_to`) and a level-only question
+  would miss the twin for exactly as long as that gap lasts -- a gap that is permanent
+  whenever `apply` fails between the two writes; and `kyc_level >= 1`, because `approved` ->
+  `kyc_expired` and `approved` -> `declined` are routine vendor events that leave the level
+  standing. The lookup is serialised per digest with `pg_advisory_xact_lock`: the case row
+  lock covers one case, and two verdicts on the same document would otherwise not see each
+  other. A unique index would be the shorter answer and is not available -- the same person
+  re-verifying their own account legitimately produces a second approved row with the same
+  digest, and no index predicate can tell that from a second account. On a hit the verdict
+  is recorded as `held_duplicate`, no level moves, and an `error!` (-> Sentry) puts it in
+  front of an operator. NOT a refusal: the honest
+  explanations are real -- a lost account remade, a shared device, a family -- and an
+  automatic rejection would lock those people out with no recourse and no human involved.
+  The hold is a DECIDED status on purpose: this plane has no RPC that closes a case, so a
+  running one would pin `/kyc/start` to the spent vendor session for ever. Decided, the
+  user may start a fresh attempt, and the operator's move is `SetKycLevel` once they have
+  looked. `KYC_IDENTITY_PEPPER` is OPTIONAL and never `required_in("production")`: absent
+  it no digest is computed and the check is skipped, which is where this plane stood before
+  the column existed, and a detection whose absence refuses to boot would take sign-in down
+  for everybody to close a hole that was already open. Because nothing else can notice that
+  state -- it is in no preflight -- the boot logs it once at `error!` when a vendor is
+  configured and the pepper is missing or too short to be a key (under 32 characters is
+  refused, not used). The secret still has to be provisioned in `rpi5.nix` (`scopes.nix`
+  platform tier, the concierge env map, `secrets/platform.json`) or the detection is off in
+  production. Rotating the pepper invalidates every stored digest, and cases decided before
+  the pepper was set keep a NULL one for ever -- there is no backfill, because the document
+  number they would be computed from was never stored.
 - **Vendor status words are copied, never retyped.** The match is case-sensitive, so a
   near-miss does not fail loudly — the arm just never fires. `"Kyc Expired"` spent a
   while here as `"KYC Expired"`, silently unclassifiable. An unknown word is answered
   200-and-ignored (a growing vocabulary must not break the endpoint) with an `error!` so
   a human adds the arm.
+- **Every `/kyc/start` refusal is JSON with one `error` code, and the redirect is
+  checked here.** The route used to answer FOUR body formats — JSON for 503, bare plain
+  text for 401, 403 and 429 — so the cabinet classified refusals by status code and by
+  probing for an ABSENT body (`403` with no code meant "stale token, reload"; `403` with
+  one meant "failed"), which is a client reading tea leaves about which half of a refusal
+  it is in (banking#193). One format now, one key, one closed vocabulary:
+  `unauthenticated` · `csrf` · `throttled` · `internal`, plus the pre-existing
+  `kyc_unavailable`, which keeps its second `contact` field and is the only one that has
+  one. `unauthenticated` has to stay REACHABLE: the CSRF check still runs before any
+  session state is touched, but it answers "nobody is signed in" for an absent or lapsed
+  session and keeps `csrf` for a signed-in caller whose token does not match — collapsing
+  the two made `csrf` the only refusal a signed-out caller could get and left the code
+  the cabinet keys "sign in again" off unreachable. ⚠️ THIS IS A WIRE BREAK: the deployed
+  cabinet renders an unknown code verbatim and keys "reload the page" off a bodyless 403,
+  so the banking half (its zod schema in `features/kyc` plus `throttled`/`internal` in
+  `shared/lib/api-client.ts`) ships FIRST. Deploy order is a condition of correctness
+  here, not a detail.
+  **The redirect is decided on this side.** The cabinet can only check
+  `protocol === "https:"` — it is browser code, the allowlist would be shipped to the
+  attacker — and any `https:` URL sends a user off the cabinet on a click this plane
+  vouched for. `/kyc/start` refuses a `redirect_url` whose ORIGIN is not one the mounted
+  adapter declares (`KycProvider::session_origins`), and answers it as the same 503 a
+  vendor outage produces. Origins and not hosts, so a port and a `user@host` prefix are
+  settled by the same comparison. The adapter is asked rather than the configuration read
+  beside it, because the two are one fact and Didit is why: `DIDIT_BASE_URL` is the API
+  host (`verification.didit.me`) while session pages are served from `verify.didit.me`,
+  so the obvious derivation refuses every real start and takes verification down for
+  everyone, arriving as silence. An adapter that declares NOTHING refuses everything and
+  the boot refuses to mount it — the shape this must never take is degrading to "any
+  `https:` will do", which is indistinguishable from working. The check runs on the
+  stored URL too, in the live-case reuse branch: rows outlive the check, a rolling deploy
+  writes them from the old binary by design (`0012`), and a case lives until a verdict.
+  `GET /kyc/status` computes `resumable` with the same predicate so the cabinet never
+  offers Continue for a link `/kyc/start` will not hand over.
 - **A user never meets a vendor failure.** `/kyc/start` collapses "no vendor configured"
   and "vendor would not open a session" (balance, quota, outage, timeout, nonsense) into
   one 503 with one stable body — `{"error":"kyc_unavailable","contact":"<SUPPORT_EMAIL>"}`
@@ -341,11 +456,17 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
+- A DB-backed suite takes its URL from `common::database_url()`, never from
+  `std::env::var("DATABASE_URL")` directly. Without `DATABASE_URL` a suite skips
+  and still reports "N passed" — libtest prints nothing for a passing test — so
+  the count alone never says whether anything ran. That helper panics when `CI`
+  is set, and prints a SKIPPED line a local `cargo test -- --nocapture` shows.
+  Quote per-suite counts AND wall time when a PR offers a run as evidence.
 - **A migration's `lock_timeout` is `SET LOCAL`, never `SET`.** sqlx runs each migration
   inside its own transaction on a connection borrowed from the service's pool and hands
   that connection back afterwards, so a plain `SET` outlives the migration: the next
   request served on that connection inherits a 3s ceiling on every row lock it waits
-  for. `0011`–`0019` predate this rule and stay as they are — sqlx checksums an applied
+  for. `0011`–`0021` predate this rule and stay as they are — sqlx checksums an applied
   migration at every boot, so editing one turns the next deploy into a refusal to start.
 - No extra deps, abstraction layers, or unasked-for features.
 - No comments explaining _what_; only _why_ if non-obvious.

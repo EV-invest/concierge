@@ -28,6 +28,21 @@ pub const PROVIDER: &str = "didit";
 /// rather than tight.
 const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Where Didit serves the applicant-facing session page from.
+///
+/// NOT the API host. `DIDIT_BASE_URL` defaults to `https://verification.didit.me` and is
+/// where `POST /v3/session/` goes; the `url` that call answers with is on
+/// `verify.didit.me` (vendor docs, Create Session). Deriving the expected redirect host
+/// from the API base — which is what this adapter did first — refuses EVERY real start
+/// and takes verification down for everyone, arriving as silence.
+///
+/// A constant rather than an env var because it is a fact about the vendor, like the
+/// `/v3/session/` path beside it, and a knob here is one more value to carry through the
+/// deploy chain for a decision nobody is in a position to make at 3am. A sandbox or
+/// self-hosted base URL is covered by [`DiditKyc::session_origins`] admitting the API
+/// origin alongside it.
+const SESSION_ORIGIN: &str = "https://verify.didit.me";
+
 /// Everything the adapter needs from the environment, resolved once at boot.
 pub struct DiditConfig {
 	pub base_url: String,
@@ -37,6 +52,9 @@ pub struct DiditConfig {
 	/// Where Didit sends the BROWSER once the flow ends. A public, user-facing page —
 	/// never the webhook path, which answers POST only.
 	pub return_url: String,
+	/// HMAC key for [`identity_digest_of`]. `None` ⇒ no digest is computed and the
+	/// duplicate-person check is skipped; verification itself is unaffected.
+	pub identity_pepper: Option<String>,
 }
 
 pub struct DiditKyc {
@@ -67,6 +85,23 @@ struct SessionResponse {
 impl KycProvider for DiditKyc {
 	fn name(&self) -> &'static str {
 		PROVIDER
+	}
+
+	/// Two, and the second is not redundant.
+	///
+	/// [`SESSION_ORIGIN`] is where the vendor actually serves session pages. The origin
+	/// of `DIDIT_BASE_URL` is admitted beside it so that a sandbox, a staging tenant or
+	/// a self-hosted base keeps working without an edit here — it is still an origin an
+	/// operator deliberately pointed this adapter at, which is the whole property being
+	/// checked. It is admitted only when it is `https`: a base URL over plain http is a
+	/// misconfiguration, and inheriting it here would let the redirect check pass
+	/// something a browser must not be sent to.
+	fn session_origins(&self) -> Vec<String> {
+		let mut origins = vec![SESSION_ORIGIN.to_string()];
+		if let Some(origin) = super::origin_of(&self.config.base_url).filter(|o| o.starts_with("https://") && o != SESSION_ORIGIN) {
+			origins.push(origin);
+		}
+		origins
 	}
 
 	/// `POST /v3/session/`. `vendor_data` carries the CASE id and nothing else: the
@@ -115,7 +150,7 @@ impl KycProvider for DiditKyc {
 	}
 
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
-		parse_webhook(&self.config.webhook_secret, headers, body, now)
+		parse_webhook(&self.config.webhook_secret, self.config.identity_pepper.as_deref(), headers, body, now)
 	}
 }
 
@@ -123,7 +158,7 @@ impl KycProvider for DiditKyc {
 ///
 /// Shared with the stub adapter so the local and CI flow exercises this exact
 /// verification rather than a bypass around it.
-pub(super) fn parse_webhook(secret: &str, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
+pub(super) fn parse_webhook(secret: &str, identity_pepper: Option<&str>, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
 	verify_signature(secret, headers, body)?;
 
 	// The transport timestamp first, per Didit's documented replay guidance...
@@ -157,11 +192,16 @@ pub(super) fn parse_webhook(secret: &str, headers: &CallbackHeaders, body: &[u8]
 	let status = status_from_didit(&payload.status)?;
 
 	let metadata = metadata_of(&payload);
+	// Computed HERE, in the one function the document number is ever visible to, and
+	// dropped again with `payload` at the end of this scope. Nothing downstream is handed
+	// the number: the digest is what leaves this function.
+	let identity_digest = identity_pepper.and_then(|pepper| identity_digest_of(&payload, pepper));
 	Ok(KycDecision {
 		provider_ref: payload.session_id,
 		status,
 		vendor_data: payload.vendor_data.unwrap_or_default(),
 		metadata,
+		identity_digest,
 		signed_at,
 	})
 }
@@ -395,11 +435,125 @@ fn metadata_of(payload: &Webhook) -> Value {
 	Value::Object(out)
 }
 
+/// `HMAC-SHA256(pepper, issuing_state || ':' || document_number)`, hex, or `None`.
+///
+/// The SIBLING of [`metadata_of`] and written beside it on purpose: this is the one place
+/// a document number is in scope, and both functions exist to make sure it leaves in a
+/// shape we chose rather than one the vendor did.
+///
+/// HMAC and not a bare hash. A document number is low-entropy and structured — a
+/// national id space is enumerable — so `sha256(number)` is a rainbow table, not a
+/// protection. The key turns it into a value that means nothing without a secret this
+/// database never sees.
+///
+/// The issuing state is part of the message rather than a second column, because
+/// "AB123456" is not the same person in two countries and a digest that conflated them
+/// would route an innocent applicant to manual review on a collision.
+///
+/// `None` when either half is missing: a verdict with no document number is not evidence
+/// about an identity, and an empty string hashed under the key would make every such case
+/// a duplicate of every other.
+///
+/// BOTH HALVES ARE CANONICALISED FIRST, and that is the difference between a detection and
+/// a detection that is quietly off. The digest only ever links two deliveries that reduce
+/// to the same message, so any variation the vendor is free to make in how it renders the
+/// same document is a variation that silently unlinks them.
+fn identity_digest_of(payload: &Webhook, pepper: &str) -> Option<String> {
+	let kyc = payload.decision.as_ref()?.get("kyc")?;
+
+	// `issuing_state` ONLY, with no fallback to `issuing_state_name` — deliberately unlike
+	// `metadata_of` one screen up, which does fall back and is right to. There the value is
+	// a label in the payload, and "Portugal" where another delivery said "PRT" costs a
+	// reader nothing. HERE it is half the HMAC message, so the two spellings are two
+	// different key spaces: the same passport delivered once with the code and once with
+	// only the spelled-out name (the repository's own note says some workflows fill only
+	// the name) would produce two digests that match nothing. No digest at all is the
+	// honest outcome — detection degrades exactly where the vendor left the field empty,
+	// instead of appearing to work everywhere and failing on the pairs that matter.
+	let state = kyc.get("issuing_state").and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty())?;
+
+	// The number is read off a scan, and the same passport reaches us as "AB 123456",
+	// "AB-123456" or "ab123456" depending on the document type and how it was recognised.
+	// Separators are dropped and the rest is upper-cased so the message depends on the
+	// document rather than on this particular rendering of it. Non-ASCII letters are KEPT
+	// — dropping them would fold two different national numbers onto one message and hold
+	// an innocent applicant on the collision.
+	let number: String = kyc
+		.get("document_number")
+		.and_then(Value::as_str)?
+		.chars()
+		.filter(|c| c.is_alphanumeric())
+		.collect::<String>()
+		.to_uppercase();
+	if number.is_empty() {
+		return None;
+	}
+
+	let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(pepper.as_bytes()).ok()?;
+	// Upper-cased so a vendor that changes its casing between workflows does not silently
+	// stop matching its own earlier verdicts — a detection that quietly turns itself off
+	// is worse than one that was never switched on.
+	mac.update(state.to_uppercase().as_bytes());
+	mac.update(b":");
+	mac.update(number.as_bytes());
+	Some(hex_lower(&mac.finalize().into_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	const SECRET: &str = "webhook-secret";
+
+	fn adapter(base_url: &str) -> DiditKyc {
+		DiditKyc::new(DiditConfig {
+			base_url: base_url.to_string(),
+			api_key: "k".to_string(),
+			workflow_id: "w".to_string(),
+			webhook_secret: SECRET.to_string(),
+			return_url: "https://evinvest.test/cabinet".to_string(),
+			// The tests reached through this helper are about session origins, which the
+			// pepper has no part in; the digest has its own tests that set one.
+			identity_pepper: None,
+		})
+	}
+
+	/// The one that was wrong, and wrong in the direction that takes verification down
+	/// for everybody.
+	///
+	/// `DIDIT_BASE_URL` defaults to the API host, `verification.didit.me`, and the session
+	/// URL that API answers with is on `verify.didit.me`. Deriving the expected redirect
+	/// from the base URL alone therefore refuses EVERY real start — a 503 per user,
+	/// arriving as silence. Nothing in the integration suite can catch that: it runs the
+	/// stub, whose two hosts happen to be the same one.
+	#[test]
+	fn the_live_adapter_expects_the_session_host_and_not_the_api_host() {
+		let origins = adapter("https://verification.didit.me").session_origins();
+		assert!(origins.contains(&"https://verify.didit.me".to_string()), "the host Didit serves session pages from: {origins:?}");
+		assert!(
+			origins.contains(&"https://verification.didit.me".to_string()),
+			"and the API origin it was pointed at: {origins:?}"
+		);
+	}
+
+	/// A sandbox or self-hosted base keeps working without an edit here — it is still an
+	/// origin an operator deliberately configured.
+	#[test]
+	fn a_configured_base_url_is_admitted_beside_the_vendor_default() {
+		assert_eq!(
+			adapter("https://sandbox.didit.example/api/").session_origins(),
+			vec!["https://verify.didit.me".to_string(), "https://sandbox.didit.example".to_string()]
+		);
+	}
+
+	/// A base URL over plain http is a misconfiguration; inheriting it would let the
+	/// redirect check pass something a browser must not be sent to.
+	#[test]
+	fn a_plaintext_or_unparsable_base_url_adds_nothing() {
+		for base in ["http://verification.didit.me", "verification.didit.me", "", "not a url"] {
+			assert_eq!(adapter(base).session_origins(), vec!["https://verify.didit.me".to_string()], "base: {base}");
+		}
+	}
 
 	/// The RAW-signature form: `X-Signature` only, no V2 at all. Every pre-existing test
 	/// keeps running through it, so the fallback path stays covered.
@@ -440,7 +594,7 @@ mod tests {
 	fn a_correctly_signed_delivery_parses() {
 		let now = 1_800_000_000;
 		let raw = body("Approved", now);
-		let decision = parse_webhook(SECRET, &headers(&raw, now), &raw, now).expect("accepted");
+		let decision = parse_webhook(SECRET, None, &headers(&raw, now), &raw, now).expect("accepted");
 		assert_eq!(decision.provider_ref, "sess-1");
 		assert_eq!(decision.status, KycStatus::Approved);
 		assert_eq!(decision.vendor_data, "case-1");
@@ -455,9 +609,9 @@ mod tests {
 		let mut tampered = raw.clone();
 		let last = tampered.len() - 1;
 		tampered[last] = b' ';
-		assert!(matches!(parse_webhook(SECRET, &signed, &tampered, now), Err(KycCallbackError::BadSignature)));
+		assert!(matches!(parse_webhook(SECRET, None, &signed, &tampered, now), Err(KycCallbackError::BadSignature)));
 		// And the same body under the wrong secret.
-		assert!(matches!(parse_webhook("other-secret", &signed, &raw, now), Err(KycCallbackError::BadSignature)));
+		assert!(matches!(parse_webhook("other-secret", None, &signed, &raw, now), Err(KycCallbackError::BadSignature)));
 	}
 
 	#[test]
@@ -466,7 +620,7 @@ mod tests {
 		let raw = body("Approved", sent);
 		let signed = headers(&raw, sent);
 		let later = sent + KYC_CALLBACK_WINDOW_SECS + 1;
-		assert!(matches!(parse_webhook(SECRET, &signed, &raw, later), Err(KycCallbackError::StaleTimestamp)));
+		assert!(matches!(parse_webhook(SECRET, None, &signed, &raw, later), Err(KycCallbackError::StaleTimestamp)));
 
 		// Re-stamping `X-Timestamp` does not rescue it: the body's own timestamp is the
 		// one the signature covers, and it is what puts this delivery out of the window.
@@ -475,7 +629,7 @@ mod tests {
 			signature_v2: None,
 			timestamp: Some(later),
 		};
-		assert!(matches!(parse_webhook(SECRET, &restamped, &raw, later), Err(KycCallbackError::StaleTimestamp)));
+		assert!(matches!(parse_webhook(SECRET, None, &restamped, &raw, later), Err(KycCallbackError::StaleTimestamp)));
 	}
 
 	#[test]
@@ -500,7 +654,7 @@ mod tests {
 			("Kyc Expired", KycStatus::KycExpired),
 		] {
 			let raw = body(raw_status, now);
-			let decision = parse_webhook(SECRET, &headers(&raw, now), &raw, now).expect(raw_status);
+			let decision = parse_webhook(SECRET, None, &headers(&raw, now), &raw, now).expect(raw_status);
 			assert_eq!(decision.status, expected, "{raw_status}");
 		}
 
@@ -511,7 +665,7 @@ mod tests {
 		for unknown in ["approved", "Auto Approved", ""] {
 			let raw = body(unknown, now);
 			assert!(
-				matches!(parse_webhook(SECRET, &headers(&raw, now), &raw, now), Err(KycCallbackError::UnknownStatus(_))),
+				matches!(parse_webhook(SECRET, None, &headers(&raw, now), &raw, now), Err(KycCallbackError::UnknownStatus(_))),
 				"{unknown:?}"
 			);
 		}
@@ -535,7 +689,7 @@ mod tests {
 		let raw = body("Approved", now);
 		let repacked = canonical_v2(&raw).expect("json").into_bytes();
 
-		let decision = parse_webhook(SECRET, &headers_v2_only(&repacked, now), &repacked, now).expect("V2 alone authenticates the delivery");
+		let decision = parse_webhook(SECRET, None, &headers_v2_only(&repacked, now), &repacked, now).expect("V2 alone authenticates the delivery");
 		assert_eq!(decision.status, KycStatus::Approved);
 	}
 
@@ -551,7 +705,7 @@ mod tests {
 			signature_v2: None,
 			timestamp: Some(now),
 		};
-		assert!(parse_webhook(SECRET, &only_raw, &raw, now).is_ok());
+		assert!(parse_webhook(SECRET, None, &only_raw, &raw, now).is_ok());
 
 		// A V2 header that does not check out must not veto a good raw one.
 		let bad_v2 = CallbackHeaders {
@@ -559,7 +713,7 @@ mod tests {
 			signature_v2: Some("00".repeat(32)),
 			timestamp: Some(now),
 		};
-		assert!(parse_webhook(SECRET, &bad_v2, &raw, now).is_ok());
+		assert!(parse_webhook(SECRET, None, &bad_v2, &raw, now).is_ok());
 	}
 
 	/// Two wrong signatures are still a rejection: accepting either does not mean
@@ -574,14 +728,14 @@ mod tests {
 			signature_v2: sign_body_v2("not-the-secret", &raw),
 			timestamp: Some(now),
 		};
-		assert!(matches!(parse_webhook(SECRET, &forged, &raw, now), Err(KycCallbackError::BadSignature)));
+		assert!(matches!(parse_webhook(SECRET, None, &forged, &raw, now), Err(KycCallbackError::BadSignature)));
 
 		let absent = CallbackHeaders {
 			signature: None,
 			signature_v2: None,
 			timestamp: Some(now),
 		};
-		assert!(matches!(parse_webhook(SECRET, &absent, &raw, now), Err(KycCallbackError::BadSignature)));
+		assert!(matches!(parse_webhook(SECRET, None, &absent, &raw, now), Err(KycCallbackError::BadSignature)));
 	}
 
 	/// Canonicalisation, field by field, against the string JavaScript would have
@@ -621,7 +775,7 @@ mod tests {
 		}))
 		.unwrap();
 
-		let decision = parse_webhook(SECRET, &headers_v2_only(&raw, now), &raw, now).expect("a whole float must not break V2");
+		let decision = parse_webhook(SECRET, None, &headers_v2_only(&raw, now), &raw, now).expect("a whole float must not break V2");
 		assert_eq!(decision.status, KycStatus::Approved);
 	}
 
@@ -629,13 +783,145 @@ mod tests {
 	fn the_payload_keeps_metadata_and_drops_the_document() {
 		let now = 1_800_000_000;
 		let raw = body("Approved", now);
-		let decision = parse_webhook(SECRET, &headers(&raw, now), &raw, now).expect("accepted");
+		let decision = parse_webhook(SECRET, None, &headers(&raw, now), &raw, now).expect("accepted");
 		let stored = serde_json::to_string(&decision.metadata).unwrap();
 		assert!(!stored.contains("X1234567"), "a document number must never reach the database: {stored}");
 		assert!(!stored.contains("document_number"), "the allowlist copies fields, it does not redact them: {stored}");
 		assert_eq!(decision.metadata["document_type"], "Passport");
 		assert_eq!(decision.metadata["document_country"], "PRT");
 		assert_eq!(decision.metadata["checks"]["face_match"], "Approved");
+	}
+
+	/// The digest is a FINGERPRINT, and a fingerprint that leaks what it is a fingerprint
+	/// OF is just the thing itself with extra steps.
+	#[test]
+	fn the_identity_digest_carries_no_document_number() {
+		let now = 1_800_000_000;
+		let raw = body("Approved", now);
+		let decision = parse_webhook(SECRET, Some("pepper"), &headers(&raw, now), &raw, now).expect("accepted");
+
+		let digest = decision.identity_digest.expect("a verdict naming a document gets a digest");
+		assert_eq!(digest.len(), 64, "hex SHA-256");
+		assert!(!digest.contains("X1234567"), "the number must not survive the hash: {digest}");
+		// And the payload allowlist is untouched by any of this.
+		let stored = serde_json::to_string(&decision.metadata).unwrap();
+		assert!(!stored.contains("X1234567"));
+		assert!(!stored.contains(&digest), "the digest has a column; it is not another key in the blob");
+	}
+
+	/// The same document, same person, twice — the case the column exists to catch.
+	#[test]
+	fn the_same_document_digests_the_same_and_a_different_one_does_not() {
+		let now = 1_800_000_000;
+		let raw = body("Approved", now);
+		let first = parse_webhook(SECRET, Some("pepper"), &headers(&raw, now), &raw, now).unwrap().identity_digest;
+		let again = parse_webhook(SECRET, Some("pepper"), &headers(&raw, now), &raw, now).unwrap().identity_digest;
+		assert_eq!(first, again, "the same document must reach the same digest, or nothing is ever linked");
+
+		// A different pepper is a different keyspace: rotating it invalidates every stored
+		// digest, which is the documented cost of the property that makes it safe to store.
+		let rotated = parse_webhook(SECRET, Some("other-pepper"), &headers(&raw, now), &raw, now).unwrap().identity_digest;
+		assert_ne!(first, rotated);
+
+		// No pepper, no digest — and no failure either. Detection degrades; the verdict
+		// does not.
+		assert_eq!(parse_webhook(SECRET, None, &headers(&raw, now), &raw, now).unwrap().identity_digest, None);
+	}
+
+	/// The issuing state is part of the message, not decoration: `AB123456` is not the
+	/// same person in two countries, and conflating them would route an innocent applicant
+	/// to manual review on a collision.
+	#[test]
+	fn the_issuing_state_is_part_of_the_identity() {
+		let now = 1_800_000_000;
+		let same_number_elsewhere = serde_json::to_vec(&json!({
+			"timestamp": now,
+			"session_id": "sess-1",
+			"status": "Approved",
+			"vendor_data": "case-1",
+			"decision": { "kyc": { "status": "Approved", "document_type": "Passport", "issuing_state": "ESP", "document_number": "X1234567" } },
+		}))
+		.unwrap();
+
+		let portugal = parse_webhook(SECRET, Some("pepper"), &headers(&body("Approved", now), now), &body("Approved", now), now)
+			.unwrap()
+			.identity_digest;
+		let spain = parse_webhook(SECRET, Some("pepper"), &headers(&same_number_elsewhere, now), &same_number_elsewhere, now)
+			.unwrap()
+			.identity_digest;
+		assert_ne!(portugal, spain);
+	}
+
+	/// The same passport, rendered the way a different scan produced it, must reach the
+	/// same digest — or the detection is off for whoever happened to land on the other
+	/// rendering, with nothing anywhere to show for it.
+	#[test]
+	fn separators_and_casing_in_the_number_are_not_an_identity() {
+		let now = 1_800_000_000;
+		let digest = |number: &str| {
+			let raw = serde_json::to_vec(&json!({
+				"timestamp": now,
+				"session_id": "sess-1",
+				"status": "Approved",
+				"decision": { "kyc": { "status": "Approved", "issuing_state": "PRT", "document_number": number } },
+			}))
+			.unwrap();
+			parse_webhook(SECRET, Some("pepper"), &headers(&raw, now), &raw, now).unwrap().identity_digest
+		};
+
+		let canonical = digest("AB123456");
+		assert!(canonical.is_some());
+		assert_eq!(digest("ab 123456"), canonical);
+		assert_eq!(digest("AB-123456"), canonical);
+		// And a number that is only punctuation is no number at all.
+		assert_eq!(digest("- /"), None);
+	}
+
+	/// The COUNTRY CODE only — never the spelled-out name `metadata_of` falls back to.
+	///
+	/// Some workflows fill only `issuing_state_name`, so a fallback here would hash "PRT"
+	/// for one delivery and "PORTUGAL" for another: two key spaces, no match, and a
+	/// detection that is silently off for that pair. No digest is the honest answer.
+	#[test]
+	fn the_spelled_out_country_name_does_not_become_a_second_keyspace() {
+		let now = 1_800_000_000;
+		let raw = serde_json::to_vec(&json!({
+			"timestamp": now,
+			"session_id": "sess-1",
+			"status": "Approved",
+			"decision": { "kyc": { "status": "Approved", "issuing_state_name": "Portugal", "document_number": "X1234567" } },
+		}))
+		.unwrap();
+
+		let decision = parse_webhook(SECRET, Some("pepper"), &headers(&raw, now), &raw, now).expect("still a valid delivery");
+		assert_eq!(decision.identity_digest, None, "half a key space is worse than no digest");
+		// The payload label is unaffected: there the fallback costs a reader nothing.
+		assert_eq!(decision.metadata.get("document_country").and_then(Value::as_str), Some("Portugal"));
+	}
+
+	/// A verdict that names no document is not evidence about an identity.
+	///
+	/// Hashing an empty string under the key would make every such case a duplicate of
+	/// every other one, which turns the check from a detection into a machine for holding
+	/// innocent people at `in_review`.
+	#[test]
+	fn a_verdict_without_a_document_gets_no_digest() {
+		let now = 1_800_000_000;
+		for kyc in [
+			json!({ "status": "Approved" }),
+			json!({ "status": "Approved", "issuing_state": "PRT" }),
+			json!({ "status": "Approved", "document_number": "  " }),
+		] {
+			let raw = serde_json::to_vec(&json!({
+				"timestamp": now,
+				"session_id": "sess-1",
+				"status": "Approved",
+				"decision": { "kyc": kyc },
+			}))
+			.unwrap();
+			let decision = parse_webhook(SECRET, Some("pepper"), &headers(&raw, now), &raw, now).expect("still a valid delivery");
+			assert_eq!(decision.identity_digest, None, "half a document is not an identity");
+		}
 	}
 
 	/// RFC 4231 test case 2 — proof the HMAC under the signature check is the standard

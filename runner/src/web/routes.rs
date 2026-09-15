@@ -136,6 +136,11 @@ pub async fn callback(State(st): State<WebState>, jar: CookieJar, headers: Heade
 }
 /// `GET /auth/session` — who-am-I for the browser, refreshing the access token (and
 /// its zone-shared cookie) transparently. Never returns a token in the body.
+///
+/// The `user` block (role, `isAdmin`, status) is read LIVE from the directory on every
+/// call, not served from the login-time copy in the session: a role granted from the
+/// console is visible on the next page load, with no wait for the refresh rotation
+/// and no re-login. Only when the directory is down does the stored copy answer.
 pub async fn session(State(st): State<WebState>, jar: CookieJar) -> Result<(CookieJar, Json<SessionInfo>), (StatusCode, &'static str)> {
 	let st = &st.inner;
 	let fresh = match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
@@ -275,18 +280,53 @@ async fn refresh_of(st: &super::Inner, jar: &CookieJar) -> Result<Option<String>
 /// against the cookie and the SERVER-SIDE copy, and the whole check runs BEFORE the
 /// session is read, so a request that fails it never touches session state.
 pub(super) async fn verify_csrf(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<bool, (StatusCode, &'static str)> {
+	Ok(matches!(csrf_outcome(st, jar, headers).await?, CsrfOutcome::Ok))
+}
+
+/// Why the double-submit check did not pass — for the routes that answer the two causes
+/// differently.
+///
+/// Every refusal here used to be one 403. That reads as "your token is stale, reload the
+/// page", and for a caller who is not signed in AT ALL it is simply wrong: they have no
+/// CSRF cookie because they have no session, so the check they failed is not the one
+/// they need told about. The cabinet keys its "reload" screen off that 403 and would
+/// send somebody whose session expired to reload a page that will expire again.
+pub(super) enum CsrfOutcome {
+	Ok,
+	/// There is nobody signed in to check a token against: no session cookie, or a
+	/// session the locker no longer holds (expired, revoked, signed out elsewhere).
+	NoSession,
+	/// Somebody IS signed in and the token does not match — the genuine CSRF refusal,
+	/// and the one a reload actually fixes.
+	Mismatch,
+}
+
+/// The check itself. Ordering is the invariant, not an implementation detail: the
+/// header is matched against the readable cookie and the SERVER-SIDE copy, and the
+/// locker is not read until both of those have passed, so a request that fails the
+/// double-submit never touches session state. The session COOKIE is read before that —
+/// its presence is not session state, and it is what separates "not signed in" from
+/// "signed in with the wrong token" without looking anything up.
+pub(super) async fn csrf_outcome(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<CsrfOutcome, (StatusCode, &'static str)> {
+	let Some(session_id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) else {
+		return Ok(CsrfOutcome::NoSession);
+	};
 	let Some(cookie) = jar.get(&st.cookies.csrf).map(|c| c.value().to_string()) else {
-		return Ok(false);
+		return Ok(CsrfOutcome::Mismatch);
 	};
 	let Some(header) = headers.get("x-ev-csrf").and_then(|v| v.to_str().ok()) else {
-		return Ok(false);
+		return Ok(CsrfOutcome::Mismatch);
 	};
 	if !ct_str_eq(&cookie, header) {
-		return Ok(false);
+		return Ok(CsrfOutcome::Mismatch);
 	}
-	match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
-		Some(id) => Ok(st.sessions.csrf(&id).await.map_err(store_err)?.is_some_and(|stored| ct_str_eq(&stored, header))),
-		None => Ok(false),
+	match st.sessions.csrf(&session_id).await.map_err(store_err)? {
+		Some(stored) if ct_str_eq(&stored, header) => Ok(CsrfOutcome::Ok),
+		// The cookie names a session the locker does not hold: it lapsed, it was revoked,
+		// or the user signed out in another tab. Nobody is signed in, and saying so is
+		// what sends them to a sign-in rather than to a reload.
+		None => Ok(CsrfOutcome::NoSession),
+		Some(_) => Ok(CsrfOutcome::Mismatch),
 	}
 }
 

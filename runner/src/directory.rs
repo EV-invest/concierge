@@ -129,10 +129,18 @@ pub async fn run_provisioner(mut rx: mpsc::Receiver<ProvisionRequest>, users: Ar
 
 /// A hold the aggregate would not place. Its policy refusals — the account is already
 /// held, or was until recently, or holds a seat the actor may not touch — come back as
-/// `FAILED_PRECONDITION` rather than the
-/// `PERMISSION_DENIED` a `Forbidden` maps to by default, because the BFF folds
-/// `PERMISSION_DENIED` into an opaque 404 and the whole point of these messages is that
-/// the operator reads which proposal to open instead.
+/// `FAILED_PRECONDITION` rather than the `PERMISSION_DENIED` a `Forbidden` maps to by
+/// default, because they are not statements about the caller's authority: the same
+/// operator, asked again after the live hold lapses or after the owners have voted, gets
+/// through. `PERMISSION_DENIED` would say "not you, ever", and these messages exist to
+/// say "not yet, and here is the proposal to open".
+///
+/// This used to be argued from the console instead — that the BFF folded
+/// `PERMISSION_DENIED` into an opaque 404, so the message would be lost. It does not:
+/// banking's cabinet BFF lists `PermissionDenied` as client-safe and relays the message
+/// verbatim under a 403 (`cabinet/backend/src/error.rs`, pinned by its own test). The
+/// argument above does not depend on that, and [`UserDirectory::set_kyc_level`] relies
+/// on the relay being real.
 fn hold_refusal(err: DomainError) -> Status {
 	match err {
 		DomainError::Forbidden(why) => Status::failed_precondition(why),
@@ -291,12 +299,56 @@ impl UserDirectory for Directory {
 		}
 	}
 
+	/// The human path to a KYC level — the only one that may move it DOWN, and the only
+	/// one that reaches tier 3.
+	///
+	/// Refused on your own account. `KycManage` is held by `Admin` as well as `Owner`
+	/// (`domain::authz`), and tier 1 is the floor for withdrawals on the MONEY plane —
+	/// so without this an operator could lift their own money gate in a plane where they
+	/// hold no permissions at all, and nothing in either plane would show it as anything
+	/// but a routine verification (#47). The neighbouring verbs already read this way:
+	/// [`Self::hold_user`] refuses its own actor, and `SetRole` refuses both directions
+	/// of ownership, with `domain::authz` calling the matrix a separation of duties.
+	///
+	/// A `PermissionDenied` and not the `FailedPrecondition` the hold uses, because the
+	/// two refusals say different things. A hold on yourself is incoherent — it ends the
+	/// session you would need to lift it — and could be re-asked in another shape. This
+	/// one is a permission the caller does not have over this target and will not have;
+	/// another operator has it.
+	///
+	/// What this does NOT buy: a person who holds `KycManage` can still provision a second
+	/// account through the ordinary sign-in and verify THAT one by hand, which is the same
+	/// money gate reached one step sideways. Comparing two ids cannot see who controls an
+	/// account; #51 is where that is being answered, with a digest of the verified document
+	/// so two accounts cleared on one identity are detectable at all. This refusal closes
+	/// the direct route and is not a substitute for it.
+	///
+	/// Your OWN level still moves — through the front door every other user goes through,
+	/// `/kyc/start` with a document and a vendor — but only as far as that door reaches.
+	/// It ends at [`crate::ports::PROVIDER_MAX_TIER`], which is 1: tier 2 and 3 on your
+	/// own account, and any downgrade of it, are now another `KycManage` holder's to make.
+	/// That is the separation of duties being bought here, and it has a cost worth naming:
+	/// where exactly one operator is seated and `DIDIT_*` is unset — a combination
+	/// `main.rs` supports, and one in which both KYC routes answer 503 — that person has
+	/// no path to any level on their own account. Seating a second holder is the way out.
 	async fn set_kyc_level(&self, request: Request<SetKycLevelRequest>) -> Result<Response<SetKycLevelResponse>, Status> {
 		require_permission(self, &request, Permission::KycManage).await?;
 		let actor = self.acting_operator(&request).await?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
 		let target = parse_target_id(&req.user_id)?;
+		if target == actor {
+			// The only trace this attempt leaves. The refusal returns before any
+			// repository call, so — correctly — it writes no `admin_action` row; but an
+			// operator repeatedly reaching for their own money gate is exactly the signal
+			// a separation of duties is supposed to surface, and without this line it
+			// reaches neither the log nor Sentry.
+			tracing::warn!(actor = %actor, requested = req.kyc_level, "SetKycLevel refused: the caller targeted their own account");
+			return Err(Status::permission_denied(
+				"a KYC level cannot be set on your own account; another holder of KycManage sets it, or \
+				 verify through /kyc/start like any other user, which reaches tier 1",
+			));
+		}
 		// The aggregate and the `users_kyc_level_range` CHECK both refuse this too — the
 		// range is theirs, not this handler's. Rejecting here as well only saves the
 		// round trip to a row we already know we will not write.

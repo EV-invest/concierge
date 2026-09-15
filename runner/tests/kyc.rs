@@ -25,6 +25,7 @@ use axum::{
 use concierge::{
 	infrastructure::{
 		db,
+		governance::PgGovernance,
 		kyc::{
 			cases::PgKycCases,
 			didit::{sign_body, sign_body_v2},
@@ -33,7 +34,9 @@ use concierge::{
 		notifications::PgNotifications,
 		users::{AdminAction, PgUsers},
 	},
-	ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, KycStatus, UserDirectoryRepository},
+	ports::{
+		CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, KycStatus, NotificationRepository, UserDirectoryRepository,
+	},
 	web::{self, KycDeps, START_MAX_PER_WINDOW},
 };
 use domain::{
@@ -50,6 +53,14 @@ use uuid::Uuid;
 const SECRET: &str = "kyc-integration-secret";
 const PROVIDER: &str = "stub";
 const SUPPORT: &str = "support@evinvest.test";
+
+/// What the stub provider is built from — `CABINET_URL` in the composition root.
+const CABINET_URL: &str = "https://evinvest.test/cabinet";
+
+/// Its ORIGIN, which is what a redirect is judged against. Written out once here and
+/// never beside a double, so a test cannot accidentally hold a different opinion of
+/// where the fixture vendor lives than the fixture vendor does.
+const CABINET_ORIGIN: &str = "https://evinvest.test";
 
 /// The vendor's own words for an exhausted account. It must never reach a browser, so
 /// the tests below grep the response body for this exact string.
@@ -73,8 +84,43 @@ impl KycProvider for RefusingKyc {
 		Err(DomainError::Repository(format!("didit: session rejected with 402 Payment Required: {VENDOR_DETAIL}")))
 	}
 
+	fn session_origins(&self) -> Vec<String> {
+		vec![CABINET_ORIGIN.to_string()]
+	}
+
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
-		StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()).parse_callback(headers, body, now)
+		StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()).parse_callback(headers, body, now)
+	}
+}
+
+/// A configured, reachable vendor that answers with a session URL somewhere else.
+///
+/// The shape of a swapped vendor domain, a misconfigured base URL, or a provider whose
+/// account has been taken over: the call succeeds, so nothing upstream notices — the only
+/// thing that can is a check on the answer.
+struct RogueRedirectKyc(&'static str);
+
+#[async_trait]
+impl KycProvider for RogueRedirectKyc {
+	fn name(&self) -> &'static str {
+		PROVIDER
+	}
+
+	async fn start_session(&self, case_id: Uuid, _requested_tier: u32) -> Result<KycSession, DomainError> {
+		Ok(KycSession {
+			provider_ref: format!("stub-{case_id}"),
+			redirect_url: self.0.to_string(),
+		})
+	}
+
+	/// The origin an honest answer would carry — the point of this double is that its
+	/// answer does NOT.
+	fn session_origins(&self) -> Vec<String> {
+		vec![CABINET_ORIGIN.to_string()]
+	}
+
+	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
+		StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()).parse_callback(headers, body, now)
 	}
 }
 
@@ -91,7 +137,7 @@ struct CountingKyc {
 impl CountingKyc {
 	fn new(sessions: Arc<AtomicUsize>) -> Self {
 		Self {
-			inner: StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()),
+			inner: StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()),
 			sessions,
 		}
 	}
@@ -106,6 +152,10 @@ impl KycProvider for CountingKyc {
 	async fn start_session(&self, case_id: Uuid, requested_tier: u32) -> Result<KycSession, DomainError> {
 		self.sessions.fetch_add(1, Ordering::SeqCst);
 		self.inner.start_session(case_id, requested_tier).await
+	}
+
+	fn session_origins(&self) -> Vec<String> {
+		self.inner.session_origins()
 	}
 
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
@@ -153,6 +203,10 @@ impl KycProvider for GatedKyc {
 		session
 	}
 
+	fn session_origins(&self) -> Vec<String> {
+		self.inner.session_origins()
+	}
+
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
 		self.inner.parse_callback(headers, body, now)
 	}
@@ -167,22 +221,33 @@ struct Harness {
 	router: Router,
 	users: Arc<PgUsers>,
 	cases: Arc<PgKycCases>,
+	notifications: Arc<PgNotifications>,
 	pool: PgPool,
 }
 
 async fn setup() -> Option<Harness> {
-	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string())))).await
+	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), CABINET_URL.to_string())))).await
 }
 
 /// The same router with the vendor swapped out, so a test can drive the two ways
 /// verification becomes unavailable — absent, and present but refusing.
 async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+		// Every test in this file is gated on a real Postgres and RETURNS when there is
+		// none — which reads as PASSED. That is the right answer on a laptop and the wrong
+		// one anywhere that believes a green run means something: this suite is the only
+		// evidence the KYC gate works at all, and a run without a database proves nothing
+		// while looking exactly like a run that proved everything. Under `CI` the missing
+		// variable is the failure.
+		assert!(std::env::var_os("CI").is_none(), "DATABASE_URL must be set in CI — these tests silently pass without it");
+		return None;
+	};
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let cases = Arc::new(PgKycCases::new(pool.clone()));
+	let notifications = Arc::new(PgNotifications::new(pool.clone()));
 	let state = web::WebState::try_new(
 		AuthService::unconfigured(),
 		"https://evinvest.test".to_string(),
@@ -190,7 +255,8 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 		KycDeps {
 			users: users.clone(),
 			cases: cases.clone(),
-			notifications: Arc::new(PgNotifications::new(pool.clone())),
+			notifications: notifications.clone(),
+			governance: Arc::new(PgGovernance::new(pool.clone(), "https://evinvest.test/governance".to_string())),
 			provider,
 			support_email: SUPPORT.to_string(),
 		},
@@ -202,6 +268,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 		router: web::router(state),
 		users,
 		cases,
+		notifications,
 		pool,
 	})
 }
@@ -217,7 +284,7 @@ impl Harness {
 	async fn case(&self, user: UserId, tier: u32) -> (Uuid, String) {
 		let id = Uuid::new_v4();
 		let provider_ref = format!("stub-{id}");
-		let redirect_url = format!("https://evinvest.test/cabinet?kyc_session={provider_ref}");
+		let redirect_url = format!("{CABINET_URL}?kyc_session={provider_ref}");
 		self.cases.open_case(id, user, PROVIDER, &provider_ref, tier, &redirect_url).await.expect("open case");
 		(id, provider_ref)
 	}
@@ -302,6 +369,86 @@ impl Harness {
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
 		let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
 		(status, value)
+	}
+
+	/// A user who actually FOLLOWS verification news. `emit` writes nothing for someone
+	/// with no subscriber row — that is its contract, not a bug — so a test about what a
+	/// user is told has to say who is listening.
+	async fn subscribed(&self, user: UserId) -> UserId {
+		let sub = self.notifications.subscriber_for_user(user.raw(), "kyc@example.com", true).await.expect("subscriber");
+		self.notifications.set_topic_subscription(sub.id, "account:verification", true, true).await.expect("subscribe");
+		user
+	}
+
+	/// In-app notices of one kind this user has. The durable record is written whatever
+	/// the channel switches say, so this is what "the user was told" means here.
+	async fn notices(&self, user: UserId, kind: &str) -> i64 {
+		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.kind = $2")
+			.bind(user.raw())
+			.bind(kind)
+			.fetch_one(&self.pool)
+			.await
+			.expect("count notices")
+	}
+
+	/// A user holding an owner seat, with a verified address — the roster the verdict
+	/// alert is addressed to.
+	async fn owner(&self) -> (UserId, String) {
+		let email = format!("owner-{}@example.com", Uuid::new_v4());
+		let subject = AuthSubject::parse(&format!("kyc-owner-{}", Uuid::new_v4())).unwrap();
+		let id = self.users.provision(subject, Email::parse(&email).unwrap(), true).await.expect("provision").id();
+		self.reseat(id).await;
+		(id, email)
+	}
+
+	/// Seat an owner again.
+	///
+	/// For the ONE interference this suite cannot design away: `authz_gate`, `genesis`,
+	/// `governance` and `user_governance` each run `UPDATE users SET role = 'investor'
+	/// WHERE role = 'owner'` — documented in `tests/common/mod.rs`, and unavoidable
+	/// because ownership is decided GLOBALLY from `users.role`, so those suites cannot
+	/// scope themselves to their own fixtures. `cargo test` runs the binaries in parallel
+	/// against one `DATABASE_URL`, so a roster read here can land in that window and come
+	/// back without this test's owner. Scoping the assertions by `case_id` fixed the
+	/// other half of that family — one test's alert reaching another's owner — but not
+	/// this half.
+	async fn reseat(&self, owner: UserId) {
+		sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1")
+			.bind(owner.raw())
+			.execute(&self.pool)
+			.await
+			.expect("seat the owner");
+	}
+
+	async fn seated(&self, owner: UserId) -> bool {
+		sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
+			.bind(owner.raw())
+			.fetch_one(&self.pool)
+			.await
+			.expect("read the role")
+			== "owner"
+	}
+
+	/// Verdict alerts queued for ONE case, optionally narrowed to one recipient.
+	///
+	/// Scoped to the case because the owner roster is global: every test in this file
+	/// seats its own owner into the same table, so an alert raised by one test is
+	/// correctly mailed to every owner another test created. Counting by recipient alone
+	/// makes those tests fail each other; counting by case counts what the test did.
+	///
+	/// Counted in `notification_deliveries` rather than through the notification topic
+	/// because that is the point of the alert — the governance queue carries no
+	/// unsubscribe target, so its recipient cannot switch it off.
+	async fn alerts_for_case(&self, case_id: Uuid, recipient: Option<&str>) -> i64 {
+		sqlx::query_scalar::<_, i64>(
+			"SELECT count(*) FROM notification_deliveries \
+			 WHERE kind = 'kyc_verdict_alert' AND dedupe_key LIKE $1 AND ($2::text IS NULL OR recipient = $2)",
+		)
+		.bind(format!("kyc-contradiction:{case_id}:%"))
+		.bind(recipient)
+		.fetch_one(&self.pool)
+		.await
+		.expect("count verdict alerts")
 	}
 
 	async fn kyc_level(&self, user: UserId) -> u32 {
@@ -671,7 +818,13 @@ async fn the_webhook_needs_no_cookie_and_no_csrf_token() {
 /// `None` when Redis is absent: the in-process fallback is per-instance by design (see
 /// `web_sessions.rs`), so a session opened here would be invisible to the router.
 async fn signed_in(user: UserId) -> Option<(String, String)> {
-	signed_in_for(user, 900).await
+	signed_in_with(&user.to_string(), 900).await
+}
+
+/// The same, with the stored user id written verbatim — so a test can open a session the
+/// CSRF check accepts and the user lookup then cannot resolve.
+async fn signed_in_as(user_id: &str) -> Option<(String, String)> {
+	signed_in_with(user_id, 900).await
 }
 
 /// The same, with the access token's remaining lifetime chosen by the caller.
@@ -680,6 +833,10 @@ async fn signed_in(user: UserId) -> Option<(String, String)> {
 /// REFRESH path — the one that rotates the pair and saves it — which is the only way a
 /// test can observe whether a handler hands the new token back to the browser.
 async fn signed_in_for(user: UserId, access_ttl_secs: i64) -> Option<(String, String)> {
+	signed_in_with(&user.to_string(), access_ttl_secs).await
+}
+
+async fn signed_in_with(user_id: &str, access_ttl_secs: i64) -> Option<(String, String)> {
 	std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
 	let sessions = web::WebSessions::from_env().await.expect("session store");
 	let now_s = now();
@@ -690,7 +847,7 @@ async fn signed_in_for(user: UserId, access_ttl_secs: i64) -> Option<(String, St
 			refresh_token: "family.secret".into(),
 			refresh_expires_at: now_s + 3600,
 			user: Some(evconcierge_contracts::concierge::v1::UserSummary {
-				user_id: user.to_string(),
+				user_id: user_id.to_string(),
 				email: "kyc@example.com".into(),
 				status: "active".into(),
 				token_version: 0,
@@ -1306,6 +1463,7 @@ async fn a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery() {
 		status: KycStatus::Approved,
 		vendor_data: case_id.to_string(),
 		metadata: json!({}),
+		identity_digest: None,
 		signed_at: at,
 	};
 	h.cases.record_decision(PROVIDER, &decision).await.expect("record the verdict");
@@ -1321,6 +1479,850 @@ async fn a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery() {
 	assert_eq!(answer["duplicate"], true, "it is still a duplicate, and still answered 2xx");
 	assert_eq!(h.kyc_level(user).await, 1, "the retry is what repairs a verdict whose level never landed");
 	assert_eq!(h.kyc_changed_count(user).await, 1, "and it emits the ONE event the original attempt owed the money plane");
+}
+
+/// The pepper the duplicate-person tests below drive the digest with.
+const PEPPER: &str = "kyc-integration-pepper";
+
+/// A stub that computes identity digests, i.e. a deployment with `KYC_IDENTITY_PEPPER`
+/// set. The default stub has none, which is also the shape of a deployment without one.
+async fn setup_with_pepper() -> Option<Harness> {
+	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()).with_identity_pepper(PEPPER)))).await
+}
+
+/// A webhook body whose verdict names a specific document.
+fn body_for_document(session_id: &str, status: &str, vendor_data: &str, at: i64, issuing_state: &str, document_number: &str) -> Vec<u8> {
+	body(
+		session_id,
+		status,
+		vendor_data,
+		at,
+		json!({
+			"decision": {
+				"kyc": { "status": status, "document_type": "Passport", "issuing_state": issuing_state, "document_number": document_number },
+				"liveness": { "status": "Approved" },
+			},
+		}),
+	)
+}
+
+/// The digest `PEPPER` reduces a document to, derived the way the running adapter derives
+/// it — by parsing a signed delivery — so a test can take the same advisory lock the
+/// decision transaction takes without the pepper's key schedule being restated here.
+fn digest_of(document: &str) -> String {
+	let at = now();
+	let raw = body_for_document("stub-probe", "Approved", "", at, "PRT", document);
+	let headers = CallbackHeaders {
+		signature: Some(signed(&raw)),
+		signature_v2: None,
+		timestamp: Some(at),
+	};
+	StubKyc::new(SECRET.to_string(), CABINET_URL.to_string())
+		.with_identity_pepper(PEPPER)
+		.parse_callback(&headers, &raw, at)
+		.expect("a well-formed delivery")
+		.identity_digest
+		.expect("a verdict naming a document gets a digest")
+}
+
+/// ONE PERSON, TWO ACCOUNTS — the case #51 is about, driven end to end.
+///
+/// It needs no forgery. Somebody registers twice through Google OAuth and honestly
+/// verifies each account with their own real passport: liveness and face-match pass,
+/// because it really is them. Before this column, both accounts reached level 1 — a
+/// deposit address and the right to withdraw — and neither plane held anything that
+/// could tie them together, before or after the fact.
+#[tokio::test]
+async fn a_second_account_on_the_same_document_is_held_for_review() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let document = format!("P{}", Uuid::new_v4().simple());
+
+	// The first account verifies normally. Nothing about this path changes.
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(first).await, 1, "an honest first verification is untouched");
+	assert_eq!(h.case_row(first_case).await.0, "approved");
+
+	// The same person, the same passport, a second account.
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+	let (status, answer) = h.post(raw.clone(), signed(&raw), at).await;
+
+	// Answered 2xx: the delivery was genuine and IS handled — refusing it would only make
+	// Didit retry a verdict we have already recorded.
+	assert_eq!(status, StatusCode::OK, "{answer}");
+	let (held_status, decided, _) = h.case_row(second_case).await;
+	assert_eq!(held_status, "held_duplicate", "held for a human, not refused outright");
+	assert!(decided, "and DECIDED: the vendor has said its last word, so the row must not claim an attempt still in flight");
+	assert_eq!(h.kyc_level(second).await, 0, "and NO level was raised on the second account");
+	assert_eq!(h.kyc_changed_count(second).await, 0, "so the money plane is never told this account is verified");
+
+	// The hold must not be a dead end. There is no RPC in this plane that closes a case,
+	// so a RUNNING hold would make `/kyc/start` hand back the spent vendor session for
+	// ever — and the people this branch exists for (a lost account remade, a family) are
+	// exactly the ones who would be stranded by it.
+	assert!(
+		h.cases.start_gate(second, 3600).await.expect("read the gate").live.is_none(),
+		"a held case is decided, so it does not pin the user to a session they cannot use"
+	);
+
+	// The first account is left exactly where it was. Whatever an operator decides, it is
+	// not this path's business to undo a verification that already happened.
+	assert_eq!(h.kyc_level(first).await, 1);
+}
+
+/// TWO APPROVALS ON ONE DOCUMENT, AT THE SAME INSTANT — both through the real router.
+///
+/// The check that holds a duplicate runs inside the decision transaction, and the level
+/// it guards is written by a LATER one (`apply` → `raise_kyc_level_to`, its own
+/// connection, begun after the first has committed). The advisory lock that serialises
+/// the two verdicts is released by that same commit — so the second verdict is woken
+/// precisely into the window where the first account's case says `approved` and its
+/// account still says 0. A check that asked only "does a twin hold a level" would look
+/// exactly there and find nothing, and the lock would not be protection but aim: it
+/// delivers the attacker's second delivery into the narrowest moment of the gap instead
+/// of leaving it to chance.
+///
+/// The window is opened deliberately rather than hoped for: the test takes the
+/// document's advisory lock itself, waits until BOTH webhooks are queued behind it in
+/// `pg_locks`, and releases them together. Without that the two deliveries would usually
+/// serialise by luck and the test would pass on code that is wrong.
+#[tokio::test]
+async fn two_approvals_on_one_document_at_once_cannot_both_grant_a_level() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let document = format!("C{}", Uuid::new_v4().simple());
+	let digest = digest_of(&document);
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+
+	// The lock the decision transaction takes per document, held here so that neither
+	// delivery can get past it until both have arrived.
+	let mut guard = h.pool.begin().await.expect("open the blocking transaction");
+	sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+		.bind(&digest)
+		.execute(&mut *guard)
+		.await
+		.expect("hold the document's lock");
+	// `pg_locks` splits the 64-bit advisory key across `classid` (high half) and `objid`
+	// (low half), so the waiters are counted by key rather than by "any advisory lock" —
+	// the other tests in this binary run at the same time and take locks of their own.
+	let key: i64 = sqlx::query_scalar("SELECT hashtextextended($1, 0)")
+		.bind(&digest)
+		.fetch_one(&h.pool)
+		.await
+		.expect("compute the lock key");
+	let (classid, objid) = ((key >> 32) & 0xffff_ffff, key & 0xffff_ffff);
+
+	let at = now();
+	let raw_first = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	let raw_second = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+
+	let ((first_status, first_answer), (second_status, second_answer), ()) =
+		tokio::join!(h.post(raw_first.clone(), signed(&raw_first), at), h.post(raw_second.clone(), signed(&raw_second), at), async {
+			for _ in 0..200 {
+				let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid::bigint = $1 AND objid::bigint = $2")
+					.bind(classid)
+					.bind(objid)
+					.fetch_one(&h.pool)
+					.await
+					.expect("read pg_locks");
+				if waiting >= 2 {
+					break;
+				}
+				tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+			}
+			// Released whether or not both waiters showed up: a delivery that never
+			// reached the lock is a failure the assertions below describe far better
+			// than a test hanging here would.
+			guard.rollback().await.expect("release the document's lock");
+		});
+
+	assert_eq!(first_status, StatusCode::OK, "{first_answer}");
+	assert_eq!(second_status, StatusCode::OK, "{second_answer}");
+
+	// Which of the two wins is a genuine race and not this test's business. What is
+	// asserted is that there is exactly one winner.
+	let (first_row, second_row) = (h.case_row(first_case).await.0, h.case_row(second_case).await.0);
+	let (winner, loser, held) = if first_row == "approved" {
+		(first, second, second_row.as_str())
+	} else {
+		(second, first, first_row.as_str())
+	};
+	assert_eq!(
+		held, "held_duplicate",
+		"one document, two accounts: the verdict that lost the race is HELD, not approved ({first_row} / {second_row})"
+	);
+	assert_eq!(h.kyc_level(winner).await, 1, "the account that won it is verified normally");
+	assert_eq!(h.kyc_level(loser).await, 0, "and the other one gets no level from the same passport");
+	assert_eq!(
+		h.kyc_changed_count(winner).await + h.kyc_changed_count(loser).await,
+		1,
+		"so the money plane is told about exactly one of them"
+	);
+}
+
+/// The twin is held even though the twin's own LEVEL has not been written yet.
+///
+/// The concurrent version of this is above; this is the same fact without any timing at
+/// all, because the split state is reachable on its own and can be permanent. Recording
+/// a verdict and raising the level are two transactions, and `apply` failing between
+/// them — a 5xx, a pod rolled mid-request — leaves an `approved` case on a level-0
+/// account until a redelivery repairs it (`a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery`
+/// pins that repair). Didit retries twice and then stops. For the whole of that window a
+/// level-only check protects the document from nothing at all.
+#[tokio::test]
+async fn a_recorded_approval_guards_the_document_before_its_level_lands() {
+	let h = harness!();
+	// The repository never inspects the digest, so the test does not need a pepper to
+	// produce one — only the 64 hex characters the column's CHECK admits.
+	let digest = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	h.cases
+		.record_decision(
+			PROVIDER,
+			&KycDecision {
+				provider_ref: first_session,
+				status: KycStatus::Approved,
+				vendor_data: first_case.to_string(),
+				metadata: json!({}),
+				identity_digest: Some(digest.clone()),
+				signed_at: now(),
+			},
+		)
+		.await
+		.expect("record the first verdict");
+	assert_eq!(h.case_row(first_case).await.0, "approved", "the verdict is recorded...");
+	assert_eq!(h.kyc_level(first).await, 0, "...and the level write never ran");
+
+	// The same document, a second account, while the first is still halfway.
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	h.cases
+		.record_decision(
+			PROVIDER,
+			&KycDecision {
+				provider_ref: second_session,
+				status: KycStatus::Approved,
+				vendor_data: second_case.to_string(),
+				metadata: json!({}),
+				identity_digest: Some(digest),
+				signed_at: now(),
+			},
+		)
+		.await
+		.expect("record the second verdict");
+
+	assert_eq!(
+		h.case_row(second_case).await.0,
+		"held_duplicate",
+		"a verdict already recorded on this document is enough to hold the next one — waiting for its level would be waiting on another transaction"
+	);
+	assert_eq!(h.kyc_level(second).await, 0);
+}
+
+/// The DOCUMENT is what is matched, not the person's luck.
+///
+/// A different passport must verify normally on an account of its own, or the check would
+/// hold innocent applicants at `in_review` — which costs more trust than the duplicate it
+/// was meant to catch.
+#[tokio::test]
+async fn a_different_document_verifies_normally() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+
+	for document in [format!("A{}", Uuid::new_v4().simple()), format!("B{}", Uuid::new_v4().simple())] {
+		let user = h.user().await;
+		let (case_id, session_id) = h.case(user, 1).await;
+		let at = now();
+		let raw = body_for_document(&session_id, "Approved", &case_id.to_string(), at, "PRT", &document);
+		assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+		assert_eq!(h.kyc_level(user).await, 1, "{document} is nobody else's document");
+	}
+}
+
+/// The SAME person re-verifying their OWN account is not a duplicate.
+///
+/// The check asks about a different `user_id` on purpose. A person who starts a second
+/// case — because the first expired, or a reviewer asked for a resubmission — presents the
+/// same passport, and holding that for review would punish exactly the people doing what
+/// they were told.
+#[tokio::test]
+async fn re_verifying_your_own_account_is_not_a_duplicate() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let document = format!("R{}", Uuid::new_v4().simple());
+
+	let (first_case, first_session) = h.case(user, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	let (second_case, second_session) = h.case(user, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	assert_eq!(h.case_row(second_case).await.0, "approved", "their own document on their own account");
+	assert_eq!(h.kyc_level(user).await, 1);
+}
+
+/// WITHOUT a pepper, everything behaves exactly as it did before this column existed.
+///
+/// This is the shape of every deployment that has not been given the secret, production
+/// included until an operator adds it. The detection is off; nothing else is.
+#[tokio::test]
+async fn without_a_pepper_the_second_account_verifies_as_it_always_did() {
+	let h = harness!();
+	let document = format!("N{}", Uuid::new_v4().simple());
+
+	let mut users = Vec::new();
+	for _ in 0..2 {
+		let user = h.user().await;
+		let (case_id, session_id) = h.case(user, 1).await;
+		let at = now();
+		let raw = body_for_document(&session_id, "Approved", &case_id.to_string(), at, "PRT", &document);
+		assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+		assert_eq!(h.case_row(case_id).await.0, "approved");
+		users.push(user);
+	}
+
+	for user in users {
+		assert_eq!(h.kyc_level(user).await, 1, "no pepper, no detection — and no change to the decision either");
+	}
+}
+
+/// The stored fingerprint is a fingerprint, and the payload discipline is unchanged.
+///
+/// 0010 says no document numbers reach this database. That still holds: the column holds
+/// a keyed digest the number cannot be recovered from without a secret this database never
+/// sees, and `payload` is as empty of it as it ever was.
+#[tokio::test]
+async fn the_document_number_reaches_neither_the_payload_nor_the_column() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 1).await;
+	let document = format!("S{}", Uuid::new_v4().simple());
+
+	let at = now();
+	let raw = body_for_document(&session_id, "Approved", &case_id.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	let (_, _, payload) = h.case_row(case_id).await;
+	let stored = payload.to_string();
+	assert!(!stored.contains(&document), "the number must never reach the payload: {stored}");
+	assert!(!stored.contains("document_number"), "the allowlist copies, it does not redact: {stored}");
+
+	let digest: Option<String> = sqlx::query_scalar("SELECT identity_digest FROM kyc_cases WHERE id = $1")
+		.bind(case_id)
+		.fetch_one(&h.pool)
+		.await
+		.expect("read the digest");
+	let digest = digest.expect("an approved verdict naming a document stores one");
+	assert_eq!(digest.len(), 64, "hex SHA-256");
+	assert!(!digest.contains(&document), "and the digest does not carry the number either: {digest}");
+}
+
+/// The document stays protected after the FIRST verification stops being `approved`.
+///
+/// Didit expires verifications on a schedule, and `approved` -> `kyc_expired` is a routine
+/// vendor event that moves no level down — the first account keeps its level 1, its deposit
+/// address and its right to withdraw. A check that asked "is there an approved row" would
+/// stop protecting the document at exactly that moment, which is a bypass the attacker does
+/// not even have to trigger: they only have to wait.
+#[tokio::test]
+async fn an_expired_first_verification_still_protects_the_document() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let document = format!("E{}", Uuid::new_v4().simple());
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(first).await, 1);
+
+	// The vendor ages that verification out. The level is NOT lowered — only a human under
+	// `KycManage` lowers one — so the account is still verified in every way that spends.
+	let at = now() + 1;
+	let raw = body_for_document(&first_session, "Kyc Expired", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.case_row(first_case).await.0, "kyc_expired");
+	assert_eq!(h.kyc_level(first).await, 1, "the aged-out verdict moves no level down");
+
+	// Same person, same passport, a second account.
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.case_row(second_case).await.0, "held_duplicate", "the document already bought somebody a level");
+	assert_eq!(h.kyc_level(second).await, 0);
+}
+
+/// Holding a duplicate must not REOPEN a case the vendor already decided.
+///
+/// `declined` -> `approved` is a legitimate vendor transition (a post-hoc review), and the
+/// hold is written on the way through it. Recorded as a running status it would clear
+/// `decision_at`, so a finished case would go back to claiming an attempt in flight — the
+/// exact invariant the guard above it exists to protect.
+#[tokio::test]
+async fn a_hold_does_not_reopen_a_decided_case() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let document = format!("D{}", Uuid::new_v4().simple());
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(first).await, 1);
+
+	// The second account is declined first — a decided case, with a `decision_at`.
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Declined", &second_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert!(h.case_row(second_case).await.1, "declined is decided");
+
+	// Then the vendor reverses itself on the same session, on a document that already
+	// carries somebody else's level.
+	let at = now() + 1;
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	let (status, decided, _) = h.case_row(second_case).await;
+	assert_eq!(status, "held_duplicate");
+	assert!(decided, "a decided case must never come back running");
+	assert_eq!(h.kyc_level(second).await, 0);
+}
+
+/// The SAME document rendered differently is still the same document.
+///
+/// The number is read off a scan: the same passport reaches us as "AB 123456", "ab-123456"
+/// or "AB123456" depending on the document type and how it was recognised. A digest taken
+/// over the raw string would make those three different identities, and the detection would
+/// be off for whoever happened to land on a different rendering — invisibly, with no log
+/// and no failed assertion anywhere.
+#[tokio::test]
+async fn the_same_document_written_differently_is_still_caught() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let stem = Uuid::new_v4().simple().to_string();
+	let document = format!("AB{}", &stem[..8]);
+	let rewritten = format!("ab-{}", &stem[..8]);
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(first).await, 1);
+
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &rewritten);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.case_row(second_case).await.0, "held_duplicate", "separators and case are not an identity");
+	assert_eq!(h.kyc_level(second).await, 0);
+}
+
+/// A verdict that grants nothing must still reach the person it is about.
+///
+/// Every branch but `in_review` used to produce not even a log line: declined,
+/// abandoned, expired, aged out (#49). A user whose documents were refused learned it
+/// from a screen that had stopped changing.
+#[tokio::test]
+async fn a_terminal_verdict_tells_the_user_what_happened() {
+	let h = harness!();
+
+	for (vendor_word, kind) in [("Declined", "kyc_declined"), ("Abandoned", "kyc_expired"), ("Expired", "kyc_expired")] {
+		let user = h.subscribed(h.user().await).await;
+		let (case_id, session_id) = h.case(user, 1).await;
+
+		let at = now();
+		let raw = body(&session_id, vendor_word, &case_id.to_string(), at, json!({}));
+		let (status, _) = h.post(raw.clone(), signed(&raw), at).await;
+
+		assert_eq!(status, StatusCode::OK, "{vendor_word} is a delivery we handled");
+		assert_eq!(h.notices(user, kind).await, 1, "{vendor_word} must reach the user as {kind}");
+		assert_eq!(h.kyc_level(user).await, 0, "and it still moves no level: {vendor_word}");
+	}
+}
+
+/// A verdict that CONTRADICTS a level the account holds reaches a human who can act.
+///
+/// The level stays — a downgrade is a human act under `KycManage`, and that policy is
+/// not in question. What #49 is about is that nothing followed: a user holding tier 1
+/// whose verification the vendor later reports as lapsed sat there indefinitely, because
+/// the contradiction existed only as a row in a table nobody watches. "A human decides"
+/// became "nobody decides".
+#[tokio::test]
+async fn an_expiry_that_contradicts_a_held_level_reaches_the_owners() {
+	let h = harness!();
+	let (owner, owner_email) = h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+	let (case_id, session_id) = h.case(user, 1).await;
+
+	let approved_at = now() - 120;
+	let approval = body(&session_id, "Approved", &case_id.to_string(), approved_at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), now()).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 1);
+
+	let expired_at = now();
+	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
+
+	// Delivered until the roster read sees this test's owner. A sibling suite clearing
+	// `users.role` between the seat and the read is the documented interference
+	// (`Harness::reseat`), and the loop is not a sleep dressed up: a redelivery re-runs
+	// `alert_owners_if_contradicted` for real, which is exactly how the vendor's own
+	// retry repairs a roster read that missed. An empty result with the owner STILL
+	// seated is the product being wrong, and fails immediately.
+	let mut alerts = 0;
+	for _ in 0..4 {
+		let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
+		assert_eq!(status, StatusCode::OK);
+		alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
+		if alerts > 0 {
+			break;
+		}
+		assert!(!h.seated(owner).await, "the owner holds a seat and was still not mailed — that is the defect, not the race");
+		h.reseat(owner).await;
+	}
+
+	assert_eq!(h.kyc_level(user).await, 1, "a vendor still never takes a level away");
+	assert_eq!(h.notices(user, "kyc_expired").await, 1, "the user is told their verification lapsed");
+	assert_eq!(alerts, 1, "and a seated owner is told, through the queue their recipient cannot switch off");
+
+	// The vendor retries; the roster must not be mailed again for the same verdict.
+	let before = h.alerts_for_case(case_id, None).await;
+	let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(h.alerts_for_case(case_id, None).await, before, "a redelivery re-mails nobody");
+	assert_eq!(h.alerts_for_case(case_id, Some(&owner_email)).await, 1, "one row per owner per verdict, not two");
+}
+
+/// A legacy case asking for tier 2 still contradicts the level it actually bought.
+///
+/// `requested_tier` is the tier a provider may be ASKED for; what an approval CONFERS is
+/// capped at `PROVIDER_MAX_TIER`, which is 1 — and `0014_kyc_requested_tier_intent.sql`
+/// leaves the rows asking for 2 standing rather than rewriting them. Judging the verdict
+/// against the request meant those rows could never contradict anything (1 < 2 returns
+/// early), so the accounts AGENTS.md specifically warns are still in the table were the
+/// ones silently excluded from #49's whole point.
+#[tokio::test]
+async fn a_case_opened_at_a_tier_the_provider_cannot_grant_still_contradicts() {
+	let h = harness!();
+	let (owner, owner_email) = h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	let approved_at = now() - 120;
+	let approval = body(&session_id, "Approved", &case_id.to_string(), approved_at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), now()).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 1, "an approval grants what the workflow checks, not what the row asked for");
+
+	let expired_at = now();
+	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
+	let mut alerts = 0;
+	for _ in 0..4 {
+		assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+		alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
+		if alerts > 0 {
+			break;
+		}
+		assert!(!h.seated(owner).await, "the owner holds a seat and was still not mailed — that is the defect, not the race");
+		h.reseat(owner).await;
+	}
+	assert_eq!(alerts, 1, "the level this case bought is 1, and 1 is what the verdict contradicts");
+}
+
+/// A level another APPROVED case still covers is not a contradiction.
+///
+/// Verified once, verified again, and then the vendor reports the first session as
+/// lapsed: routine, not an incident. The second approval is entirely valid and the level
+/// it granted is not in doubt. `ENTRY_TIER` is 1, so without this the test degenerates
+/// to "holds any level" and every decline for an already-verified user would page the
+/// owners too — and owners who learn to ignore this mail are the state #49 is already
+/// in.
+#[tokio::test]
+async fn a_level_another_approved_case_covers_wakes_nobody() {
+	let h = harness!();
+	h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+
+	let (first, first_session) = h.case(user, 1).await;
+	let at = now() - 300;
+	let approval = body(&first_session, "Approved", &first.to_string(), at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), now()).await.0, StatusCode::OK);
+
+	// A second, later verification of the same person. It grants the level they already
+	// hold, so nothing moves — but the case stands as `approved`, and that is the fact
+	// the alert has to consult.
+	let (second, second_session) = h.case(user, 1).await;
+	let again = body(&second_session, "Approved", &second.to_string(), now() - 60, json!({}));
+	assert_eq!(h.post(again.clone(), signed(&again), now()).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 1);
+
+	let expired_at = now();
+	let expiry = body(&first_session, "Kyc Expired", &first.to_string(), expired_at, json!({}));
+	assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+
+	assert_eq!(h.kyc_level(user).await, 1, "the level is still the second case's to justify");
+	assert_eq!(h.alerts_for_case(first, None).await, 0, "the lapse of a superseded verification is routine, not a page");
+
+	// And the guard is not "never alert twice": retire the covering case and the same
+	// verdict does raise the alarm.
+	sqlx::query("UPDATE kyc_cases SET status = 'kyc_expired' WHERE id = $1")
+		.bind(second)
+		.execute(&h.pool)
+		.await
+		.expect("retire the covering case");
+	assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+	assert!(h.alerts_for_case(first, None).await > 0, "with nothing left covering the level, the contradiction is real again");
+}
+
+/// The alarm is for a CONTRADICTION, not for every ending.
+///
+/// An abandoned or timed-out session says the person closed a tab; it says nothing about
+/// their identity, and neither does a decline for someone who holds no level to
+/// contradict. Alerting on those would train the owners to ignore this mail, which costs
+/// exactly the signal it exists to carry.
+#[tokio::test]
+async fn an_ending_that_contradicts_nothing_raises_no_alarm() {
+	let h = harness!();
+	h.owner().await;
+
+	for vendor_word in ["Declined", "Abandoned", "Expired", "Kyc Expired"] {
+		let user = h.subscribed(h.user().await).await;
+		let (case_id, session_id) = h.case(user, 1).await;
+		let at = now();
+		let raw = body(&session_id, vendor_word, &case_id.to_string(), at, json!({}));
+		assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+		assert_eq!(h.kyc_level(user).await, 0);
+		assert_eq!(
+			h.alerts_for_case(case_id, None).await,
+			0,
+			"{vendor_word} contradicts no level this account holds, so nothing wakes an owner"
+		);
+	}
+}
+
+/// A SUPERSEDED delivery stays silent.
+///
+/// `CaseDecision::Ignored` returns before `apply`, and that is the point: the verdict it
+/// carries has already been replaced by a later one. Announcing it would tell a user
+/// their verification failed after it had in fact succeeded.
+#[tokio::test]
+async fn a_superseded_verdict_tells_nobody_anything() {
+	let h = harness!();
+	h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+	let (case_id, session_id) = h.case(user, 1).await;
+
+	let decided_at = now();
+	let approval = body(&session_id, "Approved", &case_id.to_string(), decided_at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), decided_at).await.0, StatusCode::OK);
+
+	// A decline SENT before the approval and arriving after it — Didit retries at roughly
+	// one and four minutes, so this is routine, not an attack. Inside the 300s replay
+	// window, or it would be refused as stale before ordering is ever considered.
+	let sent_at = decided_at - 200;
+	let straggler = body(&session_id, "Declined", &case_id.to_string(), sent_at, json!({}));
+	let (status, answer) = h.post(straggler.clone(), signed(&straggler), sent_at).await;
+
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer["ignored"], "superseded");
+	assert_eq!(h.kyc_level(user).await, 1);
+	assert_eq!(h.notices(user, "kyc_declined").await, 0, "a replaced verdict is not news");
+	assert_eq!(h.alerts_for_case(case_id, None).await, 0, "and it wakes nobody either");
+}
+
+/// EVERY refusal `/kyc/start` publishes, as whole JSON documents.
+///
+/// Three of these four used to be bare plain text, so the cabinet classified them by
+/// status code and by probing for an absent body: `403` with no code meant "your CSRF
+/// token went stale, retry", `403` WITH a code meant "this failed" (banking#193a). That
+/// is a client inferring which half of a refusal it is in from the shape of the silence.
+/// One format, one key, one closed vocabulary — and a rename fails here rather than
+/// showing a user "please try again" over a healthy provider.
+#[tokio::test]
+async fn every_start_refusal_carries_a_machine_readable_code() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	// Signed in, no double-submit header: the genuine CSRF refusal, and the one a reload
+	// actually fixes.
+	let (status, answer) = h.start(&cookie, None, "").await;
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	assert_eq!(answer, json!({ "error": "csrf" }));
+
+	// A session the CSRF check accepts and the directory cannot resolve to anybody.
+	let Some((orphan_cookie, orphan_csrf)) = signed_in_as("not-a-uuid").await else {
+		eprintln!("skipped: REDIS_URL unset");
+		return;
+	};
+	let (status, answer) = h.start(&orphan_cookie, Some(&orphan_csrf), "").await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(answer, json!({ "error": "unauthenticated" }));
+
+	// Over the per-user window cap. Still the caller's doing, so still a 4xx — and now
+	// one the cabinet can key a screen to instead of matching prose.
+	for _ in 0..START_MAX_PER_WINDOW {
+		h.case(user, 1).await;
+	}
+	h.close_open_cases(user).await;
+	let (status, answer) = h.start(&cookie, Some(&csrf), "").await;
+	assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+	assert_eq!(answer, json!({ "error": "throttled" }));
+
+	// No cookies at all. `unauthenticated` has to be REACHABLE for a caller who is not
+	// signed in, or the code is contract surface nothing can ever produce and the cabinet
+	// builds a branch on it that never runs. The check still runs first and still touches
+	// no session state — the session COOKIE's absence is what answers, not a lookup.
+	let (status, answer) = h.start("", None, "").await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED, "nobody is signed in, so the refusal is not about a token");
+	assert_eq!(answer, json!({ "error": "unauthenticated" }));
+
+	// A session cookie the locker no longer holds — expired, revoked, or signed out in
+	// another tab — is the same answer, and it is the common case: `csrf` here sent
+	// people to reload a page that would lapse again, because the cabinet keys its
+	// "stale, reload" screen off exactly that 403.
+	let (status, answer) = h.start("ev_session=gone; ev_csrf=whatever", Some("whatever"), "").await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED, "a lapsed session is not a CSRF failure");
+	assert_eq!(answer, json!({ "error": "unauthenticated" }));
+
+	// `/kyc/status`, which runs no CSRF check at all, answers the same caller the same
+	// way. Two routes sharing one vocabulary must not disagree about who is asking.
+	assert_eq!(h.status(None).await, (StatusCode::UNAUTHORIZED, json!({ "error": "unauthenticated" })));
+}
+
+/// The 503 body keeps its `contact` field, which the other refusals deliberately lack.
+#[tokio::test]
+async fn the_unavailable_body_is_not_flattened_into_the_new_vocabulary() {
+	let Some(h) = setup_with(None).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset");
+		return;
+	};
+
+	let (status, answer) = h.start(&cookie, Some(&csrf), "").await;
+	assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	assert_eq!(answer, unavailable_body(), "still two fields, still the support address");
+}
+
+/// A vendor that answers with a redirect we would not follow is an OUTAGE, not a link.
+///
+/// The cabinet's own check is `new URL(raw).protocol === "https:"`, and that is the whole
+/// of what browser code can do: the allowlist would be shipped to the attacker
+/// (banking#193b). A compromised or merely misconfigured provider does not need a
+/// `javascript:` URL — any `https:` URL sends the user off the cabinet on a click they
+/// were told to trust. The host is knowable here and nowhere else, so the refusal lives
+/// here.
+#[tokio::test]
+async fn a_redirect_the_vendor_should_not_have_sent_is_refused_like_an_outage() {
+	for rogue in ["https://evil.example/session/abc", "http://evinvest.test/cabinet", "javascript:alert(1)", "not a url at all"] {
+		let Some(h) = setup_with(Some(Arc::new(RogueRedirectKyc(rogue)))).await else {
+			eprintln!("DATABASE_URL unset — skipping real-DB test");
+			return;
+		};
+		let user = h.user().await;
+		let Some((cookie, csrf)) = signed_in(user).await else {
+			eprintln!("skipped: REDIS_URL unset");
+			return;
+		};
+
+		let (status, answer) = h.start(&cookie, Some(&csrf), "").await;
+		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{rogue} must not reach a browser");
+		assert_eq!(answer, unavailable_body(), "and the user meets the SAME screen a vendor outage produces: {rogue}");
+		assert!(!answer.to_string().contains(rogue), "the vendor's URL never reaches the browser: {rogue}");
+
+		// Refused BEFORE the row is written, so the bad URL is not stored.
+		assert_eq!(h.case_count(user).await, 0, "no case row survives a refused redirect: {rogue}");
+	}
+}
+
+/// The same refusal applied to a row that is ALREADY in the table.
+///
+/// The check above only ever sees answers this binary asked for. Rows outlive it: KYC has
+/// been in production since v0.7.0 and every case opened before the check shipped was
+/// stored unexamined; `0012_kyc_case_redirect_url.sql` is designed for a rolling deploy,
+/// so the old binary's INSERT running beside the new one's read is the STATED normal
+/// during a release; and an operator repointing the vendor leaves live cases behind.
+/// A case lives until a verdict, so the window is days, and the reuse branch hands that
+/// stored string straight to a browser under a button this plane vouched for — documents
+/// and a selfie, on somebody else's host.
+#[tokio::test]
+async fn a_stored_redirect_the_plane_would_not_send_a_browser_to_is_not_handed_back() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let (case_id, _) = h.case(user, 1).await;
+	// Exactly as an older binary, or a differently configured one, would have left it.
+	sqlx::query("UPDATE kyc_cases SET redirect_url = $2 WHERE id = $1")
+		.bind(case_id)
+		.bind("https://evil.example/session/abc")
+		.execute(&h.pool)
+		.await
+		.expect("store a redirect the plane will refuse");
+
+	// The cabinet must not offer Continue for a link start will not hand over.
+	let (_, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(answer["case"]["resumable"], false, "status and start answer the same question in the same words");
+
+	// And start opens a FRESH session instead of replaying the stored one. That branch is
+	// already bounded by the window cap, so it cannot be looped.
+	let (status, answer) = h.start(&cookie, Some(&csrf), "").await;
+	assert_eq!(status, StatusCode::OK);
+	assert_ne!(answer["case_id"].as_str(), Some(case_id.to_string().as_str()), "the untrusted case is not reused");
+	assert!(
+		answer["redirect_url"].as_str().is_some_and(|u| u.starts_with(CABINET_ORIGIN)),
+		"the browser is sent to the vendor this plane is configured for, not to the stored host"
+	);
 }
 
 /// THE CONTRACT of `GET /kyc/status`, asserted as whole JSON documents rather than field

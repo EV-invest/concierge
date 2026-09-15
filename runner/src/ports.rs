@@ -279,6 +279,16 @@ pub enum KycStatus {
 	Expired,
 	/// A previously-approved verification aged out at the vendor.
 	KycExpired,
+	/// NOT one of the vendor's words, and the only status this plane writes on its own:
+	/// an approval reached on a document that has ALREADY granted a level to a different
+	/// account (#51). DECIDED on purpose — it carries a `decision_at` and stops the case
+	/// running — because the vendor has spoken its last word on this session and nothing
+	/// will ever move the row again. Leaving it in a running state instead would have
+	/// cleared `decision_at` on a case the vendor had already finished, and would have
+	/// pinned `/kyc/start` to a session the user cannot use, with no operator handle to
+	/// release it. It grants no level; an operator raises one with `SetKycLevel` if the
+	/// duplicate turns out to have an honest explanation.
+	HeldDuplicate,
 }
 
 impl KycStatus {
@@ -287,7 +297,7 @@ impl KycStatus {
 	/// lookup that names the running statuses in SQL — and a hand-written list in either
 	/// would fail SILENTLY when a variant is added: an unlisted running status simply
 	/// stops counting as running, and the user buys another vendor session.
-	pub const ALL: [Self; 9] = [
+	pub const ALL: [Self; 10] = [
 		Self::Pending,
 		Self::InProgress,
 		Self::InReview,
@@ -297,6 +307,7 @@ impl KycStatus {
 		Self::Abandoned,
 		Self::Expired,
 		Self::KycExpired,
+		Self::HeldDuplicate,
 	];
 
 	/// The persisted `kyc_cases.status` vocabulary — kept in step with that column's
@@ -312,6 +323,7 @@ impl KycStatus {
 			Self::Abandoned => "abandoned",
 			Self::Expired => "expired",
 			Self::KycExpired => "kyc_expired",
+			Self::HeldDuplicate => "held_duplicate",
 		}
 	}
 
@@ -323,7 +335,7 @@ impl KycStatus {
 			// specific steps again puts the attempt back in the user's hands, so a
 			// `decision_at` on it would claim an outcome that has not happened.
 			Self::Pending | Self::InProgress | Self::InReview | Self::Resubmitted => false,
-			Self::Approved | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired => true,
+			Self::Approved | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired | Self::HeldDuplicate => true,
 		}
 	}
 
@@ -337,7 +349,7 @@ impl KycStatus {
 	pub fn grants_tier(self, requested: u32) -> Option<u32> {
 		match self {
 			Self::Approved => Some(requested.min(PROVIDER_MAX_TIER)),
-			Self::Pending | Self::InProgress | Self::InReview | Self::Resubmitted | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired => None,
+			Self::Pending | Self::InProgress | Self::InReview | Self::Resubmitted | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired | Self::HeldDuplicate => None,
 		}
 	}
 }
@@ -368,6 +380,17 @@ pub struct KycDecision {
 	/// Allowlisted decision METADATA for `kyc_cases.payload` — document country, document
 	/// type, per-check outcomes. Never documents, images, or document numbers.
 	pub metadata: serde_json::Value,
+	/// A keyed one-way fingerprint of the DOCUMENT this verdict was reached on, and the
+	/// only cross-account handle this plane holds (#51).
+	///
+	/// A field of its own rather than a key in [`Self::metadata`], because `metadata`'s
+	/// discipline is "copy nothing the allowlist does not name" and its home is a JSON
+	/// blob. This has a column, an index and a question it answers.
+	///
+	/// `None` whenever it could not be computed — no pepper configured, or a verdict
+	/// carrying no document number. Absence disables DETECTION and never a decision: the
+	/// level still moves exactly as it did.
+	pub identity_digest: Option<String>,
 	/// Unix seconds the vendor stamped INSIDE the signed body — the instant this verdict
 	/// was made, as opposed to the instant this delivery happened to arrive.
 	///
@@ -417,6 +440,21 @@ pub trait KycProvider: Send + Sync {
 
 	/// Open a verification session for an already-opened case.
 	async fn start_session(&self, case_id: Uuid, requested_tier: u32) -> Result<KycSession, DomainError>;
+
+	/// The origins — `scheme://host[:port]`, as WHATWG serialises them — that this
+	/// adapter's [`KycSession::redirect_url`] may point at. `/kyc/start` refuses any
+	/// answer outside this set rather than sending a signed-in browser to it.
+	///
+	/// Asked of the PROVIDER and not read from configuration beside it, because the two
+	/// are the same fact and a second copy is a copy that drifts. The adapter knows both
+	/// what it dialled and what that vendor answers with — which are not always the same
+	/// host, and were not for Didit — so nothing outside it has to guess.
+	///
+	/// An EMPTY set means "this adapter cannot say", and the check then refuses
+	/// everything. That is deliberate: the alternative, degrading to "any `https:` URL",
+	/// is the state this check exists to leave, and it would arrive silently. The boot
+	/// refuses to mount a provider that declares nothing.
+	fn session_origins(&self) -> Vec<String>;
 
 	/// Authenticate and parse one webhook delivery.
 	///
@@ -542,6 +580,22 @@ pub trait KycCaseRepository: Send + Sync {
 	/// two lists here would let `/kyc/status` report a live case the start route no
 	/// longer considers live, which is precisely the disagreement #190 is about.
 	async fn live_case(&self, user_id: UserId) -> Result<Option<LiveCase>, DomainError>;
+
+	/// The highest tier any OTHER case of this user was approved for and still holds
+	/// `approved` status, if there is one.
+	///
+	/// Asked when a terminal NEGATIVE verdict looks like it contradicts the level an
+	/// account holds. Without it the predicate is "this user is above this case's tier",
+	/// which fires on the most ordinary sequence there is: verified once, verified again,
+	/// and then the vendor reports the FIRST session as lapsed. That is routine, the
+	/// second approval is entirely valid, and paging the owners about it teaches them to
+	/// ignore the one mail that exists to be read.
+	///
+	/// The raw tier comes back rather than a level: what a status grants is
+	/// [`KycStatus::grants_tier`]'s answer and nobody else's, so the SQL that finds the
+	/// row does not get to have an opinion about it. `None` when no other approved case
+	/// exists.
+	async fn approved_cover(&self, user_id: UserId, excluding: Uuid) -> Result<Option<u32>, DomainError>;
 
 	/// Apply a verdict to the case it names, if it moves anything.
 	///

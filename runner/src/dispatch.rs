@@ -81,7 +81,7 @@ fn fee_terms(payload: &serde_json::Value, key: &str) -> Option<Option<templates:
 /// Render one of the typed governance mails from its stored payload. `None` for a kind
 /// this dispatcher does not know — permanent, so the caller parks rather than retries.
 /// `cabinet_url` is the origin a fee notice's cabinet-relative link hangs off.
-fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -> Option<templates::RenderedEmail> {
+pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -> Option<templates::RenderedEmail> {
 	match kind {
 		"owner_removal_self_accept" => Some(templates::owner_removal_self_accept(
 			&text_field(payload, "initiator_email"),
@@ -89,6 +89,14 @@ fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -
 			&text_field(payload, "approval_url"),
 			&text_field(payload, "code"),
 			int_field(payload, "expires_at"),
+		)),
+		"kyc_verdict_alert" => Some(templates::kyc_verdict_alert(
+			&text_field(payload, "subject_email"),
+			&text_field(payload, "case_id"),
+			&text_field(payload, "verdict"),
+			int_field(payload, "held_level") as u32,
+			int_field(payload, "requested_tier") as u32,
+			int_field(payload, "decided_at"),
 		)),
 		"payout_approval" => Some(templates::payout_approval(
 			&text_field(payload, "consilium_id"),

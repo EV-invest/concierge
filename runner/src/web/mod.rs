@@ -36,11 +36,11 @@ use evconcierge_auth::AuthService;
 /// enforces. A test that hard-coded the number would keep passing after someone raised
 /// it, and the number is what stands between one account and the vendor balance.
 pub use kyc::START_MAX_PER_WINDOW;
-pub use session::WebSessions;
+pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
 
 use crate::{
-	ports::{KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
+	ports::{GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
 	web::{oauth::OAuthTxStore, single_flight::KeyedLocks},
 };
 
@@ -110,6 +110,7 @@ impl WebState {
 				kyc_cases: kyc.cases,
 				kyc_starts: KeyedLocks::default(),
 				notifications: kyc.notifications,
+				governance: kyc.governance,
 				kyc: kyc.provider,
 				support_email: kyc.support_email,
 			}),
@@ -124,6 +125,9 @@ pub struct KycDeps {
 	pub users: Arc<dyn UserDirectoryRepository>,
 	pub cases: Arc<dyn KycCaseRepository>,
 	pub notifications: Arc<dyn NotificationRepository>,
+	/// The owner roster and the un-mutable mail queue, for the one verdict that needs a
+	/// human and would otherwise reach nobody.
+	pub governance: Arc<dyn GovernanceRepository>,
 	/// `None` ⇒ the vendor is unconfigured and both KYC routes answer 503. There is no
 	/// arm here that verifies nothing: a webhook we cannot authenticate is dropped.
 	pub provider: Option<Arc<dyn KycProvider>>,
@@ -187,6 +191,11 @@ struct Inner {
 	/// what stops two simultaneous starts from both passing it (#56).
 	kyc_starts: KeyedLocks<UserId>,
 	notifications: Arc<dyn NotificationRepository>,
+	/// Reached for ONE thing: queueing the owners' alert when a verification verdict
+	/// contradicts a level an account already holds. That mail must not be switchable
+	/// off by its recipient, which is what the governance queue gives and the
+	/// subscribable notification topic does not.
+	governance: Arc<dyn GovernanceRepository>,
 	/// `None` ⇒ unconfigured; both KYC routes answer 503.
 	kyc: Option<Arc<dyn KycProvider>>,
 	/// Human contact handed to a user whose verification cannot run right now.

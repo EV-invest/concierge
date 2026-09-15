@@ -7,10 +7,16 @@
 //! Storage mirrors the issuance side's `RefreshStore`: `REDIS_URL` set ⇒ one hash
 //! per session in the central Redis, reaped by `EXPIREAT`, surviving restarts and
 //! shared across replicas; unset ⇒ an in-process map (local/CI unaffected).
+//!
+//! The stored `user` summary is a login-time COPY, not the truth: every
+//! [`WebSessions::fresh`] re-reads the principal from the directory (through
+//! [`PrincipalSource`]) so a role granted from the console shows up on the next
+//! `/auth/session`, not after the next refresh rotation (up to the access TTL later).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future};
 
 use color_eyre::eyre::{Context, bail};
+use evconcierge_auth::{AuthError, AuthService};
 use evconcierge_contracts::concierge::v1::{RefreshRequest, TokenResponse, UserSummary, auth_service_server::AuthService as AuthRpc};
 use prost::Message;
 use tokio::sync::Mutex;
@@ -31,6 +37,19 @@ pub struct WebSession {
 	pub refresh_expires_at: i64,
 	pub user: UserSummary,
 	pub csrf: String,
+}
+
+/// The live principal read behind [`WebSessions::fresh`]: the user's CURRENT directory
+/// summary, as opposed to the copy the session stored at login. A seam (rather than
+/// [`AuthService`] itself) so the locker's tests can answer it without a directory.
+pub trait PrincipalSource {
+	fn principal(&self, user_id: &str) -> impl Future<Output = Result<UserSummary, AuthError>> + Send;
+}
+
+impl PrincipalSource for AuthService {
+	async fn principal(&self, user_id: &str) -> Result<UserSummary, AuthError> {
+		AuthService::principal(self, user_id).await
+	}
 }
 
 /// A fresh view of a live session, for the session route and the access cookie.
@@ -89,10 +108,16 @@ impl WebSessions {
 	/// service when it is about to expire. `Ok(None)` ⇒ the session is gone (expired,
 	/// revoked upstream, or never existed) and its cookies should be cleared; `Err` ⇒
 	/// the store itself failed and the session's fate is UNKNOWN — don't touch cookies.
-	pub async fn fresh(&self, id: &str, auth: &impl AuthRpc) -> color_eyre::Result<Option<Fresh>> {
+	///
+	/// The returned `user` is LIVE: re-read from the directory on every call (once — a
+	/// refresh in the same call already carries it) and written back so the stored copy
+	/// tracks it. A directory failure keeps the stored copy: an outage there must never
+	/// sign anyone out or hide a console they hold.
+	pub async fn fresh(&self, id: &str, auth: &(impl AuthRpc + PrincipalSource)) -> color_eyre::Result<Option<Fresh>> {
 		let _flight = self.locks.acquire(id.to_string()).await;
 		let Some(mut s) = self.store.load(id).await? else { return Ok(None) };
 		let now = now_secs();
+		let mut user_is_live = false;
 
 		if s.access_expires_at <= now + ACCESS_SKEW_SECS {
 			if s.refresh_expires_at <= now {
@@ -113,6 +138,7 @@ impl WebSessions {
 					s.refresh_expires_at = t.refresh_expires_at;
 					if let Some(user) = t.user {
 						s.user = user;
+						user_is_live = true;
 					}
 					self.store.save(id, &s).await?;
 				}
@@ -123,6 +149,23 @@ impl WebSessions {
 					return Ok(None);
 				}
 				Err(_) => {}
+			}
+		}
+
+		if !user_is_live {
+			match auth.principal(&s.user.user_id).await {
+				// Taken as DATA, whatever it says: a summary that has turned `disabled`
+				// is not a verdict on the session here. Ending it stays the refresh path's
+				// job (`AuthService::refresh` revokes the family) — a second place deciding
+				// when a session dies would be a second place to disagree with the first.
+				Ok(user) =>
+					if user != s.user {
+						s.user = user;
+						self.store.save(id, &s).await?;
+					},
+				Err(err) => {
+					tracing::warn!(error = %err, user_id = %s.user.user_id, "web session: live principal read failed; serving the stored summary");
+				}
 			}
 		}
 
