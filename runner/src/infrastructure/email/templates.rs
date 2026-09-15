@@ -940,6 +940,30 @@ mod tests {
 	}
 
 	#[test]
+	fn the_verdict_alert_names_the_account_and_arms_nothing() {
+		let mail = kyc_verdict_alert("subject@example.com", "case-7", "kyc_expired", 1, 1, 1_785_143_640);
+		// This mail has no link and no code on purpose — lowering a level from a mailbox
+		// is not a thing anyone should be able to do — so the address IS the alert: it is
+		// the only way an operator finds the person in the console.
+		assert!(mail.html.contains("subject@example.com"), "the account is named");
+		assert!(mail.text.contains("Account: subject@example.com"));
+		assert!(mail.subject.contains("kyc_expired"), "the verdict is readable in an inbox list: {}", mail.subject);
+		assert!(!mail.html.contains("Type this code"), "an alert arms nothing");
+		assert!(!mail.html.contains("href=\"https"), "and links nowhere: {}", mail.html);
+		assert!(mail.html.contains("owner seat"), "an operational alert is not unsubscribable, and says why");
+	}
+
+	/// An address is attacker-influenced only in the sense that a person chooses it, but
+	/// it is still user input landing in HTML sent to every owner.
+	#[test]
+	fn the_verdict_alert_escapes_what_it_was_given() {
+		let mail = kyc_verdict_alert("<script>alert(1)</script>@example.com", "case\r\nInjected: 1", "kyc_expired", 1, 1, 0);
+		assert!(!mail.html.contains("<script>"), "markup in an address does not become markup: {}", mail.html);
+		assert!(!mail.subject.contains('\n'), "no header injection through the subject");
+		assert!(!mail.text.contains('\r'), "and the case id is flattened to one line");
+	}
+
+	#[test]
 	fn the_outcome_mail_is_a_record_and_asks_for_nothing() {
 		let mail = payout_outcome("c-1", "EXECUTED", "Ethereum", LONG_ADDRESS, "12,500.00 USDT", "Broadcast at block 21000000.", "", "", "", "");
 		assert!(mail.html.contains(LONG_ADDRESS), "the destination is shown in full here too");
