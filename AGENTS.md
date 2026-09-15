@@ -341,6 +341,12 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
+- **A migration's `lock_timeout` is `SET LOCAL`, never `SET`.** sqlx runs each migration
+  inside its own transaction on a connection borrowed from the service's pool and hands
+  that connection back afterwards, so a plain `SET` outlives the migration: the next
+  request served on that connection inherits a 3s ceiling on every row lock it waits
+  for. `0011`–`0019` predate this rule and stay as they are — sqlx checksums an applied
+  migration at every boot, so editing one turns the next deploy into a refusal to start.
 - No extra deps, abstraction layers, or unasked-for features.
 - No comments explaining _what_; only _why_ if non-obvious.
 - No `.env*`, secrets, or large binaries committed.
