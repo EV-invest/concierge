@@ -32,17 +32,17 @@ use sqlx::PgPool;
 use tonic::{Code, Request};
 use uuid::Uuid;
 
-/// The suite's preconditions, or `None` with a line saying so.
+mod common;
+
+/// The suite's preconditions, or `None` when there is no database to assert against.
 ///
-/// The marker is not cosmetic. Every test here returns early when it is missing, and a
-/// skipped run prints exactly the same "N passed" a real one does — so "7 passed" was
-/// evidence of nothing, including for the refusal in `#47` this suite is the only pin
-/// for. The wall time gives it away (0.00s), and a reader should not have to notice that.
+/// The gate is not cosmetic. Every test here returns early when `DATABASE_URL` is missing,
+/// and a skipped run prints exactly the same "N passed" a real one does — so "8 passed" is
+/// evidence of nothing on its own, including for the refusal in `#47` this suite is the
+/// only pin for. [`common::database_url`] answers that twice over: it panics under CI, and
+/// it prints a SKIPPED line a local `--nocapture` run shows.
 async fn setup() -> Option<(Arc<dyn UserDirectoryRepository>, Arc<dyn PlatformConfigRepository>, PgPool)> {
-	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
-		eprintln!("SKIPPED: DATABASE_URL unset — this test asserted nothing");
-		return None;
-	};
+	let url = common::database_url()?;
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	Some((Arc::new(PgUsers::new(pool.clone())), Arc::new(PgPlatform::new(pool.clone())), pool))
@@ -300,8 +300,7 @@ async fn kyc_level_is_bounded_beneath_the_handler() {
 /// `user_outbox`, which is the copy the banking money plane actually mirrors.
 #[tokio::test]
 async fn kyc_level_out_of_range_is_refused_by_the_store() {
-	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
-		eprintln!("SKIPPED: DATABASE_URL unset — this test asserted nothing");
+	let Some(url) = common::database_url() else {
 		return;
 	};
 	let pool = db::connect_sized(&url, 2).await.expect("connect to Postgres");
