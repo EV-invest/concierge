@@ -464,6 +464,19 @@ impl UserDirectoryRepository for PgUsers {
 	}
 
 	async fn set_kyc_level(&self, id: UserId, level: u32, action: &AdminAction, now: i64) -> Result<User, DomainError> {
+		// Nobody sets their own KYC level (#47). The RPC handler refuses this first and
+		// with a better sentence; this is the same rule where the WRITE is, so the next
+		// writer of a level — an admin HTTP route, a batch import, a consilium outcome —
+		// inherits it instead of having to remember it. The range rule is already
+		// triplicated for exactly this reason (handler, aggregate, `users_kyc_level_range`
+		// CHECK), and the aggregate cannot hold this one: it never learns who is asking.
+		//
+		// HERE and not in `mutate_audited`: actor == subject is legitimate on its
+		// siblings — `revoke_tokens` is how a person signs themselves out everywhere.
+		// The vendor path is untouched; `raise_kyc_level_to` carries no actor at all.
+		if action.actor == Some(id) {
+			return Err(DomainError::Forbidden("a KYC level cannot be set on your own account".to_owned()));
+		}
 		// The level reaches here straight from a request, so the aggregate's refusal is
 		// the caller's bad input and travels back as `Validation` -> `INVALID_ARGUMENT`.
 		self.mutate_audited(
