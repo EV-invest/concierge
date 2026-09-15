@@ -1322,6 +1322,25 @@ fn body_for_document(session_id: &str, status: &str, vendor_data: &str, at: i64,
 	)
 }
 
+/// The digest `PEPPER` reduces a document to, derived the way the running adapter derives
+/// it — by parsing a signed delivery — so a test can take the same advisory lock the
+/// decision transaction takes without the pepper's key schedule being restated here.
+fn digest_of(document: &str) -> String {
+	let at = now();
+	let raw = body_for_document("stub-probe", "Approved", "", at, "PRT", document);
+	let headers = CallbackHeaders {
+		signature: Some(signed(&raw)),
+		signature_v2: None,
+		timestamp: Some(at),
+	};
+	StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string())
+		.with_identity_pepper(PEPPER)
+		.parse_callback(&headers, &raw, at)
+		.expect("a well-formed delivery")
+		.identity_digest
+		.expect("a verdict naming a document gets a digest")
+}
+
 /// ONE PERSON, TWO ACCOUNTS — the case #51 is about, driven end to end.
 ///
 /// It needs no forgery. Somebody registers twice through Google OAuth and honestly
@@ -1374,6 +1393,163 @@ async fn a_second_account_on_the_same_document_is_held_for_review() {
 	// The first account is left exactly where it was. Whatever an operator decides, it is
 	// not this path's business to undo a verification that already happened.
 	assert_eq!(h.kyc_level(first).await, 1);
+}
+
+/// TWO APPROVALS ON ONE DOCUMENT, AT THE SAME INSTANT — both through the real router.
+///
+/// The check that holds a duplicate runs inside the decision transaction, and the level
+/// it guards is written by a LATER one (`apply` → `raise_kyc_level_to`, its own
+/// connection, begun after the first has committed). The advisory lock that serialises
+/// the two verdicts is released by that same commit — so the second verdict is woken
+/// precisely into the window where the first account's case says `approved` and its
+/// account still says 0. A check that asked only "does a twin hold a level" would look
+/// exactly there and find nothing, and the lock would not be protection but aim: it
+/// delivers the attacker's second delivery into the narrowest moment of the gap instead
+/// of leaving it to chance.
+///
+/// The window is opened deliberately rather than hoped for: the test takes the
+/// document's advisory lock itself, waits until BOTH webhooks are queued behind it in
+/// `pg_locks`, and releases them together. Without that the two deliveries would usually
+/// serialise by luck and the test would pass on code that is wrong.
+#[tokio::test]
+async fn two_approvals_on_one_document_at_once_cannot_both_grant_a_level() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let document = format!("C{}", Uuid::new_v4().simple());
+	let digest = digest_of(&document);
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+
+	// The lock the decision transaction takes per document, held here so that neither
+	// delivery can get past it until both have arrived.
+	let mut guard = h.pool.begin().await.expect("open the blocking transaction");
+	sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+		.bind(&digest)
+		.execute(&mut *guard)
+		.await
+		.expect("hold the document's lock");
+	// `pg_locks` splits the 64-bit advisory key across `classid` (high half) and `objid`
+	// (low half), so the waiters are counted by key rather than by "any advisory lock" —
+	// the other tests in this binary run at the same time and take locks of their own.
+	let key: i64 = sqlx::query_scalar("SELECT hashtextextended($1, 0)")
+		.bind(&digest)
+		.fetch_one(&h.pool)
+		.await
+		.expect("compute the lock key");
+	let (classid, objid) = ((key >> 32) & 0xffff_ffff, key & 0xffff_ffff);
+
+	let at = now();
+	let raw_first = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	let raw_second = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+
+	let ((first_status, first_answer), (second_status, second_answer), ()) =
+		tokio::join!(h.post(raw_first.clone(), signed(&raw_first), at), h.post(raw_second.clone(), signed(&raw_second), at), async {
+			for _ in 0..200 {
+				let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid::bigint = $1 AND objid::bigint = $2")
+					.bind(classid)
+					.bind(objid)
+					.fetch_one(&h.pool)
+					.await
+					.expect("read pg_locks");
+				if waiting >= 2 {
+					break;
+				}
+				tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+			}
+			// Released whether or not both waiters showed up: a delivery that never
+			// reached the lock is a failure the assertions below describe far better
+			// than a test hanging here would.
+			guard.rollback().await.expect("release the document's lock");
+		});
+
+	assert_eq!(first_status, StatusCode::OK, "{first_answer}");
+	assert_eq!(second_status, StatusCode::OK, "{second_answer}");
+
+	// Which of the two wins is a genuine race and not this test's business. What is
+	// asserted is that there is exactly one winner.
+	let (first_row, second_row) = (h.case_row(first_case).await.0, h.case_row(second_case).await.0);
+	let (winner, loser, held) = if first_row == "approved" {
+		(first, second, second_row.as_str())
+	} else {
+		(second, first, first_row.as_str())
+	};
+	assert_eq!(
+		held, "held_duplicate",
+		"one document, two accounts: the verdict that lost the race is HELD, not approved ({first_row} / {second_row})"
+	);
+	assert_eq!(h.kyc_level(winner).await, 1, "the account that won it is verified normally");
+	assert_eq!(h.kyc_level(loser).await, 0, "and the other one gets no level from the same passport");
+	assert_eq!(
+		h.kyc_changed_count(winner).await + h.kyc_changed_count(loser).await,
+		1,
+		"so the money plane is told about exactly one of them"
+	);
+}
+
+/// The twin is held even though the twin's own LEVEL has not been written yet.
+///
+/// The concurrent version of this is above; this is the same fact without any timing at
+/// all, because the split state is reachable on its own and can be permanent. Recording
+/// a verdict and raising the level are two transactions, and `apply` failing between
+/// them — a 5xx, a pod rolled mid-request — leaves an `approved` case on a level-0
+/// account until a redelivery repairs it (`a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery`
+/// pins that repair). Didit retries twice and then stops. For the whole of that window a
+/// level-only check protects the document from nothing at all.
+#[tokio::test]
+async fn a_recorded_approval_guards_the_document_before_its_level_lands() {
+	let h = harness!();
+	// The repository never inspects the digest, so the test does not need a pepper to
+	// produce one — only the 64 hex characters the column's CHECK admits.
+	let digest = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	h.cases
+		.record_decision(
+			PROVIDER,
+			&KycDecision {
+				provider_ref: first_session,
+				status: KycStatus::Approved,
+				vendor_data: first_case.to_string(),
+				metadata: json!({}),
+				identity_digest: Some(digest.clone()),
+				signed_at: now(),
+			},
+		)
+		.await
+		.expect("record the first verdict");
+	assert_eq!(h.case_row(first_case).await.0, "approved", "the verdict is recorded...");
+	assert_eq!(h.kyc_level(first).await, 0, "...and the level write never ran");
+
+	// The same document, a second account, while the first is still halfway.
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	h.cases
+		.record_decision(
+			PROVIDER,
+			&KycDecision {
+				provider_ref: second_session,
+				status: KycStatus::Approved,
+				vendor_data: second_case.to_string(),
+				metadata: json!({}),
+				identity_digest: Some(digest),
+				signed_at: now(),
+			},
+		)
+		.await
+		.expect("record the second verdict");
+
+	assert_eq!(
+		h.case_row(second_case).await.0,
+		"held_duplicate",
+		"a verdict already recorded on this document is enough to hold the next one — waiting for its level would be waiting on another transaction"
+	);
+	assert_eq!(h.kyc_level(second).await, 0);
 }
 
 /// The DOCUMENT is what is matched, not the person's luck.
