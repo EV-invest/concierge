@@ -464,14 +464,23 @@ impl UserDirectoryRepository for PgUsers {
 	}
 
 	async fn set_kyc_level(&self, id: UserId, level: u32, action: &AdminAction, now: i64) -> Result<User, DomainError> {
+		// Captured before the command, because the audit row's whole value is the DELTA.
+		// "kyc_level: 3" tells a reader where the account ended up, which they can also
+		// see by looking at the account; it does not tell them whether an operator raised
+		// somebody to 3 or quietly took them down to it (#48).
+		// An atomic rather than a `Cell` only because the future crosses a `Send` bound.
+		let from = std::sync::atomic::AtomicU32::new(0);
 		// The level reaches here straight from a request, so the aggregate's refusal is
 		// the caller's bad input and travels back as `Validation` -> `INVALID_ARGUMENT`.
 		self.mutate_audited(
 			id,
 			action,
 			now,
-			|user| user.set_kyc_level(level),
-			|user| Some(serde_json::json!({ "kyc_level": user.kyc_level() })),
+			|user| {
+				from.store(user.kyc_level(), std::sync::atomic::Ordering::Relaxed);
+				user.set_kyc_level(level)
+			},
+			|user| Some(kyc_level_detail(from.load(std::sync::atomic::Ordering::Relaxed), user.kyc_level(), serde_json::json!({}))),
 		)
 		.await
 	}
@@ -479,7 +488,7 @@ impl UserDirectoryRepository for PgUsers {
 	/// One transaction: read the target `FOR UPDATE`, compare from THAT read, and either
 	/// raise or roll back. Same shape as [`Self::set_role_outside_ownership`] and for the
 	/// same reason — the comparison that decides the write must not be a separate read.
-	async fn raise_kyc_level_to(&self, id: UserId, target: u32) -> Result<KycLevelChange, DomainError> {
+	async fn raise_kyc_level_to(&self, id: UserId, target: u32, action: &AdminAction, now: i64) -> Result<KycLevelChange, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let mut user = load_for_update(&mut tx, id).await?;
 		let current = user.kyc_level();
@@ -498,6 +507,19 @@ impl UserDirectoryRepository for PgUsers {
 			.map_err(|e| DomainError::Repository(format!("kyc level {target} is not writable: {e}")))?;
 		update_row(&mut tx, &user).await?;
 		drain_outbox(&mut tx, &mut user).await?;
+		// In the SAME transaction as the level, like every other writer of this log. A
+		// vendor decision used to write nothing here, so "who set this level, and when"
+		// was answerable for the manual half and not the automatic one — an operator
+		// opening a user's history saw the admin decisions and had to infer the rest from
+		// `kyc_cases`, a table keyed by the vendor's session id and shaped around its
+		// verdicts (#48). Same log, same question, both halves.
+		//
+		// `actor_user_id` stays NULL: no human pressed this. Who decided is in the detail
+		// the caller supplies — the provider and the case — because a vendor is not a row
+		// in `users` and inventing one would be a worse answer than none.
+		let mut action = action.clone();
+		action.detail = Some(kyc_level_detail(current, target, action.detail.take().unwrap_or_else(|| serde_json::json!({}))));
+		record_action(&mut tx, id, &action, now).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(KycLevelChange::Raised { from: current, to: target })
 	}
@@ -660,6 +682,21 @@ pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(
 	.await
 	.map_err(repo_err)?;
 	Ok(())
+}
+
+/// The `detail` both KYC writers record, so the two halves of the history read alike.
+///
+/// `kyc_level` is kept beside `to` and is the same number. Rows written before this
+/// carried only `kyc_level`, and an audit log whose shape silently forked in the middle
+/// is one whose readers quietly get half the answer; one redundant key is the cheaper
+/// side of that trade.
+fn kyc_level_detail(from: u32, to: u32, mut extra: serde_json::Value) -> serde_json::Value {
+	if let Some(obj) = extra.as_object_mut() {
+		obj.insert("from".to_owned(), from.into());
+		obj.insert("to".to_owned(), to.into());
+		obj.insert("kyc_level".to_owned(), to.into());
+	}
+	extra
 }
 
 /// Append one operator decision to `admin_action` on the OPEN transaction, so the row and

@@ -46,6 +46,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
+	infrastructure::users::AdminAction,
 	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus},
 	web::{
 		WebState, now_secs,
@@ -422,7 +423,15 @@ async fn apply(st: &super::Inner, case: &KycCase) -> Result<(), (StatusCode, &'s
 	// The aggregate call underneath is the one the operator RPC uses, so the `KYC_CHANGED`
 	// event, the `user_outbox` row and the money plane's mirror come out identical whether
 	// a person or a vendor decided — banking still never learns a vendor exists.
-	match st.users.raise_kyc_level_to(case.user_id, target).await {
+	// No actor: no human decided this. The provenance the audit row carries instead is
+	// the provider and the case, so a user's KYC history reads as one log rather than as
+	// admin decisions here and vendor verdicts in a table shaped around session ids.
+	let audit = AdminAction::system("kyc_level_set").with_detail(json!({
+		"source": st.kyc.as_ref().map_or("vendor", |p| p.name()),
+		"case_id": case.id.to_string(),
+		"requested_tier": case.requested_tier,
+	}));
+	match st.users.raise_kyc_level_to(case.user_id, target, &audit, now_secs()).await {
 		Ok(KycLevelChange::Raised { from, to }) => {
 			tracing::info!(case_id = %case.id, from, to, "kyc callback: level raised");
 			notify(
