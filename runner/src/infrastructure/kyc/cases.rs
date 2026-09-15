@@ -65,12 +65,7 @@ impl KycCaseRepository for PgKycCases {
 	/// exclusion between two starts is the caller's, held in process around this read.
 	/// Keeping them separate keeps each one a query a reader can check by eye.
 	async fn start_gate(&self, user_id: UserId, window_secs: i64) -> Result<StartGate, DomainError> {
-		let live: Option<(Uuid, Option<String>)> = sqlx::query_as("SELECT id, redirect_url FROM kyc_cases WHERE user_id = $1 AND status = ANY($2) ORDER BY created_at DESC LIMIT 1")
-			.bind(user_id.raw())
-			.bind(running_statuses())
-			.fetch_optional(&self.pool)
-			.await
-			.map_err(repo_err)?;
+		let live = self.live_case(user_id).await?;
 
 		let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM kyc_cases WHERE user_id = $1 AND created_at > now() - make_interval(secs => $2)")
 			.bind(user_id.raw())
@@ -79,10 +74,33 @@ impl KycCaseRepository for PgKycCases {
 			.await
 			.map_err(repo_err)?;
 
-		Ok(StartGate {
-			live: live.map(|(id, redirect_url)| LiveCase { id, redirect_url }),
-			recent,
+		Ok(StartGate { live, recent })
+	}
+
+	/// `created_at` leaves Postgres as epoch seconds rather than a timestamp: it is
+	/// answered to a browser, and converting here keeps the one time format this plane
+	/// publishes from depending on which type the adapter happened to bind.
+	async fn live_case(&self, user_id: UserId) -> Result<Option<LiveCase>, DomainError> {
+		let row: Option<(Uuid, Option<String>, String, i32, i64)> = sqlx::query_as(
+			"SELECT id, redirect_url, status, requested_tier, EXTRACT(EPOCH FROM created_at)::bigint \
+			 FROM kyc_cases WHERE user_id = $1 AND status = ANY($2) ORDER BY created_at DESC LIMIT 1",
+		)
+		.bind(user_id.raw())
+		.bind(running_statuses())
+		.fetch_optional(&self.pool)
+		.await
+		.map_err(repo_err)?;
+
+		row.map(|(id, redirect_url, status, requested_tier, created_at)| {
+			Ok(LiveCase {
+				id,
+				redirect_url,
+				status: status_from_column(&status)?,
+				requested_tier: requested_tier.max(0) as u32,
+				created_at,
+			})
 		})
+		.transpose()
 	}
 
 	/// One transaction: take the case `FOR UPDATE`, judge the incoming verdict against

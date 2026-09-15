@@ -147,6 +147,9 @@ pub fn router(state: WebState) -> Router {
 		// vendor, not a browser, and authenticates itself with an HMAC over the body.
 		// Publicly both are seen under the conductor's `/api` prefix.
 		.route("/kyc/start", post(kyc::start))
+		// A read, so no CSRF token and no vendor: the level and the running case are
+		// facts of THIS plane, and the cabinet needs them even while Didit is down.
+		.route("/kyc/status", get(kyc::status))
 		.route("/kyc/callback/didit", post(kyc::callback))
 		.with_state(state)
 }
