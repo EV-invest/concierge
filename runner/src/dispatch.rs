@@ -17,7 +17,10 @@
 //!   the trailing 24h count reaches the budget and lets the queue accumulate instead:
 //!   delayed mail is recoverable, a throttled sender is not.
 //! * **Never dropping work.** Nothing is deleted here. A row is `sent`, or pending
-//!   with a future attempt, or parked `failed` for an operator to look at.
+//!   with a future attempt, or parked `failed` for an operator to look at — minus
+//!   the link and code a governance mail carried, which the repository strikes from
+//!   the payload on either terminal outcome, since a secret that will never be
+//!   mailed has no reason to stay in the table.
 
 use std::{sync::Arc, time::Duration};
 

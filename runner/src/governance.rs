@@ -1348,7 +1348,7 @@ impl MailRelayService for MailRelay {
 
 		let enqueued = self
 			.governance
-			.enqueue_mail(user_id.raw(), recipient.email().as_str(), kind, &req.dedupe_key, &payload)
+			.enqueue_mail(user_id.raw(), recipient.email().as_str(), recipient.email_verified(), kind, &req.dedupe_key, &payload)
 			.await
 			.map_err(domain_to_status)?;
 		if enqueued {

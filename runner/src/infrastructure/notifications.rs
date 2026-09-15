@@ -98,9 +98,16 @@ pub struct DeliveryJob {
 	pub link: Option<String>,
 	pub occurred_at: Option<i64>,
 	/// The typed fields a governance mail renders from, including the one plaintext
-	/// copy of its secret code. Nulled by [`NotificationDispatchRepository::mark_sent`].
+	/// copy of its secret code. Nulled by [`NotificationDispatchRepository::mark_sent`];
+	/// stripped of [`SECRET_PAYLOAD_KEYS`] when a delivery is parked as `failed`.
 	pub payload: Option<serde_json::Value>,
 }
+
+/// The payload fields that arm a decision: the approval link and the code typed into
+/// it. Every kind that carries a secret carries it under these two names (the relay in
+/// `governance.rs` builds each payload), so a parked row is redacted by key rather
+/// than by kind — a new kind that reuses the names is covered without a second list.
+pub const SECRET_PAYLOAD_KEYS: &[&str] = &["approval_url", "code"];
 
 fn repo_err(err: sqlx::Error) -> DomainError {
 	DomainError::Repository(err.to_string())
@@ -527,9 +534,17 @@ impl NotificationDispatchRepository for PgNotifications {
 	async fn mark_failed(&self, delivery_id: i64, error: &str, backoff_secs: i64, max_attempts: i32) -> Result<(), DomainError> {
 		// The attempt counter was already bumped at claim time, so this only decides
 		// whether the row gets another turn or is parked as 'failed'.
+		//
+		// A parked row is terminal — nothing re-reads it to send — so its secrets go the
+		// way `mark_sent` sends them, but by REDACTION rather than nulling: the row is
+		// kept for an operator to look at, and "which consilium, from whom, how much" is
+		// what they look at. Only the link and the code that arms it are struck, since
+		// those hand a still-pending seat to anyone holding a dump of the table (#66). A
+		// retry keeps the payload intact: it is what the next attempt renders from.
 		sqlx::query(
 			"UPDATE notification_deliveries \
 			 SET status = CASE WHEN attempts >= $4 THEN 'failed' ELSE 'pending' END, \
+			     payload = CASE WHEN attempts >= $4 THEN payload - $5::TEXT[] ELSE payload END, \
 			     next_attempt_at = now() + make_interval(secs => $3), \
 			     last_error = left($2, 500) \
 			 WHERE id = $1",
@@ -538,6 +553,7 @@ impl NotificationDispatchRepository for PgNotifications {
 		.bind(error)
 		.bind(backoff_secs as f64)
 		.bind(max_attempts)
+		.bind(SECRET_PAYLOAD_KEYS)
 		.execute(&self.pool)
 		.await
 		.map_err(repo_err)?;

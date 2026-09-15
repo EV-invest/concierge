@@ -32,7 +32,7 @@ use concierge::{
 		users::PgUsers,
 	},
 	notification::RateLimiter,
-	ports::{GovernanceRepository, UserDirectoryRepository},
+	ports::{GovernanceRepository, NotificationDispatchRepository, NotificationRepository, UserDirectoryRepository},
 };
 use domain::{
 	authz::Role,
@@ -670,7 +670,7 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 
 	assert!(
 		fx.governance
-			.enqueue_mail(owner.raw(), "relay@example.com", "payout_outcome", &key, &payload)
+			.enqueue_mail(owner.raw(), "relay@example.com", true, "payout_outcome", &key, &payload)
 			.await
 			.expect("first")
 	);
@@ -683,14 +683,14 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 	let second_key = format!("payout-outcome:{}", Uuid::new_v4());
 	assert!(
 		fx.governance
-			.enqueue_mail(owner.raw(), "relay@example.com", "payout_outcome", &second_key, &payload)
+			.enqueue_mail(owner.raw(), "relay@example.com", true, "payout_outcome", &second_key, &payload)
 			.await
 			.expect("muted")
 	);
 
 	assert!(
 		!fx.governance
-			.enqueue_mail(owner.raw(), "relay@example.com", "payout_outcome", &key, &payload)
+			.enqueue_mail(owner.raw(), "relay@example.com", true, "payout_outcome", &key, &payload)
 			.await
 			.expect("retry"),
 		"an at-least-once caller may retry the same key without sending twice"
@@ -704,6 +704,101 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 			.unwrap(),
 		2
 	);
+}
+
+/// Queueing a governance mail refreshes the recipient's subscriber row, and that row's
+/// `email_verified` is what `emit` consults before mailing an ordinary notification. It
+/// must carry the identity record's flag: hard-coding `true` there made an owner whose
+/// address nobody has proved eligible for every email notification they follow (#65).
+#[tokio::test]
+async fn a_governance_mail_does_not_verify_the_subscriber_by_itself() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.unverified_owner().await;
+	let email = fx.email_of(owner).await;
+	let payload = serde_json::json!({ "consilium_id": "c-65", "outcome": "EXECUTED", "amount": "1 USDT" });
+	assert!(
+		fx.governance
+			.enqueue_mail(owner.raw(), &email, false, "payout_outcome", &format!("payout-outcome:{}", Uuid::new_v4()), &payload)
+			.await
+			.expect("queued")
+	);
+	let (subscriber_id, verified): (Uuid, bool) = sqlx::query_as("SELECT id, email_verified FROM notification_subscribers WHERE user_id = $1")
+		.bind(owner.raw())
+		.fetch_one(&fx.pool)
+		.await
+		.expect("the subscriber row the mail refreshed");
+	assert!(
+		!verified,
+		"the subscriber carries the identity record's flag, not the fact that a governance mail was addressed to it"
+	);
+
+	// The consequence the flag guards: an ordinary notification on a followed topic
+	// reaches the inbox and NOT the mail queue. The row is followed as the mail left
+	// it — re-resolving the subscriber here would overwrite the very flag under test.
+	let notifications = PgNotifications::new(fx.pool.clone());
+	notifications.set_topic_subscription(subscriber_id, "fund:quy-nhon", true, true).await.expect("follow");
+	let outcome = notifications
+		.emit(owner.raw(), "fund:quy-nhon", "nav", "NAV updated", "", "", &format!("nav:{}", Uuid::new_v4()), T0)
+		.await
+		.expect("emit");
+	assert!(outcome.in_app, "the in-app copy is unaffected");
+	assert!(!outcome.email, "no email is queued to an address nobody has proved belongs to the owner");
+}
+
+/// A delivery the dispatcher gives up on loses its link and code, exactly as one it
+/// sends does; a delivery it will retry keeps them, because the retry renders from them.
+/// Anyone holding a dump of the table must not be able to act on a still-pending seat
+/// through a mail that was never sent (#66).
+#[tokio::test]
+async fn a_parked_delivery_is_redacted_but_a_retried_one_is_not() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let key = format!("payout-approval:{}", Uuid::new_v4());
+	let payload = serde_json::json!({
+		"consilium_id": "c-66", "initiator_email": "init@example.com", "amount": "1 USDT",
+		"approval_url": "https://example.test/governance/consilium/c-66", "code": "ABCDEFGH",
+	});
+	assert!(
+		fx.governance
+			.enqueue_mail(owner.raw(), "relay@example.com", true, "payout_approval", &key, &payload)
+			.await
+			.expect("queued")
+	);
+	let delivery_id: i64 = sqlx::query_scalar("SELECT id FROM notification_deliveries WHERE dedupe_key = $1")
+		.bind(&key)
+		.fetch_one(&fx.pool)
+		.await
+		.expect("the queued row");
+	let dispatch = PgNotifications::new(fx.pool.clone());
+
+	// Attempts left ⇒ rescheduled, and the payload is what the next attempt sends.
+	dispatch.mark_failed(delivery_id, "smtp down", 60, 6).await.expect("reschedule");
+	let (status, payload_after): (String, serde_json::Value) = sqlx::query_as("SELECT status, payload FROM notification_deliveries WHERE id = $1")
+		.bind(delivery_id)
+		.fetch_one(&fx.pool)
+		.await
+		.expect("the row");
+	assert_eq!(status, "pending");
+	assert_eq!(payload_after, payload, "a retry keeps everything, secrets included");
+
+	// Out of attempts ⇒ parked. The secrets go; what an operator reads stays.
+	dispatch.mark_failed(delivery_id, "smtp down", 60, 0).await.expect("park");
+	let (status, payload_after): (String, serde_json::Value) = sqlx::query_as("SELECT status, payload FROM notification_deliveries WHERE id = $1")
+		.bind(delivery_id)
+		.fetch_one(&fx.pool)
+		.await
+		.expect("the row");
+	assert_eq!(status, "failed");
+	assert!(payload_after.get("approval_url").is_none(), "the link is gone");
+	assert!(payload_after.get("code").is_none(), "and the code that arms it");
+	assert_eq!(payload_after["consilium_id"], "c-66", "the rest is kept for the operator who looks at the parked row");
+	assert_eq!(payload_after["amount"], "1 USDT");
+	let dumped = payload_after.to_string();
+	assert!(!dumped.contains("ABCDEFGH") && !dumped.contains("consilium/c-66"), "nothing secret survives in any form");
 }
 
 /// A relay call as banking makes it: the shared service token in `authorization`.
