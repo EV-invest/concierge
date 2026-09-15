@@ -308,6 +308,23 @@ impl Harness {
 			.expect("read case")
 	}
 
+	/// The `admin_action` rows this user's KYC has left behind, newest last.
+	///
+	/// The only place the PRODUCTION assembly of that row is visible: every other test of
+	/// it builds the `AdminAction` by hand and calls the port, which pins the adapter and
+	/// not the four lines in `web::kyc::apply` that decide what the vendor half of a
+	/// user's history actually says.
+	async fn kyc_audit(&self, user: UserId) -> Vec<(Option<Uuid>, Value)> {
+		sqlx::query_as::<_, (Option<Uuid>, Option<Value>)>("SELECT actor_user_id, detail FROM admin_action WHERE subject_user_id = $1 AND action = 'kyc_level_set' ORDER BY position")
+			.bind(user.raw())
+			.fetch_all(&self.pool)
+			.await
+			.expect("read admin_action")
+			.into_iter()
+			.map(|(actor, detail)| (actor, detail.unwrap_or(Value::Null)))
+			.collect()
+	}
+
 	async fn case_row(&self, id: Uuid) -> (String, bool, Value) {
 		sqlx::query_as::<_, (String, bool, Value)>("SELECT status, decision_at IS NOT NULL, payload FROM kyc_cases WHERE id = $1")
 			.bind(id)
@@ -381,6 +398,18 @@ async fn an_approval_raises_the_level_and_emits_exactly_one_kyc_changed() {
 	);
 	assert_eq!(h.kyc_changed_count(user).await, 1, "the money plane must see the decision exactly once");
 
+	// The vendor half of the history, assembled where it is assembled in production.
+	let audit = h.kyc_audit(user).await;
+	assert_eq!(audit.len(), 1, "one verdict, one row");
+	let (actor, detail) = &audit[0];
+	assert_eq!(*actor, None, "no human decided this, and inventing one would be worse than none");
+	assert_eq!(detail["source"], PROVIDER, "who decided, since there is no actor id to say it");
+	assert_eq!(detail["case_id"], case_id.to_string(), "and which case, so the verdict is findable");
+	assert_eq!(detail["requested_tier"], 1, "what the case asked the vendor for");
+	assert_eq!(detail["from"], 0, "the delta, which is the whole point of the row");
+	assert_eq!(detail["to"], 1);
+	assert_eq!(detail["kyc_level"], 1, "kept beside `to` so rows written before this read alike");
+
 	let (case_status, decided, payload) = h.case_row(case_id).await;
 	assert_eq!(case_status, "approved");
 	assert!(decided, "an approval is a decision, so decision_at is set");
@@ -406,6 +435,11 @@ async fn a_redelivery_is_idempotent() {
 	assert_eq!(second, StatusCode::OK, "a retry must not look like a failure, or the provider retries forever");
 	assert_eq!(answer["duplicate"], true);
 	assert_eq!(h.kyc_changed_count(user).await, 1, "a replayed approval must not re-emit KYC_CHANGED onto the outbox");
+	assert_eq!(
+		h.kyc_audit(user).await.len(),
+		1,
+		"nor append a second audit row — a history that grows on retries is one nobody trusts"
+	);
 	assert_eq!(h.kyc_level(user).await, 1);
 }
 

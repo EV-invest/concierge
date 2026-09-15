@@ -378,7 +378,7 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 		}
 	};
 
-	apply(st, &case).await?;
+	apply(st, &case, provider.name()).await?;
 	Ok(Json(json!({ "ok": true, "status": case.status.as_str(), "duplicate": duplicate })))
 }
 
@@ -394,7 +394,7 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 /// A notification failure is NOT one of those errors and stays best-effort below: the
 /// level is already written by then, and retrying a delivery to re-send an email would
 /// re-run this whole path for a decision that has fully landed.
-async fn apply(st: &super::Inner, case: &KycCase) -> Result<(), (StatusCode, &'static str)> {
+async fn apply(st: &super::Inner, case: &KycCase, provider: &str) -> Result<(), (StatusCode, &'static str)> {
 	let Some(target) = case.status.grants_tier(case.requested_tier) else {
 		// Declined, abandoned, expired, unfinished, aged-out, still running: the case row
 		// now says so and the level is untouched. Someone who holds tier 2 and fails an
@@ -426,9 +426,18 @@ async fn apply(st: &super::Inner, case: &KycCase) -> Result<(), (StatusCode, &'s
 	// No actor: no human decided this. The provenance the audit row carries instead is
 	// the provider and the case, so a user's KYC history reads as one log rather than as
 	// admin decisions here and vendor verdicts in a table shaped around session ids.
+	//
+	// `provider` comes from the caller, which is the delivery's own verifier — the same
+	// name `record_decision` matched this case by. Reading `st.kyc` again here would be a
+	// second, weaker source for one fact: it needs a fallback word for a state this path
+	// cannot be in, and it would sign a late delivery with the name of whichever vendor is
+	// configured now rather than the one that decided.
 	let audit = AdminAction::system("kyc_level_set").with_detail(json!({
-		"source": st.kyc.as_ref().map_or("vendor", |p| p.name()),
+		"source": provider,
 		"case_id": case.id.to_string(),
+		// What the case ASKED the vendor for, beside the `from`/`to` the adapter records.
+		// A grant of 1 on a case that asked for 2 is the provider ceiling at work, and
+		// without this key the row cannot be told from a case that asked for 1.
 		"requested_tier": case.requested_tier,
 	}));
 	match st.users.raise_kyc_level_to(case.user_id, target, &audit, now_secs()).await {
