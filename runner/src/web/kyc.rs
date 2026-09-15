@@ -578,16 +578,15 @@ async fn apply(st: &super::Inner, case: &KycCase) -> Result<(), (StatusCode, &'s
 		// now says so and the level is untouched. Someone who holds tier 2 and fails an
 		// attempt at 3 keeps their 2 — a downgrade is a human act under `KycManage`, and
 		// there is no path to one from here.
-		if case.status == KycStatus::InReview {
-			notify(
-				st,
-				case,
-				"kyc_in_review",
-				"Your verification is being reviewed",
-				"A reviewer is looking at the documents you submitted. We will let you know as soon as there is a decision.",
-			)
-			.await;
+		//
+		// Not moving the level was always right. Telling NOBODY was not: until this arm
+		// grew, every verdict but `in_review` produced not even a log line, so a user
+		// whose verification was declined learned nothing and an expiry that contradicted
+		// a held level existed only as a row in a table nobody watches (#49).
+		if let Some((kind, title, body)) = terminal_notice(case.status) {
+			notify(st, case, kind, title, body).await;
 		}
+		alert_owners_if_contradicted(st, case).await;
 		return Ok(());
 	};
 
@@ -628,6 +627,138 @@ async fn apply(st: &super::Inner, case: &KycCase) -> Result<(), (StatusCode, &'s
 		Err(e) => {
 			tracing::error!(error = %e, case_id = %case.id, target, "kyc callback: could not apply the approved level");
 			Err((StatusCode::INTERNAL_SERVER_ERROR, "could not apply the decision"))
+		}
+	}
+}
+
+/// The user-facing copy for a verdict that does not move the level, or `None` where
+/// silence is correct.
+///
+/// `None` for the RUNNING states. `pending`, `in_progress` and `resubmitted` are steps
+/// inside an attempt the user is currently making — mailing somebody about their own
+/// click is noise, and `resubmitted` in particular already reaches them as the vendor's
+/// own "here is what to fix". `CaseDecision::Ignored` never gets this far: a superseded
+/// delivery returns before `apply`, and announcing a verdict the vendor has already
+/// replaced would be worse than announcing nothing.
+///
+/// Two KINDS across four terminal verdicts, because a kind is what a subscriber's
+/// preferences key on and "my attempt ended" is one thing to care about. The copy still
+/// differs per verdict: an attempt that timed out and a completed verification that has
+/// since lapsed are not the same news, and a reader must not have to guess which they
+/// got.
+fn terminal_notice(status: KycStatus) -> Option<(&'static str, &'static str, &'static str)> {
+	match status {
+		KycStatus::InReview => Some((
+			"kyc_in_review",
+			"Your verification is being reviewed",
+			"A reviewer is looking at the documents you submitted. We will let you know as soon as there is a decision.",
+		)),
+		KycStatus::Declined => Some((
+			"kyc_declined",
+			"Your verification was not approved",
+			"The documents you submitted were not accepted, and your account level is unchanged. You can start a new attempt from your profile, or write to us if you believe this is a mistake.",
+		)),
+		KycStatus::Abandoned | KycStatus::Expired => Some((
+			"kyc_expired",
+			"Your verification attempt has closed",
+			"The verification you started was not completed and the session has closed. Your account level is unchanged. You can start a new attempt from your profile whenever you are ready.",
+		)),
+		KycStatus::KycExpired => Some((
+			"kyc_expired",
+			"Your verification has lapsed",
+			"A verification you completed earlier has expired at our provider. Your account level is unchanged for now, and we will let you know if you need to verify again.",
+		)),
+		// Reached only from the arm where `grants_tier` said `None`, so an approval never
+		// gets here — but the arm is spelled out rather than wildcarded, because a new
+		// variant must break THIS compile and not quietly inherit somebody else's copy.
+		KycStatus::Pending | KycStatus::InProgress | KycStatus::Resubmitted | KycStatus::Approved => None,
+	}
+}
+
+/// Put a verdict that CONTRADICTS the level an account holds in front of a human.
+///
+/// The level stays where it is — that is the policy and it is not in question here. What
+/// #49 is about is that nothing followed. Consider a user holding tier 1 for whom the
+/// vendor later reports "Kyc Expired": `grants_tier` returns `None`, the level stays,
+/// and the only record is a row in `kyc_cases`. "A human decides" then means "nobody
+/// decides", indefinitely.
+///
+/// Only `declined` and `kyc_expired` qualify. An abandoned or timed-out session says
+/// nothing about the person's identity — it says they closed a tab — so treating it as a
+/// contradiction would train the owners to ignore this mail, which costs exactly the
+/// signal it exists to carry.
+///
+/// BEST EFFORT, like `notify`: the verdict is already recorded, and failing to raise the
+/// alarm must not turn a landed decision into a vendor retry that re-lands it.
+async fn alert_owners_if_contradicted(st: &super::Inner, case: &KycCase) {
+	if !matches!(case.status, KycStatus::Declined | KycStatus::KycExpired) {
+		return;
+	}
+	let held = match st.users.find_by_id(case.user_id).await {
+		Ok(Some(user)) => user.kyc_level(),
+		Ok(None) => return,
+		Err(e) => {
+			tracing::warn!(error = %e, case_id = %case.id, "kyc callback: could not read the level a terminal verdict is judged against");
+			return;
+		}
+	};
+	if held < case.requested_tier || held == 0 {
+		return;
+	}
+
+	// `error!` and not `warn!`: `error_monitoring::tracing_layer()` forwards this to
+	// Sentry, and Sentry is the only channel here that pages rather than accumulates.
+	tracing::error!(
+		case_id = %case.id,
+		user_id = %case.user_id,
+		verdict = case.status.as_str(),
+		held,
+		requested_tier = case.requested_tier,
+		"kyc callback: a terminal verdict contradicts a level this account already holds — the level was NOT changed and a human must decide"
+	);
+
+	let owners = match st.governance.owners().await {
+		Ok(owners) => owners,
+		Err(e) => {
+			tracing::warn!(error = %e, case_id = %case.id, "kyc callback: could not read the owner roster to alert");
+			return;
+		}
+	};
+	let subject_email = match st.users.find_by_id(case.user_id).await {
+		Ok(Some(user)) => user.email().as_str().to_owned(),
+		_ => String::new(),
+	};
+	let payload = json!({
+		"subject_email": subject_email,
+		"case_id": case.id.to_string(),
+		"verdict": case.status.as_str(),
+		"held_level": held,
+		"requested_tier": case.requested_tier,
+		"decided_at": now_secs(),
+	});
+
+	for owner in owners {
+		// The address is resolved from the IDENTITY RECORD and must be VERIFIED — the
+		// same rule the mail relay applies to every governance kind. An address nobody
+		// has proved belongs to the person is not where an operational alert about
+		// somebody else's account should land.
+		let recipient = match st.users.find_by_id(domain::users::UserId::from_raw(owner.id)).await {
+			Ok(Some(user)) if user.email_verified() => user,
+			Ok(_) => continue,
+			Err(e) => {
+				tracing::warn!(error = %e, case_id = %case.id, owner = %owner.id, "kyc callback: could not resolve an owner's address");
+				continue;
+			}
+		};
+		// One row per OWNER per case per verdict. The owner id is part of the key and not
+		// a detail: `enqueue_governance_mail` deduplicates on `dedupe_key` alone, across
+		// the whole queue, so a key naming only the case would deliver to whichever owner
+		// happened to be first in the roster and silently drop everyone else — a roster
+		// alert that reaches one owner is exactly the "nobody is watching" this change
+		// exists to end. A redelivery of the same verdict still re-mails nobody.
+		let dedupe_key = format!("kyc-contradiction:{}:{}:{}", case.id, case.status.as_str(), owner.id);
+		if let Err(e) = st.governance.enqueue_mail(owner.id, recipient.email().as_str(), "kyc_verdict_alert", &dedupe_key, &payload).await {
+			tracing::warn!(error = %e, case_id = %case.id, owner = %owner.id, "kyc callback: could not queue the owners' verdict alert");
 		}
 	}
 }

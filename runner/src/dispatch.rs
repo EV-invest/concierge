@@ -90,6 +90,14 @@ fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -
 			&text_field(payload, "code"),
 			int_field(payload, "expires_at"),
 		)),
+		"kyc_verdict_alert" => Some(templates::kyc_verdict_alert(
+			&text_field(payload, "subject_email"),
+			&text_field(payload, "case_id"),
+			&text_field(payload, "verdict"),
+			int_field(payload, "held_level") as u32,
+			int_field(payload, "requested_tier") as u32,
+			int_field(payload, "decided_at"),
+		)),
 		"payout_approval" => Some(templates::payout_approval(
 			&text_field(payload, "consilium_id"),
 			&text_field(payload, "initiator_email"),

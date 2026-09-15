@@ -639,6 +639,53 @@ pub fn fee_policy_notice(fund: &str, current: Option<&FeeTerms>, proposed: &FeeT
 	}
 }
 
+/// The owners' alert about a vendor verdict that contradicts a level the account holds.
+///
+/// Deliberately NOT a request to act on a link. There is no code and no button, because
+/// the decision this mail exists to trigger — lowering somebody's KYC level — is one
+/// nobody should be able to make from an inbox. It says what happened and where to look;
+/// the act itself happens in the console under `Permission::KycManage`.
+///
+/// The affected account's address is printed because it is how an operator finds the
+/// person in the console, and it is an address the recipient already administers.
+pub fn kyc_verdict_alert(subject_email: &str, case_id: &str, verdict: &str, held_level: u32, requested_tier: u32, decided_at: i64) -> RenderedEmail {
+	let subject_email = one_line(subject_email);
+	let case_id = one_line(case_id);
+	let verdict = one_line(verdict);
+	let decided = fmt_ts(decided_at);
+
+	let headline = "A verification verdict contradicts a level an account already holds";
+	let explain = format!(
+		"Our verification provider reported \u{201c}{verdict}\u{201d} for a case opened at tier {requested_tier}, and the account still stands at level {held_level}. The level has NOT been changed: only a person holding KYC management may lower one. This message exists so that somebody decides, rather than nobody."
+	);
+
+	let rows = vec![
+		("Account", subject_email.clone()),
+		("Verdict", verdict.clone()),
+		("Case", case_id.clone()),
+		("Level held", held_level.to_string()),
+		("Case tier", requested_tier.to_string()),
+		("Decided", decided.clone()),
+	];
+
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Verification"));
+	inner.push_str(&heading(headline));
+	inner.push_str(&paragraph(&explain));
+	inner.push_str(&detail_box(&rows));
+	inner.push_str(&paragraph(
+		"Review the account in the operator console. If the level should come down, lower it there — there is no link in this mail that can do it.",
+	));
+
+	RenderedEmail {
+		subject: format!("Verification verdict \u{201c}{verdict}\u{201d} contradicts level {held_level}"),
+		html: shell(headline, &card(&inner), FOOTER_SECURITY, "", "Verification"),
+		text: format!(
+			"{headline}\n\n{explain}\n\nAccount: {subject_email}\nVerdict: {verdict}\nCase: {case_id}\nLevel held: {held_level}\nCase tier: {requested_tier}\nDecided: {decided}\n\nReview the account in the operator console. If the level should come down, lower it there — there is no link in this mail that can do it.\n\n—\n{FOOTER_SECURITY}\n"
+		),
+	}
+}
+
 // ── building blocks ────────────────────────────────────────────────────────
 
 /// Why a governance mail has no unsubscribe link, said out loud.
