@@ -332,7 +332,9 @@ async fn a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge() {
 	);
 	assert_eq!(fx.reload(target).await.status(), UserStatus::Disabled);
 
-	let lapsed = fx.users.lapse_due_holds(held.hold_expires_at, 10).await.expect("sweep");
+	// Swept LATE, as the real one always is — it runs on an interval, not at the
+	// deadline — so the end it records is asserted against the deadline, not the sweep.
+	let lapsed = fx.users.lapse_due_holds(held.hold_expires_at + 300, 10).await.expect("sweep");
 	assert!(lapsed.contains(&target), "the deadline released it");
 
 	let user = fx.reload(target).await;
@@ -345,7 +347,11 @@ async fn a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge() {
 	);
 	assert_eq!(fx.audit(target).await.last().map(|a| a.0.clone()), Some("hold_lapsed".into()));
 	assert_eq!(fx.audit(target).await.last().unwrap().1, None, "nobody acted, and the log says so");
-	assert_eq!(user.hold_ended_at(), Some(held.hold_expires_at), "the lapse is what the next hold's cooldown counts from");
+	assert_eq!(
+		user.hold_ended_at(),
+		Some(held.hold_expires_at),
+		"the cooldown counts from the deadline, not from the sweep that noticed it"
+	);
 }
 
 /// A reason is required because the owners asked to ratify a hold are reading exactly

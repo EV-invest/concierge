@@ -429,12 +429,12 @@ impl User {
 	/// active. Unqualified: the decision about WHO may lift a given suspension is taken
 	/// from [`Self::suspension`] by the caller, not here.
 	///
-	/// `now` is remembered only when what ends is an admin hold — that is the instant
-	/// [`Self::hold`] measures its cooldown from. Lifting the owners' verdict, or a
-	/// pre-column suspension, starts no cooldown: neither was one actor's brake.
-	pub fn enable(&mut self, now: i64) {
+	/// `ended_at` is remembered only when what ends is an admin hold — that is the
+	/// instant [`Self::hold`] measures its cooldown from. Lifting the owners' verdict,
+	/// or a pre-column suspension, starts no cooldown: neither was one actor's brake.
+	pub fn enable(&mut self, ended_at: i64) {
 		if matches!(self.suspension, Some(Suspension::AdminHold { .. })) {
-			self.hold_ended_at = Some(now);
+			self.hold_ended_at = Some(ended_at);
 		}
 		self.suspension = None;
 		if self.status == UserStatus::Active {
@@ -457,7 +457,10 @@ impl User {
 		if now < expires_at {
 			return false;
 		}
-		self.enable(now);
+		// The hold ended at its deadline, not when the sweep got round to it: the
+		// cooldown is a promise about the DEADLINE, and dating it from the sweep would
+		// stretch it by up to one sweep interval for nobody's benefit.
+		self.enable(expires_at);
 		true
 	}
 
@@ -1147,6 +1150,22 @@ mod tests {
 		assert_eq!(user.drain_events(), [UserEvent::Reinstated]);
 		assert_eq!(user.hold_ended_at(), Some(1_000 + HOLD_TTL_SECS), "the lapse is what the cooldown counts from");
 		assert!(!user.lapse_hold(i64::MAX), "there is nothing left to lapse");
+	}
+
+	/// The sweep runs on an interval, so it reaches a due hold late. The cooldown counts
+	/// from the deadline the hold was given, not from the sweep that noticed it passing.
+	#[test]
+	fn a_late_sweep_dates_the_end_of_a_hold_at_its_deadline() {
+		let mut user = fixture();
+		user.hold(Role::Admin, 1_000, false).expect("hold");
+		let deadline = 1_000 + HOLD_TTL_SECS;
+
+		assert!(user.lapse_hold(deadline + 3_600), "an hour late is still a lapse");
+		assert_eq!(user.hold_ended_at(), Some(deadline), "dated at the deadline, not at the sweep");
+		user.drain_events();
+
+		user.hold(Role::Admin, deadline + HOLD_COOLDOWN_SECS, false)
+			.expect("the cooldown is measured from the deadline and is over");
 	}
 
 	/// The owners' verdict has no clock, and the weaker measure cannot restate it — which
