@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use axum::{
 	Router,
 	body::Body,
-	http::{Request, StatusCode},
+	http::{HeaderMap, Request, StatusCode},
 };
 use concierge::{
 	infrastructure::{
@@ -244,6 +244,14 @@ impl Harness {
 
 	/// `POST /kyc/start` as the cabinet reaches it. `body` is passed through verbatim.
 	async fn start(&self, cookie: &str, csrf: Option<&str>, body: &str) -> (StatusCode, Value) {
+		let (status, _, body) = self.start_response(cookie, csrf, body).await;
+		(status, body)
+	}
+
+	/// The same, with the response HEADERS kept — `/kyc/start` reads the session through
+	/// the same rotating reader `/kyc/status` does, so it owes the browser the same
+	/// refreshed access cookie.
+	async fn start_response(&self, cookie: &str, csrf: Option<&str>, body: &str) -> (StatusCode, HeaderMap, Value) {
 		let mut request = Request::builder()
 			.method("POST")
 			.uri("/kyc/start")
@@ -254,8 +262,30 @@ impl Harness {
 		}
 		let response = self.router.clone().oneshot(request.body(Body::from(body.to_owned())).unwrap()).await.expect("router answered");
 		let status = response.status();
+		let headers = response.headers().clone();
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
-		(status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+		(status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+	}
+
+	/// `GET /kyc/status` as the cabinet reaches it. `None` is the signed-out caller.
+	async fn status(&self, cookie: Option<&str>) -> (StatusCode, Value) {
+		let (status, _, body) = self.status_response(cookie).await;
+		(status, body)
+	}
+
+	/// `GET /kyc/status` with the response HEADERS kept, for the two properties that
+	/// live there rather than in the body: the rotated access cookie, and the
+	/// cache directives a polled per-user document needs.
+	async fn status_response(&self, cookie: Option<&str>) -> (StatusCode, HeaderMap, Value) {
+		let mut request = Request::builder().method("GET").uri("/kyc/status");
+		if let Some(cookie) = cookie {
+			request = request.header("cookie", cookie);
+		}
+		let response = self.router.clone().oneshot(request.body(Body::empty()).unwrap()).await.expect("router answered");
+		let status = response.status();
+		let headers = response.headers().clone();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+		(status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 	}
 
 	async fn post(&self, body: Vec<u8>, signature: String, timestamp: i64) -> (StatusCode, Value) {
@@ -650,13 +680,22 @@ async fn the_webhook_needs_no_cookie_and_no_csrf_token() {
 /// `None` when Redis is absent: the in-process fallback is per-instance by design (see
 /// `web_sessions.rs`), so a session opened here would be invisible to the router.
 async fn signed_in(user: UserId) -> Option<(String, String)> {
+	signed_in_for(user, 900).await
+}
+
+/// The same, with the access token's remaining lifetime chosen by the caller.
+///
+/// A value inside `ACCESS_SKEW_SECS` (30) is what puts `WebSessions::fresh` on its
+/// REFRESH path — the one that rotates the pair and saves it — which is the only way a
+/// test can observe whether a handler hands the new token back to the browser.
+async fn signed_in_for(user: UserId, access_ttl_secs: i64) -> Option<(String, String)> {
 	std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
 	let sessions = web::WebSessions::from_env().await.expect("session store");
 	let now_s = now();
 	let (session_id, csrf, _) = sessions
 		.put(evconcierge_contracts::concierge::v1::TokenResponse {
 			access_token: "access".into(),
-			access_expires_at: now_s + 900,
+			access_expires_at: now_s + access_ttl_secs,
 			refresh_token: "family.secret".into(),
 			refresh_expires_at: now_s + 3600,
 			user: Some(evconcierge_contracts::concierge::v1::UserSummary {
@@ -1774,4 +1813,188 @@ async fn the_same_document_written_differently_is_still_caught() {
 	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
 	assert_eq!(h.case_row(second_case).await.0, "held_duplicate", "separators and case are not an identity");
 	assert_eq!(h.kyc_level(second).await, 0);
+}
+
+/// THE CONTRACT of `GET /kyc/status`, asserted as whole JSON documents rather than field
+/// by field.
+///
+/// The cabinet stops guessing here. Until this route existed its only signal was
+/// `kyc_level === 0`, which cannot tell "never started" from "waiting on the vendor" —
+/// so the screen offered Start to a user already mid-flow and bought a second BILLED
+/// session for the attempt they were in (#190). Everything that replaces that inference
+/// is a name in these documents, which is why the assertions compare the whole body: a
+/// field quietly renamed, added or dropped is a cabinet that silently reverts to
+/// guessing, and the failure would otherwise surface as a user being charged for a
+/// duplicate case rather than as a red test.
+#[tokio::test]
+async fn the_status_route_publishes_the_pinned_shape() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, _csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	// Nobody signed in: one machine-readable code, no prose. This route answers JSON for
+	// every outcome — the cabinet parses one shape inside one feature.
+	let (status, answer) = h.status(None).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(answer, json!({ "error": "unauthenticated" }));
+
+	// A signed-in user who has never started. `case: null` is the whole difference from
+	// tier 0 alone, and it is what makes offering Start correct.
+	let (status, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer, json!({ "level": 0, "case": null }), "the never-started shape, verbatim");
+
+	// Mid-flow. `resumable` is what sends the browser back into the session already paid
+	// for instead of opening a second one.
+	let (case_id, session_id) = h.case(user, 1).await;
+	let (status, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK);
+	let created_at = answer["case"]["created_at"].as_i64().expect("created_at is a number");
+	assert!((created_at - now()).abs() < 300, "created_at is unix seconds, not milliseconds or a string: {created_at}");
+	assert_eq!(
+		answer,
+		json!({ "level": 0, "case": { "status": "pending", "requested_tier": 1, "created_at": created_at, "resumable": true } }),
+		"the running-case shape, verbatim — keys, nesting and the persisted status vocabulary"
+	);
+
+	// A case opened before `kyc_cases.redirect_url` existed still holds the start gate,
+	// but there is nowhere to send the browser back to, and the cabinet must be told so
+	// rather than rendering a dead link.
+	sqlx::query("UPDATE kyc_cases SET redirect_url = NULL WHERE id = $1")
+		.bind(case_id)
+		.execute(&h.pool)
+		.await
+		.expect("clear redirect_url");
+	let (_, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(answer["case"]["resumable"], false, "a case with no vendor URL is live but not resumable");
+
+	// The verdict lands. The level moves and the case leaves the answer entirely: a
+	// decided case is history, and history is not what this route reports.
+	let at = now();
+	let raw = body(&session_id, "Approved", &case_id.to_string(), at, json!({}));
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	let (status, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer, json!({ "level": 1, "case": null }), "the verified shape, verbatim");
+}
+
+/// The status route must not depend on the vendor being configured.
+///
+/// With `DIDIT_*` unset `/kyc/start` answers 503, and a cabinet that could not read the
+/// level or the running case in that state would fall back to exactly the guesswork this
+/// route removes — on the day verification is already broken.
+#[tokio::test]
+async fn status_answers_while_verification_itself_is_unavailable() {
+	let Some(h) = setup_with(None).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	let (start_status, start_answer) = h.start(&cookie, Some(&csrf), "").await;
+	assert_eq!(start_status, StatusCode::SERVICE_UNAVAILABLE);
+	assert_eq!(start_answer, unavailable_body());
+
+	let (status, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK, "the level is a fact of this plane, not of the vendor's");
+	assert_eq!(answer, json!({ "level": 0, "case": null }));
+}
+
+/// The polled route must leave the browser holding the token the SERVER holds.
+///
+/// Reading a session is not a read: inside `ACCESS_SKEW_SECS` of expiry
+/// `WebSessions::fresh` renews the access token, rotates the refresh token and saves the
+/// new pair. A handler that takes the caller out of that and drops the rest leaves the
+/// store with the new pair and the browser with a JWT expiring inside the half-minute —
+/// after which every `/api/*` call the cabinet makes eats a 401 and a round trip through
+/// `/api/auth/session` before it works. On a route the cabinet POLLS, that window is not
+/// a corner case: it is most polls.
+///
+/// Pinned on both KYC routes, because both read the session through the same reader.
+#[tokio::test]
+async fn reading_the_session_hands_the_refreshed_access_cookie_back() {
+	let h = harness!();
+	let user = h.user().await;
+	// Inside the 30-second skew, so `fresh` takes its refresh path.
+	let Some((cookie, csrf)) = signed_in_for(user, 10).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	let (status, headers, _) = h.status_response(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK);
+	let cookies: Vec<&str> = headers.get_all("set-cookie").iter().map(|v| v.to_str().expect("ascii cookie")).collect();
+	assert!(
+		cookies.iter().any(|c| c.starts_with("ev_access=")),
+		"the access cookie the store now holds must come back with the answer, got {cookies:?}"
+	);
+
+	// `/kyc/start` reaches the session through the same reader and owes the same cookie.
+	let (status, headers, _) = h.start_response(&cookie, Some(&csrf), "").await;
+	assert_eq!(status, StatusCode::OK);
+	let cookies: Vec<&str> = headers.get_all("set-cookie").iter().map(|v| v.to_str().expect("ascii cookie")).collect();
+	assert!(cookies.iter().any(|c| c.starts_with("ev_access=")), "start rotates the same pair, got {cookies:?}");
+}
+
+/// A per-user document on a polled route says so to every cache between here and the
+/// browser.
+///
+/// This answer names one person's verification level. It leaves the pod through the
+/// shell's `/api/kyc/:path*` rewrite and a CDN, and unlike `/auth/session` it does not
+/// always carry a `Set-Cookie` an intermediary might take as a hint. Without directives
+/// of its own, a 200 here is something a shared cache is entitled to store and replay.
+#[tokio::test]
+async fn status_is_never_cacheable() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, _csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	for cookie in [Some(cookie.as_str()), None] {
+		let (_, headers, _) = h.status_response(cookie).await;
+		assert_eq!(
+			headers.get("cache-control").and_then(|v| v.to_str().ok()),
+			Some("no-store"),
+			"hit and refusal are equally personal"
+		);
+		assert_eq!(headers.get("vary").and_then(|v| v.to_str().ok()), Some("Cookie"));
+	}
+}
+
+/// With no vendor configured, a stored URL is not something the cabinet may offer.
+///
+/// `/kyc/start` refuses with 503 BEFORE it reaches the branch that hands a running
+/// case's `redirect_url` back, so `resumable: true` here would put a Continue button on
+/// screen whose every click is an outage — on precisely the day this route exists to
+/// stop the cabinet from guessing.
+#[tokio::test]
+async fn a_running_case_is_not_resumable_while_the_vendor_is_unconfigured() {
+	let Some(h) = setup_with(None).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	// A case WITH a redirect_url, exactly as a start before the outage left it.
+	h.case(user, 1).await;
+
+	let (_, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(answer["case"]["status"], "pending", "the attempt is still reported — it is a fact of this plane");
+	assert_eq!(answer["case"]["resumable"], false, "nothing the cabinet may offer: start cannot run at all");
+
+	// And that is not a guess about start — it is what start does.
+	assert_eq!(h.start(&cookie, Some(&csrf), "").await.0, StatusCode::SERVICE_UNAVAILABLE);
 }
