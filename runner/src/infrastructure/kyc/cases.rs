@@ -103,6 +103,18 @@ impl KycCaseRepository for PgKycCases {
 		.transpose()
 	}
 
+	async fn approved_cover(&self, user_id: UserId, excluding: Uuid) -> Result<Option<u32>, DomainError> {
+		let row: Option<(Option<i32>,)> = sqlx::query_as("SELECT max(requested_tier) FROM kyc_cases WHERE user_id = $1 AND id <> $2 AND status = $3")
+			.bind(user_id.raw())
+			.bind(excluding)
+			.bind(KycStatus::Approved.as_str())
+			.fetch_optional(&self.pool)
+			.await
+			.map_err(repo_err)?;
+
+		Ok(row.and_then(|(tier,)| tier).map(|tier| tier.max(0) as u32))
+	}
+
 	/// One transaction: take the case `FOR UPDATE`, judge the incoming verdict against
 	/// the stored one, and write only if it actually moves the case FORWARD.
 	///

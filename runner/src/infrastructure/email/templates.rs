@@ -639,6 +639,53 @@ pub fn fee_policy_notice(fund: &str, current: Option<&FeeTerms>, proposed: &FeeT
 	}
 }
 
+/// The owners' alert about a vendor verdict that contradicts a level the account holds.
+///
+/// Deliberately NOT a request to act on a link. There is no code and no button, because
+/// the decision this mail exists to trigger — lowering somebody's KYC level — is one
+/// nobody should be able to make from an inbox. It says what happened and where to look;
+/// the act itself happens in the console under `Permission::KycManage`.
+///
+/// The affected account's address is printed because it is how an operator finds the
+/// person in the console, and it is an address the recipient already administers.
+pub fn kyc_verdict_alert(subject_email: &str, case_id: &str, verdict: &str, held_level: u32, requested_tier: u32, decided_at: i64) -> RenderedEmail {
+	let subject_email = one_line(subject_email);
+	let case_id = one_line(case_id);
+	let verdict = one_line(verdict);
+	let decided = fmt_ts(decided_at);
+
+	let headline = "A verification verdict contradicts a level an account already holds";
+	let explain = format!(
+		"Our verification provider reported \u{201c}{verdict}\u{201d} for a case opened at tier {requested_tier}, and the account still stands at level {held_level}. The level has NOT been changed: only a person holding KYC management may lower one. This message exists so that somebody decides, rather than nobody."
+	);
+
+	let rows = vec![
+		("Account", subject_email.clone()),
+		("Verdict", verdict.clone()),
+		("Case", case_id.clone()),
+		("Level held", held_level.to_string()),
+		("Case tier", requested_tier.to_string()),
+		("Decided", decided.clone()),
+	];
+
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Verification"));
+	inner.push_str(&heading(headline));
+	inner.push_str(&paragraph(&explain));
+	inner.push_str(&detail_box(&rows));
+	inner.push_str(&paragraph(
+		"Review the account in the operator console. If the level should come down, lower it there — there is no link in this mail that can do it.",
+	));
+
+	RenderedEmail {
+		subject: format!("Verification verdict \u{201c}{verdict}\u{201d} contradicts level {held_level}"),
+		html: shell(headline, &card(&inner), FOOTER_SECURITY, "", "Verification"),
+		text: format!(
+			"{headline}\n\n{explain}\n\nAccount: {subject_email}\nVerdict: {verdict}\nCase: {case_id}\nLevel held: {held_level}\nCase tier: {requested_tier}\nDecided: {decided}\n\nReview the account in the operator console. If the level should come down, lower it there — there is no link in this mail that can do it.\n\n—\n{FOOTER_SECURITY}\n"
+		),
+	}
+}
+
 // ── building blocks ────────────────────────────────────────────────────────
 
 /// Why a governance mail has no unsubscribe link, said out loud.
@@ -890,6 +937,30 @@ mod tests {
 		);
 		assert!(mail.html.contains("&lt;sweep&gt;"), "the memo is escaped");
 		assert!(mail.subject.contains("12,500.00 USDT"), "the subject alone tells an owner what is being asked");
+	}
+
+	#[test]
+	fn the_verdict_alert_names_the_account_and_arms_nothing() {
+		let mail = kyc_verdict_alert("subject@example.com", "case-7", "kyc_expired", 1, 1, 1_785_143_640);
+		// This mail has no link and no code on purpose — lowering a level from a mailbox
+		// is not a thing anyone should be able to do — so the address IS the alert: it is
+		// the only way an operator finds the person in the console.
+		assert!(mail.html.contains("subject@example.com"), "the account is named");
+		assert!(mail.text.contains("Account: subject@example.com"));
+		assert!(mail.subject.contains("kyc_expired"), "the verdict is readable in an inbox list: {}", mail.subject);
+		assert!(!mail.html.contains("Type this code"), "an alert arms nothing");
+		assert!(!mail.html.contains("href=\"https"), "and links nowhere: {}", mail.html);
+		assert!(mail.html.contains("owner seat"), "an operational alert is not unsubscribable, and says why");
+	}
+
+	/// An address is attacker-influenced only in the sense that a person chooses it, but
+	/// it is still user input landing in HTML sent to every owner.
+	#[test]
+	fn the_verdict_alert_escapes_what_it_was_given() {
+		let mail = kyc_verdict_alert("<script>alert(1)</script>@example.com", "case\r\nInjected: 1", "kyc_expired", 1, 1, 0);
+		assert!(!mail.html.contains("<script>"), "markup in an address does not become markup: {}", mail.html);
+		assert!(!mail.subject.contains('\n'), "no header injection through the subject");
+		assert!(!mail.text.contains('\r'), "and the case id is flattened to one line");
 	}
 
 	#[test]

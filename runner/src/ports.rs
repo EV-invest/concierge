@@ -438,6 +438,21 @@ pub trait KycProvider: Send + Sync {
 	/// Open a verification session for an already-opened case.
 	async fn start_session(&self, case_id: Uuid, requested_tier: u32) -> Result<KycSession, DomainError>;
 
+	/// The origins — `scheme://host[:port]`, as WHATWG serialises them — that this
+	/// adapter's [`KycSession::redirect_url`] may point at. `/kyc/start` refuses any
+	/// answer outside this set rather than sending a signed-in browser to it.
+	///
+	/// Asked of the PROVIDER and not read from configuration beside it, because the two
+	/// are the same fact and a second copy is a copy that drifts. The adapter knows both
+	/// what it dialled and what that vendor answers with — which are not always the same
+	/// host, and were not for Didit — so nothing outside it has to guess.
+	///
+	/// An EMPTY set means "this adapter cannot say", and the check then refuses
+	/// everything. That is deliberate: the alternative, degrading to "any `https:` URL",
+	/// is the state this check exists to leave, and it would arrive silently. The boot
+	/// refuses to mount a provider that declares nothing.
+	fn session_origins(&self) -> Vec<String>;
+
 	/// Authenticate and parse one webhook delivery.
 	///
 	/// I/O-FREE by contract — signature check, replay window and parsing only, with the
@@ -562,6 +577,22 @@ pub trait KycCaseRepository: Send + Sync {
 	/// two lists here would let `/kyc/status` report a live case the start route no
 	/// longer considers live, which is precisely the disagreement #190 is about.
 	async fn live_case(&self, user_id: UserId) -> Result<Option<LiveCase>, DomainError>;
+
+	/// The highest tier any OTHER case of this user was approved for and still holds
+	/// `approved` status, if there is one.
+	///
+	/// Asked when a terminal NEGATIVE verdict looks like it contradicts the level an
+	/// account holds. Without it the predicate is "this user is above this case's tier",
+	/// which fires on the most ordinary sequence there is: verified once, verified again,
+	/// and then the vendor reports the FIRST session as lapsed. That is routine, the
+	/// second approval is entirely valid, and paging the owners about it teaches them to
+	/// ignore the one mail that exists to be read.
+	///
+	/// The raw tier comes back rather than a level: what a status grants is
+	/// [`KycStatus::grants_tier`]'s answer and nobody else's, so the SQL that finds the
+	/// row does not get to have an opinion about it. `None` when no other approved case
+	/// exists.
+	async fn approved_cover(&self, user_id: UserId, excluding: Uuid) -> Result<Option<u32>, DomainError>;
 
 	/// Apply a verdict to the case it names, if it moves anything.
 	///
