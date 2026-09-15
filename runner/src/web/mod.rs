@@ -36,7 +36,7 @@ use evconcierge_auth::AuthService;
 /// enforces. A test that hard-coded the number would keep passing after someone raised
 /// it, and the number is what stands between one account and the vendor balance.
 pub use kyc::START_MAX_PER_WINDOW;
-pub use session::WebSessions;
+pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
 
 use crate::{

@@ -87,6 +87,19 @@ impl AuthService {
 			}),
 		}
 	}
+
+	/// The user's CURRENT principal snapshot, read live from the directory — the
+	/// same [`UserSummary`] a token pair carries, but not frozen at issuance. The web
+	/// session locker re-reads it on every session view so a role granted through the
+	/// console shows up at once, not only after the next refresh rotation.
+	///
+	/// Purely a read: a disabled status here is reported as data, never acted on —
+	/// revoking the family stays the refresh path's job. `Unavailable` when the
+	/// directory task is gone (an unconfigured service has no receiver at all).
+	pub async fn principal(&self, user_id: &str) -> Result<UserSummary, AuthError> {
+		let user = self.engine.provisioner.lookup(user_id.to_string()).await.inspect_err(crate::telemetry::report_unexpected)?;
+		Ok(user_summary(&user))
+	}
 }
 
 struct AuthEngine {
@@ -104,14 +117,20 @@ fn token_response(access_token: String, access_exp: u64, refresh: IssuedRefresh,
 		access_expires_at: access_exp as i64,
 		refresh_token: refresh.token,
 		refresh_expires_at: refresh.expires_at as i64,
-		user: Some(UserSummary {
-			user_id: summary.user_id.clone(),
-			email: summary.email.clone(),
-			status: summary.status.clone(),
-			token_version: summary.token_version,
-			role: summary.role.clone(),
-			role_is_break_glass: summary.role_is_break_glass,
-		}),
+		user: Some(user_summary(summary)),
+	}
+}
+
+/// The wire principal snapshot of a directory record — the same shape a token pair
+/// carries, so a live re-read and a login-time copy are interchangeable.
+fn user_summary(summary: &ProvisionedUser) -> UserSummary {
+	UserSummary {
+		user_id: summary.user_id.clone(),
+		email: summary.email.clone(),
+		status: summary.status.clone(),
+		token_version: summary.token_version,
+		role: summary.role.clone(),
+		role_is_break_glass: summary.role_is_break_glass,
 	}
 }
 
