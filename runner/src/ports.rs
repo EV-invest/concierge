@@ -111,8 +111,10 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// own expiry clock. Refused, too, while a hold is live or within
 	/// [`domain::users::HOLD_COOLDOWN_SECS`] of one ending, unless a suspension proposal
 	/// about the account is open — decided under the row lock, like the rest. `by` is
-	/// the actor's PERSISTED role: an admin or owner seat is held only by an owner.
-	async fn hold_user(&self, id: UserId, action: &AdminAction, by: Role, now: i64) -> Result<User, DomainError>;
+	/// the actor, whose PERSISTED role is read inside that same transaction: an admin
+	/// or owner seat is held only by an owner, and a role resolved on another connection
+	/// before the lock could be one the owners had just revoked.
+	async fn hold_user(&self, id: UserId, action: &AdminAction, by: UserId, now: i64) -> Result<User, DomainError>;
 
 	/// Re-enable a disabled user UNQUALIFIED; emits REINSTATED. The raw writer beneath
 	/// [`Self::reinstate_outside_governance`]. `now` is when a lifted hold is recorded as

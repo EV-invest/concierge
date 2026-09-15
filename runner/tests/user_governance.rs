@@ -163,7 +163,7 @@ impl Fixture {
 	async fn hold_at(&self, actor: UserId, target: UserId, now: i64) -> Result<i64, domain::error::DomainError> {
 		let action = AdminAction::by(actor, "held", &Audit::default()).with_reason("credential stuffing");
 		self.users
-			.hold_user(target, &action, Role::Owner, now)
+			.hold_user(target, &action, actor, now)
 			.await
 			.map(|user| user.suspension().and_then(Suspension::hold_expires_at).unwrap())
 	}
