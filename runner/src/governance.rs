@@ -744,12 +744,17 @@ impl OwnerRemovalApprovalService for RemovalApproval {
 
 		match self.governance.self_decision(&req.token, &req.code, vote, now_secs(), &audit).await.map_err(domain_to_status)? {
 			SelfDecision::Unusable => Err(Status::not_found(INVITATION_MISSING)),
-			// INVALID_ARGUMENT, deliberately not PERMISSION_DENIED: the BFF folds
-			// PermissionDenied into an opaque 404, so an owner who mistyped one character
-			// would be told their invitation does not exist — and would retry, burn their
-			// own token, and set off a brute-force alert to every owner. This is not an
-			// enumeration oracle: a wrong code is only reachable by someone already
-			// holding a valid, live, unspent token.
+			// INVALID_ARGUMENT, deliberately not PERMISSION_DENIED: a mistyped character is
+			// bad input, not a fact about who the caller is — the same owner retyping the
+			// same code gets in. PERMISSION_DENIED would read as "this is not yours",
+			// which is what makes an owner burn their remaining attempts and set off a
+			// brute-force alert to every other owner. This is not an enumeration oracle: a
+			// wrong code is only reachable by someone already holding a valid, live,
+			// unspent token.
+			//
+			// The older wording argued this from the console — that the BFF folded
+			// PermissionDenied into an opaque 404. It does not: banking's cabinet BFF
+			// treats PermissionDenied as client-safe and relays the message under a 403.
 			SelfDecision::WrongCode { attempts_remaining } => Err(Status::invalid_argument(format!("incorrect code — {attempts_remaining} attempts remain"))),
 			SelfDecision::Decided(record) => {
 				announce(self.governance.as_ref(), &self.revisions).await;
