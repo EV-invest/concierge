@@ -28,6 +28,21 @@ pub const PROVIDER: &str = "didit";
 /// rather than tight.
 const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Where Didit serves the applicant-facing session page from.
+///
+/// NOT the API host. `DIDIT_BASE_URL` defaults to `https://verification.didit.me` and is
+/// where `POST /v3/session/` goes; the `url` that call answers with is on
+/// `verify.didit.me` (vendor docs, Create Session). Deriving the expected redirect host
+/// from the API base — which is what this adapter did first — refuses EVERY real start
+/// and takes verification down for everyone, arriving as silence.
+///
+/// A constant rather than an env var because it is a fact about the vendor, like the
+/// `/v3/session/` path beside it, and a knob here is one more value to carry through the
+/// deploy chain for a decision nobody is in a position to make at 3am. A sandbox or
+/// self-hosted base URL is covered by [`DiditKyc::session_origins`] admitting the API
+/// origin alongside it.
+const SESSION_ORIGIN: &str = "https://verify.didit.me";
+
 /// Everything the adapter needs from the environment, resolved once at boot.
 pub struct DiditConfig {
 	pub base_url: String,
@@ -67,6 +82,23 @@ struct SessionResponse {
 impl KycProvider for DiditKyc {
 	fn name(&self) -> &'static str {
 		PROVIDER
+	}
+
+	/// Two, and the second is not redundant.
+	///
+	/// [`SESSION_ORIGIN`] is where the vendor actually serves session pages. The origin
+	/// of `DIDIT_BASE_URL` is admitted beside it so that a sandbox, a staging tenant or
+	/// a self-hosted base keeps working without an edit here — it is still an origin an
+	/// operator deliberately pointed this adapter at, which is the whole property being
+	/// checked. It is admitted only when it is `https`: a base URL over plain http is a
+	/// misconfiguration, and inheriting it here would let the redirect check pass
+	/// something a browser must not be sent to.
+	fn session_origins(&self) -> Vec<String> {
+		let mut origins = vec![SESSION_ORIGIN.to_string()];
+		if let Some(origin) = super::origin_of(&self.config.base_url).filter(|o| o.starts_with("https://") && o != SESSION_ORIGIN) {
+			origins.push(origin);
+		}
+		origins
 	}
 
 	/// `POST /v3/session/`. `vendor_data` carries the CASE id and nothing else: the
@@ -400,6 +432,53 @@ mod tests {
 	use super::*;
 
 	const SECRET: &str = "webhook-secret";
+
+	fn adapter(base_url: &str) -> DiditKyc {
+		DiditKyc::new(DiditConfig {
+			base_url: base_url.to_string(),
+			api_key: "k".to_string(),
+			workflow_id: "w".to_string(),
+			webhook_secret: SECRET.to_string(),
+			return_url: "https://evinvest.test/cabinet".to_string(),
+		})
+	}
+
+	/// The one that was wrong, and wrong in the direction that takes verification down
+	/// for everybody.
+	///
+	/// `DIDIT_BASE_URL` defaults to the API host, `verification.didit.me`, and the session
+	/// URL that API answers with is on `verify.didit.me`. Deriving the expected redirect
+	/// from the base URL alone therefore refuses EVERY real start — a 503 per user,
+	/// arriving as silence. Nothing in the integration suite can catch that: it runs the
+	/// stub, whose two hosts happen to be the same one.
+	#[test]
+	fn the_live_adapter_expects_the_session_host_and_not_the_api_host() {
+		let origins = adapter("https://verification.didit.me").session_origins();
+		assert!(origins.contains(&"https://verify.didit.me".to_string()), "the host Didit serves session pages from: {origins:?}");
+		assert!(
+			origins.contains(&"https://verification.didit.me".to_string()),
+			"and the API origin it was pointed at: {origins:?}"
+		);
+	}
+
+	/// A sandbox or self-hosted base keeps working without an edit here — it is still an
+	/// origin an operator deliberately configured.
+	#[test]
+	fn a_configured_base_url_is_admitted_beside_the_vendor_default() {
+		assert_eq!(
+			adapter("https://sandbox.didit.example/api/").session_origins(),
+			vec!["https://verify.didit.me".to_string(), "https://sandbox.didit.example".to_string()]
+		);
+	}
+
+	/// A base URL over plain http is a misconfiguration; inheriting it would let the
+	/// redirect check pass something a browser must not be sent to.
+	#[test]
+	fn a_plaintext_or_unparsable_base_url_adds_nothing() {
+		for base in ["http://verification.didit.me", "verification.didit.me", "", "not a url"] {
+			assert_eq!(adapter(base).session_origins(), vec!["https://verify.didit.me".to_string()], "base: {base}");
+		}
+	}
 
 	/// The RAW-signature form: `X-Signature` only, no V2 at all. Every pre-existing test
 	/// keeps running through it, so the fallback path stays covered.

@@ -255,6 +255,19 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// never learns a vendor exists.
 	let kyc_cases: Arc<dyn concierge::ports::KycCaseRepository> = Arc::new(infrastructure::kyc::cases::PgKycCases::new(pool.clone()));
 	let kyc_provider = build_kyc_provider(&config)?;
+	// Fail the BOOT, not the first start. A provider that cannot say where its session
+	// URLs live turns the redirect check into a no-op, and the whole point of that check
+	// is that the plane stops trusting any `https:` the vendor happens to return. A
+	// process that has quietly lost a defence is worse than one that refuses to come up,
+	// because nothing about it looks wrong — the same reasoning that makes `KYC_STUB` in
+	// production an `ensure!` below rather than a warning.
+	if let Some(provider) = kyc_provider.as_ref() {
+		ensure!(
+			!provider.session_origins().is_empty(),
+			"the {} KYC provider declares no session origin — check DIDIT_BASE_URL (or CABINET_URL under KYC_STUB): it must parse as an absolute URL with a host",
+			provider.name()
+		);
+	}
 	let web_state = web::WebState::try_new(
 		auth_service.clone(),
 		config.public_origin.clone(),
