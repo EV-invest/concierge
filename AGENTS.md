@@ -167,8 +167,30 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   stored `kyc_cases` row, NEVER from the request body; the body's echoed `vendor_data` is
   a CROSS-CHECK against that row and is decided inside the recording transaction, because
   a refusal reached after the commit is not a refusal — it used to answer 400 over a row
-  it had already moved (#54). Absent `DIDIT_*` config, both routes answer 503 — there is
-  no arm that skips the signature.
+  it had already moved (#54). Absent `DIDIT_*` config, those two routes answer 503 —
+  there is no arm that skips the signature.
+- **`GET /kyc/status` is the cabinet's only alternative to guessing, and it does not
+  need the vendor.** Until it existed the screen had one signal, `kyc_level === 0`, and
+  could not tell "never started" from "waiting on Didit" — so it offered Start to a user
+  already mid-flow and bought a second BILLED session for the attempt they were in
+  (#190). The route answers `{"level": <u32>, "case": null | {"status", "requested_tier",
+  "created_at", "resumable"}}` — `status` is the PERSISTED vocabulary (`pending`,
+  `in_progress`, `in_review`, `resubmitted`), `created_at` is unix seconds, and a DECIDED
+  case is history and leaves the answer. Refusals are JSON too
+  (`{"error":"unauthenticated"|"internal"}`); the names are pinned field for field by an
+  integration test, because a rename here surfaces as a user charged for a duplicate case
+  rather than as a red test. Unlike `/kyc/start` it stays 200 with `DIDIT_*` unset: the
+  level a user holds and the case they opened are facts of THIS plane, and a screen that
+  could not read them on the day verification is already broken would fall straight back
+  to the inference above. `resumable` is the one field the vendor does reach — it means
+  "Continue will work", so it is `false` when no vendor is configured just as it is for a
+  row predating `kyc_cases.redirect_url`, since `/kyc/start` refuses 503 before it ever
+  hands a stored URL back. The route takes no CSRF token (a double-submit check on a GET
+  can only ever be wrong) but it is NOT side-effect free: reading the session rotates its
+  tokens, so it answers with the refreshed access cookie exactly as `/auth/session` does,
+  under `Cache-Control: no-store` and `Vary: Cookie` — it is the first authenticated GET
+  here that browsers POLL, and it reaches them through the shell's `/api/kyc/:path*`
+  rewrite and a CDN.
 - **The vendor ceiling is what the vendor actually CHECKS, and it is 1.** There is one
   Didit workflow (`DIDIT_WORKFLOW_ID`) and it verifies a document and a selfie — tier-1
   evidence. Tier 2 means "plus proof of address and source of funds" (`banking`'s

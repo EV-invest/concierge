@@ -36,7 +36,7 @@ use axum::{
 	Json,
 	body::Bytes,
 	extract::State,
-	http::{HeaderMap, StatusCode},
+	http::{HeaderMap, HeaderName, StatusCode, header},
 	response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::CookieJar;
@@ -69,6 +69,13 @@ const UNAUTHENTICATED: &str = "unauthenticated";
 const CSRF: &str = "csrf";
 const THROTTLED: &str = "throttled";
 const INTERNAL: &str = "internal";
+
+/// What every answer from `GET /kyc/status` carries, hit or refusal.
+///
+/// `Vary: Cookie` alone would be enough for a cache that honours it; `no-store` is here
+/// because the answer is keyed to a cookie a shared cache has no business keying on at
+/// all, and it costs one header to stop guessing which intermediary is well behaved.
+const NO_STORE: [(HeaderName, &str); 2] = [(header::CACHE_CONTROL, "no-store"), (header::VARY, "Cookie")];
 
 /// What `/kyc/start` can answer with.
 pub(super) enum StartError {
@@ -109,13 +116,39 @@ impl From<SessionStoreDown> for StartError {
 	}
 }
 
+/// The signed-in caller, plus the access token their browser must be left holding.
+///
+/// The token half is not incidental. Reading a session ROTATES it (see
+/// [`session_user`]), so a handler that takes the caller and drops the rest signs the
+/// browser out from under itself.
+pub(super) struct Caller {
+	id: UserId,
+	access_token: String,
+	remaining_secs: i64,
+}
+
+impl Caller {
+	/// Put the refreshed access token back in the browser, the way `/auth/session` does.
+	fn refreshed(self, st: &super::Inner, jar: CookieJar) -> CookieJar {
+		jar.add(st.cookies.server_cookie(st.cookies.access.clone(), self.access_token, self.remaining_secs))
+	}
+}
+
 /// The signed-in caller behind the session cookie, or `None` when there is no live
 /// session to read one from.
 ///
 /// One reader for BOTH KYC routes. `/kyc/status` answers "is this person mid-flow?" and
 /// `/kyc/start` acts on it; a second copy of "take the cookie, refresh the session,
 /// parse the id" is a second place for those two to stop agreeing about who is asking.
-async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<Option<UserId>, SessionStoreDown> {
+///
+/// This READ WRITES. `WebSessions::fresh` renews an access token inside
+/// `ACCESS_SKEW_SECS` of expiry: it calls `AuthRpc::refresh`, rotates the refresh token
+/// and saves the new pair, and past the refresh deadline it deletes the session
+/// outright. So the returned [`Caller`] carries the new access token, and every caller
+/// of this function owes the browser a `Set-Cookie` — otherwise the server holds the
+/// rotated pair and the browser holds a JWT that expires within the half-minute. On a
+/// polled route that is not a corner case; it is most polls that land in the window.
+async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<Option<Caller>, SessionStoreDown> {
 	let Some(session_id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) else {
 		return Ok(None);
 	};
@@ -125,7 +158,13 @@ async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<Option<UserI
 	})?;
 	// A cookie whose stored pair no longer carries a parsable user is the same answer as
 	// no cookie at all: there is nobody to act for.
-	Ok(fresh.and_then(|f| Uuid::parse_str(&f.user.user_id).map(UserId::from_raw).ok()))
+	Ok(fresh.and_then(|f| {
+		Uuid::parse_str(&f.user.user_id).map(UserId::from_raw).ok().map(|id| Caller {
+			id,
+			access_token: f.access_token,
+			remaining_secs: f.remaining_secs,
+		})
+	}))
 }
 
 impl IntoResponse for StartError {
@@ -181,7 +220,7 @@ pub struct StartResponse {
 /// the provider's URL.
 ///
 /// Takes NO body. It used to take a tier and act on it; see [`ENTRY_TIER`].
-pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Result<Json<StartResponse>, StartError> {
+pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap) -> Result<(CookieJar, Json<StartResponse>), StartError> {
 	let st = &st.inner;
 	let Some(provider) = st.kyc.as_ref() else {
 		// `debug!`, not `error!`: an unconfigured vendor is a SUPPORTED state that the
@@ -199,9 +238,13 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		return Err(StartError::Refused(StatusCode::FORBIDDEN, CSRF));
 	}
 
-	let Some(user_id) = session_user(st, &jar).await? else {
+	let Some(caller) = session_user(st, &jar).await? else {
 		return Err(StartError::Refused(StatusCode::UNAUTHORIZED, UNAUTHENTICATED));
 	};
+	let user_id = caller.id;
+	// Same rotation as on `/kyc/status`, and the same obligation: this read may have
+	// renewed the pair, so the browser leaves with the token the store now holds.
+	let jar = caller.refreshed(st, jar);
 
 	// One start per user at a time, from the gate read to the row write. The gate below
 	// is a READ: two requests arriving together would both see "no live case", both
@@ -234,10 +277,13 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	if let Some(live) = &gate.live {
 		if let Some(redirect_url) = &live.redirect_url {
 			tracing::debug!(case_id = %live.id, "kyc: start reused the caller's running case");
-			return Ok(Json(StartResponse {
-				redirect_url: redirect_url.clone(),
-				case_id: live.id.to_string(),
-			}));
+			return Ok((
+				jar,
+				Json(StartResponse {
+					redirect_url: redirect_url.clone(),
+					case_id: live.id.to_string(),
+				}),
+			));
 		}
 		// A case opened before `kyc_cases.redirect_url` existed. There is no URL to hand
 		// back and no way to fetch one, so the choice is a new session or a dead end — and
@@ -304,10 +350,13 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		})?;
 
 	tracing::info!(%case_id, tier = ENTRY_TIER, provider = provider.name(), "kyc: case opened");
-	Ok(Json(StartResponse {
-		redirect_url: session.redirect_url,
-		case_id: case_id.to_string(),
-	}))
+	Ok((
+		jar,
+		Json(StartResponse {
+			redirect_url: session.redirect_url,
+			case_id: case_id.to_string(),
+		}),
+	))
 }
 
 /// Whether the vendor's answer is somewhere we may send a signed-in browser.
@@ -373,6 +422,12 @@ pub struct CaseView {
 	/// `false` for a row written before `kyc_cases.redirect_url` existed: the attempt is
 	/// real and still holds the start gate, but there is nowhere to resume it — the
 	/// cabinet must offer a fresh start rather than a dead link.
+	///
+	/// `false` too while no vendor is configured, for the same reason read from the other
+	/// end: what this field promises is not "a URL exists" but "Continue will work", and
+	/// `/kyc/start` refuses 503 before it ever reaches the branch that would hand that URL
+	/// back. The two causes are one answer on purpose — a cabinet that had to tell them
+	/// apart would be back to inferring, which is what this route removes.
 	resumable: bool,
 }
 
@@ -398,7 +453,9 @@ impl IntoResponse for StatusError {
 			Self::Unauthenticated => (StatusCode::UNAUTHORIZED, UNAUTHENTICATED),
 			Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL),
 		};
-		(status, Json(json!({ "error": code }))).into_response()
+		// A refusal is as personal as a hit: "you are not signed in" cached and replayed
+		// to somebody who is would be the same mistake wearing a different status code.
+		(status, NO_STORE, Json(json!({ "error": code }))).into_response()
 	}
 }
 
@@ -410,13 +467,22 @@ impl IntoResponse for StatusError {
 /// facts of this plane, and a screen that cannot read them degrades into the guesswork
 /// this route exists to remove.
 ///
-/// No CSRF token: nothing here changes state, and a double-submit check on a GET is a
-/// check that can only ever be wrong.
-pub async fn status(State(st): State<WebState>, jar: CookieJar) -> Result<Json<StatusResponse>, StatusError> {
+/// No CSRF token: this route changes nothing the CALLER asked to change, and a
+/// double-submit check on a GET is a check that can only ever be wrong. It is not
+/// side-effect free, though — reading the session rotates its tokens (see
+/// [`session_user`]), which is why the jar comes back out.
+///
+/// `Cache-Control: no-store` and `Vary: Cookie` because this is a per-user document on
+/// the first route of this surface a browser POLLS. Everything between here and the user
+/// — the shell's `/api/kyc/:path*` rewrite and the CDN behind it — is otherwise free to
+/// read a 200 with no cache directives as cacheable, and one user's verification level
+/// served to another is the worst shape that mistake can take.
+pub async fn status(State(st): State<WebState>, jar: CookieJar) -> Result<(CookieJar, [(HeaderName, &'static str); 2], Json<StatusResponse>), StatusError> {
 	let st = &st.inner;
-	let Some(user_id) = session_user(st, &jar).await? else {
+	let Some(caller) = session_user(st, &jar).await? else {
 		return Err(StatusError::Unauthenticated);
 	};
+	let user_id = caller.id;
 
 	// The level comes from the directory, never from the session's cached summary: a
 	// verdict applied while this session was open would otherwise be invisible until the
@@ -437,15 +503,21 @@ pub async fn status(State(st): State<WebState>, jar: CookieJar) -> Result<Json<S
 		StatusError::Internal
 	})?;
 
-	Ok(Json(StatusResponse {
+	let body = Json(StatusResponse {
 		level: user.kyc_level(),
 		case: live.map(|c| CaseView {
+			// A stored URL is only resumable if the route that hands it back can run at
+			// all. With no vendor configured `/kyc/start` is 503 BEFORE it reaches the
+			// reuse branch, so `true` here would put a Continue button on screen whose
+			// every click is an outage — on the exact day this route exists to be honest
+			// about.
+			resumable: st.kyc.is_some() && c.redirect_url.is_some(),
 			status: c.status.as_str().to_owned(),
 			requested_tier: c.requested_tier,
 			created_at: c.created_at,
-			resumable: c.redirect_url.is_some(),
 		}),
-	}))
+	});
+	Ok((caller.refreshed(st, jar), NO_STORE, body))
 }
 
 /// `POST /kyc/callback/didit` — the provider's webhook. Public and unauthenticated
