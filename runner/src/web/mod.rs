@@ -112,7 +112,6 @@ impl WebState {
 				notifications: kyc.notifications,
 				governance: kyc.governance,
 				kyc: kyc.provider,
-				kyc_session_host: kyc.session_host,
 				support_email: kyc.support_email,
 			}),
 		})
@@ -132,13 +131,6 @@ pub struct KycDeps {
 	/// `None` ⇒ the vendor is unconfigured and both KYC routes answer 503. There is no
 	/// arm here that verifies nothing: a webhook we cannot authenticate is dropped.
 	pub provider: Option<Arc<dyn KycProvider>>,
-	/// The host `provider` is expected to serve its session URLs from — the composition
-	/// root's reading of that provider's own configuration, kept here rather than behind
-	/// a trait method so the two are supplied together and cannot disagree.
-	///
-	/// `None` ⇒ the host cannot be determined; `/kyc/start` then checks the redirect's
-	/// scheme and nothing more.
-	pub session_host: Option<String>,
 	/// Printed on the "verification is unavailable" answer, so a user who cannot get
 	/// verified has somewhere to go instead of a dead end.
 	pub support_email: String,
@@ -206,10 +198,6 @@ struct Inner {
 	governance: Arc<dyn GovernanceRepository>,
 	/// `None` ⇒ unconfigured; both KYC routes answer 503.
 	kyc: Option<Arc<dyn KycProvider>>,
-	/// The host the mounted provider serves its verification sessions from, derived by
-	/// the composition root from that provider's own configuration. A redirect naming
-	/// any other host is refused before it is stored or handed to a browser.
-	kyc_session_host: Option<String>,
 	/// Human contact handed to a user whose verification cannot run right now.
 	support_email: String,
 }

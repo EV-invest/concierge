@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use axum::{
 	Router,
 	body::Body,
-	http::{Request, StatusCode},
+	http::{HeaderMap, Request, StatusCode},
 };
 use concierge::{
 	infrastructure::{
@@ -54,6 +54,14 @@ const SECRET: &str = "kyc-integration-secret";
 const PROVIDER: &str = "stub";
 const SUPPORT: &str = "support@evinvest.test";
 
+/// What the stub provider is built from — `CABINET_URL` in the composition root.
+const CABINET_URL: &str = "https://evinvest.test/cabinet";
+
+/// Its ORIGIN, which is what a redirect is judged against. Written out once here and
+/// never beside a double, so a test cannot accidentally hold a different opinion of
+/// where the fixture vendor lives than the fixture vendor does.
+const CABINET_ORIGIN: &str = "https://evinvest.test";
+
 /// The vendor's own words for an exhausted account. It must never reach a browser, so
 /// the tests below grep the response body for this exact string.
 const VENDOR_DETAIL: &str = "insufficient balance on the didit account";
@@ -76,8 +84,12 @@ impl KycProvider for RefusingKyc {
 		Err(DomainError::Repository(format!("didit: session rejected with 402 Payment Required: {VENDOR_DETAIL}")))
 	}
 
+	fn session_origins(&self) -> Vec<String> {
+		vec![CABINET_ORIGIN.to_string()]
+	}
+
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
-		StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()).parse_callback(headers, body, now)
+		StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()).parse_callback(headers, body, now)
 	}
 }
 
@@ -101,8 +113,14 @@ impl KycProvider for RogueRedirectKyc {
 		})
 	}
 
+	/// The origin an honest answer would carry — the point of this double is that its
+	/// answer does NOT.
+	fn session_origins(&self) -> Vec<String> {
+		vec![CABINET_ORIGIN.to_string()]
+	}
+
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
-		StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()).parse_callback(headers, body, now)
+		StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()).parse_callback(headers, body, now)
 	}
 }
 
@@ -119,7 +137,7 @@ struct CountingKyc {
 impl CountingKyc {
 	fn new(sessions: Arc<AtomicUsize>) -> Self {
 		Self {
-			inner: StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()),
+			inner: StubKyc::new(SECRET.to_string(), CABINET_URL.to_string()),
 			sessions,
 		}
 	}
@@ -134,6 +152,10 @@ impl KycProvider for CountingKyc {
 	async fn start_session(&self, case_id: Uuid, requested_tier: u32) -> Result<KycSession, DomainError> {
 		self.sessions.fetch_add(1, Ordering::SeqCst);
 		self.inner.start_session(case_id, requested_tier).await
+	}
+
+	fn session_origins(&self) -> Vec<String> {
+		self.inner.session_origins()
 	}
 
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
@@ -181,6 +203,10 @@ impl KycProvider for GatedKyc {
 		session
 	}
 
+	fn session_origins(&self) -> Vec<String> {
+		self.inner.session_origins()
+	}
+
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
 		self.inner.parse_callback(headers, body, now)
 	}
@@ -200,7 +226,7 @@ struct Harness {
 }
 
 async fn setup() -> Option<Harness> {
-	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string())))).await
+	setup_with(Some(Arc::new(StubKyc::new(SECRET.to_string(), CABINET_URL.to_string())))).await
 }
 
 /// The same router with the vendor swapped out, so a test can drive the two ways
@@ -222,7 +248,6 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 			cases: cases.clone(),
 			notifications: notifications.clone(),
 			governance: Arc::new(PgGovernance::new(pool.clone(), "https://evinvest.test/governance".to_string())),
-			session_host: provider.as_ref().map(|_| "evinvest.test".to_string()),
 			provider,
 			support_email: SUPPORT.to_string(),
 		},
@@ -250,7 +275,7 @@ impl Harness {
 	async fn case(&self, user: UserId, tier: u32) -> (Uuid, String) {
 		let id = Uuid::new_v4();
 		let provider_ref = format!("stub-{id}");
-		let redirect_url = format!("https://evinvest.test/cabinet?kyc_session={provider_ref}");
+		let redirect_url = format!("{CABINET_URL}?kyc_session={provider_ref}");
 		self.cases.open_case(id, user, PROVIDER, &provider_ref, tier, &redirect_url).await.expect("open case");
 		(id, provider_ref)
 	}
@@ -268,6 +293,14 @@ impl Harness {
 
 	/// `POST /kyc/start` as the cabinet reaches it. `body` is passed through verbatim.
 	async fn start(&self, cookie: &str, csrf: Option<&str>, body: &str) -> (StatusCode, Value) {
+		let (status, _, body) = self.start_response(cookie, csrf, body).await;
+		(status, body)
+	}
+
+	/// The same, with the response HEADERS kept — `/kyc/start` reads the session through
+	/// the same rotating reader `/kyc/status` does, so it owes the browser the same
+	/// refreshed access cookie.
+	async fn start_response(&self, cookie: &str, csrf: Option<&str>, body: &str) -> (StatusCode, HeaderMap, Value) {
 		let mut request = Request::builder()
 			.method("POST")
 			.uri("/kyc/start")
@@ -278,20 +311,30 @@ impl Harness {
 		}
 		let response = self.router.clone().oneshot(request.body(Body::from(body.to_owned())).unwrap()).await.expect("router answered");
 		let status = response.status();
+		let headers = response.headers().clone();
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
-		(status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+		(status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 	}
 
 	/// `GET /kyc/status` as the cabinet reaches it. `None` is the signed-out caller.
 	async fn status(&self, cookie: Option<&str>) -> (StatusCode, Value) {
+		let (status, _, body) = self.status_response(cookie).await;
+		(status, body)
+	}
+
+	/// `GET /kyc/status` with the response HEADERS kept, for the two properties that
+	/// live there rather than in the body: the rotated access cookie, and the
+	/// cache directives a polled per-user document needs.
+	async fn status_response(&self, cookie: Option<&str>) -> (StatusCode, HeaderMap, Value) {
 		let mut request = Request::builder().method("GET").uri("/kyc/status");
 		if let Some(cookie) = cookie {
 			request = request.header("cookie", cookie);
 		}
 		let response = self.router.clone().oneshot(request.body(Body::empty()).unwrap()).await.expect("router answered");
 		let status = response.status();
+		let headers = response.headers().clone();
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
-		(status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+		(status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 	}
 
 	async fn post(&self, body: Vec<u8>, signature: String, timestamp: i64) -> (StatusCode, Value) {
@@ -742,19 +785,32 @@ async fn the_webhook_needs_no_cookie_and_no_csrf_token() {
 /// `None` when Redis is absent: the in-process fallback is per-instance by design (see
 /// `web_sessions.rs`), so a session opened here would be invisible to the router.
 async fn signed_in(user: UserId) -> Option<(String, String)> {
-	signed_in_as(&user.to_string()).await
+	signed_in_with(&user.to_string(), 900).await
 }
 
 /// The same, with the stored user id written verbatim — so a test can open a session the
 /// CSRF check accepts and the user lookup then cannot resolve.
 async fn signed_in_as(user_id: &str) -> Option<(String, String)> {
+	signed_in_with(user_id, 900).await
+}
+
+/// The same, with the access token's remaining lifetime chosen by the caller.
+///
+/// A value inside `ACCESS_SKEW_SECS` (30) is what puts `WebSessions::fresh` on its
+/// REFRESH path — the one that rotates the pair and saves it — which is the only way a
+/// test can observe whether a handler hands the new token back to the browser.
+async fn signed_in_for(user: UserId, access_ttl_secs: i64) -> Option<(String, String)> {
+	signed_in_with(&user.to_string(), access_ttl_secs).await
+}
+
+async fn signed_in_with(user_id: &str, access_ttl_secs: i64) -> Option<(String, String)> {
 	std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
 	let sessions = web::WebSessions::from_env().await.expect("session store");
 	let now_s = now();
 	let (session_id, csrf, _) = sessions
 		.put(evconcierge_contracts::concierge::v1::TokenResponse {
 			access_token: "access".into(),
-			access_expires_at: now_s + 900,
+			access_expires_at: now_s + access_ttl_secs,
 			refresh_token: "family.secret".into(),
 			refresh_expires_at: now_s + 3600,
 			user: Some(evconcierge_contracts::concierge::v1::UserSummary {
@@ -1527,8 +1583,8 @@ async fn every_start_refusal_carries_a_machine_readable_code() {
 		return;
 	};
 
-	// No double-submit header. Reached before the session is reachanything, so it is also what
-	// a caller with no cookies at all gets.
+	// Signed in, no double-submit header: the genuine CSRF refusal, and the one a reload
+	// actually fixes.
 	let (status, answer) = h.start(&cookie, None, "").await;
 	assert_eq!(status, StatusCode::FORBIDDEN);
 	assert_eq!(answer, json!({ "error": "csrf" }));
@@ -1552,11 +1608,25 @@ async fn every_start_refusal_carries_a_machine_readable_code() {
 	assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 	assert_eq!(answer, json!({ "error": "throttled" }));
 
-	// And the one body that was ALREADY a contract is untouched: it carries a second
-	// field the cabinet renders, and widening the others must not have narrowed it.
+	// No cookies at all. `unauthenticated` has to be REACHABLE for a caller who is not
+	// signed in, or the code is contract surface nothing can ever produce and the cabinet
+	// builds a branch on it that never runs. The check still runs first and still touches
+	// no session state — the session COOKIE's absence is what answers, not a lookup.
 	let (status, answer) = h.start("", None, "").await;
-	assert_eq!(status, StatusCode::FORBIDDEN, "no cookies at all is still the CSRF refusal");
-	assert_eq!(answer, json!({ "error": "csrf" }));
+	assert_eq!(status, StatusCode::UNAUTHORIZED, "nobody is signed in, so the refusal is not about a token");
+	assert_eq!(answer, json!({ "error": "unauthenticated" }));
+
+	// A session cookie the locker no longer holds — expired, revoked, or signed out in
+	// another tab — is the same answer, and it is the common case: `csrf` here sent
+	// people to reload a page that would lapse again, because the cabinet keys its
+	// "stale, reload" screen off exactly that 403.
+	let (status, answer) = h.start("ev_session=gone; ev_csrf=whatever", Some("whatever"), "").await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED, "a lapsed session is not a CSRF failure");
+	assert_eq!(answer, json!({ "error": "unauthenticated" }));
+
+	// `/kyc/status`, which runs no CSRF check at all, answers the same caller the same
+	// way. Two routes sharing one vocabulary must not disagree about who is asking.
+	assert_eq!(h.status(None).await, (StatusCode::UNAUTHORIZED, json!({ "error": "unauthenticated" })));
 }
 
 /// The 503 body keeps its `contact` field, which the other refusals deliberately lack.
@@ -1603,10 +1673,51 @@ async fn a_redirect_the_vendor_should_not_have_sent_is_refused_like_an_outage() 
 		assert_eq!(answer, unavailable_body(), "and the user meets the SAME screen a vendor outage produces: {rogue}");
 		assert!(!answer.to_string().contains(rogue), "the vendor's URL never reaches the browser: {rogue}");
 
-		// Refused BEFORE the row is written, so the bad URL is not stored and cannot be
-		// handed back later by the live-case reuse path.
+		// Refused BEFORE the row is written, so the bad URL is not stored.
 		assert_eq!(h.case_count(user).await, 0, "no case row survives a refused redirect: {rogue}");
 	}
+}
+
+/// The same refusal applied to a row that is ALREADY in the table.
+///
+/// The check above only ever sees answers this binary asked for. Rows outlive it: KYC has
+/// been in production since v0.7.0 and every case opened before the check shipped was
+/// stored unexamined; `0012_kyc_case_redirect_url.sql` is designed for a rolling deploy,
+/// so the old binary's INSERT running beside the new one's read is the STATED normal
+/// during a release; and an operator repointing the vendor leaves live cases behind.
+/// A case lives until a verdict, so the window is days, and the reuse branch hands that
+/// stored string straight to a browser under a button this plane vouched for — documents
+/// and a selfie, on somebody else's host.
+#[tokio::test]
+async fn a_stored_redirect_the_plane_would_not_send_a_browser_to_is_not_handed_back() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let (case_id, _) = h.case(user, 1).await;
+	// Exactly as an older binary, or a differently configured one, would have left it.
+	sqlx::query("UPDATE kyc_cases SET redirect_url = $2 WHERE id = $1")
+		.bind(case_id)
+		.bind("https://evil.example/session/abc")
+		.execute(&h.pool)
+		.await
+		.expect("store a redirect the plane will refuse");
+
+	// The cabinet must not offer Continue for a link start will not hand over.
+	let (_, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(answer["case"]["resumable"], false, "status and start answer the same question in the same words");
+
+	// And start opens a FRESH session instead of replaying the stored one. That branch is
+	// already bounded by the window cap, so it cannot be looped.
+	let (status, answer) = h.start(&cookie, Some(&csrf), "").await;
+	assert_eq!(status, StatusCode::OK);
+	assert_ne!(answer["case_id"].as_str(), Some(case_id.to_string().as_str()), "the untrusted case is not reused");
+	assert!(
+		answer["redirect_url"].as_str().is_some_and(|u| u.starts_with(CABINET_ORIGIN)),
+		"the browser is sent to the vendor this plane is configured for, not to the stored host"
+	);
 }
 
 /// THE CONTRACT of `GET /kyc/status`, asserted as whole JSON documents rather than field
@@ -1700,4 +1811,95 @@ async fn status_answers_while_verification_itself_is_unavailable() {
 	let (status, answer) = h.status(Some(&cookie)).await;
 	assert_eq!(status, StatusCode::OK, "the level is a fact of this plane, not of the vendor's");
 	assert_eq!(answer, json!({ "level": 0, "case": null }));
+}
+
+/// The polled route must leave the browser holding the token the SERVER holds.
+///
+/// Reading a session is not a read: inside `ACCESS_SKEW_SECS` of expiry
+/// `WebSessions::fresh` renews the access token, rotates the refresh token and saves the
+/// new pair. A handler that takes the caller out of that and drops the rest leaves the
+/// store with the new pair and the browser with a JWT expiring inside the half-minute —
+/// after which every `/api/*` call the cabinet makes eats a 401 and a round trip through
+/// `/api/auth/session` before it works. On a route the cabinet POLLS, that window is not
+/// a corner case: it is most polls.
+///
+/// Pinned on both KYC routes, because both read the session through the same reader.
+#[tokio::test]
+async fn reading_the_session_hands_the_refreshed_access_cookie_back() {
+	let h = harness!();
+	let user = h.user().await;
+	// Inside the 30-second skew, so `fresh` takes its refresh path.
+	let Some((cookie, csrf)) = signed_in_for(user, 10).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	let (status, headers, _) = h.status_response(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK);
+	let cookies: Vec<&str> = headers.get_all("set-cookie").iter().map(|v| v.to_str().expect("ascii cookie")).collect();
+	assert!(
+		cookies.iter().any(|c| c.starts_with("ev_access=")),
+		"the access cookie the store now holds must come back with the answer, got {cookies:?}"
+	);
+
+	// `/kyc/start` reaches the session through the same reader and owes the same cookie.
+	let (status, headers, _) = h.start_response(&cookie, Some(&csrf), "").await;
+	assert_eq!(status, StatusCode::OK);
+	let cookies: Vec<&str> = headers.get_all("set-cookie").iter().map(|v| v.to_str().expect("ascii cookie")).collect();
+	assert!(cookies.iter().any(|c| c.starts_with("ev_access=")), "start rotates the same pair, got {cookies:?}");
+}
+
+/// A per-user document on a polled route says so to every cache between here and the
+/// browser.
+///
+/// This answer names one person's verification level. It leaves the pod through the
+/// shell's `/api/kyc/:path*` rewrite and a CDN, and unlike `/auth/session` it does not
+/// always carry a `Set-Cookie` an intermediary might take as a hint. Without directives
+/// of its own, a 200 here is something a shared cache is entitled to store and replay.
+#[tokio::test]
+async fn status_is_never_cacheable() {
+	let h = harness!();
+	let user = h.user().await;
+	let Some((cookie, _csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+
+	for cookie in [Some(cookie.as_str()), None] {
+		let (_, headers, _) = h.status_response(cookie).await;
+		assert_eq!(
+			headers.get("cache-control").and_then(|v| v.to_str().ok()),
+			Some("no-store"),
+			"hit and refusal are equally personal"
+		);
+		assert_eq!(headers.get("vary").and_then(|v| v.to_str().ok()), Some("Cookie"));
+	}
+}
+
+/// With no vendor configured, a stored URL is not something the cabinet may offer.
+///
+/// `/kyc/start` refuses with 503 BEFORE it reaches the branch that hands a running
+/// case's `redirect_url` back, so `resumable: true` here would put a Continue button on
+/// screen whose every click is an outage — on precisely the day this route exists to
+/// stop the cabinet from guessing.
+#[tokio::test]
+async fn a_running_case_is_not_resumable_while_the_vendor_is_unconfigured() {
+	let Some(h) = setup_with(None).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	// A case WITH a redirect_url, exactly as a start before the outage left it.
+	h.case(user, 1).await;
+
+	let (_, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(answer["case"]["status"], "pending", "the attempt is still reported — it is a fact of this plane");
+	assert_eq!(answer["case"]["resumable"], false, "nothing the cabinet may offer: start cannot run at all");
+
+	// And that is not a guess about start — it is what start does.
+	assert_eq!(h.start(&cookie, Some(&csrf), "").await.0, StatusCode::SERVICE_UNAVAILABLE);
 }

@@ -167,8 +167,30 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   stored `kyc_cases` row, NEVER from the request body; the body's echoed `vendor_data` is
   a CROSS-CHECK against that row and is decided inside the recording transaction, because
   a refusal reached after the commit is not a refusal — it used to answer 400 over a row
-  it had already moved (#54). Absent `DIDIT_*` config, both routes answer 503 — there is
-  no arm that skips the signature.
+  it had already moved (#54). Absent `DIDIT_*` config, those two routes answer 503 —
+  there is no arm that skips the signature.
+- **`GET /kyc/status` is the cabinet's only alternative to guessing, and it does not
+  need the vendor.** Until it existed the screen had one signal, `kyc_level === 0`, and
+  could not tell "never started" from "waiting on Didit" — so it offered Start to a user
+  already mid-flow and bought a second BILLED session for the attempt they were in
+  (#190). The route answers `{"level": <u32>, "case": null | {"status", "requested_tier",
+  "created_at", "resumable"}}` — `status` is the PERSISTED vocabulary (`pending`,
+  `in_progress`, `in_review`, `resubmitted`), `created_at` is unix seconds, and a DECIDED
+  case is history and leaves the answer. Refusals are JSON too
+  (`{"error":"unauthenticated"|"internal"}`); the names are pinned field for field by an
+  integration test, because a rename here surfaces as a user charged for a duplicate case
+  rather than as a red test. Unlike `/kyc/start` it stays 200 with `DIDIT_*` unset: the
+  level a user holds and the case they opened are facts of THIS plane, and a screen that
+  could not read them on the day verification is already broken would fall straight back
+  to the inference above. `resumable` is the one field the vendor does reach — it means
+  "Continue will work", so it is `false` when no vendor is configured just as it is for a
+  row predating `kyc_cases.redirect_url`, since `/kyc/start` refuses 503 before it ever
+  hands a stored URL back. The route takes no CSRF token (a double-submit check on a GET
+  can only ever be wrong) but it is NOT side-effect free: reading the session rotates its
+  tokens, so it answers with the refreshed access cookie exactly as `/auth/session` does,
+  under `Cache-Control: no-store` and `Vary: Cookie` — it is the first authenticated GET
+  here that browsers POLL, and it reaches them through the shell's `/api/kyc/:path*`
+  rewrite and a CDN.
 - **The vendor ceiling is what the vendor actually CHECKS, and it is 1.** There is one
   Didit workflow (`DIDIT_WORKFLOW_ID`) and it verifies a document and a selfie — tier-1
   evidence. Tier 2 means "plus proof of address and source of funds" (`banking`'s
@@ -234,6 +256,40 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   while here as `"KYC Expired"`, silently unclassifiable. An unknown word is answered
   200-and-ignored (a growing vocabulary must not break the endpoint) with an `error!` so
   a human adds the arm.
+- **Every `/kyc/start` refusal is JSON with one `error` code, and the redirect is
+  checked here.** The route used to answer FOUR body formats — JSON for 503, bare plain
+  text for 401, 403 and 429 — so the cabinet classified refusals by status code and by
+  probing for an ABSENT body (`403` with no code meant "stale token, reload"; `403` with
+  one meant "failed"), which is a client reading tea leaves about which half of a refusal
+  it is in (banking#193). One format now, one key, one closed vocabulary:
+  `unauthenticated` · `csrf` · `throttled` · `internal`, plus the pre-existing
+  `kyc_unavailable`, which keeps its second `contact` field and is the only one that has
+  one. `unauthenticated` has to stay REACHABLE: the CSRF check still runs before any
+  session state is touched, but it answers "nobody is signed in" for an absent or lapsed
+  session and keeps `csrf` for a signed-in caller whose token does not match — collapsing
+  the two made `csrf` the only refusal a signed-out caller could get and left the code
+  the cabinet keys "sign in again" off unreachable. ⚠️ THIS IS A WIRE BREAK: the deployed
+  cabinet renders an unknown code verbatim and keys "reload the page" off a bodyless 403,
+  so the banking half (its zod schema in `features/kyc` plus `throttled`/`internal` in
+  `shared/lib/api-client.ts`) ships FIRST. Deploy order is a condition of correctness
+  here, not a detail.
+  **The redirect is decided on this side.** The cabinet can only check
+  `protocol === "https:"` — it is browser code, the allowlist would be shipped to the
+  attacker — and any `https:` URL sends a user off the cabinet on a click this plane
+  vouched for. `/kyc/start` refuses a `redirect_url` whose ORIGIN is not one the mounted
+  adapter declares (`KycProvider::session_origins`), and answers it as the same 503 a
+  vendor outage produces. Origins and not hosts, so a port and a `user@host` prefix are
+  settled by the same comparison. The adapter is asked rather than the configuration read
+  beside it, because the two are one fact and Didit is why: `DIDIT_BASE_URL` is the API
+  host (`verification.didit.me`) while session pages are served from `verify.didit.me`,
+  so the obvious derivation refuses every real start and takes verification down for
+  everyone, arriving as silence. An adapter that declares NOTHING refuses everything and
+  the boot refuses to mount it — the shape this must never take is degrading to "any
+  `https:` will do", which is indistinguishable from working. The check runs on the
+  stored URL too, in the live-case reuse branch: rows outlive the check, a rolling deploy
+  writes them from the old binary by design (`0012`), and a case lives until a verdict.
+  `GET /kyc/status` computes `resumable` with the same predicate so the cabinet never
+  offers Continue for a link `/kyc/start` will not hand over.
 - **A user never meets a vendor failure.** `/kyc/start` collapses "no vendor configured"
   and "vendor would not open a session" (balance, quota, outage, timeout, nonsense) into
   one 503 with one stable body — `{"error":"kyc_unavailable","contact":"<SUPPORT_EMAIL>"}`
