@@ -421,15 +421,41 @@ fn metadata_of(payload: &Webhook) -> Value {
 /// `None` when either half is missing: a verdict with no document number is not evidence
 /// about an identity, and an empty string hashed under the key would make every such case
 /// a duplicate of every other.
+///
+/// BOTH HALVES ARE CANONICALISED FIRST, and that is the difference between a detection and
+/// a detection that is quietly off. The digest only ever links two deliveries that reduce
+/// to the same message, so any variation the vendor is free to make in how it renders the
+/// same document is a variation that silently unlinks them.
 fn identity_digest_of(payload: &Webhook, pepper: &str) -> Option<String> {
 	let kyc = payload.decision.as_ref()?.get("kyc")?;
-	let number = kyc.get("document_number").and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty())?;
-	let state = kyc
-		.get("issuing_state")
-		.or_else(|| kyc.get("issuing_state_name"))
-		.and_then(Value::as_str)
-		.map(str::trim)
-		.filter(|v| !v.is_empty())?;
+
+	// `issuing_state` ONLY, with no fallback to `issuing_state_name` — deliberately unlike
+	// `metadata_of` one screen up, which does fall back and is right to. There the value is
+	// a label in the payload, and "Portugal" where another delivery said "PRT" costs a
+	// reader nothing. HERE it is half the HMAC message, so the two spellings are two
+	// different key spaces: the same passport delivered once with the code and once with
+	// only the spelled-out name (the repository's own note says some workflows fill only
+	// the name) would produce two digests that match nothing. No digest at all is the
+	// honest outcome — detection degrades exactly where the vendor left the field empty,
+	// instead of appearing to work everywhere and failing on the pairs that matter.
+	let state = kyc.get("issuing_state").and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty())?;
+
+	// The number is read off a scan, and the same passport reaches us as "AB 123456",
+	// "AB-123456" or "ab123456" depending on the document type and how it was recognised.
+	// Separators are dropped and the rest is upper-cased so the message depends on the
+	// document rather than on this particular rendering of it. Non-ASCII letters are KEPT
+	// — dropping them would fold two different national numbers onto one message and hold
+	// an innocent applicant on the collision.
+	let number: String = kyc
+		.get("document_number")
+		.and_then(Value::as_str)?
+		.chars()
+		.filter(|c| c.is_alphanumeric())
+		.collect::<String>()
+		.to_uppercase();
+	if number.is_empty() {
+		return None;
+	}
 
 	let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(pepper.as_bytes()).ok()?;
 	// Upper-cased so a vendor that changes its casing between workflows does not silently
@@ -437,7 +463,7 @@ fn identity_digest_of(payload: &Webhook, pepper: &str) -> Option<String> {
 	// is worse than one that was never switched on.
 	mac.update(state.to_uppercase().as_bytes());
 	mac.update(b":");
-	mac.update(number.to_uppercase().as_bytes());
+	mac.update(number.as_bytes());
 	Some(hex_lower(&mac.finalize().into_bytes()))
 }
 
@@ -742,6 +768,53 @@ mod tests {
 			.unwrap()
 			.identity_digest;
 		assert_ne!(portugal, spain);
+	}
+
+	/// The same passport, rendered the way a different scan produced it, must reach the
+	/// same digest — or the detection is off for whoever happened to land on the other
+	/// rendering, with nothing anywhere to show for it.
+	#[test]
+	fn separators_and_casing_in_the_number_are_not_an_identity() {
+		let now = 1_800_000_000;
+		let digest = |number: &str| {
+			let raw = serde_json::to_vec(&json!({
+				"timestamp": now,
+				"session_id": "sess-1",
+				"status": "Approved",
+				"decision": { "kyc": { "status": "Approved", "issuing_state": "PRT", "document_number": number } },
+			}))
+			.unwrap();
+			parse_webhook(SECRET, Some("pepper"), &headers(&raw, now), &raw, now).unwrap().identity_digest
+		};
+
+		let canonical = digest("AB123456");
+		assert!(canonical.is_some());
+		assert_eq!(digest("ab 123456"), canonical);
+		assert_eq!(digest("AB-123456"), canonical);
+		// And a number that is only punctuation is no number at all.
+		assert_eq!(digest("- /"), None);
+	}
+
+	/// The COUNTRY CODE only — never the spelled-out name `metadata_of` falls back to.
+	///
+	/// Some workflows fill only `issuing_state_name`, so a fallback here would hash "PRT"
+	/// for one delivery and "PORTUGAL" for another: two key spaces, no match, and a
+	/// detection that is silently off for that pair. No digest is the honest answer.
+	#[test]
+	fn the_spelled_out_country_name_does_not_become_a_second_keyspace() {
+		let now = 1_800_000_000;
+		let raw = serde_json::to_vec(&json!({
+			"timestamp": now,
+			"session_id": "sess-1",
+			"status": "Approved",
+			"decision": { "kyc": { "status": "Approved", "issuing_state_name": "Portugal", "document_number": "X1234567" } },
+		}))
+		.unwrap();
+
+		let decision = parse_webhook(SECRET, Some("pepper"), &headers(&raw, now), &raw, now).expect("still a valid delivery");
+		assert_eq!(decision.identity_digest, None, "half a key space is worse than no digest");
+		// The payload label is unaffected: there the fallback costs a reader nothing.
+		assert_eq!(decision.metadata.get("document_country").and_then(Value::as_str), Some("Portugal"));
 	}
 
 	/// A verdict that names no document is not evidence about an identity.
