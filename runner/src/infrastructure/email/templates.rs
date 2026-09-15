@@ -187,7 +187,9 @@ pub fn payout_approval(
 ///
 /// One renderer for both subjects, switching on which pair the payload filled: a payout
 /// names a rail and an address, a payment names two ends of a transfer in words. The
-/// payout copy is byte-for-byte what it was before payments existed.
+/// payout copy is byte-for-byte what it was before payments existed. The payload's third
+/// subject — a fund's fee terms — is [`fee_policy_outcome`]; the dispatcher tells the
+/// rows apart before either renderer sees them.
 // Positional like its neighbours: the arguments are the payload's fields in the order
 // the wire declares them, and a struct here would exist only to satisfy the lint.
 #[allow(clippy::too_many_arguments)]
@@ -273,6 +275,56 @@ fn payout_outcome_on_a_rail(consilium_id: &str, outcome: &str, network: &str, ad
 		html: shell(&headline, &card(&inner), FOOTER_SECURITY, "", "Treasury"),
 		text: format!(
 			"{headline}\n\nOutcome: {outcome}\nAmount: {amount}\nNetwork: {network}\nDestination address: {address}\nRequest: {consilium_id}\n\n{detail}\n\n—\n{FOOTER_SECURITY}\n"
+		),
+	}
+}
+
+/// The third subject of the outcome payload: how a consilium over a fund's FEE TERMS
+/// ended, and the burn notice that rides the same row.
+///
+/// Its own renderer rather than a third arm of [`payout_outcome`], because that one
+/// switches on strings the wire has carried since before payments existed, and the fee
+/// description is typed terms the dispatcher has to parse first — so the dispatcher
+/// decides which mail a row is, and each renderer takes only the fields its subject has.
+/// No money is named here: the consilium decided a PRICE, so the rows are the terms as
+/// [`fee_policy_approval`] showed them, now beside proposed, and nothing reads as an
+/// amount, a rail or a transfer.
+pub fn fee_policy_outcome(consilium_id: &str, outcome: &str, fund: &str, current: Option<&FeeTerms>, proposed: &FeeTerms, detail: &str, reason: &str) -> RenderedEmail {
+	// Folded BEFORE either part is built — see `one_line`.
+	let (consilium_id, outcome, fund) = (one_line(consilium_id), one_line(outcome), one_line(fund));
+	let (detail, reason) = (one_line(detail), one_line(reason));
+	let terms = fee_rows(current, proposed);
+
+	let headline = format!("Fee terms {}", outcome.to_lowercase());
+	let mut inner = String::new();
+	inner.push_str(&eyebrow("Treasury"));
+	inner.push_str(&heading(&headline));
+	let mut rows = vec![("Outcome", outcome.clone()), ("Fund", fund.clone())];
+	rows.extend(terms.iter().map(|(label, value)| (*label, value.clone())));
+	rows.push(("Request", consilium_id.clone()));
+	inner.push_str(&detail_box(&rows));
+	// The burn notice rides this payload with no reason of its own; an empty one gets
+	// no attribution block rather than a label over nothing.
+	let note = if reason.is_empty() {
+		String::new()
+	} else {
+		format!("{INITIATOR_NOTE_LABEL}\n  {reason}\n\n")
+	};
+	if !reason.is_empty() {
+		inner.push_str(&initiator_note(&reason));
+	}
+	if !detail.is_empty() {
+		inner.push_str(&paragraph(&detail));
+	}
+	inner.push_str(&paragraph("This message needs no action from you. It is the record of what the consilium decided."));
+
+	RenderedEmail {
+		// The stated reason is never in the subject line — see `payment_consent`.
+		subject: format!("{headline} — {fund}"),
+		html: shell(&headline, &card(&inner), FOOTER_SECURITY, "", "Treasury"),
+		text: format!(
+			"{headline}\n\nOutcome: {outcome}\nFund: {fund}\n{}Request: {consilium_id}\n\n{note}{detail}\n\n—\n{FOOTER_SECURITY}\n",
+			fee_lines(&terms)
 		),
 	}
 }
@@ -1227,6 +1279,65 @@ mod tests {
 				"an operator may set terms alone within the house terms; the notice must not claim a consilium"
 			);
 		}
+	}
+
+	/// The outcome of a fee-policy consilium describes TERMS — now beside proposed, as the
+	/// approval showed them — and names no money, no rail and no transfer; the burn notice
+	/// over the same consilium quotes nobody.
+	#[test]
+	fn a_fee_policy_outcome_describes_terms_and_no_money() {
+		let executed = fee_policy_outcome(
+			"c-12",
+			"EXECUTED",
+			"Quy Nhon Fund",
+			Some(&house()),
+			&dearer(),
+			"The new terms apply from the next crystallization.",
+			"Align <the> prospectus",
+		);
+		assert_eq!(executed.subject, "Fee terms executed — Quy Nhon Fund");
+		for expected in ["Quy Nhon Fund", "2% → 2.5%", "annual → quarterly", "c-12", "The new terms apply from the next crystallization."] {
+			assert!(executed.html.contains(expected) && executed.text.contains(expected), "{expected}");
+		}
+		assert!(executed.html.contains("needs no action"), "nobody should hunt for a button that is not there");
+		assert!(
+			executed.html.contains("Align &lt;the&gt; prospectus") && executed.html.contains(INITIATOR_NOTE_LABEL),
+			"the reason is shown, escaped and attributed"
+		);
+		assert!(!executed.subject.contains("prospectus"), "the operator's words stay out of the subject");
+		for part in [&executed.html, &executed.text] {
+			for money in ["Amount", "Network", "Destination address", "Payment", "Payout"] {
+				assert!(!part.contains(money), "a fee outcome names no money: {money}");
+			}
+			assert!(!part.contains("Type this code") && !part.contains("Your code"), "an outcome carries no secret");
+		}
+		assert!(executed.html.contains("owner seat"), "the reader holds a seat, so the owner footer is the true one");
+
+		let burn = fee_policy_outcome(
+			"c-12",
+			"TOKEN_BURNED",
+			"Quy Nhon Fund",
+			None,
+			&dearer(),
+			"five failed code attempts burned the approval token for seat u-1",
+			"",
+		);
+		assert_eq!(burn.subject, "Fee terms token_burned — Quy Nhon Fund");
+		assert!(
+			!burn.html.contains(INITIATOR_NOTE_LABEL) && !burn.text.contains(INITIATOR_NOTE_LABEL),
+			"an empty reason renders no attribution block"
+		);
+		assert!(burn.text.contains("Management fee: none → 2.5%"), "a fund that charged nothing shows none");
+
+		let forged = fee_policy_outcome("c-12", "EXECUTED", "QN\nAmount: 0", Some(&house()), &dearer(), "", "");
+		assert!(!forged.text.contains("\nAmount: 0"), "a forged line in the fund collapses");
+		assert!(forged.text.contains("Fund: QN Amount: 0"));
+
+		// The other two subjects are untouched, subject line and all.
+		let payment = payout_outcome("c-9", "EXECUTED", "", "", "25 000.00 USDT", "", "service", "treasury", "pool", "");
+		assert_eq!(payment.subject, "Payment executed — 25 000.00 USDT");
+		let payout = payout_outcome("c-1", "EXECUTED", "Ethereum", LONG_ADDRESS, "12,500.00 USDT", "Broadcast.", "", "", "", "");
+		assert_eq!(payout.subject, "Payout executed — 12,500.00 USDT on Ethereum");
 	}
 
 	#[test]

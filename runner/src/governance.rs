@@ -1114,25 +1114,33 @@ impl MailRelayService for MailRelay {
 			// A burned approval token is an outcome the owners are told about, and the
 			// outcome payload already carries everything that mail needs to say. The
 			// payout fields keep `bounded` (a live contract); the payment tuple added
-			// later is held to `line` like every other payment field.
+			// later is held to `line` like every other payment field, and the fee terms
+			// added after that to the fee approval's rules, so the money plane learns one
+			// rule per field across every kind that carries it.
 			Ok(GovernanceMailKind::PayoutOutcome) | Ok(GovernanceMailKind::ApprovalTokenBurned) => {
 				let mail = req.payout_outcome.ok_or_else(|| Status::invalid_argument("payout_outcome is required for this kind"))?;
 				let outcome = bounded(&mail.outcome, 64, "outcome")?;
 				if !OUTCOMES.contains(&outcome.as_str()) {
 					return Err(Status::invalid_argument("outcome must be one of the consilium outcomes"));
 				}
-				// One subject per mail. The renderer switches on which pair is filled, so a
-				// payload naming both would describe a rail on a payment — or the reverse —
-				// and half a payment pair would render a transfer with one end missing.
+				// One subject per mail. The renderer switches on which description is filled,
+				// so a payload naming two would describe a rail on a payment, or a price on a
+				// transfer — and half a description would render a transfer with one end
+				// missing, or new terms for no fund. A payload naming NONE is a payout with
+				// an empty rail: a live contract, left as it is.
 				let names_a_rail = !mail.network.is_empty() || !mail.address.is_empty();
 				let names_a_payment = !mail.source.is_empty() || !mail.destination.is_empty() || !mail.tier.is_empty();
-				if names_a_rail && names_a_payment {
+				let names_fee_terms = !mail.fund.is_empty() || mail.current.is_some() || mail.proposed.is_some();
+				if [names_a_rail, names_a_payment, names_fee_terms].into_iter().filter(|named| *named).count() > 1 {
 					return Err(Status::invalid_argument(
-						"an outcome names either a rail (network, address) or a payment (tier, source, destination), not both",
+						"an outcome names either a rail (network, address), a payment (tier, source, destination), or fee terms (fund, proposed), not two",
 					));
 				}
 				if names_a_payment && (mail.source.is_empty() || mail.destination.is_empty() || mail.tier.is_empty()) {
 					return Err(Status::invalid_argument("a payment outcome needs tier, source and destination together"));
+				}
+				if names_fee_terms && (mail.fund.is_empty() || mail.proposed.is_none()) {
+					return Err(Status::invalid_argument("a fee terms outcome needs fund and proposed together"));
 				}
 				let payload = serde_json::json!({
 					"consilium_id": bounded(&mail.consilium_id, 64, "consilium_id")?,
@@ -1141,11 +1149,18 @@ impl MailRelayService for MailRelay {
 					"address": bounded(&mail.address, 128, "address")?,
 					"amount": bounded(&mail.amount, 64, "amount")?,
 					"detail": bounded(&mail.detail, 500, "detail")?,
-					// Empty for a payout; the burn notice over a payment carries no reason.
+					// Empty for a payout; the burn notice over a payment or over fee terms
+					// carries no reason.
 					"tier": if mail.tier.is_empty() { String::new() } else { payment_tier(&mail.tier)? },
 					"source": line(&mail.source, 160, "source")?,
 					"destination": line(&mail.destination, 160, "destination")?,
 					"reason": line(&mail.reason, 500, "reason")?,
+					// Empty and null for a payout and for a payment. `fund` is what the mail is
+					// about, so it must say something and, as in the fee approval, must not be
+					// able to carry a link.
+					"fund": if names_fee_terms { no_url(&required_line(&mail.fund, 160, "fund")?, "fund")? } else { String::new() },
+					"current": current_fee_terms(mail.current.as_ref())?,
+					"proposed": mail.proposed.as_ref().map_or(Ok(serde_json::Value::Null), |terms| fee_terms(terms, "proposed"))?,
 				});
 				("payout_outcome", payload, Recipient::FundOwner, None)
 			}

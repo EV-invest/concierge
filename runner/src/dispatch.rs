@@ -65,11 +65,17 @@ fn int_field(payload: &serde_json::Value, key: &str) -> i64 {
 	payload.get(key).and_then(serde_json::Value::as_i64).unwrap_or_default()
 }
 
-/// The fee terms under `key`, as the relay wrote them. `None` for JSON `null` — a fund
-/// that charged nothing — and for anything that does not parse, which the caller treats
-/// as unrenderable.
-fn fee_terms(payload: &serde_json::Value, key: &str) -> Option<templates::FeeTerms> {
-	serde_json::from_value(payload.get(key)?.clone()).ok()
+/// The fee terms under `key`, as the relay wrote them. Two absences that must not be
+/// confused: `Some(None)` is JSON `null` or no key — a fund that charged nothing, which
+/// the mail says out loud as "none" — while the outer `None` is a value that does not
+/// parse (the `FeeTerms` shape drifted between queueing and sending). Rendering the
+/// latter as "none" would tell the owners the fund took nothing, so the caller parks
+/// the row instead.
+fn fee_terms(payload: &serde_json::Value, key: &str) -> Option<Option<templates::FeeTerms>> {
+	match payload.get(key) {
+		None | Some(serde_json::Value::Null) => Some(None),
+		Some(terms) => serde_json::from_value(terms.clone()).ok().map(Some),
+	}
 }
 
 /// Render one of the typed governance mails from its stored payload. `None` for a kind
@@ -111,18 +117,41 @@ fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -
 			&text_field(payload, "approval_url"),
 			&text_field(payload, "code"),
 		)),
-		"payout_outcome" => Some(templates::payout_outcome(
-			&text_field(payload, "consilium_id"),
-			&text_field(payload, "outcome"),
-			&text_field(payload, "network"),
-			&text_field(payload, "address"),
-			&text_field(payload, "amount"),
-			&text_field(payload, "detail"),
-			&text_field(payload, "tier"),
-			&text_field(payload, "source"),
-			&text_field(payload, "destination"),
-			&text_field(payload, "reason"),
-		)),
+		// The fee terms description was added to this row after the payout and payment
+		// ones, so a row queued before it carries neither key and renders exactly as it
+		// did. A row that names a fund, or proposes terms, is about fee terms — and like a
+		// `fee_policy_approval`, one missing either half is unrenderable rather than a
+		// payout with an empty rail or a mail proposing nothing.
+		"payout_outcome" => {
+			let fund = text_field(payload, "fund");
+			let proposed = payload.get("proposed").is_some_and(|terms| !terms.is_null());
+			if fund.is_empty() && !proposed {
+				Some(templates::payout_outcome(
+					&text_field(payload, "consilium_id"),
+					&text_field(payload, "outcome"),
+					&text_field(payload, "network"),
+					&text_field(payload, "address"),
+					&text_field(payload, "amount"),
+					&text_field(payload, "detail"),
+					&text_field(payload, "tier"),
+					&text_field(payload, "source"),
+					&text_field(payload, "destination"),
+					&text_field(payload, "reason"),
+				))
+			} else if fund.is_empty() {
+				None
+			} else {
+				Some(templates::fee_policy_outcome(
+					&text_field(payload, "consilium_id"),
+					&text_field(payload, "outcome"),
+					&fund,
+					fee_terms(payload, "current")?.as_ref(),
+					&fee_terms(payload, "proposed")??,
+					&text_field(payload, "detail"),
+					&text_field(payload, "reason"),
+				))
+			}
+		}
 		"payment_approval" => Some(templates::payment_approval(
 			&text_field(payload, "consilium_id"),
 			&text_field(payload, "payment_id"),
@@ -145,8 +174,8 @@ fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -
 			&text_field(payload, "consilium_id"),
 			&text_field(payload, "initiator_email"),
 			&text_field(payload, "fund"),
-			fee_terms(payload, "current").as_ref(),
-			&fee_terms(payload, "proposed")?,
+			fee_terms(payload, "current")?.as_ref(),
+			&fee_terms(payload, "proposed")??,
 			&text_field(payload, "reason"),
 			&text_field(payload, "payload_hash"),
 			int_field(payload, "threshold") as u32,
@@ -157,8 +186,8 @@ fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_url: &str) -
 		)),
 		"fee_policy_notice" => Some(templates::fee_policy_notice(
 			&text_field(payload, "fund"),
-			fee_terms(payload, "current").as_ref(),
-			&fee_terms(payload, "proposed")?,
+			fee_terms(payload, "current")?.as_ref(),
+			&fee_terms(payload, "proposed")??,
 			int_field(payload, "effective_at"),
 			// The relay admitted only a path starting with a single `/` (or nothing), so
 			// joining onto the origin cannot leave it.
@@ -368,6 +397,93 @@ mod tests {
 			governance_mail("fee_policy_approval", &half_terms, "https://cabinet.example").is_none(),
 			"so is a payload missing half its terms"
 		);
+	}
+
+	/// One outcome row, three subjects: a row naming a fund with terms renders as fee terms,
+	/// a row queued before the fee description existed renders as the payout it always
+	/// was, and a fund with half its terms is unrenderable — like a fee approval's.
+	#[test]
+	fn an_outcome_row_naming_a_fund_renders_as_fee_terms() {
+		let fee = serde_json::json!({
+			"consilium_id": "c-12",
+			"outcome": "EXECUTED",
+			"network": "", "address": "", "amount": "", "detail": "",
+			"tier": "", "source": "", "destination": "", "reason": "",
+			"fund": "Quy Nhon Fund",
+			"current": null,
+			"proposed": {"management_bps": 250, "performance_bps": 2000, "hurdle_bps": 800, "basis": "market_value", "crystallization": "quarterly"},
+		});
+		let mail = governance_mail("payout_outcome", &fee, "https://cabinet.example").expect("renderable");
+		assert_eq!(mail.subject, "Fee terms executed — Quy Nhon Fund");
+		assert!(mail.text.contains("Management fee: none → 2.5%"));
+
+		let old_row = serde_json::json!({
+			"consilium_id": "c-1",
+			"outcome": "EXECUTED",
+			"network": "Ethereum", "address": "0xabc", "amount": "12,500.00 USDT", "detail": "Broadcast.",
+			"tier": "", "source": "", "destination": "", "reason": "",
+		});
+		let mail = governance_mail("payout_outcome", &old_row, "https://cabinet.example").expect("renderable");
+		assert_eq!(
+			mail.subject, "Payout executed — 12,500.00 USDT on Ethereum",
+			"a row from before the fee description is what it was"
+		);
+
+		let mut half_terms = fee.clone();
+		half_terms["proposed"] = serde_json::json!({"management_bps": 250});
+		assert!(governance_mail("payout_outcome", &half_terms, "https://cabinet.example").is_none(), "half the terms is no mail");
+		let mut no_terms = fee.clone();
+		no_terms["proposed"] = serde_json::Value::Null;
+		assert!(
+			governance_mail("payout_outcome", &no_terms, "https://cabinet.example").is_none(),
+			"a fund proposing nothing is no mail"
+		);
+		let mut no_fund = fee;
+		no_fund["fund"] = serde_json::Value::String(String::new());
+		assert!(governance_mail("payout_outcome", &no_fund, "https://cabinet.example").is_none(), "terms for no fund are no mail");
+	}
+
+	/// `current` has two absences: `null` is a fund that charged nothing and reads "none",
+	/// while a value that no longer parses (the terms' shape drifted between queueing and
+	/// sending) is unrenderable — like `proposed` — rather than rendered as "none", which
+	/// would tell the owners the fund took nothing.
+	#[test]
+	fn unparseable_current_terms_park_the_mail_rather_than_read_as_none() {
+		let proposed = serde_json::json!({"management_bps": 250, "performance_bps": 2000, "hurdle_bps": 800, "basis": "market_value", "crystallization": "quarterly"});
+		let outcome = serde_json::json!({
+			"consilium_id": "c-12", "outcome": "EXECUTED", "fund": "Quy Nhon Fund",
+			"network": "", "address": "", "amount": "", "detail": "",
+			"tier": "", "source": "", "destination": "", "reason": "",
+			"current": null, "proposed": proposed,
+		});
+		let mail = governance_mail("payout_outcome", &outcome, "https://cabinet.example").expect("renderable");
+		assert!(mail.text.contains("Management fee: none → 2.5%"), "null is a fund that charged nothing");
+
+		let mut absent = outcome.clone();
+		absent.as_object_mut().expect("object").remove("current");
+		let mail = governance_mail("payout_outcome", &absent, "https://cabinet.example").expect("renderable");
+		assert!(mail.text.contains("Management fee: none → 2.5%"), "so is a row with no `current` key at all");
+
+		let mut drifted = outcome;
+		drifted["current"] = serde_json::json!({"management_bps": "two percent"});
+		assert!(
+			governance_mail("payout_outcome", &drifted, "https://cabinet.example").is_none(),
+			"terms that fail to parse are not a fund that charged nothing"
+		);
+
+		// The same helper feeds the approval and the notice; the distinction holds there too.
+		let approval = serde_json::json!({
+			"consilium_id": "c-12", "initiator_email": "a@example.com", "fund": "Quy Nhon Fund",
+			"current": {"management_bps": "two percent"}, "proposed": proposed,
+			"reason": "", "payload_hash": "", "threshold": 2, "owner_count": 3, "expires_at": 1_785_143_640,
+			"approval_url": "https://cabinet.example/a", "code": "123456",
+		});
+		assert!(governance_mail("fee_policy_approval", &approval, "https://cabinet.example").is_none());
+		let notice = serde_json::json!({
+			"fund": "Quy Nhon Fund", "current": 42, "proposed": proposed,
+			"effective_at": 1_785_143_640, "link": "/funds/quy-nhon/fees",
+		});
+		assert!(governance_mail("fee_policy_notice", &notice, "https://cabinet.example").is_none());
 	}
 
 	#[test]
