@@ -233,6 +233,25 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   vendor's retry is the only thing that ever revisits a decided case, and answering
   200 to it makes that split state permanent. Re-applying is free: the monotonic
   writer compares under the row lock and emits nothing when the level is already held.
+- **A terminal verdict reaches the person it is about, and a CONTRADICTING one reaches
+  a human who can act.** Not moving the level was always right — a downgrade is a human
+  act under `KycManage` and a vendor must never take a level away — but telling nobody
+  was not: a declined or lapsed verification existed only as a row in a table nobody
+  watches, so "a human decides" meant "nobody decides" (#49). The user is told over
+  `account:verification`, which they may switch off; the owners' copy is operational and
+  goes through the governance queue, which has no unsubscribe target, no link and no
+  code — nobody lowers a level from a mailbox.
+  **What counts as a contradiction is narrow on purpose**, because a mail that cries wolf
+  costs exactly the signal it exists to carry. Only `declined` and `kyc_expired` qualify
+  (an abandoned session says a tab was closed, not that an identity is in doubt); the
+  comparison is against what the case would GRANT — `KycStatus::grants_tier`, capped at
+  `PROVIDER_MAX_TIER` — and never against `requested_tier`, or the legacy rows asking for
+  2 that `0014` deliberately leaves standing could never contradict anything; and a level
+  another still-`approved` case covers is not a contradiction at all, because verified
+  twice and then told the first session lapsed is routine. The page (`error!` → Sentry)
+  is raised only on the FIRST delivery: the mail is deduplicated per case, per verdict
+  and per owner, and Didit retries at roughly one and four minutes, so paging on every
+  delivery would turn one contradiction into three incidents.
 - **Verdicts are ordered by the SIGNED timestamp, never by arrival.** Didit retries at
   ~1 min and ~4 min, so a superseded `in_review` landing after the `approved` that
   replaced it is routine. `kyc_cases.event_at` holds the signed instant of the stored
