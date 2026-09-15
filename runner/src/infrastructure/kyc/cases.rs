@@ -219,25 +219,45 @@ impl KycCaseRepository for PgKycCases {
 				.await
 				.map_err(repo_err)?;
 
-			// "Has this document already given somebody ELSE a level", not "is there an
-			// approved row with it". A case leaves `approved` by routes the vendor drives
-			// on its own — `approved` → `kyc_expired` when a verification ages out,
-			// `approved` → `declined` on a post-hoc review — and neither takes the level
-			// back down, because only a human under `KycManage` ever lowers one. So a
-			// status-only question stops protecting the document the moment the vendor
-			// expires the first verification, while the first account keeps the deposit
-			// address and the right to withdraw that the level bought. The level is what
-			// is being guarded, so the level is what is asked about.
+			// "Has this document already BOUGHT somebody else a level" — asked as TWO
+			// facts OR-ed together, and the pair is the whole point.
+			//
+			// `u.kyc_level >= 1` alone is not enough, and that is not a refinement: it is
+			// the hole this branch exists to close, left open. The level is written by a
+			// DIFFERENT transaction on a different connection — `web::kyc::apply` →
+			// `UserDirectoryRepository::raise_kyc_level_to` — which only begins once THIS
+			// one has committed. The advisory lock above is released by that same commit,
+			// so the twin waiting on it wakes precisely inside the window where the first
+			// account's case says `approved` and its account still says 0, reads the
+			// level, finds nothing, and is approved too. The lock does not close that; it
+			// aims the second verdict straight at it.
+			//
+			// The same gap without any concurrency, and permanent: `apply` failing
+			// between the two writes (a 5xx, a pod rolled) leaves an `approved` case at
+			// level 0 — a state this plane treats as ordinary and repairs on redelivery —
+			// and Didit retries twice before giving up. For as long as it lasted, a
+			// level-only question would have protected that document from nothing.
+			//
+			// `c.status = approved` alone is not enough either, for the reason the level
+			// was asked about in the first place: a case LEAVES `approved` by routes the
+			// vendor drives on its own — `approved` → `kyc_expired` when a verification
+			// ages out, `approved` → `declined` on a post-hoc review — and neither takes
+			// the level back down, because only a human under `KycManage` ever lowers
+			// one. So the status arm covers the verdict this plane has already recorded,
+			// committed but not yet applied included, and the level arm covers the grant
+			// that outlived the verdict which bought it.
 			//
 			// A level an OPERATOR granted counts too: the join asks what the account
 			// holds, not where it came from. That errs towards a human looking at a case,
 			// which is the direction this whole branch errs in.
 			let twin: Option<Uuid> = sqlx::query_scalar(
 				"SELECT c.user_id FROM kyc_cases c JOIN users u ON u.id = c.user_id \
-				 WHERE c.identity_digest = $1 AND c.user_id <> $2 AND c.decision_at IS NOT NULL AND u.kyc_level >= 1 LIMIT 1",
+				 WHERE c.identity_digest = $1 AND c.user_id <> $2 AND c.decision_at IS NOT NULL \
+				 AND (c.status = $3 OR u.kyc_level >= 1) LIMIT 1",
 			)
 			.bind(digest)
 			.bind(user_id)
+			.bind(KycStatus::Approved.as_str())
 			.fetch_optional(&mut *tx)
 			.await
 			.map_err(repo_err)?;

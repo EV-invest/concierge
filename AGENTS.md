@@ -245,13 +245,19 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   appears in `payload` still holds -- this is a COLUMN precisely so it does not become one
   more key in a blob whose rule is "copy nothing unless named". `record_decision` asks,
   inside the transaction holding the case and BEFORE the status that would grant a level
-  is written, whether that digest has already raised the level of a DIFFERENT user -- the
-  question is about the level, not about a current `approved` row, because `approved` ->
+  is written, whether that digest has already bought a DIFFERENT user a level. Two facts
+  OR-ed, and both are load-bearing: a recorded `approved` case, because the level itself is
+  written by a LATER transaction (`apply` -> `raise_kyc_level_to`) and a level-only question
+  would miss the twin for exactly as long as that gap lasts -- a gap that is permanent
+  whenever `apply` fails between the two writes; and `kyc_level >= 1`, because `approved` ->
   `kyc_expired` and `approved` -> `declined` are routine vendor events that leave the level
   standing. The lookup is serialised per digest with `pg_advisory_xact_lock`: the case row
   lock covers one case, and two verdicts on the same document would otherwise not see each
-  other. On a hit the verdict is recorded as `held_duplicate`, no level moves, and an
-  `error!` (-> Sentry) puts it in front of an operator. NOT a refusal: the honest
+  other. A unique index would be the shorter answer and is not available -- the same person
+  re-verifying their own account legitimately produces a second approved row with the same
+  digest, and no index predicate can tell that from a second account. On a hit the verdict
+  is recorded as `held_duplicate`, no level moves, and an `error!` (-> Sentry) puts it in
+  front of an operator. NOT a refusal: the honest
   explanations are real -- a lost account remade, a shared device, a family -- and an
   automatic rejection would lock those people out with no recourse and no human involved.
   The hold is a DECIDED status on purpose: this plane has no RPC that closes a case, so a

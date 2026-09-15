@@ -30,31 +30,44 @@
 --     duplicate check is skipped -- concierge must boot and verify people either way, so
 --     this is a detection that degrades, never a gate that fails closed on an absent
 --     secret.
---   * The index is NOT unique, deliberately. A unique constraint would make the SECOND
---     honest re-verification of the same person fail at the database, which is a
---     write error on a path that is supposed to end in a human reading a case. Duplicates
---     are routed to `held_duplicate` by the application instead: the level is not raised,
---     and an operator decides. What a unique index WOULD have bought -- mutual exclusion
---     between two verdicts landing on the same document at once -- is bought instead by
---     `pg_advisory_xact_lock(hashtextextended(digest, 0))`, taken inside the decision
---     transaction just before the lookup (`infrastructure::kyc::cases`). Without it the
---     two transactions do not see each other's uncommitted rows under READ COMMITTED,
---     both find no twin, and both grant a level -- and the check never runs again,
---     because it only ever runs on a status transition.
---   * Partial on `identity_digest IS NOT NULL` only. It deliberately does NOT also
---     predicate on `status = 'approved'`: see the next paragraph for why the lookup
---     stopped asking that question.
+--   * The index is NOT unique, deliberately. `UNIQUE (identity_digest) WHERE status =
+--     'approved'` is the obvious way to make the race impossible in the schema, and it
+--     cannot be used here: the same person re-verifying their OWN account is legitimate
+--     and routine (the first attempt expired, a reviewer asked for a resubmission), it
+--     produces a second approved row carrying the same digest, and a unique index cannot
+--     be told the difference -- the account that owns the row is exactly the distinction
+--     the constraint may not express. It would turn that honest second approval into a
+--     23505 on the webhook path, where the only available answers are a 5xx the vendor
+--     retries into the same error or a hold on somebody who did nothing wrong. Mutual
+--     exclusion between two verdicts landing on the same document at once is bought
+--     instead by `pg_advisory_xact_lock(hashtextextended(digest, 0))`, taken inside the
+--     decision transaction just before the lookup (`infrastructure::kyc::cases`).
+--     Without it the two transactions do not see each other's uncommitted rows under
+--     READ COMMITTED, both find no twin, and both grant a level -- and the check never
+--     runs again, because it only ever runs on a status transition. The lock is only
+--     worth as much as the question asked under it, which is the next paragraph.
+--   * Partial on `identity_digest IS NOT NULL` only -- not on a status. The lookup asks
+--     about two statuses' worth of fact plus the joined level, and the digest alone is
+--     the column all of it hangs off.
 --
--- WHAT THE LOOKUP ASKS, AND WHY IT IS NOT "IS THERE AN APPROVED ROW". The guarded fact is
--- "this document has already raised somebody's level", not "this document has an approved
--- case right now". A case leaves `approved` by routes the vendor drives on its own --
--- `approved` -> `kyc_expired` when a verification ages out, `approved` -> `declined` on a
--- post-hoc review -- and neither takes the level back down, because only a human under
--- `Permission::KycManage` ever lowers one. A status-only question would therefore stop
--- protecting a document the moment the vendor expired the first verification, while the
--- first account kept the deposit address and the right to withdraw that its level bought.
--- So the lookup joins `users` and asks about `kyc_level`, and the index covers the digest
--- alone.
+-- WHAT THE LOOKUP ASKS: TWO FACTS, OR-ED. The guarded fact is "this document has already
+-- bought somebody a level", and no single column holds it.
+--   * `kyc_level >= 1` on the joined `users` row, because a case LEAVES `approved` by
+--     routes the vendor drives on its own -- `approved` -> `kyc_expired` when a
+--     verification ages out, `approved` -> `declined` on a post-hoc review -- and neither
+--     takes the level back down, since only a human under `Permission::KycManage` ever
+--     lowers one. A status-only question would stop protecting a document the moment the
+--     vendor expired the first verification, while the first account kept the deposit
+--     address and the right to withdraw that its level bought.
+--   * `status = 'approved'` on the case, because the level is written by ANOTHER
+--     transaction (`web::kyc::apply` -> `raise_kyc_level_to`) that only begins after the
+--     decision transaction has committed -- which is the same instant the advisory lock
+--     is released. A level-only question would hand the waiting twin the one window in
+--     which the first account's verdict is recorded and its level is not, and the same
+--     split state survives indefinitely whenever `apply` fails between the two writes.
+-- Hence `decision_at IS NOT NULL AND (status = 'approved' OR kyc_level >= 1)`: the status
+-- arm covers a verdict already recorded, the level arm covers a grant that outlived the
+-- verdict which bought it. The index covers the digest alone and serves both.
 --
 -- WHY `held_duplicate` IS A DECIDED STATUS. It carries a `decision_at` like every other
 -- decided value, and that is load-bearing twice over. The vendor has spoken its last word
@@ -118,9 +131,10 @@ ALTER TABLE kyc_cases ADD CONSTRAINT kyc_cases_status CHECK (
     status IN ('pending', 'in_progress', 'in_review', 'resubmitted', 'approved', 'declined', 'abandoned', 'expired', 'kyc_expired', 'held_duplicate')
 );
 
--- "has this document already raised somebody else's level?" -- the one question asked,
+-- "has this document already bought somebody else a level?" -- the one question asked,
 -- inside the decision transaction, before a level is raised. Not predicated on a status:
--- the row the lookup must still find is one that has LEFT `approved`.
+-- the rows the lookup must find include one that has LEFT `approved` and one that has not
+-- yet been applied.
 CREATE INDEX kyc_cases_identity_digest_idx ON kyc_cases (identity_digest)
     WHERE identity_digest IS NOT NULL;
 
