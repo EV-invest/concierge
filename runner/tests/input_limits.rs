@@ -57,6 +57,14 @@ fn request_with<T>(sub: &str, inner: T) -> Request<T> {
 	req
 }
 
+/// An ordinary user for an admin verb to act ON. Every one of these handlers now
+/// distinguishes the caller from the target, so a suite that reused the caller's own
+/// subject as the target was testing a path the handler refuses.
+async fn subject_of(users: &Arc<dyn UserDirectoryRepository>, tag: &str) -> String {
+	let subject = AuthSubject::parse(&format!("{tag}-{}", Uuid::new_v4())).unwrap();
+	users.provision(subject, Email::parse("limits-target@example.com").unwrap(), true).await.unwrap().id().to_string()
+}
+
 /// A PERSISTED admin, so one principal exercises both the self-service and the admin
 /// surfaces. Deliberately NOT an `OWNER_SUBJECTS` caller: emergency elevation is live
 /// only while the owner registry is empty, and this suite shares a database with the
@@ -109,13 +117,14 @@ async fn set_kyc_level_is_bounded() {
 		return;
 	};
 	let (sub, break_glass) = admin(&users).await;
+	let target = subject_of(&users, "kyc-target").await;
 	let directory = Directory::new(users, break_glass);
 
 	let err = directory
 		.set_kyc_level(request_with(
 			&sub,
 			SetKycLevelRequest {
-				user_id: sub.clone(),
+				user_id: target.clone(),
 				kyc_level: 4,
 				reason: String::new(),
 			},
@@ -128,7 +137,7 @@ async fn set_kyc_level_is_bounded() {
 		.set_kyc_level(request_with(
 			&sub,
 			SetKycLevelRequest {
-				user_id: sub.clone(),
+				user_id: target,
 				kyc_level: 3,
 				reason: String::new(),
 			},
@@ -137,6 +146,69 @@ async fn set_kyc_level_is_bounded() {
 		.unwrap()
 		.into_inner();
 	assert_eq!(ok.kyc_level, 3);
+}
+
+/// #47: a `KycManage` holder may not set their OWN level.
+///
+/// This test used to pin the opposite. It sent `SetKycLevelRequest { user_id: sub, .. }`
+/// against the caller's own subject and asserted `kyc_level == 3` — which made the
+/// behaviour look deliberate without anywhere saying so, while `SetRole` in the same file
+/// forbids the dangerous direction at length and `domain::authz` describes the matrix as a
+/// separation of duties.
+///
+/// What it was pinning: `KycManage` is granted to `Admin`, not only `Owner`, and tier 1 is
+/// the floor for withdrawals on the MONEY plane. So an operator could lift their own money
+/// gate in a plane where they hold no permissions at all, and it would read in both planes
+/// as an ordinary verification.
+///
+/// The refusal is checked BEFORE the range check, so "level 4 on myself" is denied rather
+/// than merely called out of range: an operator must not learn which of the two rules they
+/// tripped by picking a legal number.
+#[tokio::test]
+async fn an_operator_cannot_set_their_own_kyc_level() {
+	let Some((users, _)) = setup().await else {
+		return;
+	};
+	let (sub, break_glass) = admin(&users).await;
+	let directory = Directory::new(users.clone(), break_glass);
+
+	for level in [1, 3, 0, 4] {
+		let err = directory
+			.set_kyc_level(request_with(
+				&sub,
+				SetKycLevelRequest {
+					user_id: sub.clone(),
+					kyc_level: level,
+					reason: String::new(),
+				},
+			))
+			.await
+			.unwrap_err();
+		assert_eq!(err.code(), Code::PermissionDenied, "setting level {level} on yourself must be refused");
+	}
+
+	let me = users
+		.find_by_id(sub.parse::<Uuid>().map(domain::users::UserId::from_raw).unwrap())
+		.await
+		.unwrap()
+		.expect("the operator still exists");
+	assert_eq!(me.kyc_level(), 0, "a refused write leaves the level where it was");
+
+	// And the verb still works — the refusal is about the TARGET, not about the caller.
+	let target = subject_of(&users, "kyc-other").await;
+	let ok = directory
+		.set_kyc_level(request_with(
+			&sub,
+			SetKycLevelRequest {
+				user_id: target,
+				kyc_level: 2,
+				reason: String::new(),
+			},
+		))
+		.await
+		.unwrap()
+		.into_inner();
+	assert_eq!(ok.kyc_level, 2);
 }
 
 /// #45: the handler guard above is a fast path, not the boundary. Skip it — call the

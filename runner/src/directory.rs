@@ -290,12 +290,36 @@ impl UserDirectory for Directory {
 		}
 	}
 
+	/// The human path to a KYC level — the only one that may move it DOWN, and the only
+	/// one that reaches tier 3.
+	///
+	/// Refused on your own account. `KycManage` is held by `Admin` as well as `Owner`
+	/// (`domain::authz`), and tier 1 is the floor for withdrawals on the MONEY plane —
+	/// so without this an operator could lift their own money gate in a plane where they
+	/// hold no permissions at all, and nothing in either plane would show it as anything
+	/// but a routine verification (#47). The neighbouring verbs already read this way:
+	/// [`Self::hold_user`] refuses its own actor, and `SetRole` refuses both directions
+	/// of ownership, with `domain::authz` calling the matrix a separation of duties.
+	///
+	/// A `PermissionDenied` and not the `FailedPrecondition` the hold uses, because the
+	/// two refusals say different things. A hold on yourself is incoherent — it ends the
+	/// session you would need to lift it — and could be re-asked in another shape. This
+	/// one is a permission the caller does not have over this target and will not have;
+	/// another operator has it.
+	///
+	/// Raising your OWN level is still perfectly possible, through the front door every
+	/// other user goes through: `/kyc/start`, a document and a vendor.
 	async fn set_kyc_level(&self, request: Request<SetKycLevelRequest>) -> Result<Response<SetKycLevelResponse>, Status> {
 		require_permission(self, &request, Permission::KycManage).await?;
 		let actor = self.acting_operator(&request).await?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
 		let target = parse_target_id(&req.user_id)?;
+		if target == actor {
+			return Err(Status::permission_denied(
+				"a KYC level cannot be set on your own account; ask another holder of KycManage, or verify through /kyc/start like any other user",
+			));
+		}
 		// The aggregate and the `users_kyc_level_range` CHECK both refuse this too — the
 		// range is theirs, not this handler's. Rejecting here as well only saves the
 		// round trip to a row we already know we will not write.
