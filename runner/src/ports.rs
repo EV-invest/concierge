@@ -489,6 +489,13 @@ pub struct LiveCase {
 	/// COUNTED but not resumed: the vendor's session URL is not derivable from anything
 	/// else we keep, and there is no second call that would fetch it back.
 	pub redirect_url: Option<String>,
+	pub status: KycStatus,
+	pub requested_tier: u32,
+	/// Unix seconds. Carried as a scalar rather than a timestamp type because the only
+	/// consumer is a JSON body, and a plane that answers in epoch seconds everywhere
+	/// (`*_expires_at`, `occurred_at`, `event_at`) must not grow a second time format
+	/// for one route.
+	pub created_at: i64,
 }
 
 /// What `/kyc/start` must know BEFORE it is allowed to spend a paid vendor session.
@@ -526,6 +533,17 @@ pub trait KycCaseRepository: Send + Sync {
 	/// single-flight does not reach (a second replica), the window cap is what bounds the
 	/// race.
 	async fn start_gate(&self, user_id: UserId, window_secs: i64) -> Result<StartGate, DomainError>;
+
+	/// This caller's still-running attempt, if they are in one.
+	///
+	/// The read half of [`Self::start_gate`], on its own, because `GET /kyc/status` must
+	/// not pay for the window count: it is polled by every cabinet that has a signed-in
+	/// user on a verification screen, while the count exists only to decide whether a
+	/// BILLED vendor call may happen. Sharing the SQL with `start_gate` rather than
+	/// copying it is what keeps "which statuses are still running" a single answer —
+	/// two lists here would let `/kyc/status` report a live case the start route no
+	/// longer considers live, which is precisely the disagreement #190 is about.
+	async fn live_case(&self, user_id: UserId) -> Result<Option<LiveCase>, DomainError>;
 
 	/// Apply a verdict to the case it names, if it moves anything.
 	///
