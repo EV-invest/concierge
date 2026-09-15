@@ -902,10 +902,13 @@ fn no_link(value: &str, field: &str) -> Result<String, Status> {
 }
 
 /// [`no_link`] for a field that is FREE TEXT — a fund's name, which the money plane
-/// spells as a product slug. Only `://` and `www.` are refused: those are what a client
-/// linkifies on its own, while a bare `http` with no scheme stays a word — and `httpfund`
-/// or `lighthttp-arb` is a legal slug. Refusing the word there would not stop a link;
-/// it would make every fee mail about such a fund undeliverable.
+/// spells as a product slug. Only the explicit shapes of a URL are refused: a scheme
+/// (`://`) and `www.`. This does NOT catch a bare domain — Gmail, iOS Mail and Outlook
+/// linkify `evil.example/login` on their own — and that gap is a deliberate trade-off,
+/// not an oversight: a bare `http` with no scheme stays a word, and `httpfund` or
+/// `lighthttp-arb` is a legal slug (banking#265). Refusing the word would not close the
+/// gap; it would make every fee mail about such a fund undeliverable. Closing it takes a
+/// `<label>.<tld>` heuristic that knows which dots a slug may carry — a follow-up.
 fn no_url(value: &str, field: &str) -> Result<String, Status> {
 	without_needles(value, &["://", "www."], field)
 }
