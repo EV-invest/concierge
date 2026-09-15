@@ -21,6 +21,13 @@
 -- answers `None` for a kind it does not know and PARKS the row rather than retrying it,
 -- so a kind accepted here without a renderer would be mail that is silently never sent.
 --
+-- `lock_timeout`, as in 0016/0017/0019 for this same DROP/ADD, and load-bearing here for
+-- the reason those state: migrations run ON BOOT, the drop-and-re-add takes ACCESS
+-- EXCLUSIVE, and the dispatcher holds transactions over this very table while it claims
+-- rows on a 300-second lease. Without a timeout the migrator queues behind one of those
+-- indefinitely, the boot never finishes and the deploy stops with no error at all —
+-- instead of failing honestly in three seconds and retrying on the next start.
+--
 -- REVERSIBILITY. Reversible while the new kind is unused --
 --   ALTER TABLE notification_deliveries DROP CONSTRAINT notification_deliveries_kind;
 --   ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_kind
@@ -29,6 +36,8 @@
 --                       'payment_approval', 'fee_policy_approval', 'fee_policy_notice'));
 -- -- and stops being so the moment a row of this kind is queued: the narrowing fails,
 -- and forcing it would silently strand a mail an owner is waiting on.
+
+SET lock_timeout = '3s';
 
 ALTER TABLE notification_deliveries DROP CONSTRAINT notification_deliveries_kind;
 ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_kind
