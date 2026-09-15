@@ -351,7 +351,11 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 		);
 		let secret = config.didit_webhook_secret.clone().unwrap_or_else(|| "kyc-stub-secret".to_string());
 		tracing::warn!(webhook = %webhook_url, "kyc: running the STUB provider — no vendor is contacted and verdicts are locally signed");
-		return Ok(Some(Arc::new(stub::StubKyc::new(secret, config.cabinet_url.clone()))));
+		let mut stub = stub::StubKyc::new(secret, config.cabinet_url.clone());
+		if let Some(pepper) = config.kyc_identity_pepper.clone().filter(|p| !p.is_empty()) {
+			stub = stub.with_identity_pepper(pepper);
+		}
+		return Ok(Some(Arc::new(stub)));
 	}
 
 	let (Some(api_key), Some(workflow_id), Some(webhook_secret)) = (config.didit_api_key.clone(), config.didit_workflow_id.clone(), config.didit_webhook_secret.clone()) else {
@@ -359,6 +363,14 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 		return Ok(None);
 	};
 	tracing::info!(webhook = %webhook_url, "kyc: didit provider configured — this is the URL to register in the vendor console");
+	let identity_pepper = config.kyc_identity_pepper.clone().filter(|p| !p.is_empty());
+	if identity_pepper.is_none() {
+		// Once, at boot, and never fatal. Without the pepper nothing links two accounts
+		// verified on the same document — which is where this plane stood before the
+		// column existed — so the gap has to be visible, and refusing to boot over it
+		// would take sign-in down for everybody to close a hole that was already open.
+		tracing::warn!("kyc: KYC_IDENTITY_PEPPER is not set — identity dedup disabled; two accounts verified on the same document will not be linked");
+	}
 	Ok(Some(Arc::new(didit::DiditKyc::new(didit::DiditConfig {
 		base_url: config.didit_base_url.clone(),
 		api_key,
@@ -367,6 +379,7 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 		// Where the BROWSER lands when the flow ends — a user-facing page, never the
 		// webhook path, which answers POST only.
 		return_url: config.cabinet_url.clone(),
+		identity_pepper,
 	}))))
 }
 

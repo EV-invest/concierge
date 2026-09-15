@@ -1267,6 +1267,7 @@ async fn a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery() {
 		status: KycStatus::Approved,
 		vendor_data: case_id.to_string(),
 		metadata: json!({}),
+		identity_digest: None,
 		signed_at: at,
 	};
 	h.cases.record_decision(PROVIDER, &decision).await.expect("record the verdict");
@@ -1282,4 +1283,185 @@ async fn a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery() {
 	assert_eq!(answer["duplicate"], true, "it is still a duplicate, and still answered 2xx");
 	assert_eq!(h.kyc_level(user).await, 1, "the retry is what repairs a verdict whose level never landed");
 	assert_eq!(h.kyc_changed_count(user).await, 1, "and it emits the ONE event the original attempt owed the money plane");
+}
+
+/// The pepper the duplicate-person tests below drive the digest with.
+const PEPPER: &str = "kyc-integration-pepper";
+
+/// A stub that computes identity digests, i.e. a deployment with `KYC_IDENTITY_PEPPER`
+/// set. The default stub has none, which is also the shape of a deployment without one.
+async fn setup_with_pepper() -> Option<Harness> {
+	setup_with(Some(Arc::new(
+		StubKyc::new(SECRET.to_string(), "https://evinvest.test/cabinet".to_string()).with_identity_pepper(PEPPER),
+	)))
+	.await
+}
+
+/// A webhook body whose verdict names a specific document.
+fn body_for_document(session_id: &str, status: &str, vendor_data: &str, at: i64, issuing_state: &str, document_number: &str) -> Vec<u8> {
+	body(
+		session_id,
+		status,
+		vendor_data,
+		at,
+		json!({
+			"decision": {
+				"kyc": { "status": status, "document_type": "Passport", "issuing_state": issuing_state, "document_number": document_number },
+				"liveness": { "status": "Approved" },
+			},
+		}),
+	)
+}
+
+/// ONE PERSON, TWO ACCOUNTS — the case #51 is about, driven end to end.
+///
+/// It needs no forgery. Somebody registers twice through Google OAuth and honestly
+/// verifies each account with their own real passport: liveness and face-match pass,
+/// because it really is them. Before this column, both accounts reached level 1 — a
+/// deposit address and the right to withdraw — and neither plane held anything that
+/// could tie them together, before or after the fact.
+#[tokio::test]
+async fn a_second_account_on_the_same_document_is_held_for_review() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let document = format!("P{}", Uuid::new_v4().simple());
+
+	// The first account verifies normally. Nothing about this path changes.
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(first).await, 1, "an honest first verification is untouched");
+	assert_eq!(h.case_row(first_case).await.0, "approved");
+
+	// The same person, the same passport, a second account.
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+	let (status, answer) = h.post(raw.clone(), signed(&raw), at).await;
+
+	// Answered 2xx: the delivery was genuine and IS handled — refusing it would only make
+	// Didit retry a verdict we have already recorded.
+	assert_eq!(status, StatusCode::OK, "{answer}");
+	assert_eq!(h.case_row(second_case).await.0, "in_review", "held for a human, not refused outright");
+	assert_eq!(h.kyc_level(second).await, 0, "and NO level was raised on the second account");
+	assert_eq!(h.kyc_changed_count(second).await, 0, "so the money plane is never told this account is verified");
+
+	// The first account is left exactly where it was. Whatever an operator decides, it is
+	// not this path's business to undo a verification that already happened.
+	assert_eq!(h.kyc_level(first).await, 1);
+}
+
+/// The DOCUMENT is what is matched, not the person's luck.
+///
+/// A different passport must verify normally on an account of its own, or the check would
+/// hold innocent applicants at `in_review` — which costs more trust than the duplicate it
+/// was meant to catch.
+#[tokio::test]
+async fn a_different_document_verifies_normally() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+
+	for document in [format!("A{}", Uuid::new_v4().simple()), format!("B{}", Uuid::new_v4().simple())] {
+		let user = h.user().await;
+		let (case_id, session_id) = h.case(user, 1).await;
+		let at = now();
+		let raw = body_for_document(&session_id, "Approved", &case_id.to_string(), at, "PRT", &document);
+		assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+		assert_eq!(h.kyc_level(user).await, 1, "{document} is nobody else's document");
+	}
+}
+
+/// The SAME person re-verifying their OWN account is not a duplicate.
+///
+/// The check asks about a different `user_id` on purpose. A person who starts a second
+/// case — because the first expired, or a reviewer asked for a resubmission — presents the
+/// same passport, and holding that for review would punish exactly the people doing what
+/// they were told.
+#[tokio::test]
+async fn re_verifying_your_own_account_is_not_a_duplicate() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let document = format!("R{}", Uuid::new_v4().simple());
+
+	let (first_case, first_session) = h.case(user, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	let (second_case, second_session) = h.case(user, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	assert_eq!(h.case_row(second_case).await.0, "approved", "their own document on their own account");
+	assert_eq!(h.kyc_level(user).await, 1);
+}
+
+/// WITHOUT a pepper, everything behaves exactly as it did before this column existed.
+///
+/// This is the shape of every deployment that has not been given the secret, production
+/// included until an operator adds it. The detection is off; nothing else is.
+#[tokio::test]
+async fn without_a_pepper_the_second_account_verifies_as_it_always_did() {
+	let h = harness!();
+	let document = format!("N{}", Uuid::new_v4().simple());
+
+	let mut users = Vec::new();
+	for _ in 0..2 {
+		let user = h.user().await;
+		let (case_id, session_id) = h.case(user, 1).await;
+		let at = now();
+		let raw = body_for_document(&session_id, "Approved", &case_id.to_string(), at, "PRT", &document);
+		assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+		assert_eq!(h.case_row(case_id).await.0, "approved");
+		users.push(user);
+	}
+
+	for user in users {
+		assert_eq!(h.kyc_level(user).await, 1, "no pepper, no detection — and no change to the decision either");
+	}
+}
+
+/// The stored fingerprint is a fingerprint, and the payload discipline is unchanged.
+///
+/// 0010 says no document numbers reach this database. That still holds: the column holds
+/// a keyed digest the number cannot be recovered from without a secret this database never
+/// sees, and `payload` is as empty of it as it ever was.
+#[tokio::test]
+async fn the_document_number_reaches_neither_the_payload_nor_the_column() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 1).await;
+	let document = format!("S{}", Uuid::new_v4().simple());
+
+	let at = now();
+	let raw = body_for_document(&session_id, "Approved", &case_id.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	let (_, _, payload) = h.case_row(case_id).await;
+	let stored = payload.to_string();
+	assert!(!stored.contains(&document), "the number must never reach the payload: {stored}");
+	assert!(!stored.contains("document_number"), "the allowlist copies, it does not redact: {stored}");
+
+	let digest: Option<String> = sqlx::query_scalar("SELECT identity_digest FROM kyc_cases WHERE id = $1")
+		.bind(case_id)
+		.fetch_one(&h.pool)
+		.await
+		.expect("read the digest");
+	let digest = digest.expect("an approved verdict naming a document stores one");
+	assert_eq!(digest.len(), 64, "hex SHA-256");
+	assert!(!digest.contains(&document), "and the digest does not carry the number either: {digest}");
 }

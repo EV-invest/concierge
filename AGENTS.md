@@ -229,6 +229,32 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   min), which is what resolves the webhook-overtakes-the-insert race. Do not "fix" it to
   200. The handler must answer inside 5s, so nothing on that path may wait on a network
   hop.
+- **One document, one account -- detected, never refused.** Nothing linked two accounts
+  verified by the same physical person, and by construction nothing could (#51): the
+  `kyc_cases.payload` allowlist stores document type, issuing country and check outcomes,
+  and identifying fields reach the database in no form at all. The scenario needs no
+  forgery -- one person registers N accounts through Google OAuth and honestly verifies
+  each with their own real passport, so liveness and face-match pass and every account
+  reaches level >= 1. `kyc_cases.identity_digest` is the one cross-account handle this
+  plane holds: `HMAC-SHA256(KYC_IDENTITY_PEPPER, issuing_state || ':' || document_number)`,
+  computed in `didit::identity_digest_of` beside `metadata_of` -- the one scope a document
+  number is ever visible in -- and dropped with the payload at the end of it. HMAC and not
+  a bare hash because a document number is low-entropy and enumerable; the issuing state
+  is part of the message because "AB123456" is not the same person in two countries. The
+  discipline 0010 states is unchanged, and the test asserting `document_number` never
+  appears in `payload` still holds -- this is a COLUMN precisely so it does not become one
+  more key in a blob whose rule is "copy nothing unless named". `record_decision` asks,
+  inside the transaction holding the case and BEFORE the status that would grant a level
+  is written, whether that digest is already approved for a different user; on a hit the
+  verdict is recorded as `in_review`, no level moves, and an `error!` (-> Sentry) puts it
+  in front of an operator. NOT a refusal: the honest explanations are real -- a lost
+  account remade, a shared device, a family -- and an automatic rejection would lock those
+  people out with no recourse and no human involved. `KYC_IDENTITY_PEPPER` is OPTIONAL and
+  never `required_in("production")`: absent it no digest is computed and the check is
+  skipped, which is where this plane stood before the column existed, and a detection
+  whose absence refuses to boot would take sign-in down for everybody to close a hole that
+  was already open. The boot logs it once at `warn!` when a vendor is configured and the
+  pepper is not. Rotating the pepper invalidates every stored digest.
 - **Vendor status words are copied, never retyped.** The match is case-sensitive, so a
   near-miss does not fail loudly — the arm just never fires. `"Kyc Expired"` spent a
   while here as `"KYC Expired"`, silently unclassifiable. An unknown word is answered

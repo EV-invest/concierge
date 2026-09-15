@@ -365,6 +365,17 @@ pub struct KycDecision {
 	/// Allowlisted decision METADATA for `kyc_cases.payload` — document country, document
 	/// type, per-check outcomes. Never documents, images, or document numbers.
 	pub metadata: serde_json::Value,
+	/// A keyed one-way fingerprint of the DOCUMENT this verdict was reached on, and the
+	/// only cross-account handle this plane holds (#51).
+	///
+	/// A field of its own rather than a key in [`Self::metadata`], because `metadata`'s
+	/// discipline is "copy nothing the allowlist does not name" and its home is a JSON
+	/// blob. This has a column, an index and a question it answers.
+	///
+	/// `None` whenever it could not be computed — no pepper configured, or a verdict
+	/// carrying no document number. Absence disables DETECTION and never a decision: the
+	/// level still moves exactly as it did.
+	pub identity_digest: Option<String>,
 	/// Unix seconds the vendor stamped INSIDE the signed body — the instant this verdict
 	/// was made, as opposed to the instant this delivery happened to arrive.
 	///

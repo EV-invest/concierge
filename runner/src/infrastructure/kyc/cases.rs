@@ -170,24 +170,72 @@ impl KycCaseRepository for PgKycCases {
 			return Ok(CaseDecision::Ignored(case(stored)));
 		}
 
+		// ONE PERSON, N ACCOUNTS (#51). Asked here — inside the transaction that holds
+		// this case, and BEFORE the status that would grant a level is written — because
+		// it is the last point at which the answer can still change what happens. The
+		// scenario needs no forgery: somebody registers several accounts and honestly
+		// verifies each with their own real passport, so every check the vendor runs
+		// passes and every account reaches level >= 1.
+		//
+		// The duplicate is not REFUSED. The honest explanations are real — a person who
+		// lost an account and made another, a shared device, a family — and an automatic
+		// rejection would lock those people out with no recourse and no human involved.
+		// So the verdict is recorded as `in_review`: no level moves, the case stays open,
+		// and an operator decides. That is also what the user is told, through the
+		// `in_review` notice the handler already sends.
+		//
+		// Skipped entirely when no digest was computed (no `KYC_IDENTITY_PEPPER`, or a
+		// verdict carrying no document number). Detection degrades; the decision does not.
+		let mut status = decision.status;
+		if status == KycStatus::Approved
+			&& let Some(digest) = decision.identity_digest.as_deref()
+		{
+			let twin: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM kyc_cases WHERE identity_digest = $1 AND status = 'approved' AND user_id <> $2 LIMIT 1")
+				.bind(digest)
+				.bind(user_id)
+				.fetch_optional(&mut *tx)
+				.await
+				.map_err(repo_err)?;
+			if let Some(twin) = twin {
+				// `error!` because `error_monitoring::tracing_layer()` forwards it to
+				// Sentry, which is the only channel here that reaches a person rather
+				// than a log nobody reads. The digest is NOT logged: it is the one
+				// cross-account handle this plane holds, and a log aggregator is not
+				// where it belongs.
+				tracing::error!(
+					case_id = %id,
+					%user_id,
+					twin_user_id = %twin,
+					"kyc: this document is already approved for a different account — the verdict is held for review and no level was raised"
+				);
+				status = KycStatus::InReview;
+			}
+		}
+
 		// `decision_at` follows `is_decided` exactly, which is what the
 		// `kyc_cases_decision_at` CHECK asserts — a disagreement fails the write rather
 		// than leaving a row whose "still running?" has two answers.
+		//
+		// `identity_digest` is written with COALESCE so a later verdict that carries no
+		// document number — or one recorded after the pepper was unset — cannot erase the
+		// fingerprint an earlier verdict on the same case established.
 		sqlx::query(
 			"UPDATE kyc_cases SET status = $2, payload = $3, \
-			 decision_at = CASE WHEN $4 THEN now() ELSE NULL END, event_at = $5, updated_at = now() \
+			 decision_at = CASE WHEN $4 THEN now() ELSE NULL END, event_at = $5, \
+			 identity_digest = COALESCE($6, identity_digest), updated_at = now() \
 			 WHERE id = $1",
 		)
 		.bind(id)
-		.bind(decision.status.as_str())
+		.bind(status.as_str())
 		.bind(&decision.metadata)
-		.bind(decision.status.is_decided())
+		.bind(status.is_decided())
 		.bind(decision.signed_at)
+		.bind(decision.identity_digest.as_deref())
 		.execute(&mut *tx)
 		.await
 		.map_err(repo_err)?;
 
 		tx.commit().await.map_err(repo_err)?;
-		Ok(CaseDecision::Recorded(case(decision.status)))
+		Ok(CaseDecision::Recorded(case(status)))
 	}
 }

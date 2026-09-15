@@ -17,11 +17,24 @@ pub const PROVIDER: &str = "stub";
 pub struct StubKyc {
 	secret: String,
 	return_url: String,
+	identity_pepper: Option<String>,
 }
 
 impl StubKyc {
 	pub fn new(secret: String, return_url: String) -> Self {
-		Self { secret, return_url }
+		Self {
+			secret,
+			return_url,
+			identity_pepper: None,
+		}
+	}
+
+	/// Compute identity digests, so the duplicate-person path is exercisable without a
+	/// vendor account. Off by default, which is also the shape of a deployment with no
+	/// `KYC_IDENTITY_PEPPER`.
+	pub fn with_identity_pepper(mut self, pepper: impl Into<String>) -> Self {
+		self.identity_pepper = Some(pepper.into());
+		self
 	}
 
 	/// The secret a caller signs a simulated delivery with (`didit::sign_body`).
@@ -45,6 +58,6 @@ impl KycProvider for StubKyc {
 	}
 
 	fn parse_callback(&self, headers: &CallbackHeaders, body: &[u8], now: i64) -> Result<KycDecision, KycCallbackError> {
-		super::didit::parse_webhook(&self.secret, headers, body, now)
+		super::didit::parse_webhook(&self.secret, self.identity_pepper.as_deref(), headers, body, now)
 	}
 }
