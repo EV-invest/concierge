@@ -136,6 +136,11 @@ pub async fn callback(State(st): State<WebState>, jar: CookieJar, headers: Heade
 }
 /// `GET /auth/session` — who-am-I for the browser, refreshing the access token (and
 /// its zone-shared cookie) transparently. Never returns a token in the body.
+///
+/// The `user` block (role, `isAdmin`, status) is read LIVE from the directory on every
+/// call, not served from the login-time copy in the session: a role granted from the
+/// console is visible on the next page load, with no wait for the refresh rotation
+/// and no re-login. Only when the directory is down does the stored copy answer.
 pub async fn session(State(st): State<WebState>, jar: CookieJar) -> Result<(CookieJar, Json<SessionInfo>), (StatusCode, &'static str)> {
 	let st = &st.inner;
 	let fresh = match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
