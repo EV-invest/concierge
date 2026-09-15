@@ -254,7 +254,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   code — nobody lowers a level from a mailbox.
   **What counts as a contradiction is narrow on purpose**, because a mail that cries wolf
   costs exactly the signal it exists to carry. Only `declined` and `kyc_expired` qualify
-  (an abandoned session says a tab was closed, not that an identity is in doubt); the
+  (an abandoned session says a tab was closed, not that an identity is in doubt);
+  `held_duplicate` does not qualify and could not be made to by listing it — the twin is a
+  SECOND account, so the level the hold refused to grant was never held and the comparison
+  below returns, and `kyc_verdict_alert`'s copy offers to lower a level there is none of.
+  Its operator is reached instead by `record_decision`'s `error!` → Sentry, at the instant
+  the hold is written; mailing the owners about one is a separate kind with its own copy
+  and its own `notification_deliveries.kind` migration. The
   comparison is against what the case would GRANT — `KycStatus::grants_tier`, capped at
   `PROVIDER_MAX_TIER` — and never against `requested_tier`, or the legacy rows asking for
   2 that `0014` deliberately leaves standing could never contradict anything; and a level
@@ -281,6 +287,51 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   min), which is what resolves the webhook-overtakes-the-insert race. Do not "fix" it to
   200. The handler must answer inside 5s, so nothing on that path may wait on a network
   hop.
+- **One document, one account -- detected, never refused.** Nothing linked two accounts
+  verified by the same physical person, and by construction nothing could (#51): the
+  `kyc_cases.payload` allowlist stores document type, issuing country and check outcomes,
+  and identifying fields reach the database in no form at all. The scenario needs no
+  forgery -- one person registers N accounts through Google OAuth and honestly verifies
+  each with their own real passport, so liveness and face-match pass and every account
+  reaches level >= 1. `kyc_cases.identity_digest` is the one cross-account handle this
+  plane holds: `HMAC-SHA256(KYC_IDENTITY_PEPPER, issuing_state || ':' || document_number)`,
+  computed in `didit::identity_digest_of` beside `metadata_of` -- the one scope a document
+  number is ever visible in -- and dropped with the payload at the end of it. HMAC and not
+  a bare hash because a document number is low-entropy and enumerable; the issuing state
+  is part of the message because "AB123456" is not the same person in two countries. The
+  discipline 0010 states is unchanged, and the test asserting `document_number` never
+  appears in `payload` still holds -- this is a COLUMN precisely so it does not become one
+  more key in a blob whose rule is "copy nothing unless named". `record_decision` asks,
+  inside the transaction holding the case and BEFORE the status that would grant a level
+  is written, whether that digest has already bought a DIFFERENT user a level. Two facts
+  OR-ed, and both are load-bearing: a recorded `approved` case, because the level itself is
+  written by a LATER transaction (`apply` -> `raise_kyc_level_to`) and a level-only question
+  would miss the twin for exactly as long as that gap lasts -- a gap that is permanent
+  whenever `apply` fails between the two writes; and `kyc_level >= 1`, because `approved` ->
+  `kyc_expired` and `approved` -> `declined` are routine vendor events that leave the level
+  standing. The lookup is serialised per digest with `pg_advisory_xact_lock`: the case row
+  lock covers one case, and two verdicts on the same document would otherwise not see each
+  other. A unique index would be the shorter answer and is not available -- the same person
+  re-verifying their own account legitimately produces a second approved row with the same
+  digest, and no index predicate can tell that from a second account. On a hit the verdict
+  is recorded as `held_duplicate`, no level moves, and an `error!` (-> Sentry) puts it in
+  front of an operator. NOT a refusal: the honest
+  explanations are real -- a lost account remade, a shared device, a family -- and an
+  automatic rejection would lock those people out with no recourse and no human involved.
+  The hold is a DECIDED status on purpose: this plane has no RPC that closes a case, so a
+  running one would pin `/kyc/start` to the spent vendor session for ever. Decided, the
+  user may start a fresh attempt, and the operator's move is `SetKycLevel` once they have
+  looked. `KYC_IDENTITY_PEPPER` is OPTIONAL and never `required_in("production")`: absent
+  it no digest is computed and the check is skipped, which is where this plane stood before
+  the column existed, and a detection whose absence refuses to boot would take sign-in down
+  for everybody to close a hole that was already open. Because nothing else can notice that
+  state -- it is in no preflight -- the boot logs it once at `error!` when a vendor is
+  configured and the pepper is missing or too short to be a key (under 32 characters is
+  refused, not used). The secret still has to be provisioned in `rpi5.nix` (`scopes.nix`
+  platform tier, the concierge env map, `secrets/platform.json`) or the detection is off in
+  production. Rotating the pepper invalidates every stored digest, and cases decided before
+  the pepper was set keep a NULL one for ever -- there is no backfill, because the document
+  number they would be computed from was never stored.
 - **Vendor status words are copied, never retyped.** The match is case-sensitive, so a
   near-miss does not fail loudly — the arm just never fires. `"Kyc Expired"` spent a
   while here as `"KYC Expired"`, silently unclassifiable. An unknown word is answered

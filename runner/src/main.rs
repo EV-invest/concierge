@@ -365,7 +365,11 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 		);
 		let secret = config.didit_webhook_secret.clone().unwrap_or_else(|| "kyc-stub-secret".to_string());
 		tracing::warn!(webhook = %webhook_url, "kyc: running the STUB provider — no vendor is contacted and verdicts are locally signed");
-		return Ok(Some(Arc::new(stub::StubKyc::new(secret, config.cabinet_url.clone()))));
+		let mut stub = stub::StubKyc::new(secret, config.cabinet_url.clone());
+		if let Some(pepper) = identity_pepper(config) {
+			stub = stub.with_identity_pepper(pepper);
+		}
+		return Ok(Some(Arc::new(stub)));
 	}
 
 	let (Some(api_key), Some(workflow_id), Some(webhook_secret)) = (config.didit_api_key.clone(), config.didit_workflow_id.clone(), config.didit_webhook_secret.clone()) else {
@@ -373,6 +377,21 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 		return Ok(None);
 	};
 	tracing::info!(webhook = %webhook_url, "kyc: didit provider configured — this is the URL to register in the vendor console");
+	let identity_pepper = identity_pepper(config);
+	if identity_pepper.is_none() {
+		// Once, at boot, and never fatal. Without the pepper nothing links two accounts
+		// verified on the same document — which is where this plane stood before the
+		// column existed — so the gap has to be visible, and refusing to boot over it
+		// would take sign-in down for everybody to close a hole that was already open.
+		//
+		// `error!` and not `warn!`, for the same reason the duplicate hold uses one:
+		// `error_monitoring::tracing_layer()` forwards it to Sentry, and that is the only
+		// channel here that reaches a person. This line is the WHOLE signal that a control
+		// the schema, the docs and the PR all describe as in place is in fact switched
+		// off — and since the secret is not required in production, no boot check, no
+		// deploy preflight and no test will say it for us.
+		tracing::error!("kyc: KYC_IDENTITY_PEPPER is not set — identity dedup is DISABLED; two accounts verified on the same document will not be linked");
+	}
 	Ok(Some(Arc::new(didit::DiditKyc::new(didit::DiditConfig {
 		base_url: config.didit_base_url.clone(),
 		api_key,
@@ -381,7 +400,37 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 		// Where the BROWSER lands when the flow ends — a user-facing page, never the
 		// webhook path, which answers POST only.
 		return_url: config.cabinet_url.clone(),
+		identity_pepper,
 	}))))
+}
+
+/// The shortest `KYC_IDENTITY_PEPPER` this plane will use as a key.
+///
+/// The entire protection of `kyc_cases.identity_digest` is the entropy of this value. The
+/// HMAC message is `country:number` — a few dozen bits and fully enumerable — so anyone
+/// holding a dump of the table plus ONE known pairing of document to digest (their own
+/// account is one) can brute-force a hand-typed key offline and then recover the document
+/// number behind every stored row. That is precisely the PII `0010_kyc_cases.sql` promises
+/// this database does not hold, handed over by a weak secret rather than by the schema.
+const MIN_IDENTITY_PEPPER_LEN: usize = 32;
+
+/// The configured identity pepper, or `None` — with the reason on the way out.
+///
+/// A value too short to be a key is REFUSED, not stretched or accepted: a weak pepper that
+/// is taken silently leaves a deployment looking configured while the column it fills is
+/// reversible. `error!` rather than a boot failure for the same reason the absent case is
+/// not fatal — sign-in must not go down over a detection that degrades — but it is the
+/// loud channel, because "switched on but worthless" is the one state nobody would check.
+fn identity_pepper(config: &config::AppConfig) -> Option<String> {
+	let pepper = config.kyc_identity_pepper.as_deref().map(str::trim).filter(|p| !p.is_empty())?;
+	if pepper.len() < MIN_IDENTITY_PEPPER_LEN {
+		tracing::error!(
+			min = MIN_IDENTITY_PEPPER_LEN,
+			"kyc: KYC_IDENTITY_PEPPER is too short to be a key — identity dedup is DISABLED; generate one with `openssl rand -hex 32`"
+		);
+		return None;
+	}
+	Some(pepper.to_string())
 }
 
 /// Resolve on SIGTERM or ctrl-c so the server drains in-flight RPCs instead of
