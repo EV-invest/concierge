@@ -889,14 +889,19 @@ fn address(value: &str, field: &str) -> Result<String, Status> {
 }
 
 /// Refuse anything that a mail client or the cabinet would turn into a link. For the
-/// fields the INBOX repeats: there they cannot be set apart as the money plane's text,
-/// and a tappable `http://…` in the platform's own sentence is a phishing line.
+/// fields the INBOX repeats, and for the fields the SUBJECT LINE repeats: in neither
+/// place can they be set apart as the money plane's text, and a tappable `http://…` in
+/// the platform's own sentence is a phishing line. The subject is the worse of the two
+/// — it is what a lock screen previews and what a reply quotes — and it used to be the
+/// gap: a payment approval's amount was only bounded, so "Approve a payment of 1 USDT
+/// https://x" went out as a branded security mail (#81).
 ///
 /// Deliberately coarser than "contains a URL": the needles are `://`, `www.` and the
 /// bare word `http` (which also covers `https`, `http:evil` and `HTTP evil.example`,
-/// which a client may still linkify). The field this guards is an AMOUNT — a number
-/// and a currency — so the false positives that coarseness buys are strings that had no
-/// business in it anyway. A field that is free text gets [`no_url`] instead.
+/// which a client may still linkify). The fields this guards are an AMOUNT — a number
+/// and a currency — and a rail's NAME, so the false positives that coarseness buys are
+/// strings that had no business in them anyway. A field that is free text gets
+/// [`no_url`] instead.
 fn no_link(value: &str, field: &str) -> Result<String, Status> {
 	without_needles(value, &["://", "www.", "http"], field)
 }
@@ -1098,9 +1103,11 @@ impl MailRelayService for MailRelay {
 				let payload = serde_json::json!({
 					"consilium_id": bounded(&mail.consilium_id, 64, "consilium_id")?,
 					"initiator_email": address(&mail.initiator_email, "initiator_email")?,
-					"network": bounded(&mail.network, 64, "network")?,
+					// Both make the subject line, so both take the amount's link rule on top
+					// of the live bound — a rail's name and a sum have no link to lose.
+					"network": no_link(&bounded(&mail.network, 64, "network")?, "network")?,
 					"address": bounded(&mail.address, 128, "address")?,
-					"amount": bounded(&mail.amount, 64, "amount")?,
+					"amount": no_link(&bounded(&mail.amount, 64, "amount")?, "amount")?,
 					"memo": bounded(&mail.memo, 500, "memo")?,
 					"payload_hash": bounded(&mail.payload_hash, 128, "payload_hash")?,
 					"threshold": mail.threshold,
@@ -1145,9 +1152,10 @@ impl MailRelayService for MailRelay {
 				let payload = serde_json::json!({
 					"consilium_id": bounded(&mail.consilium_id, 64, "consilium_id")?,
 					"outcome": outcome,
-					"network": bounded(&mail.network, 64, "network")?,
+					// Subject-line fields, under the payout approval's rule.
+					"network": no_link(&bounded(&mail.network, 64, "network")?, "network")?,
 					"address": bounded(&mail.address, 128, "address")?,
-					"amount": bounded(&mail.amount, 64, "amount")?,
+					"amount": no_link(&bounded(&mail.amount, 64, "amount")?, "amount")?,
 					"detail": bounded(&mail.detail, 500, "detail")?,
 					// Empty for a payout; the burn notice over a payment or over fee terms
 					// carries no reason.
@@ -1176,7 +1184,8 @@ impl MailRelayService for MailRelay {
 					"tier": payment_tier(&mail.tier)?,
 					"source": line(&mail.source, 160, "source")?,
 					"destination": line(&mail.destination, 160, "destination")?,
-					"amount": line(&mail.amount, 64, "amount")?,
+					// The subject line repeats it — the consent's rule, for the consent's reason.
+					"amount": no_link(&line(&mail.amount, 64, "amount")?, "amount")?,
 					"reason": required_line(&mail.reason, 500, "reason")?,
 					"payload_hash": line(&mail.payload_hash, 128, "payload_hash")?,
 					"threshold": mail.threshold,

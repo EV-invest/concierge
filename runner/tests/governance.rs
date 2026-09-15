@@ -1480,6 +1480,57 @@ async fn a_consent_inbox_entry_cannot_carry_a_link_or_squat_a_key() {
 	assert!(fx.inbox(investor).await.is_empty(), "nothing was queued, so nothing was traced");
 }
 
+/// The subject line is the one part of a mail no client sets apart as somebody else's
+/// text, so every money-plane field that reaches it takes the consent amount's rule. The
+/// payment approval's amount used to be only bounded, and "Approve a payment of 1 USDT
+/// https://x" went out as a branded security mail (#81); the payout kinds put an amount
+/// and a rail in theirs.
+#[tokio::test]
+async fn a_subject_line_field_cannot_carry_a_link() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+
+	let mut approval = payment_approval(owner);
+	approval.payment_approval.as_mut().unwrap().amount = "1 USDT https://x".into();
+	let key = approval.dedupe_key.clone();
+	let err = fx.relay().send_governance_mail(relayed(approval)).await.unwrap_err();
+	assert_eq!(err.code(), Code::InvalidArgument);
+	assert_eq!(err.message(), "amount must not contain a link");
+	assert!(fx.delivery(&key).await.is_none(), "nothing may be queued");
+
+	let payout_with = |edit: &dyn Fn(&mut PayoutApprovalMail)| {
+		let mut request = payout(owner);
+		edit(request.payout_approval.as_mut().unwrap());
+		request
+	};
+	let rail_outcome_with = |edit: &dyn Fn(&mut PayoutOutcomeMail)| {
+		let mut request = payment_outcome(owner, GovernanceMailKind::PayoutOutcome);
+		let mail = request.payout_outcome.as_mut().unwrap();
+		mail.tier = String::new();
+		mail.source = String::new();
+		mail.destination = String::new();
+		mail.reason = String::new();
+		mail.network = "TRON".into();
+		mail.address = "TJRabc".into();
+		edit(mail);
+		request
+	};
+	for (request, why) in [
+		(payout_with(&|m| m.amount = "10 000 USDT www.evil.example".into()), "a host in a payout amount"),
+		(payout_with(&|m| m.network = "http://tron.example".into()), "a link for a rail"),
+		(rail_outcome_with(&|m| m.amount = "1 USDT HTTPS://x".into()), "a link in an outcome amount"),
+		(rail_outcome_with(&|m| m.network = "TRON http evil.example".into()), "the bare word on a rail"),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(err.message().ends_with("must not contain a link"), "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
+}
+
 /// The house terms, as the money plane would state them.
 fn house_terms() -> FeeTerms {
 	FeeTerms {
