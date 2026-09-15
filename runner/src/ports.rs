@@ -555,6 +555,22 @@ pub trait KycCaseRepository: Send + Sync {
 	/// longer considers live, which is precisely the disagreement #190 is about.
 	async fn live_case(&self, user_id: UserId) -> Result<Option<LiveCase>, DomainError>;
 
+	/// The highest tier any OTHER case of this user was approved for and still holds
+	/// `approved` status, if there is one.
+	///
+	/// Asked when a terminal NEGATIVE verdict looks like it contradicts the level an
+	/// account holds. Without it the predicate is "this user is above this case's tier",
+	/// which fires on the most ordinary sequence there is: verified once, verified again,
+	/// and then the vendor reports the FIRST session as lapsed. That is routine, the
+	/// second approval is entirely valid, and paging the owners about it teaches them to
+	/// ignore the one mail that exists to be read.
+	///
+	/// The raw tier comes back rather than a level: what a status grants is
+	/// [`KycStatus::grants_tier`]'s answer and nobody else's, so the SQL that finds the
+	/// row does not get to have an opinion about it. `None` when no other approved case
+	/// exists.
+	async fn approved_cover(&self, user_id: UserId, excluding: Uuid) -> Result<Option<u32>, DomainError>;
+
 	/// Apply a verdict to the case it names, if it moves anything.
 	///
 	/// Ordering is decided here and nowhere else, from [`KycDecision::signed_at`] against

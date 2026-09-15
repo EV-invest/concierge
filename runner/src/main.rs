@@ -276,6 +276,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			users: users.clone(),
 			cases: kyc_cases,
 			notifications: notification_repo.clone(),
+			governance: governance_repo.clone(),
 			provider: kyc_provider,
 			support_email: config.support_email.clone(),
 		},

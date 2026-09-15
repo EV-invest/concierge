@@ -25,6 +25,7 @@ use axum::{
 use concierge::{
 	infrastructure::{
 		db,
+		governance::PgGovernance,
 		kyc::{
 			cases::PgKycCases,
 			didit::{sign_body, sign_body_v2},
@@ -33,7 +34,9 @@ use concierge::{
 		notifications::PgNotifications,
 		users::{AdminAction, PgUsers},
 	},
-	ports::{CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, KycStatus, UserDirectoryRepository},
+	ports::{
+		CallbackHeaders, KYC_CALLBACK_WINDOW_SECS, KycCallbackError, KycCaseRepository, KycDecision, KycProvider, KycSession, KycStatus, NotificationRepository, UserDirectoryRepository,
+	},
 	web::{self, KycDeps, START_MAX_PER_WINDOW},
 };
 use domain::{
@@ -218,6 +221,7 @@ struct Harness {
 	router: Router,
 	users: Arc<PgUsers>,
 	cases: Arc<PgKycCases>,
+	notifications: Arc<PgNotifications>,
 	pool: PgPool,
 }
 
@@ -234,6 +238,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let cases = Arc::new(PgKycCases::new(pool.clone()));
+	let notifications = Arc::new(PgNotifications::new(pool.clone()));
 	let state = web::WebState::try_new(
 		AuthService::unconfigured(),
 		"https://evinvest.test".to_string(),
@@ -241,7 +246,8 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 		KycDeps {
 			users: users.clone(),
 			cases: cases.clone(),
-			notifications: Arc::new(PgNotifications::new(pool.clone())),
+			notifications: notifications.clone(),
+			governance: Arc::new(PgGovernance::new(pool.clone(), "https://evinvest.test/governance".to_string())),
 			provider,
 			support_email: SUPPORT.to_string(),
 		},
@@ -253,6 +259,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 		router: web::router(state),
 		users,
 		cases,
+		notifications,
 		pool,
 	})
 }
@@ -353,6 +360,86 @@ impl Harness {
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("read body");
 		let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
 		(status, value)
+	}
+
+	/// A user who actually FOLLOWS verification news. `emit` writes nothing for someone
+	/// with no subscriber row — that is its contract, not a bug — so a test about what a
+	/// user is told has to say who is listening.
+	async fn subscribed(&self, user: UserId) -> UserId {
+		let sub = self.notifications.subscriber_for_user(user.raw(), "kyc@example.com", true).await.expect("subscriber");
+		self.notifications.set_topic_subscription(sub.id, "account:verification", true, true).await.expect("subscribe");
+		user
+	}
+
+	/// In-app notices of one kind this user has. The durable record is written whatever
+	/// the channel switches say, so this is what "the user was told" means here.
+	async fn notices(&self, user: UserId, kind: &str) -> i64 {
+		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notifications n JOIN notification_subscribers s ON s.id = n.subscriber_id WHERE s.user_id = $1 AND n.kind = $2")
+			.bind(user.raw())
+			.bind(kind)
+			.fetch_one(&self.pool)
+			.await
+			.expect("count notices")
+	}
+
+	/// A user holding an owner seat, with a verified address — the roster the verdict
+	/// alert is addressed to.
+	async fn owner(&self) -> (UserId, String) {
+		let email = format!("owner-{}@example.com", Uuid::new_v4());
+		let subject = AuthSubject::parse(&format!("kyc-owner-{}", Uuid::new_v4())).unwrap();
+		let id = self.users.provision(subject, Email::parse(&email).unwrap(), true).await.expect("provision").id();
+		self.reseat(id).await;
+		(id, email)
+	}
+
+	/// Seat an owner again.
+	///
+	/// For the ONE interference this suite cannot design away: `authz_gate`, `genesis`,
+	/// `governance` and `user_governance` each run `UPDATE users SET role = 'investor'
+	/// WHERE role = 'owner'` — documented in `tests/common/mod.rs`, and unavoidable
+	/// because ownership is decided GLOBALLY from `users.role`, so those suites cannot
+	/// scope themselves to their own fixtures. `cargo test` runs the binaries in parallel
+	/// against one `DATABASE_URL`, so a roster read here can land in that window and come
+	/// back without this test's owner. Scoping the assertions by `case_id` fixed the
+	/// other half of that family — one test's alert reaching another's owner — but not
+	/// this half.
+	async fn reseat(&self, owner: UserId) {
+		sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1")
+			.bind(owner.raw())
+			.execute(&self.pool)
+			.await
+			.expect("seat the owner");
+	}
+
+	async fn seated(&self, owner: UserId) -> bool {
+		sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
+			.bind(owner.raw())
+			.fetch_one(&self.pool)
+			.await
+			.expect("read the role")
+			== "owner"
+	}
+
+	/// Verdict alerts queued for ONE case, optionally narrowed to one recipient.
+	///
+	/// Scoped to the case because the owner roster is global: every test in this file
+	/// seats its own owner into the same table, so an alert raised by one test is
+	/// correctly mailed to every owner another test created. Counting by recipient alone
+	/// makes those tests fail each other; counting by case counts what the test did.
+	///
+	/// Counted in `notification_deliveries` rather than through the notification topic
+	/// because that is the point of the alert — the governance queue carries no
+	/// unsubscribe target, so its recipient cannot switch it off.
+	async fn alerts_for_case(&self, case_id: Uuid, recipient: Option<&str>) -> i64 {
+		sqlx::query_scalar::<_, i64>(
+			"SELECT count(*) FROM notification_deliveries \
+			 WHERE kind = 'kyc_verdict_alert' AND dedupe_key LIKE $1 AND ($2::text IS NULL OR recipient = $2)",
+		)
+		.bind(format!("kyc-contradiction:{case_id}:%"))
+		.bind(recipient)
+		.fetch_one(&self.pool)
+		.await
+		.expect("count verdict alerts")
 	}
 
 	async fn kyc_level(&self, user: UserId) -> u32 {
@@ -1382,6 +1469,217 @@ async fn a_verdict_recorded_without_its_level_is_repaired_by_the_redelivery() {
 	assert_eq!(answer["duplicate"], true, "it is still a duplicate, and still answered 2xx");
 	assert_eq!(h.kyc_level(user).await, 1, "the retry is what repairs a verdict whose level never landed");
 	assert_eq!(h.kyc_changed_count(user).await, 1, "and it emits the ONE event the original attempt owed the money plane");
+}
+
+/// A verdict that grants nothing must still reach the person it is about.
+///
+/// Every branch but `in_review` used to produce not even a log line: declined,
+/// abandoned, expired, aged out (#49). A user whose documents were refused learned it
+/// from a screen that had stopped changing.
+#[tokio::test]
+async fn a_terminal_verdict_tells_the_user_what_happened() {
+	let h = harness!();
+
+	for (vendor_word, kind) in [("Declined", "kyc_declined"), ("Abandoned", "kyc_expired"), ("Expired", "kyc_expired")] {
+		let user = h.subscribed(h.user().await).await;
+		let (case_id, session_id) = h.case(user, 1).await;
+
+		let at = now();
+		let raw = body(&session_id, vendor_word, &case_id.to_string(), at, json!({}));
+		let (status, _) = h.post(raw.clone(), signed(&raw), at).await;
+
+		assert_eq!(status, StatusCode::OK, "{vendor_word} is a delivery we handled");
+		assert_eq!(h.notices(user, kind).await, 1, "{vendor_word} must reach the user as {kind}");
+		assert_eq!(h.kyc_level(user).await, 0, "and it still moves no level: {vendor_word}");
+	}
+}
+
+/// A verdict that CONTRADICTS a level the account holds reaches a human who can act.
+///
+/// The level stays — a downgrade is a human act under `KycManage`, and that policy is
+/// not in question. What #49 is about is that nothing followed: a user holding tier 1
+/// whose verification the vendor later reports as lapsed sat there indefinitely, because
+/// the contradiction existed only as a row in a table nobody watches. "A human decides"
+/// became "nobody decides".
+#[tokio::test]
+async fn an_expiry_that_contradicts_a_held_level_reaches_the_owners() {
+	let h = harness!();
+	let (owner, owner_email) = h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+	let (case_id, session_id) = h.case(user, 1).await;
+
+	let approved_at = now() - 120;
+	let approval = body(&session_id, "Approved", &case_id.to_string(), approved_at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), now()).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 1);
+
+	let expired_at = now();
+	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
+
+	// Delivered until the roster read sees this test's owner. A sibling suite clearing
+	// `users.role` between the seat and the read is the documented interference
+	// (`Harness::reseat`), and the loop is not a sleep dressed up: a redelivery re-runs
+	// `alert_owners_if_contradicted` for real, which is exactly how the vendor's own
+	// retry repairs a roster read that missed. An empty result with the owner STILL
+	// seated is the product being wrong, and fails immediately.
+	let mut alerts = 0;
+	for _ in 0..4 {
+		let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
+		assert_eq!(status, StatusCode::OK);
+		alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
+		if alerts > 0 {
+			break;
+		}
+		assert!(!h.seated(owner).await, "the owner holds a seat and was still not mailed — that is the defect, not the race");
+		h.reseat(owner).await;
+	}
+
+	assert_eq!(h.kyc_level(user).await, 1, "a vendor still never takes a level away");
+	assert_eq!(h.notices(user, "kyc_expired").await, 1, "the user is told their verification lapsed");
+	assert_eq!(alerts, 1, "and a seated owner is told, through the queue their recipient cannot switch off");
+
+	// The vendor retries; the roster must not be mailed again for the same verdict.
+	let before = h.alerts_for_case(case_id, None).await;
+	let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(h.alerts_for_case(case_id, None).await, before, "a redelivery re-mails nobody");
+	assert_eq!(h.alerts_for_case(case_id, Some(&owner_email)).await, 1, "one row per owner per verdict, not two");
+}
+
+/// A legacy case asking for tier 2 still contradicts the level it actually bought.
+///
+/// `requested_tier` is the tier a provider may be ASKED for; what an approval CONFERS is
+/// capped at `PROVIDER_MAX_TIER`, which is 1 — and `0014_kyc_requested_tier_intent.sql`
+/// leaves the rows asking for 2 standing rather than rewriting them. Judging the verdict
+/// against the request meant those rows could never contradict anything (1 < 2 returns
+/// early), so the accounts AGENTS.md specifically warns are still in the table were the
+/// ones silently excluded from #49's whole point.
+#[tokio::test]
+async fn a_case_opened_at_a_tier_the_provider_cannot_grant_still_contradicts() {
+	let h = harness!();
+	let (owner, owner_email) = h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	let approved_at = now() - 120;
+	let approval = body(&session_id, "Approved", &case_id.to_string(), approved_at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), now()).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 1, "an approval grants what the workflow checks, not what the row asked for");
+
+	let expired_at = now();
+	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
+	let mut alerts = 0;
+	for _ in 0..4 {
+		assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+		alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
+		if alerts > 0 {
+			break;
+		}
+		assert!(!h.seated(owner).await, "the owner holds a seat and was still not mailed — that is the defect, not the race");
+		h.reseat(owner).await;
+	}
+	assert_eq!(alerts, 1, "the level this case bought is 1, and 1 is what the verdict contradicts");
+}
+
+/// A level another APPROVED case still covers is not a contradiction.
+///
+/// Verified once, verified again, and then the vendor reports the first session as
+/// lapsed: routine, not an incident. The second approval is entirely valid and the level
+/// it granted is not in doubt. `ENTRY_TIER` is 1, so without this the test degenerates
+/// to "holds any level" and every decline for an already-verified user would page the
+/// owners too — and owners who learn to ignore this mail are the state #49 is already
+/// in.
+#[tokio::test]
+async fn a_level_another_approved_case_covers_wakes_nobody() {
+	let h = harness!();
+	h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+
+	let (first, first_session) = h.case(user, 1).await;
+	let at = now() - 300;
+	let approval = body(&first_session, "Approved", &first.to_string(), at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), now()).await.0, StatusCode::OK);
+
+	// A second, later verification of the same person. It grants the level they already
+	// hold, so nothing moves — but the case stands as `approved`, and that is the fact
+	// the alert has to consult.
+	let (second, second_session) = h.case(user, 1).await;
+	let again = body(&second_session, "Approved", &second.to_string(), now() - 60, json!({}));
+	assert_eq!(h.post(again.clone(), signed(&again), now()).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 1);
+
+	let expired_at = now();
+	let expiry = body(&first_session, "Kyc Expired", &first.to_string(), expired_at, json!({}));
+	assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+
+	assert_eq!(h.kyc_level(user).await, 1, "the level is still the second case's to justify");
+	assert_eq!(h.alerts_for_case(first, None).await, 0, "the lapse of a superseded verification is routine, not a page");
+
+	// And the guard is not "never alert twice": retire the covering case and the same
+	// verdict does raise the alarm.
+	sqlx::query("UPDATE kyc_cases SET status = 'kyc_expired' WHERE id = $1")
+		.bind(second)
+		.execute(&h.pool)
+		.await
+		.expect("retire the covering case");
+	assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+	assert!(h.alerts_for_case(first, None).await > 0, "with nothing left covering the level, the contradiction is real again");
+}
+
+/// The alarm is for a CONTRADICTION, not for every ending.
+///
+/// An abandoned or timed-out session says the person closed a tab; it says nothing about
+/// their identity, and neither does a decline for someone who holds no level to
+/// contradict. Alerting on those would train the owners to ignore this mail, which costs
+/// exactly the signal it exists to carry.
+#[tokio::test]
+async fn an_ending_that_contradicts_nothing_raises_no_alarm() {
+	let h = harness!();
+	h.owner().await;
+
+	for vendor_word in ["Declined", "Abandoned", "Expired", "Kyc Expired"] {
+		let user = h.subscribed(h.user().await).await;
+		let (case_id, session_id) = h.case(user, 1).await;
+		let at = now();
+		let raw = body(&session_id, vendor_word, &case_id.to_string(), at, json!({}));
+		assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+		assert_eq!(h.kyc_level(user).await, 0);
+		assert_eq!(
+			h.alerts_for_case(case_id, None).await,
+			0,
+			"{vendor_word} contradicts no level this account holds, so nothing wakes an owner"
+		);
+	}
+}
+
+/// A SUPERSEDED delivery stays silent.
+///
+/// `CaseDecision::Ignored` returns before `apply`, and that is the point: the verdict it
+/// carries has already been replaced by a later one. Announcing it would tell a user
+/// their verification failed after it had in fact succeeded.
+#[tokio::test]
+async fn a_superseded_verdict_tells_nobody_anything() {
+	let h = harness!();
+	h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+	let (case_id, session_id) = h.case(user, 1).await;
+
+	let decided_at = now();
+	let approval = body(&session_id, "Approved", &case_id.to_string(), decided_at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), decided_at).await.0, StatusCode::OK);
+
+	// A decline SENT before the approval and arriving after it — Didit retries at roughly
+	// one and four minutes, so this is routine, not an attack. Inside the 300s replay
+	// window, or it would be refused as stale before ordering is ever considered.
+	let sent_at = decided_at - 200;
+	let straggler = body(&session_id, "Declined", &case_id.to_string(), sent_at, json!({}));
+	let (status, answer) = h.post(straggler.clone(), signed(&straggler), sent_at).await;
+
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer["ignored"], "superseded");
+	assert_eq!(h.kyc_level(user).await, 1);
+	assert_eq!(h.notices(user, "kyc_declined").await, 0, "a replaced verdict is not news");
+	assert_eq!(h.alerts_for_case(case_id, None).await, 0, "and it wakes nobody either");
 }
 
 /// EVERY refusal `/kyc/start` publishes, as whole JSON documents.
