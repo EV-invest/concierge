@@ -415,6 +415,21 @@ pub trait KycProvider: Send + Sync {
 	/// Open a verification session for an already-opened case.
 	async fn start_session(&self, case_id: Uuid, requested_tier: u32) -> Result<KycSession, DomainError>;
 
+	/// The origins — `scheme://host[:port]`, as WHATWG serialises them — that this
+	/// adapter's [`KycSession::redirect_url`] may point at. `/kyc/start` refuses any
+	/// answer outside this set rather than sending a signed-in browser to it.
+	///
+	/// Asked of the PROVIDER and not read from configuration beside it, because the two
+	/// are the same fact and a second copy is a copy that drifts. The adapter knows both
+	/// what it dialled and what that vendor answers with — which are not always the same
+	/// host, and were not for Didit — so nothing outside it has to guess.
+	///
+	/// An EMPTY set means "this adapter cannot say", and the check then refuses
+	/// everything. That is deliberate: the alternative, degrading to "any `https:` URL",
+	/// is the state this check exists to leave, and it would arrive silently. The boot
+	/// refuses to mount a provider that declares nothing.
+	fn session_origins(&self) -> Vec<String>;
+
 	/// Authenticate and parse one webhook delivery.
 	///
 	/// I/O-FREE by contract — signature check, replay window and parsing only, with the

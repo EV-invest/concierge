@@ -47,7 +47,10 @@ use uuid::Uuid;
 
 use crate::{
 	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus},
-	web::{WebState, now_secs, routes::verify_csrf},
+	web::{
+		WebState, now_secs,
+		routes::{CsrfOutcome, csrf_outcome},
+	},
 };
 
 /// The topic a verification decision is announced on. Emitting is a no-op for anyone who
@@ -230,12 +233,22 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		return Err(StartError::unavailable(st));
 	};
 	// State-changing POST behind a cookie ⇒ the same double-submit check `/auth/logout`
-	// and `DELETE /auth/sessions` run.
-	if !verify_csrf(st, &jar, &headers)
+	// and `DELETE /auth/sessions` run, and it still runs FIRST — a request that fails it
+	// never reaches session state.
+	//
+	// It is read for two answers rather than one, because collapsing them made `csrf` the
+	// only refusal this route could ever produce for a signed-out caller and left
+	// `unauthenticated` unreachable in production. The cabinet keys "your token is stale,
+	// reload" off the 403 and "sign in again" off the 401, so a lapsed session answered
+	// `csrf` sent people to reload a page that would lapse again. `/kyc/status`, which
+	// has no CSRF check, already answered `unauthenticated` to the very same caller.
+	match csrf_outcome(st, &jar, &headers)
 		.await
 		.map_err(|_| StartError::Refused(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL))?
 	{
-		return Err(StartError::Refused(StatusCode::FORBIDDEN, CSRF));
+		CsrfOutcome::Ok => {}
+		CsrfOutcome::NoSession => return Err(StartError::Refused(StatusCode::UNAUTHORIZED, UNAUTHENTICATED)),
+		CsrfOutcome::Mismatch => return Err(StartError::Refused(StatusCode::FORBIDDEN, CSRF)),
 	}
 
 	let Some(caller) = session_user(st, &jar).await? else {
@@ -275,21 +288,46 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	// session would charge us to give them a worse version of what they have: two open
 	// cases, one of which they will abandon and which will then read as a user who gave up.
 	if let Some(live) = &gate.live {
-		if let Some(redirect_url) = &live.redirect_url {
-			tracing::debug!(case_id = %live.id, "kyc: start reused the caller's running case");
-			return Ok((
-				jar,
-				Json(StartResponse {
-					redirect_url: redirect_url.clone(),
-					case_id: live.id.to_string(),
-				}),
-			));
+		// The STORED url is checked exactly as a fresh one is, and that is the point: the
+		// check at the bottom of this handler only ever saw rows written after it shipped.
+		// A row can predate it (KYC has been in production since v0.7.0), it can be
+		// written by the other replica mid-rollout — `0012_kyc_case_redirect_url.sql`
+		// designs for exactly that mix — or it can predate an operator changing which
+		// vendor origin is configured. A case lives until a verdict, so the window is
+		// days, and what is on the other side of it is a user handing their documents and
+		// a selfie to somebody else's host, under a button this plane vouched for.
+		match live.redirect_url.as_deref().filter(|u| redirect_is_trustworthy(u, &provider.session_origins())) {
+			Some(redirect_url) => {
+				tracing::debug!(case_id = %live.id, "kyc: start reused the caller's running case");
+				return Ok((
+					jar,
+					Json(StartResponse {
+						redirect_url: redirect_url.to_owned(),
+						case_id: live.id.to_string(),
+					}),
+				));
+			}
+			// Two causes, one answer: a case opened before `kyc_cases.redirect_url`
+			// existed, and a stored URL this plane will not send a browser to. Both leave
+			// nothing to resume, and the choice is then a new session or a dead end —
+			// stranding a user who did nothing wrong is the worse of the two. The window
+			// cap below still applies, so this cannot be looped.
+			None if live.redirect_url.is_some() => {
+				// `error!`, unlike the sibling arm: a row we refuse to hand back is not a
+				// fact of life, it is either an old vendor answer nobody checked or a
+				// configuration that moved under live cases, and both want a human.
+				tracing::error!(
+					case_id = %live.id,
+					provider = provider.name(),
+					stored_origin = ?live.redirect_url.as_deref().and_then(crate::infrastructure::kyc::origin_of),
+					expected_origins = ?provider.session_origins(),
+					"kyc: the caller's running case holds a redirect this plane will not send a browser to — opening a fresh session"
+				);
+			}
+			None => {
+				tracing::info!(case_id = %live.id, "kyc: the caller's running case predates redirect_url — opening a fresh session");
+			}
 		}
-		// A case opened before `kyc_cases.redirect_url` existed. There is no URL to hand
-		// back and no way to fetch one, so the choice is a new session or a dead end — and
-		// stranding a user who did nothing wrong is the worse of the two. The window cap
-		// below still applies, so this cannot be looped.
-		tracing::info!(case_id = %live.id, "kyc: the caller's running case predates redirect_url — opening a fresh session");
 	}
 
 	if gate.recent >= START_MAX_PER_WINDOW {
@@ -322,18 +360,27 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 		StartError::unavailable(st)
 	})?;
 
-	// BEFORE the row is written, so a redirect we would not follow is never stored and
-	// never handed back by the live-case reuse path either.
-	if !redirect_is_trustworthy(&session.redirect_url, st.kyc_session_host.as_deref()) {
+	// BEFORE the row is written, so a redirect we would not follow is never stored. The
+	// reuse branch above re-checks what IS stored, because rows outlive this check.
+	let allowed = provider.session_origins();
+	if !redirect_is_trustworthy(&session.redirect_url, &allowed) {
 		// `error!` for the same reason the vendor-refusal arm above uses one: the user
 		// sees a polite "try later" and reports nothing, so this line is the only thing
-		// that wakes a human. Both hosts are named because the fix is almost always a
-		// configuration one — the expected host is derived from `DIDIT_BASE_URL`.
+		// that wakes a human. Both sides are named because the fix is almost always a
+		// configuration one.
+		//
+		// The ORIGIN and never the URL. `0012_kyc_case_redirect_url.sql` calls this
+		// string a capability — whoever holds it can walk that session's flow — and the
+		// reason it is not treated as a secret is that we hand it to its own user's
+		// browser. That reason stops applying the moment it is copied to Sentry, whose
+		// readers and retention are somebody else's. The origin is the whole diagnosis
+		// anyway; for a string that does not parse it is absent, which is also the
+		// diagnosis.
 		tracing::error!(
 			%case_id,
 			provider = provider.name(),
-			redirect_url = %session.redirect_url,
-			expected_host = ?st.kyc_session_host,
+			answered_origin = ?crate::infrastructure::kyc::origin_of(&session.redirect_url),
+			expected_origins = ?allowed,
 			"kyc: the provider answered with a redirect this plane will not send a browser to"
 		);
 		return Err(StartError::unavailable(st));
@@ -368,24 +415,21 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 /// (banking#193b). The decision belongs on this side, where the host the vendor is
 /// configured at is known and not guessable.
 ///
-/// `expected_host` is `None` only when the configured base URL has no host to compare
-/// against; the scheme check still applies, because a plane that cannot say where its
-/// vendor lives must still refuse to hand a browser a `javascript:` or `data:` URL.
-fn redirect_is_trustworthy(raw: &str, expected_host: Option<&str>) -> bool {
-	let Ok(url) = reqwest::Url::parse(raw) else {
+/// `allowed` is [`KycProvider::session_origins`] — the origins the MOUNTED adapter says
+/// its own session URLs live on. An empty set refuses everything: an adapter that cannot
+/// name its vendor's origin has lost this control, and the shape that failure must NOT
+/// take is "accept any `https:` URL", which is indistinguishable from working.
+///
+/// Origins and not hosts, so the comparison settles the port
+/// (`https://verification.didit.me:8443/` is not the vendor) and the userinfo trick
+/// (`https://verification.didit.me@evil.example/` has origin `https://evil.example`) at
+/// the same time as the scheme. `Url::origin` lower-cases and punycodes what it parsed,
+/// so a look-alike written in another script cannot slip through as an equal string.
+fn redirect_is_trustworthy(raw: &str, allowed: &[String]) -> bool {
+	let Some(origin) = crate::infrastructure::kyc::origin_of(raw) else {
 		return false;
 	};
-	if url.scheme() != "https" {
-		return false;
-	}
-	match (url.host_str(), expected_host) {
-		// Host comparison is ASCII-case-insensitive because DNS is, and `Url` already
-		// lower-cases and punycodes what it parsed — so a look-alike written in another
-		// script cannot slip through as an equal string.
-		(Some(host), Some(expected)) => host.eq_ignore_ascii_case(expected),
-		(Some(_), None) => true,
-		(None, _) => false,
-	}
+	allowed.contains(&origin)
 }
 
 /// What `GET /kyc/status` publishes.
@@ -506,12 +550,16 @@ pub async fn status(State(st): State<WebState>, jar: CookieJar) -> Result<(Cooki
 	let body = Json(StatusResponse {
 		level: user.kyc_level(),
 		case: live.map(|c| CaseView {
-			// A stored URL is only resumable if the route that hands it back can run at
-			// all. With no vendor configured `/kyc/start` is 503 BEFORE it reaches the
-			// reuse branch, so `true` here would put a Continue button on screen whose
-			// every click is an outage — on the exact day this route exists to be honest
-			// about.
-			resumable: st.kyc.is_some() && c.redirect_url.is_some(),
+			// Exactly the question `/kyc/start` asks on its reuse branch, asked here in
+			// the same words. With no vendor configured that route refuses 503 before it
+			// reaches the branch at all, and a stored URL it would not hand back is not
+			// one the cabinet may offer either — `true` in either case is a Continue
+			// button whose every click is an outage, on the exact day this route exists
+			// to be honest about.
+			resumable: st
+				.kyc
+				.as_ref()
+				.is_some_and(|p| c.redirect_url.as_deref().is_some_and(|u| redirect_is_trustworthy(u, &p.session_origins()))),
 			status: c.status.as_str().to_owned(),
 			requested_tier: c.requested_tier,
 			created_at: c.created_at,
