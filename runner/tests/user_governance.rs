@@ -509,6 +509,28 @@ async fn a_seat_is_held_only_by_an_owner() {
 	fx.users.enable_user(another_admin, T_FAR).await.expect("cleanup — see T_FAR");
 }
 
+/// The RPC gate refuses a disabled caller, but it runs before the target's row is
+/// locked. Two owners pressing on each other at the same instant each pass that gate
+/// and then queue on the other's row — so the actor's status is decided again under
+/// the lock, from the row as it is THEN. Driven through the port, which is what the
+/// window looks like from the transaction's side: an actor whose row is already held.
+#[tokio::test]
+async fn an_actor_held_in_the_window_holds_nobody() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let other_owner = fx.owner().await;
+	let target = fx.user().await;
+	fx.hold_at(owner, other_owner, T_FAR).await.expect("the first press lands");
+
+	let err = fx.hold_at(other_owner, target, T_FAR + 1).await.unwrap_err();
+	assert!(matches!(err, domain::error::DomainError::Forbidden(_)), "{err}");
+	assert_eq!(fx.reload(target).await.status(), UserStatus::Active, "nothing was written");
+	assert!(fx.audit(target).await.is_empty(), "a refusal is not an action");
+	fx.users.enable_user(other_owner, T_FAR).await.expect("cleanup — see T_FAR");
+}
+
 /// A hold on yourself ends your own session, and with it your ability to explain, lift
 /// or ratify it. Refused before anything is read or written.
 #[tokio::test]
