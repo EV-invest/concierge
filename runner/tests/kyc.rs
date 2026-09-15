@@ -388,12 +388,36 @@ impl Harness {
 		let email = format!("owner-{}@example.com", Uuid::new_v4());
 		let subject = AuthSubject::parse(&format!("kyc-owner-{}", Uuid::new_v4())).unwrap();
 		let id = self.users.provision(subject, Email::parse(&email).unwrap(), true).await.expect("provision").id();
+		self.reseat(id).await;
+		(id, email)
+	}
+
+	/// Seat an owner again.
+	///
+	/// For the ONE interference this suite cannot design away: `authz_gate`, `genesis`,
+	/// `governance` and `user_governance` each run `UPDATE users SET role = 'investor'
+	/// WHERE role = 'owner'` — documented in `tests/common/mod.rs`, and unavoidable
+	/// because ownership is decided GLOBALLY from `users.role`, so those suites cannot
+	/// scope themselves to their own fixtures. `cargo test` runs the binaries in parallel
+	/// against one `DATABASE_URL`, so a roster read here can land in that window and come
+	/// back without this test's owner. Scoping the assertions by `case_id` fixed the
+	/// other half of that family — one test's alert reaching another's owner — but not
+	/// this half.
+	async fn reseat(&self, owner: UserId) {
 		sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1")
-			.bind(id.raw())
+			.bind(owner.raw())
 			.execute(&self.pool)
 			.await
 			.expect("seat the owner");
-		(id, email)
+	}
+
+	async fn seated(&self, owner: UserId) -> bool {
+		sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
+			.bind(owner.raw())
+			.fetch_one(&self.pool)
+			.await
+			.expect("read the role")
+			== "owner"
 	}
 
 	/// Verdict alerts queued for ONE case, optionally narrowed to one recipient.
@@ -1480,7 +1504,7 @@ async fn a_terminal_verdict_tells_the_user_what_happened() {
 #[tokio::test]
 async fn an_expiry_that_contradicts_a_held_level_reaches_the_owners() {
 	let h = harness!();
-	let (_, owner_email) = h.owner().await;
+	let (owner, owner_email) = h.owner().await;
 	let user = h.subscribed(h.user().await).await;
 	let (case_id, session_id) = h.case(user, 1).await;
 
@@ -1491,16 +1515,28 @@ async fn an_expiry_that_contradicts_a_held_level_reaches_the_owners() {
 
 	let expired_at = now();
 	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
-	let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
 
-	assert_eq!(status, StatusCode::OK);
+	// Delivered until the roster read sees this test's owner. A sibling suite clearing
+	// `users.role` between the seat and the read is the documented interference
+	// (`Harness::reseat`), and the loop is not a sleep dressed up: a redelivery re-runs
+	// `alert_owners_if_contradicted` for real, which is exactly how the vendor's own
+	// retry repairs a roster read that missed. An empty result with the owner STILL
+	// seated is the product being wrong, and fails immediately.
+	let mut alerts = 0;
+	for _ in 0..4 {
+		let (status, _) = h.post(expiry.clone(), signed(&expiry), expired_at).await;
+		assert_eq!(status, StatusCode::OK);
+		alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
+		if alerts > 0 {
+			break;
+		}
+		assert!(!h.seated(owner).await, "the owner holds a seat and was still not mailed — that is the defect, not the race");
+		h.reseat(owner).await;
+	}
+
 	assert_eq!(h.kyc_level(user).await, 1, "a vendor still never takes a level away");
 	assert_eq!(h.notices(user, "kyc_expired").await, 1, "the user is told their verification lapsed");
-	assert_eq!(
-		h.alerts_for_case(case_id, Some(&owner_email)).await,
-		1,
-		"and a seated owner is told, through the queue their recipient cannot switch off"
-	);
+	assert_eq!(alerts, 1, "and a seated owner is told, through the queue their recipient cannot switch off");
 
 	// The vendor retries; the roster must not be mailed again for the same verdict.
 	let before = h.alerts_for_case(case_id, None).await;
@@ -1508,6 +1544,86 @@ async fn an_expiry_that_contradicts_a_held_level_reaches_the_owners() {
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(h.alerts_for_case(case_id, None).await, before, "a redelivery re-mails nobody");
 	assert_eq!(h.alerts_for_case(case_id, Some(&owner_email)).await, 1, "one row per owner per verdict, not two");
+}
+
+/// A legacy case asking for tier 2 still contradicts the level it actually bought.
+///
+/// `requested_tier` is the tier a provider may be ASKED for; what an approval CONFERS is
+/// capped at `PROVIDER_MAX_TIER`, which is 1 — and `0014_kyc_requested_tier_intent.sql`
+/// leaves the rows asking for 2 standing rather than rewriting them. Judging the verdict
+/// against the request meant those rows could never contradict anything (1 < 2 returns
+/// early), so the accounts AGENTS.md specifically warns are still in the table were the
+/// ones silently excluded from #49's whole point.
+#[tokio::test]
+async fn a_case_opened_at_a_tier_the_provider_cannot_grant_still_contradicts() {
+	let h = harness!();
+	let (owner, owner_email) = h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+	let (case_id, session_id) = h.case(user, 2).await;
+
+	let approved_at = now() - 120;
+	let approval = body(&session_id, "Approved", &case_id.to_string(), approved_at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), now()).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 1, "an approval grants what the workflow checks, not what the row asked for");
+
+	let expired_at = now();
+	let expiry = body(&session_id, "Kyc Expired", &case_id.to_string(), expired_at, json!({}));
+	let mut alerts = 0;
+	for _ in 0..4 {
+		assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+		alerts = h.alerts_for_case(case_id, Some(&owner_email)).await;
+		if alerts > 0 {
+			break;
+		}
+		assert!(!h.seated(owner).await, "the owner holds a seat and was still not mailed — that is the defect, not the race");
+		h.reseat(owner).await;
+	}
+	assert_eq!(alerts, 1, "the level this case bought is 1, and 1 is what the verdict contradicts");
+}
+
+/// A level another APPROVED case still covers is not a contradiction.
+///
+/// Verified once, verified again, and then the vendor reports the first session as
+/// lapsed: routine, not an incident. The second approval is entirely valid and the level
+/// it granted is not in doubt. `ENTRY_TIER` is 1, so without this the test degenerates
+/// to "holds any level" and every decline for an already-verified user would page the
+/// owners too — and owners who learn to ignore this mail are the state #49 is already
+/// in.
+#[tokio::test]
+async fn a_level_another_approved_case_covers_wakes_nobody() {
+	let h = harness!();
+	h.owner().await;
+	let user = h.subscribed(h.user().await).await;
+
+	let (first, first_session) = h.case(user, 1).await;
+	let at = now() - 300;
+	let approval = body(&first_session, "Approved", &first.to_string(), at, json!({}));
+	assert_eq!(h.post(approval.clone(), signed(&approval), now()).await.0, StatusCode::OK);
+
+	// A second, later verification of the same person. It grants the level they already
+	// hold, so nothing moves — but the case stands as `approved`, and that is the fact
+	// the alert has to consult.
+	let (second, second_session) = h.case(user, 1).await;
+	let again = body(&second_session, "Approved", &second.to_string(), now() - 60, json!({}));
+	assert_eq!(h.post(again.clone(), signed(&again), now()).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(user).await, 1);
+
+	let expired_at = now();
+	let expiry = body(&first_session, "Kyc Expired", &first.to_string(), expired_at, json!({}));
+	assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+
+	assert_eq!(h.kyc_level(user).await, 1, "the level is still the second case's to justify");
+	assert_eq!(h.alerts_for_case(first, None).await, 0, "the lapse of a superseded verification is routine, not a page");
+
+	// And the guard is not "never alert twice": retire the covering case and the same
+	// verdict does raise the alarm.
+	sqlx::query("UPDATE kyc_cases SET status = 'kyc_expired' WHERE id = $1")
+		.bind(second)
+		.execute(&h.pool)
+		.await
+		.expect("retire the covering case");
+	assert_eq!(h.post(expiry.clone(), signed(&expiry), expired_at).await.0, StatusCode::OK);
+	assert!(h.alerts_for_case(first, None).await > 0, "with nothing left covering the level, the contradiction is real again");
 }
 
 /// The alarm is for a CONTRADICTION, not for every ending.

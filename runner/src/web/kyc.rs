@@ -676,7 +676,7 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 		}
 	};
 
-	apply(st, &case).await?;
+	apply(st, &case, duplicate).await?;
 	Ok(Json(json!({ "ok": true, "status": case.status.as_str(), "duplicate": duplicate })))
 }
 
@@ -692,7 +692,7 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 /// A notification failure is NOT one of those errors and stays best-effort below: the
 /// level is already written by then, and retrying a delivery to re-send an email would
 /// re-run this whole path for a decision that has fully landed.
-async fn apply(st: &super::Inner, case: &KycCase) -> Result<(), (StatusCode, &'static str)> {
+async fn apply(st: &super::Inner, case: &KycCase, redelivered: bool) -> Result<(), (StatusCode, &'static str)> {
 	let Some(target) = case.status.grants_tier(case.requested_tier) else {
 		// Declined, abandoned, expired, unfinished, aged-out, still running: the case row
 		// now says so and the level is untouched. Someone who holds tier 2 and fails an
@@ -706,7 +706,7 @@ async fn apply(st: &super::Inner, case: &KycCase) -> Result<(), (StatusCode, &'s
 		if let Some((kind, title, body)) = terminal_notice(case.status) {
 			notify(st, case, kind, title, body).await;
 		}
-		alert_owners_if_contradicted(st, case).await;
+		alert_owners_if_contradicted(st, case, redelivered).await;
 		return Ok(());
 	};
 
@@ -810,32 +810,73 @@ fn terminal_notice(status: KycStatus) -> Option<(&'static str, &'static str, &'s
 ///
 /// BEST EFFORT, like `notify`: the verdict is already recorded, and failing to raise the
 /// alarm must not turn a landed decision into a vendor retry that re-lands it.
-async fn alert_owners_if_contradicted(st: &super::Inner, case: &KycCase) {
+async fn alert_owners_if_contradicted(st: &super::Inner, case: &KycCase, redelivered: bool) {
 	if !matches!(case.status, KycStatus::Declined | KycStatus::KycExpired) {
 		return;
 	}
-	let held = match st.users.find_by_id(case.user_id).await {
-		Ok(Some(user)) => user.kyc_level(),
+	// ONE read of the subject, used for both the level and the address. It used to be two,
+	// and the second one swallowed its failure into `String::new()` — so a transient
+	// database blip between them mailed the owners "a verdict contradicts an account's
+	// level" with no account named. This mail carries no link and no code by design, so
+	// the address is the only way to find the person; without it the alert is not
+	// degraded, it is unactionable, and nothing in the log would say why.
+	let subject = match st.users.find_by_id(case.user_id).await {
+		Ok(Some(user)) => user,
 		Ok(None) => return,
 		Err(e) => {
 			tracing::warn!(error = %e, case_id = %case.id, "kyc callback: could not read the level a terminal verdict is judged against");
 			return;
 		}
 	};
-	if held < case.requested_tier || held == 0 {
+	let held = subject.kyc_level();
+
+	// What this case would GRANT, not what it asked for. `requested_tier` is the tier a
+	// provider may be ASKED for and rows asking for 2 are already in the table
+	// (`0014_kyc_requested_tier_intent.sql`); what an approval actually confers is capped
+	// at `PROVIDER_MAX_TIER`. Comparing against the request meant a legacy case with
+	// `requested_tier = 2` — approved, so the account holds 1 — could never contradict
+	// anything, because 1 < 2 returns here. That is exactly the #49 scenario, silently
+	// skipped for exactly the rows AGENTS.md warns are still standing.
+	let granted = KycStatus::Approved.grants_tier(case.requested_tier).unwrap_or(0);
+	if held == 0 || held < granted {
 		return;
 	}
 
-	// `error!` and not `warn!`: `error_monitoring::tracing_layer()` forwards this to
-	// Sentry, and Sentry is the only channel here that pages rather than accumulates.
-	tracing::error!(
-		case_id = %case.id,
-		user_id = %case.user_id,
-		verdict = case.status.as_str(),
-		held,
-		requested_tier = case.requested_tier,
-		"kyc callback: a terminal verdict contradicts a level this account already holds — the level was NOT changed and a human must decide"
-	);
+	// And a level covered by ANOTHER still-approved case is not a contradiction at all.
+	// Verified once, verified again, then the vendor reports the first session as lapsed
+	// is routine — not an incident — and `ENTRY_TIER` being 1 makes the test above
+	// degenerate to "holds any level", so without this every decline for an
+	// already-verified user would page the owners too. A false page costs the signal
+	// itself: owners who learn to ignore this mail are the state #49 is already in.
+	match st.kyc_cases.approved_cover(case.user_id, case.id).await {
+		Ok(cover) =>
+			if cover.and_then(|tier| KycStatus::Approved.grants_tier(tier)).is_some_and(|covered| covered >= held) {
+				tracing::info!(case_id = %case.id, verdict = case.status.as_str(), held, "kyc callback: a terminal verdict leaves a level another approved case still covers");
+				return;
+			},
+		// Fail LOUD: an unreadable cover means we cannot tell an incident from a routine
+		// lapse, and the direction that loses information is the one that stays quiet.
+		Err(e) => tracing::warn!(error = %e, case_id = %case.id, "kyc callback: could not check for another approved case — alerting anyway"),
+	}
+
+	if redelivered {
+		// The mail is deduplicated on `dedupe_key`, the page is not. Didit retries at
+		// roughly one and four minutes, so paging on every delivery turns one
+		// contradiction into three Sentry events that look like three incidents.
+		tracing::info!(case_id = %case.id, verdict = case.status.as_str(), held, "kyc callback: redelivery of a contradicting verdict — already raised");
+	} else {
+		// `error!` and not `warn!`: `error_monitoring::tracing_layer()` forwards this to
+		// Sentry, and Sentry is the only channel here that pages rather than accumulates.
+		tracing::error!(
+			case_id = %case.id,
+			user_id = %case.user_id,
+			verdict = case.status.as_str(),
+			held,
+			granted,
+			requested_tier = case.requested_tier,
+			"kyc callback: a terminal verdict contradicts a level this account already holds — the level was NOT changed and a human must decide"
+		);
+	}
 
 	let owners = match st.governance.owners().await {
 		Ok(owners) => owners,
@@ -844,31 +885,18 @@ async fn alert_owners_if_contradicted(st: &super::Inner, case: &KycCase) {
 			return;
 		}
 	};
-	let subject_email = match st.users.find_by_id(case.user_id).await {
-		Ok(Some(user)) => user.email().as_str().to_owned(),
-		_ => String::new(),
-	};
-	let payload = json!({
-		"subject_email": subject_email,
-		"case_id": case.id.to_string(),
-		"verdict": case.status.as_str(),
-		"held_level": held,
-		"requested_tier": case.requested_tier,
-		"decided_at": now_secs(),
-	});
+	let payload = verdict_alert_payload(subject.email().as_str(), case, held, now_secs());
 
 	for owner in owners {
-		// The address is resolved from the IDENTITY RECORD and must be VERIFIED — the
-		// same rule the mail relay applies to every governance kind. An address nobody
-		// has proved belongs to the person is not where an operational alert about
-		// somebody else's account should land.
-		let recipient = match st.users.find_by_id(domain::users::UserId::from_raw(owner.id)).await {
-			Ok(Some(user)) if user.email_verified() => user,
-			Ok(_) => continue,
-			Err(e) => {
-				tracing::warn!(error = %e, case_id = %case.id, owner = %owner.id, "kyc callback: could not resolve an owner's address");
-				continue;
-			}
+		// The address comes from the IDENTITY RECORD — the roster read above IS that
+		// record — and must be VERIFIED, the same rule the mail relay applies to every
+		// governance kind: an address nobody has proved belongs to the person is not
+		// where an operational alert about somebody else's account should land. Read off
+		// the roster rather than by a lookup per owner, because this handler answers a
+		// webhook with a 5-second vendor budget and a round trip each is the shape that
+		// turns a verdict into a retry.
+		let (Some(address), true) = (owner.email.as_deref(), owner.email_verified) else {
+			continue;
 		};
 		// One row per OWNER per case per verdict. The owner id is part of the key and not
 		// a detail: `enqueue_governance_mail` deduplicates on `dedupe_key` alone, across
@@ -877,10 +905,29 @@ async fn alert_owners_if_contradicted(st: &super::Inner, case: &KycCase) {
 		// alert that reaches one owner is exactly the "nobody is watching" this change
 		// exists to end. A redelivery of the same verdict still re-mails nobody.
 		let dedupe_key = format!("kyc-contradiction:{}:{}:{}", case.id, case.status.as_str(), owner.id);
-		if let Err(e) = st.governance.enqueue_mail(owner.id, recipient.email().as_str(), "kyc_verdict_alert", &dedupe_key, &payload).await {
+		if let Err(e) = st.governance.enqueue_mail(owner.id, address, "kyc_verdict_alert", &dedupe_key, &payload).await {
 			tracing::warn!(error = %e, case_id = %case.id, owner = %owner.id, "kyc callback: could not queue the owners' verdict alert");
 		}
 	}
+}
+
+/// The owners' alert as the queue carries it.
+///
+/// Its own function so that the six keys written here are the six keys a test can hand
+/// to `dispatch::governance_mail`. Producer and renderer agree by convention and by
+/// nothing else: `text_field`/`int_field` answer `""` and `0` for a key that is not
+/// there, so renaming one on either side renders a mail addressed to nobody, holding
+/// level 0, and every integration test still passes — they count rows in the queue and
+/// never render one. Migration 0020 names that exact failure as the risk it is guarding.
+pub(crate) fn verdict_alert_payload(subject_email: &str, case: &KycCase, held: u32, decided_at: i64) -> Value {
+	json!({
+		"subject_email": subject_email,
+		"case_id": case.id.to_string(),
+		"verdict": case.status.as_str(),
+		"held_level": held,
+		"requested_tier": case.requested_tier,
+		"decided_at": decided_at,
+	})
 }
 
 /// Best-effort in-app/e-mail notice. A user who never subscribed to the topic gets
@@ -895,4 +942,51 @@ async fn notify(st: &super::Inner, case: &KycCase, kind: &str, title: &str, body
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 	headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The ONE place the producer's keys meet the renderer's, exercised with the
+	/// producer's own writer.
+	///
+	/// The integration suite counts rows in `notification_deliveries` and never renders
+	/// one, so a key renamed on either side would leave every one of those tests green
+	/// while the owners received a mail addressed to nobody, holding "level 0" — or, if
+	/// the kind stopped being renderable at all, a row PARKED as unrenderable and no mail
+	/// whatsoever. Migration 0020 names that failure as the risk the `kind` CHECK exists
+	/// to guard, so it is the one that has to be nailed down here.
+	#[test]
+	fn the_verdict_alert_renders_what_the_webhook_writes() {
+		let case = KycCase {
+			id: uuid::Uuid::nil(),
+			user_id: domain::users::UserId::from_raw(uuid::Uuid::nil()),
+			requested_tier: 1,
+			status: KycStatus::KycExpired,
+		};
+		let payload = verdict_alert_payload("subject@example.com", &case, 1, 1_785_143_640);
+		let mail = crate::dispatch::governance_mail("kyc_verdict_alert", &payload, "https://cabinet.example/").expect("renderable");
+
+		// The address is how an operator finds the person: this mail carries no link and
+		// no code on purpose, so losing it makes the alert unactionable rather than ugly.
+		assert!(mail.text.contains("subject@example.com"), "the subject's address survives the payload round trip: {}", mail.text);
+		assert!(mail.text.contains("kyc_expired"), "and the vendor's verdict: {}", mail.text);
+		assert!(mail.text.contains('1'), "and the level being held");
+		assert!(!mail.subject.is_empty());
+
+		// Nobody unsubscribes from an operational alert about somebody else's account.
+		assert!(!mail.html.contains("Unsubscribe"), "governance mail carries no unsubscribe target");
+		// No link and no code: lowering a level from a mailbox is not a thing anyone does.
+		assert!(!mail.html.contains("https://cabinet.example"), "this alert deliberately links nowhere: {}", mail.html);
+
+		// A key the producer stopped writing must not render as a plausible mail.
+		let mut renamed = payload.clone();
+		renamed["subject"] = renamed["subject_email"].take();
+		let drifted = crate::dispatch::governance_mail("kyc_verdict_alert", &renamed, "https://cabinet.example/").expect("still renderable");
+		assert!(
+			!drifted.text.contains("subject@example.com"),
+			"a renamed key silently empties the field — which is why the assertions above exist"
+		);
+	}
 }
