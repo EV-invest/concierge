@@ -177,7 +177,16 @@ async fn setup() -> Option<Harness> {
 /// The same router with the vendor swapped out, so a test can drive the two ways
 /// verification becomes unavailable — absent, and present but refusing.
 async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+	let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+		// Every test in this file is gated on a real Postgres and RETURNS when there is
+		// none — which reads as PASSED. That is the right answer on a laptop and the wrong
+		// one anywhere that believes a green run means something: this suite is the only
+		// evidence the KYC gate works at all, and a run without a database proves nothing
+		// while looking exactly like a run that proved everything. Under `CI` the missing
+		// variable is the failure.
+		assert!(std::env::var_os("CI").is_none(), "DATABASE_URL must be set in CI — these tests silently pass without it");
+		return None;
+	};
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 
@@ -1347,9 +1356,20 @@ async fn a_second_account_on_the_same_document_is_held_for_review() {
 	// Answered 2xx: the delivery was genuine and IS handled — refusing it would only make
 	// Didit retry a verdict we have already recorded.
 	assert_eq!(status, StatusCode::OK, "{answer}");
-	assert_eq!(h.case_row(second_case).await.0, "in_review", "held for a human, not refused outright");
+	let (held_status, decided, _) = h.case_row(second_case).await;
+	assert_eq!(held_status, "held_duplicate", "held for a human, not refused outright");
+	assert!(decided, "and DECIDED: the vendor has said its last word, so the row must not claim an attempt still in flight");
 	assert_eq!(h.kyc_level(second).await, 0, "and NO level was raised on the second account");
 	assert_eq!(h.kyc_changed_count(second).await, 0, "so the money plane is never told this account is verified");
+
+	// The hold must not be a dead end. There is no RPC in this plane that closes a case,
+	// so a RUNNING hold would make `/kyc/start` hand back the spent vendor session for
+	// ever — and the people this branch exists for (a lost account remade, a family) are
+	// exactly the ones who would be stranded by it.
+	assert!(
+		h.cases.start_gate(second, 3600).await.expect("read the gate").live.is_none(),
+		"a held case is decided, so it does not pin the user to a session they cannot use"
+	);
 
 	// The first account is left exactly where it was. Whatever an operator decides, it is
 	// not this path's business to undo a verification that already happened.
@@ -1464,4 +1484,118 @@ async fn the_document_number_reaches_neither_the_payload_nor_the_column() {
 	let digest = digest.expect("an approved verdict naming a document stores one");
 	assert_eq!(digest.len(), 64, "hex SHA-256");
 	assert!(!digest.contains(&document), "and the digest does not carry the number either: {digest}");
+}
+
+/// The document stays protected after the FIRST verification stops being `approved`.
+///
+/// Didit expires verifications on a schedule, and `approved` -> `kyc_expired` is a routine
+/// vendor event that moves no level down — the first account keeps its level 1, its deposit
+/// address and its right to withdraw. A check that asked "is there an approved row" would
+/// stop protecting the document at exactly that moment, which is a bypass the attacker does
+/// not even have to trigger: they only have to wait.
+#[tokio::test]
+async fn an_expired_first_verification_still_protects_the_document() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let document = format!("E{}", Uuid::new_v4().simple());
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(first).await, 1);
+
+	// The vendor ages that verification out. The level is NOT lowered — only a human under
+	// `KycManage` lowers one — so the account is still verified in every way that spends.
+	let at = now() + 1;
+	let raw = body_for_document(&first_session, "Kyc Expired", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.case_row(first_case).await.0, "kyc_expired");
+	assert_eq!(h.kyc_level(first).await, 1, "the aged-out verdict moves no level down");
+
+	// Same person, same passport, a second account.
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.case_row(second_case).await.0, "held_duplicate", "the document already bought somebody a level");
+	assert_eq!(h.kyc_level(second).await, 0);
+}
+
+/// Holding a duplicate must not REOPEN a case the vendor already decided.
+///
+/// `declined` -> `approved` is a legitimate vendor transition (a post-hoc review), and the
+/// hold is written on the way through it. Recorded as a running status it would clear
+/// `decision_at`, so a finished case would go back to claiming an attempt in flight — the
+/// exact invariant the guard above it exists to protect.
+#[tokio::test]
+async fn a_hold_does_not_reopen_a_decided_case() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let document = format!("D{}", Uuid::new_v4().simple());
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(first).await, 1);
+
+	// The second account is declined first — a decided case, with a `decision_at`.
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Declined", &second_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert!(h.case_row(second_case).await.1, "declined is decided");
+
+	// Then the vendor reverses itself on the same session, on a document that already
+	// carries somebody else's level.
+	let at = now() + 1;
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+
+	let (status, decided, _) = h.case_row(second_case).await;
+	assert_eq!(status, "held_duplicate");
+	assert!(decided, "a decided case must never come back running");
+	assert_eq!(h.kyc_level(second).await, 0);
+}
+
+/// The SAME document rendered differently is still the same document.
+///
+/// The number is read off a scan: the same passport reaches us as "AB 123456", "ab-123456"
+/// or "AB123456" depending on the document type and how it was recognised. A digest taken
+/// over the raw string would make those three different identities, and the detection would
+/// be off for whoever happened to land on a different rendering — invisibly, with no log
+/// and no failed assertion anywhere.
+#[tokio::test]
+async fn the_same_document_written_differently_is_still_caught() {
+	let Some(h) = setup_with_pepper().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let stem = Uuid::new_v4().simple().to_string();
+	let document = format!("AB{}", &stem[..8]);
+	let rewritten = format!("ab-{}", &stem[..8]);
+
+	let first = h.user().await;
+	let (first_case, first_session) = h.case(first, 1).await;
+	let at = now();
+	let raw = body_for_document(&first_session, "Approved", &first_case.to_string(), at, "PRT", &document);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.kyc_level(first).await, 1);
+
+	let second = h.user().await;
+	let (second_case, second_session) = h.case(second, 1).await;
+	let at = now();
+	let raw = body_for_document(&second_session, "Approved", &second_case.to_string(), at, "PRT", &rewritten);
+	assert_eq!(h.post(raw.clone(), signed(&raw), at).await.0, StatusCode::OK);
+	assert_eq!(h.case_row(second_case).await.0, "held_duplicate", "separators and case are not an identity");
+	assert_eq!(h.kyc_level(second).await, 0);
 }

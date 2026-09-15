@@ -276,6 +276,16 @@ pub enum KycStatus {
 	Expired,
 	/// A previously-approved verification aged out at the vendor.
 	KycExpired,
+	/// NOT one of the vendor's words, and the only status this plane writes on its own:
+	/// an approval reached on a document that has ALREADY granted a level to a different
+	/// account (#51). DECIDED on purpose — it carries a `decision_at` and stops the case
+	/// running — because the vendor has spoken its last word on this session and nothing
+	/// will ever move the row again. Leaving it in a running state instead would have
+	/// cleared `decision_at` on a case the vendor had already finished, and would have
+	/// pinned `/kyc/start` to a session the user cannot use, with no operator handle to
+	/// release it. It grants no level; an operator raises one with `SetKycLevel` if the
+	/// duplicate turns out to have an honest explanation.
+	HeldDuplicate,
 }
 
 impl KycStatus {
@@ -284,7 +294,7 @@ impl KycStatus {
 	/// lookup that names the running statuses in SQL — and a hand-written list in either
 	/// would fail SILENTLY when a variant is added: an unlisted running status simply
 	/// stops counting as running, and the user buys another vendor session.
-	pub const ALL: [Self; 9] = [
+	pub const ALL: [Self; 10] = [
 		Self::Pending,
 		Self::InProgress,
 		Self::InReview,
@@ -294,6 +304,7 @@ impl KycStatus {
 		Self::Abandoned,
 		Self::Expired,
 		Self::KycExpired,
+		Self::HeldDuplicate,
 	];
 
 	/// The persisted `kyc_cases.status` vocabulary — kept in step with that column's
@@ -309,6 +320,7 @@ impl KycStatus {
 			Self::Abandoned => "abandoned",
 			Self::Expired => "expired",
 			Self::KycExpired => "kyc_expired",
+			Self::HeldDuplicate => "held_duplicate",
 		}
 	}
 
@@ -320,7 +332,7 @@ impl KycStatus {
 			// specific steps again puts the attempt back in the user's hands, so a
 			// `decision_at` on it would claim an outcome that has not happened.
 			Self::Pending | Self::InProgress | Self::InReview | Self::Resubmitted => false,
-			Self::Approved | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired => true,
+			Self::Approved | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired | Self::HeldDuplicate => true,
 		}
 	}
 
@@ -334,7 +346,7 @@ impl KycStatus {
 	pub fn grants_tier(self, requested: u32) -> Option<u32> {
 		match self {
 			Self::Approved => Some(requested.min(PROVIDER_MAX_TIER)),
-			Self::Pending | Self::InProgress | Self::InReview | Self::Resubmitted | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired => None,
+			Self::Pending | Self::InProgress | Self::InReview | Self::Resubmitted | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired | Self::HeldDuplicate => None,
 		}
 	}
 }

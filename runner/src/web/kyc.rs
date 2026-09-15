@@ -399,15 +399,43 @@ async fn apply(st: &super::Inner, case: &KycCase) -> Result<(), (StatusCode, &'s
 		// now says so and the level is untouched. Someone who holds tier 2 and fails an
 		// attempt at 3 keeps their 2 — a downgrade is a human act under `KycManage`, and
 		// there is no path to one from here.
-		if case.status == KycStatus::InReview {
-			notify(
-				st,
-				case,
-				"kyc_in_review",
-				"Your verification is being reviewed",
-				"A reviewer is looking at the documents you submitted. We will let you know as soon as there is a decision.",
-			)
-			.await;
+		// Exhaustive on purpose: a new status must force a decision about what, if
+		// anything, its owner is told, rather than silently inheriting "nothing".
+		match case.status {
+			KycStatus::InReview => {
+				notify(
+					st,
+					case,
+					"kyc_in_review",
+					"Your verification is being reviewed",
+					"A reviewer is looking at the documents you submitted. We will let you know as soon as there is a decision.",
+				)
+				.await;
+			}
+			// The duplicate-document hold (#51). What it does NOT say is which signal
+			// fired: "this document already verified another account" would confirm to
+			// whoever is trying that the other account exists, and would tell the one
+			// person this check is aimed at exactly what to change. The honest cases —
+			// a lost account remade, a family — reach a human either way, which is the
+			// whole reason this is a hold and not a refusal.
+			KycStatus::HeldDuplicate => {
+				notify(
+					st,
+					case,
+					"kyc_held",
+					"Your verification needs a closer look",
+					"We could not finish this verification automatically. Someone from our team is looking at it, and we will let you know as soon as there is a decision.",
+				)
+				.await;
+			}
+			KycStatus::Pending
+			| KycStatus::InProgress
+			| KycStatus::Resubmitted
+			| KycStatus::Approved
+			| KycStatus::Declined
+			| KycStatus::Abandoned
+			| KycStatus::Expired
+			| KycStatus::KycExpired => {}
 		}
 		return Ok(());
 	};

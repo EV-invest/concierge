@@ -245,16 +245,29 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   appears in `payload` still holds -- this is a COLUMN precisely so it does not become one
   more key in a blob whose rule is "copy nothing unless named". `record_decision` asks,
   inside the transaction holding the case and BEFORE the status that would grant a level
-  is written, whether that digest is already approved for a different user; on a hit the
-  verdict is recorded as `in_review`, no level moves, and an `error!` (-> Sentry) puts it
-  in front of an operator. NOT a refusal: the honest explanations are real -- a lost
-  account remade, a shared device, a family -- and an automatic rejection would lock those
-  people out with no recourse and no human involved. `KYC_IDENTITY_PEPPER` is OPTIONAL and
-  never `required_in("production")`: absent it no digest is computed and the check is
-  skipped, which is where this plane stood before the column existed, and a detection
-  whose absence refuses to boot would take sign-in down for everybody to close a hole that
-  was already open. The boot logs it once at `warn!` when a vendor is configured and the
-  pepper is not. Rotating the pepper invalidates every stored digest.
+  is written, whether that digest has already raised the level of a DIFFERENT user -- the
+  question is about the level, not about a current `approved` row, because `approved` ->
+  `kyc_expired` and `approved` -> `declined` are routine vendor events that leave the level
+  standing. The lookup is serialised per digest with `pg_advisory_xact_lock`: the case row
+  lock covers one case, and two verdicts on the same document would otherwise not see each
+  other. On a hit the verdict is recorded as `held_duplicate`, no level moves, and an
+  `error!` (-> Sentry) puts it in front of an operator. NOT a refusal: the honest
+  explanations are real -- a lost account remade, a shared device, a family -- and an
+  automatic rejection would lock those people out with no recourse and no human involved.
+  The hold is a DECIDED status on purpose: this plane has no RPC that closes a case, so a
+  running one would pin `/kyc/start` to the spent vendor session for ever. Decided, the
+  user may start a fresh attempt, and the operator's move is `SetKycLevel` once they have
+  looked. `KYC_IDENTITY_PEPPER` is OPTIONAL and never `required_in("production")`: absent
+  it no digest is computed and the check is skipped, which is where this plane stood before
+  the column existed, and a detection whose absence refuses to boot would take sign-in down
+  for everybody to close a hole that was already open. Because nothing else can notice that
+  state -- it is in no preflight -- the boot logs it once at `error!` when a vendor is
+  configured and the pepper is missing or too short to be a key (under 32 characters is
+  refused, not used). The secret still has to be provisioned in `rpi5.nix` (`scopes.nix`
+  platform tier, the concierge env map, `secrets/platform.json`) or the detection is off in
+  production. Rotating the pepper invalidates every stored digest, and cases decided before
+  the pepper was set keep a NULL one for ever -- there is no backfill, because the document
+  number they would be computed from was never stored.
 - **Vendor status words are copied, never retyped.** The match is case-sensitive, so a
   near-miss does not fail loudly — the arm just never fires. `"Kyc Expired"` spent a
   while here as `"KYC Expired"`, silently unclassifiable. An unknown word is answered
