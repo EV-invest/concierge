@@ -894,14 +894,19 @@ fn address(value: &str, field: &str) -> Result<String, Status> {
 }
 
 /// Refuse anything that a mail client or the cabinet would turn into a link. For the
-/// fields the INBOX repeats: there they cannot be set apart as the money plane's text,
-/// and a tappable `http://…` in the platform's own sentence is a phishing line.
+/// fields the INBOX repeats, and for the fields the SUBJECT LINE repeats: in neither
+/// place can they be set apart as the money plane's text, and a tappable `http://…` in
+/// the platform's own sentence is a phishing line. The subject is the worse of the two
+/// — it is what a lock screen previews and what a reply quotes — and it used to be the
+/// gap: a payment approval's amount was only bounded, so "Approve a payment of 1 USDT
+/// https://x" went out as a branded security mail (#81).
 ///
 /// Deliberately coarser than "contains a URL": the needles are `://`, `www.` and the
 /// bare word `http` (which also covers `https`, `http:evil` and `HTTP evil.example`,
-/// which a client may still linkify). The field this guards is an AMOUNT — a number
-/// and a currency — so the false positives that coarseness buys are strings that had no
-/// business in it anyway. A field that is free text gets [`no_url`] instead.
+/// which a client may still linkify). The fields this guards are an AMOUNT — a number
+/// and a currency — and a rail's NAME, so the false positives that coarseness buys are
+/// strings that had no business in them anyway. A field that is free text gets
+/// [`no_url`] instead.
 fn no_link(value: &str, field: &str) -> Result<String, Status> {
 	without_needles(value, &["://", "www.", "http"], field)
 }
@@ -1103,9 +1108,11 @@ impl MailRelayService for MailRelay {
 				let payload = serde_json::json!({
 					"consilium_id": bounded(&mail.consilium_id, 64, "consilium_id")?,
 					"initiator_email": address(&mail.initiator_email, "initiator_email")?,
-					"network": bounded(&mail.network, 64, "network")?,
+					// Both make the subject line, so both take the amount's link rule on top
+					// of the live bound — a rail's name and a sum have no link to lose.
+					"network": no_link(&bounded(&mail.network, 64, "network")?, "network")?,
 					"address": bounded(&mail.address, 128, "address")?,
-					"amount": bounded(&mail.amount, 64, "amount")?,
+					"amount": no_link(&bounded(&mail.amount, 64, "amount")?, "amount")?,
 					"memo": bounded(&mail.memo, 500, "memo")?,
 					"payload_hash": bounded(&mail.payload_hash, 128, "payload_hash")?,
 					"threshold": mail.threshold,
@@ -1119,9 +1126,10 @@ impl MailRelayService for MailRelay {
 			// A burned approval token is an outcome the owners are told about, and the
 			// outcome payload already carries everything that mail needs to say. The
 			// payout fields keep `bounded` (a live contract); the payment tuple added
-			// later is held to `line` like every other payment field, and the fee terms
-			// added after that to the fee approval's rules, so the money plane learns one
-			// rule per field across every kind that carries it.
+			// later is held to `line` like every other payment field, the fee terms
+			// added after that to the fee approval's rules, and the mark to the amount's,
+			// so the money plane learns one rule per field across every kind that
+			// carries it.
 			Ok(GovernanceMailKind::PayoutOutcome) | Ok(GovernanceMailKind::ApprovalTokenBurned) => {
 				let mail = req.payout_outcome.ok_or_else(|| Status::invalid_argument("payout_outcome is required for this kind"))?;
 				let outcome = bounded(&mail.outcome, 64, "outcome")?;
@@ -1135,10 +1143,14 @@ impl MailRelayService for MailRelay {
 				// an empty rail: a live contract, left as it is.
 				let names_a_rail = !mail.network.is_empty() || !mail.address.is_empty();
 				let names_a_payment = !mail.source.is_empty() || !mail.destination.is_empty() || !mail.tier.is_empty();
-				let names_fee_terms = !mail.fund.is_empty() || mail.current.is_some() || mail.proposed.is_some();
-				if [names_a_rail, names_a_payment, names_fee_terms].into_iter().filter(|named| *named).count() > 1 {
+				let names_a_mark = !mail.mark.is_empty();
+				// `fund` belongs to both descriptions of a product. On its own it names fee
+				// terms — the description that had it first — and is refused there for
+				// lacking them, so a bare fund stays the refusal it always was.
+				let names_fee_terms = mail.current.is_some() || mail.proposed.is_some() || (!mail.fund.is_empty() && !names_a_mark);
+				if [names_a_rail, names_a_payment, names_fee_terms, names_a_mark].into_iter().filter(|named| *named).count() > 1 {
 					return Err(Status::invalid_argument(
-						"an outcome names either a rail (network, address), a payment (tier, source, destination), or fee terms (fund, proposed), not two",
+						"an outcome names either a rail (network, address), a payment (tier, source, destination), fee terms (fund, proposed), or a mark (fund, mark), not two",
 					));
 				}
 				if names_a_payment && (mail.source.is_empty() || mail.destination.is_empty() || mail.tier.is_empty()) {
@@ -1147,12 +1159,16 @@ impl MailRelayService for MailRelay {
 				if names_fee_terms && (mail.fund.is_empty() || mail.proposed.is_none()) {
 					return Err(Status::invalid_argument("a fee terms outcome needs fund and proposed together"));
 				}
+				if names_a_mark && mail.fund.is_empty() {
+					return Err(Status::invalid_argument("a valuation outcome needs fund and mark together"));
+				}
 				let payload = serde_json::json!({
 					"consilium_id": bounded(&mail.consilium_id, 64, "consilium_id")?,
 					"outcome": outcome,
-					"network": bounded(&mail.network, 64, "network")?,
+					// Subject-line fields, under the payout approval's rule.
+					"network": no_link(&bounded(&mail.network, 64, "network")?, "network")?,
 					"address": bounded(&mail.address, 128, "address")?,
-					"amount": bounded(&mail.amount, 64, "amount")?,
+					"amount": no_link(&bounded(&mail.amount, 64, "amount")?, "amount")?,
 					"detail": bounded(&mail.detail, 500, "detail")?,
 					// Empty for a payout; the burn notice over a payment or over fee terms
 					// carries no reason.
@@ -1163,9 +1179,11 @@ impl MailRelayService for MailRelay {
 					// Empty and null for a payout and for a payment. `fund` is what the mail is
 					// about, so it must say something and, as in the fee approval, must not be
 					// able to carry a link.
-					"fund": if names_fee_terms { no_url(&required_line(&mail.fund, 160, "fund")?, "fund")? } else { String::new() },
+					"fund": if names_fee_terms || names_a_mark { no_url(&required_line(&mail.fund, 160, "fund")?, "fund")? } else { String::new() },
 					"current": current_fee_terms(mail.current.as_ref())?,
 					"proposed": mail.proposed.as_ref().map_or(Ok(serde_json::Value::Null), |terms| fee_terms(terms, "proposed"))?,
+					// A value, spelled as an amount is, under the amount's rules.
+					"mark": if names_a_mark { no_link(&required_line(&mail.mark, 64, "mark")?, "mark")? } else { String::new() },
 				});
 				("payout_outcome", payload, Recipient::FundOwner, None)
 			}
@@ -1181,7 +1199,8 @@ impl MailRelayService for MailRelay {
 					"tier": payment_tier(&mail.tier)?,
 					"source": line(&mail.source, 160, "source")?,
 					"destination": line(&mail.destination, 160, "destination")?,
-					"amount": line(&mail.amount, 64, "amount")?,
+					// The subject line repeats it — the consent's rule, for the consent's reason.
+					"amount": no_link(&line(&mail.amount, 64, "amount")?, "amount")?,
 					"reason": required_line(&mail.reason, 500, "reason")?,
 					"payload_hash": line(&mail.payload_hash, 128, "payload_hash")?,
 					"threshold": mail.threshold,

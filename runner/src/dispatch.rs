@@ -125,15 +125,29 @@ pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_u
 			&text_field(payload, "approval_url"),
 			&text_field(payload, "code"),
 		)),
-		// The fee terms description was added to this row after the payout and payment
-		// ones, so a row queued before it carries neither key and renders exactly as it
-		// did. A row that names a fund, or proposes terms, is about fee terms — and like a
+		// The fee terms and the mark descriptions were added to this row after the payout
+		// and payment ones, so a row queued before them carries none of their keys and
+		// renders exactly as it did. A row that names a mark is about a fund's NAV mark;
+		// one that names a fund, or proposes terms, is about fee terms — and like a
 		// `fee_policy_approval`, one missing either half is unrenderable rather than a
-		// payout with an empty rail or a mail proposing nothing.
+		// payout with an empty rail, a mail proposing nothing, or a mark on no fund.
 		"payout_outcome" => {
 			let fund = text_field(payload, "fund");
+			let mark = text_field(payload, "mark");
 			let proposed = payload.get("proposed").is_some_and(|terms| !terms.is_null());
-			if fund.is_empty() && !proposed {
+			if !mark.is_empty() {
+				if fund.is_empty() {
+					return None;
+				}
+				Some(templates::valuation_outcome(
+					&text_field(payload, "consilium_id"),
+					&text_field(payload, "outcome"),
+					&fund,
+					&mark,
+					&text_field(payload, "detail"),
+					&text_field(payload, "reason"),
+				))
+			} else if fund.is_empty() && !proposed {
 				Some(templates::payout_outcome(
 					&text_field(payload, "consilium_id"),
 					&text_field(payload, "outcome"),
@@ -449,6 +463,29 @@ mod tests {
 		let mut no_fund = fee;
 		no_fund["fund"] = serde_json::Value::String(String::new());
 		assert!(governance_mail("payout_outcome", &no_fund, "https://cabinet.example").is_none(), "terms for no fund are no mail");
+	}
+
+	/// The fourth subject: a row naming a mark renders as a NAV mark, and a mark on no fund
+	/// is unrenderable — the relay refuses it, and the dispatcher parks rather than mails a
+	/// value for nothing.
+	#[test]
+	fn an_outcome_row_naming_a_mark_renders_as_a_valuation() {
+		let mark = serde_json::json!({
+			"consilium_id": "c-15",
+			"outcome": "TOKEN_BURNED",
+			"network": "", "address": "", "amount": "", "detail": "five failed code attempts burned the approval token for seat u-1",
+			"tier": "", "source": "", "destination": "", "reason": "",
+			"fund": "Quy Nhon Fund", "current": null, "proposed": null,
+			"mark": "5 000.00 USDT",
+		});
+		let mail = governance_mail("payout_outcome", &mark, "https://cabinet.example").expect("renderable");
+		assert_eq!(mail.subject, "NAV mark invitation burned — Quy Nhon Fund");
+		assert!(mail.text.contains("Mark: 5 000.00 USDT"));
+		assert!(!mail.text.contains("Amount") && !mail.text.contains("Payment"), "a mark is not a payment");
+
+		let mut no_fund = mark;
+		no_fund["fund"] = serde_json::Value::String(String::new());
+		assert!(governance_mail("payout_outcome", &no_fund, "https://cabinet.example").is_none(), "a mark on no fund is no mail");
 	}
 
 	/// `current` has two absences: `null` is a fund that charged nothing and reads "none",
