@@ -163,7 +163,7 @@ impl Fixture {
 	async fn hold_at(&self, actor: UserId, target: UserId, now: i64) -> Result<i64, domain::error::DomainError> {
 		let action = AdminAction::by(actor, "held", &Audit::default()).with_reason("credential stuffing");
 		self.users
-			.hold_user(target, &action, Role::Owner, now)
+			.hold_user(target, &action, actor, now)
 			.await
 			.map(|user| user.suspension().and_then(Suspension::hold_expires_at).unwrap())
 	}
@@ -332,7 +332,9 @@ async fn a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge() {
 	);
 	assert_eq!(fx.reload(target).await.status(), UserStatus::Disabled);
 
-	let lapsed = fx.users.lapse_due_holds(held.hold_expires_at, 10).await.expect("sweep");
+	// Swept LATE, as the real one always is — it runs on an interval, not at the
+	// deadline — so the end it records is asserted against the deadline, not the sweep.
+	let lapsed = fx.users.lapse_due_holds(held.hold_expires_at + 300, 10).await.expect("sweep");
 	assert!(lapsed.contains(&target), "the deadline released it");
 
 	let user = fx.reload(target).await;
@@ -345,7 +347,11 @@ async fn a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge() {
 	);
 	assert_eq!(fx.audit(target).await.last().map(|a| a.0.clone()), Some("hold_lapsed".into()));
 	assert_eq!(fx.audit(target).await.last().unwrap().1, None, "nobody acted, and the log says so");
-	assert_eq!(user.hold_ended_at(), Some(held.hold_expires_at), "the lapse is what the next hold's cooldown counts from");
+	assert_eq!(
+		user.hold_ended_at(),
+		Some(held.hold_expires_at),
+		"the cooldown counts from the deadline, not from the sweep that noticed it"
+	);
 }
 
 /// A reason is required because the owners asked to ratify a hold are reading exactly
@@ -407,10 +413,12 @@ async fn a_lapsed_hold_starts_a_cooldown() {
 	fx.hold_at(owner, target, T_FAR).await.expect("hold");
 	// Lifted by one act rather than swept: the sweep is global (see `T_FAR`), and the
 	// aggregate records the end the same way for both — the lapse path is proved in
-	// `a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge`.
+	// `a_hold_freezes_instantly_and_lapses_unratified_across_the_bridge`. Lifted three
+	// hours AFTER the deadline, as an operator beating a stalled sweep would: the end
+	// is still the deadline, or the cooldown would stretch by however late they were.
 	let ended = T_FAR + HOLD_TTL_SECS;
-	fx.users.enable_user(target, ended).await.expect("lifted");
-	assert_eq!(fx.reload(target).await.hold_ended_at(), Some(ended));
+	fx.users.enable_user(target, ended + 3 * 3_600).await.expect("lifted");
+	assert_eq!(fx.reload(target).await.hold_ended_at(), Some(ended), "dated at the deadline, not at the lift");
 
 	let err = fx.hold_at(owner, target, ended + HOLD_COOLDOWN_SECS - 1).await.unwrap_err();
 	assert!(matches!(err, domain::error::DomainError::Forbidden(_)), "inside the cooldown: {err}");
@@ -499,6 +507,28 @@ async fn a_seat_is_held_only_by_an_owner() {
 	fx.hold(owner, another_admin, "rogue operator").await.expect("an owner holds a seat");
 	assert_eq!(fx.reload(another_admin).await.status(), UserStatus::Disabled);
 	fx.users.enable_user(another_admin, T_FAR).await.expect("cleanup — see T_FAR");
+}
+
+/// The RPC gate refuses a disabled caller, but it runs before the target's row is
+/// locked. Two owners pressing on each other at the same instant each pass that gate
+/// and then queue on the other's row — so the actor's status is decided again under
+/// the lock, from the row as it is THEN. Driven through the port, which is what the
+/// window looks like from the transaction's side: an actor whose row is already held.
+#[tokio::test]
+async fn an_actor_held_in_the_window_holds_nobody() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.owner().await;
+	let other_owner = fx.owner().await;
+	let target = fx.user().await;
+	fx.hold_at(owner, other_owner, T_FAR).await.expect("the first press lands");
+
+	let err = fx.hold_at(other_owner, target, T_FAR + 1).await.unwrap_err();
+	assert!(matches!(err, domain::error::DomainError::Forbidden(_)), "{err}");
+	assert_eq!(fx.reload(target).await.status(), UserStatus::Active, "nothing was written");
+	assert!(fx.audit(target).await.is_empty(), "a refusal is not an action");
+	fx.users.enable_user(other_owner, T_FAR).await.expect("cleanup — see T_FAR");
 }
 
 /// A hold on yourself ends your own session, and with it your ability to explain, lift

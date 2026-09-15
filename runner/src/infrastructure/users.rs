@@ -365,9 +365,35 @@ impl UserDirectoryRepository for PgUsers {
 	/// TOCTOU window in the direction that matters — a proposal cancelled between the read
 	/// and the write would let a hold extend on the strength of a decision nobody is
 	/// making any more.
-	async fn hold_user(&self, id: UserId, action: &AdminAction, by: Role, now: i64) -> Result<User, DomainError> {
+	async fn hold_user(&self, id: UserId, action: &AdminAction, by: UserId, now: i64) -> Result<User, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 		let mut user = load_for_update(&mut tx, id).await?;
+		// The actor's role and status are taken AFTER the target's lock and on the same
+		// connection, so they are at least as fresh as everything else this decision is
+		// made from. A plain read, not `FOR SHARE`: two operators holding each other at
+		// once would otherwise deadlock on the pair of rows — and the status is re-read
+		// for exactly that pair. `caller_gate` refused a disabled actor before the lock,
+		// but between that gate and this lock the actor may have been held themselves;
+		// without this check two owners pressing on each other at once both succeed,
+		// and each is then frozen by someone who was already frozen. No row is an
+		// investor — the persisted register is what seats anyone, and emergency access
+		// seats nobody.
+		let actor: Option<(String, String)> = sqlx::query_as("SELECT role, status FROM users WHERE id = $1")
+			.bind(by.raw())
+			.fetch_optional(&mut *tx)
+			.await
+			.map_err(repo_err)?;
+		let by = match actor {
+			Some((role, status)) => {
+				if UserStatus::parse(&status)? == UserStatus::Disabled {
+					return Err(DomainError::Forbidden(
+						"your account was suspended while this request was in flight; a suspended operator holds nobody".into(),
+					));
+				}
+				Role::parse(&role)?
+			}
+			None => Role::Investor,
+		};
 		// The plane's lazy-expiry convention: a proposal past its deadline is not open,
 		// whether or not a write path has got round to stamping it so.
 		let ratification_pending: bool =

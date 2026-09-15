@@ -462,6 +462,12 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   the count alone never says whether anything ran. That helper panics when `CI`
   is set, and prints a SKIPPED line a local `cargo test -- --nocapture` shows.
   Quote per-suite counts AND wall time when a PR offers a run as evidence.
+- **A migration's `lock_timeout` is `SET LOCAL`, never `SET`.** sqlx runs each migration
+  inside its own transaction on a connection borrowed from the service's pool and hands
+  that connection back afterwards, so a plain `SET` outlives the migration: the next
+  request served on that connection inherits a 3s ceiling on every row lock it waits
+  for. `0011`–`0021` predate this rule and stay as they are — sqlx checksums an applied
+  migration at every boot, so editing one turns the next deploy into a refusal to start.
 - No extra deps, abstraction layers, or unasked-for features.
 - No comments explaining _what_; only _why_ if non-obvious.
 - No `.env*`, secrets, or large binaries committed.

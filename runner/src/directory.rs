@@ -253,10 +253,11 @@ impl UserDirectory for Directory {
 		require_permission(self, &request, Permission::UserSuspend).await?;
 		let caller = crate::authz::caller_gate(self.users.as_ref(), &request).await?;
 		let actor = caller.id.ok_or_else(|| Status::unauthenticated("subject is not a user id"))?;
-		// The PERSISTED role, never the elevated one — the same choice the mail relay
-		// makes: emergency access authorizes an operator, it does not seat them, and
-		// holding a seat is a seated owner's call.
-		let actor_role = caller.record.map_or(Role::Investor, |record| record.role);
+		// The actor's role is NOT taken from `caller` here: the repository reads the
+		// PERSISTED one — never the elevated one, the same choice the mail relay makes,
+		// since emergency access authorizes an operator but does not seat them — inside
+		// the transaction that holds the target, so a demotion committed between this
+		// gate and that lock is seen rather than sailed past.
 		let audit = audit_of(&request);
 		let req = request.into_inner();
 		let target = parse_target_id(&req.user_id)?;
@@ -270,7 +271,7 @@ impl UserDirectory for Directory {
 		}
 		let reason = require_reason(&req.reason)?;
 		let action = AdminAction::by(actor, "held", &audit).with_reason(&reason);
-		let user = self.users.hold_user(target, &action, actor_role, now_secs()).await.map_err(hold_refusal)?;
+		let user = self.users.hold_user(target, &action, actor, now_secs()).await.map_err(hold_refusal)?;
 		Ok(Response::new(HoldUserResponse {
 			hold_expires_at: user.suspension().and_then(Suspension::hold_expires_at).unwrap_or_default(),
 		}))
