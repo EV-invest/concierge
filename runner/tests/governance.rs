@@ -32,7 +32,7 @@ use concierge::{
 		users::PgUsers,
 	},
 	notification::RateLimiter,
-	ports::{GovernanceRepository, NotificationDispatchRepository, UserDirectoryRepository},
+	ports::{GovernanceRepository, NotificationDispatchRepository, NotificationRepository, UserDirectoryRepository},
 };
 use domain::{
 	authz::Role,
@@ -670,7 +670,7 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 
 	assert!(
 		fx.governance
-			.enqueue_mail(owner.raw(), "relay@example.com", "payout_outcome", &key, &payload)
+			.enqueue_mail(owner.raw(), "relay@example.com", true, "payout_outcome", &key, &payload)
 			.await
 			.expect("first")
 	);
@@ -683,14 +683,14 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 	let second_key = format!("payout-outcome:{}", Uuid::new_v4());
 	assert!(
 		fx.governance
-			.enqueue_mail(owner.raw(), "relay@example.com", "payout_outcome", &second_key, &payload)
+			.enqueue_mail(owner.raw(), "relay@example.com", true, "payout_outcome", &second_key, &payload)
 			.await
 			.expect("muted")
 	);
 
 	assert!(
 		!fx.governance
-			.enqueue_mail(owner.raw(), "relay@example.com", "payout_outcome", &key, &payload)
+			.enqueue_mail(owner.raw(), "relay@example.com", true, "payout_outcome", &key, &payload)
 			.await
 			.expect("retry"),
 		"an at-least-once caller may retry the same key without sending twice"
@@ -704,6 +704,47 @@ async fn governance_mail_is_deduped_and_ignores_notification_preferences() {
 			.unwrap(),
 		2
 	);
+}
+
+/// Queueing a governance mail refreshes the recipient's subscriber row, and that row's
+/// `email_verified` is what `emit` consults before mailing an ordinary notification. It
+/// must carry the identity record's flag: hard-coding `true` there made an owner whose
+/// address nobody has proved eligible for every email notification they follow (#65).
+#[tokio::test]
+async fn a_governance_mail_does_not_verify_the_subscriber_by_itself() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let owner = fx.unverified_owner().await;
+	let email = fx.email_of(owner).await;
+	let payload = serde_json::json!({ "consilium_id": "c-65", "outcome": "EXECUTED", "amount": "1 USDT" });
+	assert!(
+		fx.governance
+			.enqueue_mail(owner.raw(), &email, false, "payout_outcome", &format!("payout-outcome:{}", Uuid::new_v4()), &payload)
+			.await
+			.expect("queued")
+	);
+	let (subscriber_id, verified): (Uuid, bool) = sqlx::query_as("SELECT id, email_verified FROM notification_subscribers WHERE user_id = $1")
+		.bind(owner.raw())
+		.fetch_one(&fx.pool)
+		.await
+		.expect("the subscriber row the mail refreshed");
+	assert!(
+		!verified,
+		"the subscriber carries the identity record's flag, not the fact that a governance mail was addressed to it"
+	);
+
+	// The consequence the flag guards: an ordinary notification on a followed topic
+	// reaches the inbox and NOT the mail queue. The row is followed as the mail left
+	// it — re-resolving the subscriber here would overwrite the very flag under test.
+	let notifications = PgNotifications::new(fx.pool.clone());
+	notifications.set_topic_subscription(subscriber_id, "fund:quy-nhon", true, true).await.expect("follow");
+	let outcome = notifications
+		.emit(owner.raw(), "fund:quy-nhon", "nav", "NAV updated", "", "", &format!("nav:{}", Uuid::new_v4()), T0)
+		.await
+		.expect("emit");
+	assert!(outcome.in_app, "the in-app copy is unaffected");
+	assert!(!outcome.email, "no email is queued to an address nobody has proved belongs to the owner");
 }
 
 /// A delivery the dispatcher gives up on loses its link and code, exactly as one it
@@ -723,7 +764,7 @@ async fn a_parked_delivery_is_redacted_but_a_retried_one_is_not() {
 	});
 	assert!(
 		fx.governance
-			.enqueue_mail(owner.raw(), "relay@example.com", "payout_approval", &key, &payload)
+			.enqueue_mail(owner.raw(), "relay@example.com", true, "payout_approval", &key, &payload)
 			.await
 			.expect("queued")
 	);
