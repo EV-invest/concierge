@@ -24,8 +24,16 @@ use domain::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
+mod common;
+
+/// The suite's preconditions, or `None` when there is no database to assert against.
+///
+/// A skipped run prints exactly the "N passed" a real one does, and the only tell is the
+/// wall time — so a count quoted as evidence that these assertions ran is evidence of
+/// nothing. [`common::database_url`] answers that where it matters: it panics under CI,
+/// and prints a SKIPPED line a local `--nocapture` run shows.
 async fn setup() -> Option<(PgUsers, PgPool)> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+	let url = common::database_url()?;
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	Some((PgUsers::new(pool.clone()), pool))
@@ -169,4 +177,95 @@ async fn role_change_emits_role_changed_carrying_the_new_role() {
 	assert_eq!(row.kind, "ROLE_CHANGED");
 	assert_eq!(row.role.as_deref(), Some("admin"), "the outbox row carries the new role for banking to mirror");
 	assert_eq!(row.sequence, 2, "the per-user sequence advanced past CREATED");
+}
+
+#[derive(sqlx::FromRow)]
+struct ActionRow {
+	action: String,
+	actor_user_id: Option<Uuid>,
+	detail: Option<serde_json::Value>,
+}
+
+async fn actions_for(pool: &PgPool, user_id: Uuid) -> Vec<ActionRow> {
+	sqlx::query_as::<_, ActionRow>("SELECT action, actor_user_id, detail FROM admin_action WHERE subject_user_id = $1 ORDER BY position")
+		.bind(user_id)
+		.fetch_all(pool)
+		.await
+		.expect("read admin_action")
+}
+
+/// #48: a user's KYC history is ONE log, and it carries the delta.
+///
+/// Both entry points reach `users.set_kyc_level` in the aggregate, but only the manual
+/// one used to leave a trace. An operator opening a user's history saw the admin
+/// decisions and had to infer the rest from `kyc_cases` — a table keyed by the vendor's
+/// session id, shaped around its verdicts, and holding no manual rows at all. "Who set
+/// tier 3 by hand, and when" was recoverable; "and what was it before" was not, because
+/// the row said only where the level ended up, which is also what the account says.
+///
+/// No new table and no manual rows in `kyc_cases`: its `requested_tier` CHECK and unique
+/// `provider_ref` are shaped for vendor cases, and reusing them for a human decision is a
+/// modelling choice, not a mechanical one.
+#[tokio::test]
+async fn both_kyc_writers_land_in_one_audit_log_with_the_delta() {
+	let Some((repo, pool)) = setup().await else {
+		return;
+	};
+	let operator = repo.provision(unique_subject(), Email::parse("kyc-operator@example.com").unwrap(), true).await.unwrap();
+	let user = repo.provision(unique_subject(), Email::parse("kyc-subject@example.com").unwrap(), true).await.unwrap();
+
+	// The VENDOR half, which used to write nothing here.
+	let vendor_case = Uuid::new_v4();
+	let vendor_audit = AdminAction::system("kyc_level_set").with_detail(serde_json::json!({ "source": "didit", "case_id": vendor_case.to_string() }));
+	repo.raise_kyc_level_to(user.id(), 1, &vendor_audit, 1_700_000_000).await.unwrap();
+
+	// The MANUAL half, moving the level DOWN — the direction only a human may take, and
+	// precisely the one a row saying "kyc_level: 0" cannot be told apart from a fresh
+	// account that was never raised at all.
+	// WITH a detail of its own, which is the half that used to be fragile: the manual path
+	// filled `from`/`to` in only while every caller left `detail` empty, so the first
+	// caller to attach anything would have dropped the delta with every test still green.
+	let manual = AdminAction::by(operator.id(), "kyc_level_set", &Default::default())
+		.with_reason("documents withdrawn")
+		.with_detail(serde_json::json!({ "ticket": "OPS-1204" }));
+	repo.set_kyc_level(user.id(), 0, &manual, 1_700_000_100).await.unwrap();
+
+	let rows = actions_for(&pool, user.id().raw()).await;
+	assert_eq!(rows.len(), 2, "one log, both halves");
+	assert!(rows.iter().all(|r| r.action == "kyc_level_set"), "one verb, so a history view needs no union");
+
+	let vendor = rows[0].detail.as_ref().expect("the vendor row carries a detail");
+	assert_eq!(rows[0].actor_user_id, None, "no human decided this, and inventing one would be worse than none");
+	assert_eq!(vendor["from"], 0);
+	assert_eq!(vendor["to"], 1);
+	assert_eq!(vendor["source"], "didit", "who decided instead of an actor id");
+	assert_eq!(vendor["case_id"], vendor_case.to_string(), "and which case, so the verdict is findable");
+
+	let human = rows[1].detail.as_ref().expect("the manual row carries a detail");
+	assert_eq!(rows[1].actor_user_id, Some(operator.id().raw()), "a human decision names its human");
+	assert_eq!(human["from"], 1, "the DOWNGRADE is legible — this is the direction no vendor may take");
+	assert_eq!(human["to"], 0);
+	assert_eq!(human["kyc_level"], 0, "kept beside `to` so rows written before this still read alike");
+	assert_eq!(human["ticket"], "OPS-1204", "and the caller's own keys survive the merge rather than replacing it");
+}
+
+/// A vendor verdict that raises nothing writes nothing.
+///
+/// `raise_kyc_level_to` is monotonic and returns before any write when the account
+/// already holds the level — which is also the REDELIVERY path, travelled every time
+/// Didit retries. An audit row there would turn one decision into a log entry per retry,
+/// and a history that grows when nothing happened is a history nobody trusts.
+#[tokio::test]
+async fn a_vendor_approval_that_changes_nothing_writes_no_audit_row() {
+	let Some((repo, pool)) = setup().await else {
+		return;
+	};
+	let user = repo.provision(unique_subject(), Email::parse("kyc-noop@example.com").unwrap(), true).await.unwrap();
+	let audit = AdminAction::system("kyc_level_set").with_detail(serde_json::json!({ "source": "didit", "case_id": Uuid::new_v4().to_string() }));
+
+	repo.raise_kyc_level_to(user.id(), 1, &audit, 1_700_000_000).await.unwrap();
+	repo.raise_kyc_level_to(user.id(), 1, &audit, 1_700_000_100).await.unwrap();
+	repo.raise_kyc_level_to(user.id(), 1, &audit, 1_700_000_200).await.unwrap();
+
+	assert_eq!(actions_for(&pool, user.id().raw()).await.len(), 1, "three deliveries, one decision, one row");
 }

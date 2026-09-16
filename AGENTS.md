@@ -451,8 +451,17 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `SetKycLevel` and `RevokeTokens` never wrote at all. Every one of them is appended in
   the SAME transaction as the change it describes: a log that can be missing the entry
   for a change that happened is a source of false confidence, so a rolled-back command
-  takes its audit row with it. `actor_user_id` is NULL only where nobody acted (the hold
-  sweep) — never as a stand-in for an actor we failed to resolve.
+  takes its audit row with it. `actor_user_id` is NULL only where no HUMAN acted — never
+  as a stand-in for an actor we failed to resolve. Two writers leave it NULL: the hold
+  sweep, where nobody acted at all, and the vendor's verdict (`raise_kyc_level_to`),
+  where something did act but is not a row in `users`. The second one is not anonymous:
+  its provenance is in `detail` (`source`, `case_id`), because inventing a user id for a
+  vendor would be the one kind of audit row worse than none (#48). The applied migration
+  `0015_user_governance.sql` still comments that the sweep is the only such writer; it is
+  history and stays as written. `kyc_level_set` rows carry `from` and `to` — where an
+  account ENDED UP is also what the account itself says, and only the delta tells a raise
+  apart from a downgrade, which is the direction no vendor may take. `kyc_level` is kept
+  beside `to` and is the same number: rows written before this carried only that key.
 - Keep `cargo check` independent of a live database at BUILD time: use runtime
   queries (`sqlx::query*`), never the compile-time `sqlx::query!` macros. Tests
   hit a REAL Postgres (no DB mocks); the binary applies migrations on boot.
