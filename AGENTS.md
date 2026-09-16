@@ -246,12 +246,17 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   way out but support (#91). So a case whose next move is the USER's — `pending`,
   `in_progress`, `resubmitted`, i.e. `KycStatus::is_abandonable` — stops counting as
   running `KYC_CASE_TTL_SECS` (default 24h, config and not a constant, never
-  `required_in`, refused at boot if non-positive) after `created_at`: `live_case` ignores
-  it, so `/kyc/status` answers `case: null` and `start_gate` lets a new start through.
-  `in_review` is exempt at any TTL — a human at the vendor is holding that case, their
-  queue is not the applicant's fault, and retiring it would buy a second BILLED session
-  for an attempt about to be answered. The READS decide nothing: the status is rewritten
-  exactly once, to `abandoned` with its `decision_at`, in the same transaction as the
+  `required_in`, refused at boot if non-positive) after it LAST MOVED —
+  `GREATEST(created_at, updated_at)`, the identical predicate in `live_case` and in
+  `open_case`'s retirement: `live_case` ignores it, so `/kyc/status` answers `case: null`
+  and `start_gate` lets a new start through. Measured from `created_at` instead, the two
+  vendor-written statuses would be born stale — a `resubmitted` a reviewer returns on day
+  two is a live case somebody is working, and retiring it sells the applicant a second
+  BILLED session while the reviewer waits. `in_review` is exempt at any TTL — a human at
+  the vendor is holding that case, their queue is not the applicant's fault, and retiring
+  it would buy a second BILLED session for an attempt about to be answered. The READS
+  decide nothing: the status is rewritten exactly once, to `abandoned` with its
+  `decision_at` and a `payload.retired_by_ttl` mark, in the same transaction as the
   INSERT that opens the next case (`open_case`) — opening a new attempt is the user's own
   statement that the old one is over, and a polled `GET` must not be what decides a case.
   The row is kept, never deleted; the window cap (`START_MAX_PER_WINDOW`) is untouched
@@ -260,7 +265,14 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   exists as far as the vendor is concerned, and a 404 would be a retry loop — and it
   raises no level: that would grant a tier off an attempt the user walked away from,
   contradicting the case they are now in. `SetKycLevel` is the path if it turns out to
-  have been right.
+  have been right. **That arm is keyed on `payload.retired_by_ttl`, never on the word
+  `abandoned`**: Didit writes `abandoned` itself for an applicant who left a session it
+  still holds open, and one who comes back by the same link and finishes is approved on
+  that same case — so a vendor `abandoned` keeps the ordinary decided → decided path and
+  still raises the level. An ignored delivery that carries an APPROVAL is logged at
+  `error!`, not `info!`: there is no `apply` on that path, so no owner alert and no
+  applicant mail, and Sentry is the only thing left that tells anyone the vendor
+  considers this person verified while we do not.
 - **A verdict is not handled until the level moved.** Recording the decision and
   writing the level are two transactions, so `kyc_cases` saying `approved` beside an
   account still at tier 0 is a reachable state. The webhook answers 5xx when the level

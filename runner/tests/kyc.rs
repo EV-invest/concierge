@@ -520,10 +520,17 @@ impl Harness {
 	}
 
 	/// Backdate a case, so a test can ask what the routes do with an attempt that has been
-	/// sitting there for a day. `created_at` is what the TTL is measured from, and there is
-	/// no other way to reach that state inside one test run.
+	/// sitting there for a day. There is no other way to reach that state inside one test
+	/// run.
+	///
+	/// BOTH timestamps move, because the TTL is measured from `GREATEST(created_at,
+	/// updated_at)` and the state being staged is "nothing has touched this row since" —
+	/// which is exactly what an untouched `pending` case looks like in production, where
+	/// `updated_at` defaults to `created_at` and only a write ever moves it. Ageing
+	/// `created_at` alone would stage a row no production path produces and quietly leave
+	/// every TTL test asserting nothing.
 	async fn age_case(&self, id: Uuid, secs: i64) {
-		sqlx::query("UPDATE kyc_cases SET created_at = now() - make_interval(secs => $2) WHERE id = $1")
+		sqlx::query("UPDATE kyc_cases SET created_at = now() - make_interval(secs => $2), updated_at = now() - make_interval(secs => $2) WHERE id = $1")
 			.bind(id)
 			.bind(secs as f64)
 			.execute(&self.pool)
@@ -534,9 +541,13 @@ impl Harness {
 	/// Put a case into a running status the stub vendor would otherwise have to be walked
 	/// through. Written directly because the point of the test using it is the AGE of the
 	/// row, not the path that produced the status.
+	///
+	/// `updated_at = now()` because that is what moving a status MEANS here: every
+	/// production writer of `kyc_cases.status` bumps it in the same statement, and a
+	/// helper that did not would stage a case the vendor moved and the clock did not.
 	async fn set_status(&self, id: Uuid, status: KycStatus) {
 		assert!(!status.is_decided(), "this writes no decision_at, so it only sets running statuses");
-		sqlx::query("UPDATE kyc_cases SET status = $2 WHERE id = $1")
+		sqlx::query("UPDATE kyc_cases SET status = $2, updated_at = now() WHERE id = $1")
 			.bind(id)
 			.bind(status.as_str())
 			.execute(&self.pool)
@@ -2726,4 +2737,124 @@ async fn a_late_verdict_on_a_retired_case_is_answered_but_moves_no_level() {
 	assert_eq!(stale_status, "abandoned", "the verdict must not reopen the case either");
 	assert!(decided);
 	assert_eq!(h.case_row(fresh_id).await.0, "pending", "and the attempt the user IS in is untouched");
+}
+
+/// The TTL runs from the case's LAST MOVEMENT, and `resubmitted` is a movement.
+///
+/// `is_abandonable` covers three statuses and only `pending` is motionless by nature: a
+/// row holding `in_progress` or `resubmitted` is there because the VENDOR put it there.
+/// `resubmitted` is the sharp one — a reviewer sending specific steps back, which can
+/// easily land a day or two after the session was opened. Measured from `created_at` that
+/// case is stale the instant it is written: `/kyc/status` answers `case: null`, the
+/// cabinet offers Start, and the click buys a second BILLED session while retiring, in
+/// the same transaction, the live attempt a human at the vendor is waiting on. The
+/// applicant then finishes the OLD session from the vendor's own mail and the approval
+/// lands on a case this plane has already closed.
+///
+/// Both halves are asserted because they are one predicate: the read must keep reporting
+/// the case, and the start route must neither buy a session nor retire the row.
+#[tokio::test]
+async fn a_case_the_vendor_moved_is_live_however_old_the_row_is() {
+	let counter = Arc::new(AtomicUsize::new(0));
+	let Some(h) = setup_with(Some(Arc::new(CountingKyc::new(counter.clone())))).await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let user = h.user().await;
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let (case_id, _) = h.case(user, 1).await;
+	// Opened well past two deadlines ago, and then moved by the vendor a moment ago.
+	h.age_case(case_id, CASE_TTL_SECS * 2).await;
+	h.set_status(case_id, KycStatus::Resubmitted).await;
+
+	let (status, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(
+		answer["case"]["status"], "resubmitted",
+		"a reviewer asked for steps just now — the attempt is the user's and it is live"
+	);
+
+	let (status, started) = h.start(&cookie, Some(&csrf), "").await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(started["case_id"], case_id.to_string(), "start hands back the attempt the reviewer is waiting on");
+	assert_eq!(counter.load(Ordering::SeqCst), 0, "and buys nothing: a second session here is money spent to break a live case");
+	assert_eq!(h.case_count(user).await, 1);
+	assert_eq!(h.case_row(case_id).await.0, "resubmitted", "nor may it be retired behind the reviewer's back");
+
+	// And the deadline really does run from the move, not from creation: nothing has
+	// touched the row for a full TTL, so now it ages out like any other.
+	h.age_case(case_id, CASE_TTL_SECS + 3600).await;
+	let (_, answer) = h.status(Some(&cookie)).await;
+	assert_eq!(answer, json!({ "level": 0, "case": null }), "a TTL of silence AFTER the move is what ends it");
+}
+
+/// `abandoned` is not only our word, and the difference decides whether a level moves.
+///
+/// Didit writes `Abandoned` for an applicant who walked out of a session it still holds
+/// open, and returning by the same link and finishing is an ordinary thing to do — the
+/// `Approved` that follows arrives on that very case. #91 added an arm that answers a
+/// late verdict on a RETIRED case with `ignored: superseded`, and keyed on the status
+/// column alone it would swallow this approval too: 200, no level, no owner alert, no
+/// applicant mail, an `info!` line, and a user verified at the vendor sitting at tier 0
+/// until they write to support. So the arm is keyed on `payload.retired_by_ttl`, which
+/// only `open_case` ever writes, and this case never had it.
+#[tokio::test]
+async fn a_vendor_abandoned_case_the_applicant_returns_to_is_still_approved() {
+	let h = harness!();
+	let user = h.user().await;
+	let (case_id, session_id) = h.case(user, 1).await;
+
+	let left_at = now() - 120;
+	let walked_out = body(&session_id, "Abandoned", &case_id.to_string(), left_at, json!({}));
+	let (status, _) = h.post(walked_out.clone(), signed(&walked_out), now()).await;
+	assert_eq!(status, StatusCode::OK);
+	let (stored, decided, payload) = h.case_row(case_id).await;
+	assert_eq!(stored, "abandoned", "the vendor's own word, written by the vendor's own delivery");
+	assert!(decided);
+	assert_eq!(payload["retired_by_ttl"], Value::Null, "and NOT marked as ours: this plane retired nothing");
+	assert_eq!(h.kyc_level(user).await, 0);
+
+	// Back by the same link, and finished.
+	let approved_at = now();
+	let approval = body(&session_id, "Approved", &case_id.to_string(), approved_at, json!({}));
+	let (status, answer) = h.post(approval.clone(), signed(&approval), approved_at).await;
+
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer["ignored"], Value::Null, "the applicant did not walk away from this — they came back and finished it");
+	assert_eq!(h.case_row(case_id).await.0, "approved", "so the verdict is recorded on the case it names");
+	assert_eq!(h.kyc_level(user).await, 1, "and the level the vendor granted is actually granted");
+	assert_eq!(h.kyc_changed_count(user).await, 1, "exactly once, onto the cross-plane outbox");
+}
+
+/// The same webhook, on a case this plane DID retire — the mark is what tells them apart.
+///
+/// Pinned beside the test above because the pair is the whole rule: identical rows as far
+/// as `status` is concerned, opposite outcomes, and the only difference is who wrote the
+/// word. Asserting the mark itself keeps the two ends of that contract — `open_case`
+/// writing it and `record_decision` reading it — from drifting into a silent no-op.
+#[tokio::test]
+async fn only_a_case_this_plane_retired_carries_the_mark_that_ignores_its_verdict() {
+	let h = harness!();
+	let user = h.user().await;
+	let (stale_id, stale_session) = h.case(user, 1).await;
+	h.age_case(stale_id, CASE_TTL_SECS + 3600).await;
+	// Opening the next case is what retires — and marks — the old one.
+	let (fresh_id, _) = h.case(user, 1).await;
+
+	let (stored, _, payload) = h.case_row(stale_id).await;
+	assert_eq!(stored, "abandoned");
+	assert_eq!(payload["retired_by_ttl"], json!(true), "the mark that says WE closed this, not the vendor");
+	assert_eq!(h.case_row(fresh_id).await.2["retired_by_ttl"], Value::Null, "and only the retired row carries it");
+
+	let at = now();
+	let approval = body(&stale_session, "Approved", &stale_id.to_string(), at, json!({}));
+	let (status, answer) = h.post(approval.clone(), signed(&approval), at).await;
+
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(answer["ignored"], "superseded");
+	assert_eq!(h.kyc_level(user).await, 0);
+	assert_eq!(h.case_row(stale_id).await.2["retired_by_ttl"], json!(true), "and the mark survives the delivery it refused");
 }

@@ -671,12 +671,25 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 		// handled correctly and there is nothing for the vendor to retry. NOT applied — a
 		// superseded verdict must not reach `apply`.
 		//
-		// `info!` and no louder, on purpose. This is an ordinary consequence of a user
-		// walking away and coming back, not a fault: raising it to `warn!`/`error!` would
-		// route it to Sentry (`error_monitoring::tracing_layer`) and spend the one channel
-		// that wakes a human on the most routine thing this route sees.
+		// `info!` and no louder for the ordinary shape of this — a user walking away and
+		// coming back, or a retry landing behind the word that replaced it. Routing that
+		// to Sentry (`error_monitoring::tracing_layer`) would spend the one channel that
+		// wakes a human on the most routine thing this route sees.
+		//
+		// An APPROVAL is the exception, and it is the only state here worth a person's
+		// attention: the vendor has verified this applicant and we are about to leave
+		// them at the level they had, with nothing but a log line to say so. There is no
+		// `apply` on this path, so no `terminal_notice` and no
+		// `alert_owners_if_contradicted` — every other channel that would surface a
+		// "verified there, not here" disagreement is skipped by construction. `error!` is
+		// what is left. Asked through `grants_tier` rather than by naming `Approved`, so
+		// a vendor word that starts granting a tier is covered the day it is mapped.
 		CaseDecision::Ignored(case) => {
-			tracing::info!(case_id = %case.id, held = case.status.as_str(), superseded = decision.status.as_str(), "kyc callback: superseded delivery ignored");
+			if decision.status.grants_tier(case.requested_tier).is_some() {
+				tracing::error!(case_id = %case.id, held = case.status.as_str(), superseded = decision.status.as_str(), "kyc callback: an APPROVAL landed on a superseded case — the applicant is verified at the vendor and no level was raised here");
+			} else {
+				tracing::info!(case_id = %case.id, held = case.status.as_str(), superseded = decision.status.as_str(), "kyc callback: superseded delivery ignored");
+			}
 			return Ok(Json(json!({ "ok": true, "ignored": "superseded", "status": case.status.as_str() })));
 		}
 		// Also the shape of the legitimate race where the webhook overtakes the insert

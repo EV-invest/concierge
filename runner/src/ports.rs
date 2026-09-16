@@ -347,6 +347,11 @@ impl KycStatus {
 	/// Whether a case sitting in this status may be retired by `KYC_CASE_TTL_SECS` —
 	/// i.e. whether waiting on it is waiting on the USER.
 	///
+	/// The clock the TTL runs on is the case's LAST MOVEMENT, not its creation: two of
+	/// these three statuses are written by the vendor, so a row holding one is proof of
+	/// an exchange that happened. Measured from creation, a `resubmitted` a reviewer
+	/// returns on day two would be stale the second it was written.
+	///
 	/// `pending` in particular is the status a case is opened in and the one it never
 	/// leaves when the user closes the tab at the vendor: Didit sends no event for a
 	/// session nobody began, so nothing else in this plane would ever move that row
@@ -530,6 +535,13 @@ pub enum CaseDecision {
 	/// this, and a 404 would put it in a retry loop that can only ever end in a delivery
 	/// nobody accepted.
 	///
+	/// A case the VENDOR called `abandoned` is NOT this, and the implementation must be
+	/// able to tell the two apart by something other than the column: Didit writes that
+	/// word for an applicant who left a session it still considers open, and one who
+	/// returns by the same link and finishes is approved on that very case. Treating the
+	/// status as proof of our own retirement would answer that approval here and leave a
+	/// verified applicant at the level they had.
+	///
 	/// Carries the case as it actually stands, never the superseded verdict.
 	Ignored(KycCase),
 	/// The delivery's [`KycDecision::vendor_data`] names a different case than the one
@@ -610,11 +622,16 @@ pub trait KycCaseRepository: Send + Sync {
 	///
 	/// This is also the ONE place a case is written to `abandoned`, and it must happen in
 	/// the SAME transaction as the insert: every attempt of this user that
-	/// [`KycStatus::is_abandonable`] and is older than `ttl_secs` is decided as
+	/// [`KycStatus::is_abandonable`] and has not MOVED for `ttl_secs` is decided as
 	/// `abandoned` here, because opening a new case is the moment the user says the old
 	/// one is over. The read paths only IGNORE such a row (see [`Self::live_case`]) — a
 	/// read that rewrote a status would put a decision on a `GET`, and a polled `GET` at
 	/// that.
+	///
+	/// The row must also be MARKED as retired by this plane, in a way
+	/// [`Self::record_decision`] can read back: `abandoned` on its own is a word the
+	/// vendor writes too, and only our own mark may send a later verdict to
+	/// [`CaseDecision::Ignored`].
 	///
 	/// Both halves under one transaction so the table never shows the state where the old
 	/// case has been retired and the new one does not exist: a `/kyc/status` landing in
@@ -649,8 +666,10 @@ pub trait KycCaseRepository: Send + Sync {
 	/// longer considers live, which is precisely the disagreement #190 is about.
 	///
 	/// `ttl_secs` bounds how long an attempt whose next move is the USER's counts as
-	/// running: past it the case is ABANDONED in fact, and this read says so by ignoring
-	/// it (#91). The row is left exactly as it stands — a read decides nothing, and the
+	/// running, measured from the last time the case MOVED: past it the case is ABANDONED
+	/// in fact, and this read says so by ignoring it (#91). The same clock and the same
+	/// predicate as [`Self::open_case`] retires by — a row one of them calls dead and the
+	/// other leaves running is a user told to continue an attempt that has been closed. The row is left exactly as it stands — a read decides nothing, and the
 	/// status is rewritten only when the user actually opens the next case
 	/// ([`Self::open_case`]). Statuses that are not [`KycStatus::is_abandonable`] —
 	/// `in_review`, where a human at the vendor is holding the case — never age out, at
@@ -690,7 +709,9 @@ pub trait KycCaseRepository: Send + Sync {
 	///
 	/// A case this plane retired as `abandoned` still EXISTS as far as the vendor is
 	/// concerned, so a late delivery about it is answered, never 404-ed — see
-	/// [`CaseDecision::Ignored`].
+	/// [`CaseDecision::Ignored`]. That arm is for cases THIS plane retired and no other:
+	/// a case the vendor itself called `abandoned` takes the ordinary path, so an
+	/// applicant who returns by the same session link and finishes is still approved.
 	async fn record_decision(&self, provider: &str, decision: &KycDecision) -> Result<CaseDecision, DomainError>;
 }
 

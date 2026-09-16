@@ -50,6 +50,24 @@ fn held_statuses() -> Vec<&'static str> {
 	KycStatus::ALL.into_iter().filter(|s| !s.is_decided() && !s.is_abandonable()).map(KycStatus::as_str).collect()
 }
 
+/// The `payload` key that marks a case THIS plane retired on the TTL.
+///
+/// `abandoned` is not our word alone — Didit sends it for an applicant who walked away
+/// mid-session — so the column cannot tell the two apart, and the difference decides
+/// whether a late verdict may still be applied. A vendor `abandoned` is an ordinary
+/// decided status the user can still come back from by the same session link; a retired
+/// one names an attempt superseded by a case the user is now in.
+///
+/// In `payload` and not a new status because the `kyc_cases_status` CHECK fixes that
+/// vocabulary (0010/0021): a tenth word would need a migration to record a fact that is
+/// ours, not the vendor's. Bound as a parameter at both ends rather than spelled twice,
+/// so the write and the read cannot drift apart.
+///
+/// Written only by [`KycCaseRepository::open_case`]'s retirement, and never erased:
+/// `record_decision` returns before the UPDATE that would overwrite `payload` whenever it
+/// finds the mark.
+const RETIRED_BY_TTL: &str = "retired_by_ttl";
+
 #[async_trait]
 impl KycCaseRepository for PgKycCases {
 	async fn open_case(&self, case: NewCase<'_>) -> Result<(), DomainError> {
@@ -66,15 +84,30 @@ impl KycCaseRepository for PgKycCases {
 		// Exactly the predicate `live_case` reads by, so what the status route already
 		// ignores is what gets written down. A case the user could still be in —
 		// `in_review`, or an abandonable one inside the TTL — is untouched.
+		//
+		// AGE IS MEASURED FROM THE LAST MOVEMENT, not from `created_at`. Only `pending`
+		// is motionless by nature; `in_progress` and `resubmitted` are written BY the
+		// vendor, so a row holding one is evidence of an exchange that happened — and
+		// `resubmitted` in particular is a reviewer handing specific steps back, hours or
+		// days after the case was opened. Measured from creation, such a case is born
+		// already past the TTL: the user would be shown `case: null`, buy a second BILLED
+		// session, and the live attempt a reviewer is working would be retired under
+		// them. `GREATEST` and not `updated_at` alone because the column is only ever set
+		// by a write, and an untouched `pending` row — the one the TTL was built for —
+		// carries `updated_at = created_at` anyway, so the two agree exactly where it
+		// matters. `event_at` is the wrong clock for this: it is the VENDOR's signed
+		// instant, out of order by design.
 		let retired: Vec<Uuid> = sqlx::query_scalar(
-			"UPDATE kyc_cases SET status = $3, decision_at = now(), updated_at = now() \
-			 WHERE user_id = $1 AND status = ANY($2) AND created_at <= now() - make_interval(secs => $4) \
+			"UPDATE kyc_cases SET status = $3, decision_at = now(), updated_at = now(), \
+			 payload = payload || jsonb_build_object($5::text, TRUE) \
+			 WHERE user_id = $1 AND status = ANY($2) AND GREATEST(created_at, updated_at) <= now() - make_interval(secs => $4) \
 			 RETURNING id",
 		)
 		.bind(case.user_id.raw())
 		.bind(abandonable_statuses())
 		.bind(KycStatus::Abandoned.as_str())
 		.bind(case.ttl_secs as f64)
+		.bind(RETIRED_BY_TTL)
 		.fetch_all(&mut *tx)
 		.await
 		.map_err(repo_err)?;
@@ -127,15 +160,22 @@ impl KycCaseRepository for PgKycCases {
 	async fn live_case(&self, user_id: UserId, ttl_secs: i64) -> Result<Option<LiveCase>, DomainError> {
 		// Two arms rather than one list plus an age test, because the two halves are
 		// different facts: a case somebody at the vendor is holding runs for as long as
-		// they take, and a case waiting on the USER runs for `ttl_secs` and is then
-		// abandoned in fact whatever the column still says (#91).
+		// they take, and a case waiting on the USER runs for `ttl_secs` since it last
+		// moved and is then abandoned in fact whatever the column still says (#91).
+		//
+		// `GREATEST(created_at, updated_at)` is the same clock `open_case` retires by, and
+		// the two must stay identical to the character: this read is what decides that a
+		// case is over, and that write is what records it. A row this read calls dead and
+		// that write leaves alone would make `/kyc/start` buy a session while the old case
+		// still counts, and the reverse retires an attempt the user is being told to
+		// continue.
 		//
 		// Served by `kyc_cases_user_idx (user_id, created_at DESC)` exactly as before —
 		// the added predicates only narrow rows the index already hands over in order.
 		let row: Option<(Uuid, Option<String>, String, i32, i64)> = sqlx::query_as(
 			"SELECT id, redirect_url, status, requested_tier, EXTRACT(EPOCH FROM created_at)::bigint \
 			 FROM kyc_cases WHERE user_id = $1 \
-			 AND (status = ANY($2) OR (status = ANY($3) AND created_at > now() - make_interval(secs => $4))) \
+			 AND (status = ANY($2) OR (status = ANY($3) AND GREATEST(created_at, updated_at) > now() - make_interval(secs => $4))) \
 			 ORDER BY created_at DESC LIMIT 1",
 		)
 		.bind(user_id.raw())
@@ -188,15 +228,18 @@ impl KycCaseRepository for PgKycCases {
 	async fn record_decision(&self, provider: &str, decision: &KycDecision) -> Result<CaseDecision, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
 
-		let row: Option<(Uuid, Uuid, i32, String, Option<i64>)> =
-			sqlx::query_as("SELECT id, user_id, requested_tier, status, event_at FROM kyc_cases WHERE provider = $1 AND provider_ref = $2 FOR UPDATE")
-				.bind(provider)
-				.bind(&decision.provider_ref)
-				.fetch_optional(&mut *tx)
-				.await
-				.map_err(repo_err)?;
+		let row: Option<(Uuid, Uuid, i32, String, Option<i64>, bool)> = sqlx::query_as(
+			"SELECT id, user_id, requested_tier, status, event_at, COALESCE((payload ->> $3::text)::boolean, FALSE) \
+			 FROM kyc_cases WHERE provider = $1 AND provider_ref = $2 FOR UPDATE",
+		)
+		.bind(provider)
+		.bind(&decision.provider_ref)
+		.bind(RETIRED_BY_TTL)
+		.fetch_optional(&mut *tx)
+		.await
+		.map_err(repo_err)?;
 
-		let Some((id, user_id, requested_tier, stored_status, stored_at)) = row else {
+		let Some((id, user_id, requested_tier, stored_status, stored_at, retired_by_ttl)) = row else {
 			return Ok(CaseDecision::Unknown);
 		};
 		let stored = status_from_column(&stored_status)?;
@@ -238,16 +281,21 @@ impl KycCaseRepository for PgKycCases {
 		// cannot recover: the verdict stays visible in the case's history, and
 		// `SetKycLevel` under `KycManage` is the path if it turns out to have been right.
 		//
-		// `abandoned` written by the VENDOR's own word reads the same way and is treated
-		// the same: Didit says it when the applicant walked away from the session, which
-		// is the state this branch is about however the row came to hold it.
+		// GATED ON OUR OWN MARK, NOT ON THE WORD `abandoned`. Didit writes that status
+		// too, for an applicant who left a session it still considers open, and before
+		// #91 such a row took the ordinary decided → decided path: the user returned by
+		// the same link, finished, and the `Approved` that followed raised their level.
+		// Reading the column alone would silently end that — a verified user left at
+		// level 0 with an `info!` line as the only record, which is a regression well
+		// outside what #91 asked for. `payload` carries the mark because only this plane
+		// ever writes it; a vendor `abandoned` has none and keeps its old path.
 		//
 		// This is deliberately placed BEFORE the equality check below, so every late
 		// delivery on a retired case gets one answer rather than one per vendor word.
 		// It does not overlap the `is_decided` guard further down: that one refuses a
 		// RUNNING verdict on any decided case, while what is dangerous here is a decided
 		// one.
-		if stored == KycStatus::Abandoned {
+		if retired_by_ttl {
 			return Ok(CaseDecision::Ignored(case(stored)));
 		}
 
