@@ -946,7 +946,16 @@ async fn alert_owners_if_contradicted(st: &super::Inner, case: &KycCase, redeliv
 		// alert that reaches one owner is exactly the "nobody is watching" this change
 		// exists to end. A redelivery of the same verdict still re-mails nobody.
 		let dedupe_key = format!("kyc-contradiction:{}:{}:{}", case.id, case.status.as_str(), owner.id);
-		if let Err(e) = st.governance.enqueue_mail(owner.id, address, "kyc_verdict_alert", &dedupe_key, &payload).await {
+		// The flag is FORWARDED, never written as a literal: `enqueue_mail` upserts the
+		// subscriber row with it, so a hard-coded `true` here would mark the address
+		// mailable for every ordinary notification topic too — the #65 regression. The
+		// guard above already admits only verified owners, so this reads `true` today;
+		// it stays correct if that guard ever moves.
+		if let Err(e) = st
+			.governance
+			.enqueue_mail(owner.id, address, owner.email_verified, "kyc_verdict_alert", &dedupe_key, &payload)
+			.await
+		{
 			tracing::warn!(error = %e, case_id = %case.id, owner = %owner.id, "kyc callback: could not queue the owners' verdict alert");
 		}
 	}
