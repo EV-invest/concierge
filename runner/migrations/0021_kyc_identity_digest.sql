@@ -106,7 +106,11 @@
 -- A migration that WAITS is a service that does not come up: these statements take an
 -- ACCESS EXCLUSIVE lock, and queueing behind somebody's open transaction would stall every
 -- boot behind it. Fail fast instead and retry on the next start.
-SET lock_timeout = '3s';
+--
+-- LOCAL, because sqlx borrows this connection from the service's pool and returns it after
+-- the migration: a session-level SET would survive into the requests served on that
+-- connection and cap every row lock they wait for at 3s.
+SET LOCAL lock_timeout = '3s';
 
 ALTER TABLE kyc_cases ADD COLUMN identity_digest TEXT;
 

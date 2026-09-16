@@ -28,6 +28,13 @@
 -- indefinitely, the boot never finishes and the deploy stops with no error at all —
 -- instead of failing honestly in three seconds and retrying on the next start.
 --
+-- SET LOCAL, not SET — the one way this differs from 0016/0017/0019. sqlx runs this file
+-- in its own transaction on a connection BORROWED from the service's pool and hands that
+-- connection back afterwards, so a session-level SET outlives the migration and puts a 3s
+-- ceiling on every row lock the next request served on that connection waits for. LOCAL
+-- ends the setting with the transaction. 0011–0019 predate the rule and stay as they are:
+-- sqlx checksums an applied migration at every boot, so editing one is a refusal to start.
+--
 -- REVERSIBILITY. Reversible while the new kind is unused --
 --   ALTER TABLE notification_deliveries DROP CONSTRAINT notification_deliveries_kind;
 --   ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_kind
@@ -37,7 +44,7 @@
 -- -- and stops being so the moment a row of this kind is queued: the narrowing fails,
 -- and forcing it would silently strand a mail an owner is waiting on.
 
-SET lock_timeout = '3s';
+SET LOCAL lock_timeout = '3s';
 
 ALTER TABLE notification_deliveries DROP CONSTRAINT notification_deliveries_kind;
 ALTER TABLE notification_deliveries ADD CONSTRAINT notification_deliveries_kind
