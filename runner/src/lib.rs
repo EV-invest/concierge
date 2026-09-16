@@ -11,6 +11,7 @@
 //! Hexagonal layout over the shared `domain`:
 //!   directory       — the user/profile gRPC service + the auth→directory provisioner loop
 //!   bridge          — the cross-plane (identity→money) producer over the user_outbox
+//!   bridge_tls      — the TLS listener that serves the bridge seams to the money plane
 //!   platform        — the platform/cabinet config service (maintenance · announcement · flags)
 //!   governance      — the consilia: the owner roster, owner admission/removal proposals,
 //!                     the user proposals over suspension/reinstatement/`admin`, the
@@ -31,6 +32,7 @@
 
 pub mod authz;
 pub mod bridge;
+pub mod bridge_tls;
 pub mod config;
 pub mod directory;
 pub mod dispatch;

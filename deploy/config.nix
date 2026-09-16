@@ -9,4 +9,9 @@
   public_origin = "https://evinvest.ltd";
   app_env = "production";
   bridge_service_token.env = "BRIDGE_SERVICE_TOKEN";
+  # The bridge seams over TLS on a second port (banking#199 phase 2); the PEM
+  # files are the mounted Secret keys BRIDGE_TLS_CERT_PEM / BRIDGE_TLS_KEY_PEM.
+  bridge_tls_bind = "0.0.0.0:55672";
+  bridge_tls_cert_pem_file = "/etc/settings/BRIDGE_TLS_CERT_PEM";
+  bridge_tls_key_pem_file = "/etc/settings/BRIDGE_TLS_KEY_PEM";
 }

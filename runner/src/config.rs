@@ -35,6 +35,30 @@ ev::settings! {
 		/// Shared bearer token for the cross-plane bridge (`UserEvents.PullUserLifecycle`).
 		#[secret]
 		bridge_service_token: String,
+		/// A SECOND gRPC listener that serves ONLY the two seams the money plane dials —
+		/// `UserEvents` and `MailRelayService` — over TLS (EV-invest/banking#199, phase 2).
+		///
+		/// A second port rather than TLS on `bind`, because 55670 has three cleartext
+		/// callers that would all have to move at once: the in-process JWKS verifier
+		/// (`AUTH_JWKS_GRPC_ENDPOINT`), the cabinet BFF (`CONCIERGE_GRPC_ADDR`, a tonic
+		/// client built without TLS) and the gRPC-Web browser path. This one is the seam
+		/// that can rewrite a KYC tier or an operator role on the money plane, so it gets
+		/// the server proof first.
+		///
+		/// Unset ⇒ no TLS listener (development: 55670 on loopback stays cleartext). Set ⇒
+		/// `BRIDGE_TLS_CERT_PEM_FILE` and `BRIDGE_TLS_KEY_PEM_FILE` are both required and
+		/// both files must be readable at boot — see `crate::bridge_tls`.
+		bridge_tls_bind: Option<std::net::SocketAddr>,
+		/// PEM chain the TLS listener presents; the money plane pins its CA with
+		/// `BRIDGE_TLS_CA_PEM_FILE`. A path, not the PEM itself: the deploy mounts each
+		/// Secret key as a file under `/etc/settings/<KEY>`.
+		bridge_tls_cert_pem_file: Option<String>,
+		/// PEM private key matching `bridge_tls_cert_pem_file`. The FILE is the secret; the
+		/// path is not, so this field is not `#[secret]`.
+		bridge_tls_key_pem_file: Option<String>,
+		/// Optional client CA root. Set ⇒ mTLS: a caller must present a certificate this
+		/// CA signed, on top of the shared bridge token. Refused without `bridge_tls_bind`.
+		bridge_tls_client_ca_pem_file: Option<String>,
 		#[required_in("production")]
 		sentry_dsn: Option<String>,
 		/// PostHog project key for native product-analytics capture.

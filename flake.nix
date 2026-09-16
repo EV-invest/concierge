@@ -73,9 +73,10 @@
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           doCheck = false;
         };
-        # ONE container: the runner binary serves gRPC (:55670) AND the auth web
-        # surface (:55671) in-process. The contract's port/healthPath describe the
-        # web surface (http probes); gitops patches the Service to expose both.
+        # ONE container: the runner binary serves gRPC (:55670), the auth web
+        # surface (:55671) AND the bridge seams over TLS (:55672) in-process. The
+        # contract's port/healthPath describe the web surface (http probes); gitops
+        # patches the Service to expose the others.
         # Secret env (signing key, JWKS, Google OAuth, bridge token) arrives via
         # the automatic optional `kubernetes-concierge` envFrom — never baked in.
         # Topology literals are set directly as contract env vars (read by
@@ -99,6 +100,20 @@
               # deploy/config.nix is kept for reference.
               BIND = "0.0.0.0:55670";
               WEB_BIND = "0.0.0.0:55671";
+              # The bridge seams (UserEvents + MailRelayService) over TLS, on a SECOND
+              # port (EV-invest/banking#199, phase 2). Not TLS on 55670: that port has
+              # three cleartext callers — the in-process JWKS verifier above, the cabinet
+              # BFF (banking CONCIERGE_GRPC_ADDR) and gRPC-Web — that would all have to
+              # move at once. The PEM files are the sops keys BRIDGE_TLS_CERT_PEM /
+              # BRIDGE_TLS_KEY_PEM of the kubernetes-concierge Secret, which devops mounts
+              # one file per key under /etc/settings/<KEY>. Rollout order: the keys land
+              # in rpi5.nix (scopes.nix) and the host is rebuilt BEFORE this release —
+              # the binary refuses to boot when the files are missing — then devops opens
+              # 55672 in the concierge Service and NetworkPolicy, then banking switches
+              # CONCIERGE_BRIDGE_ADDR to https://concierge:55672 with the CA pinned.
+              BRIDGE_TLS_BIND = "0.0.0.0:55672";
+              BRIDGE_TLS_CERT_PEM_FILE = "/etc/settings/BRIDGE_TLS_CERT_PEM";
+              BRIDGE_TLS_KEY_PEM_FILE = "/etc/settings/BRIDGE_TLS_KEY_PEM";
               PUBLIC_ORIGIN = "https://evinvest.ltd";
               APP_ENV = "production";
               # Gmail rejects a From that isn't the authenticated mailbox, so this
