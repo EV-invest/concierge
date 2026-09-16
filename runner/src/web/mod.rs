@@ -113,6 +113,7 @@ impl WebState {
 				governance: kyc.governance,
 				kyc: kyc.provider,
 				support_email: kyc.support_email,
+				kyc_case_ttl_secs: kyc.case_ttl_secs,
 			}),
 		})
 	}
@@ -134,6 +135,9 @@ pub struct KycDeps {
 	/// Printed on the "verification is unavailable" answer, so a user who cannot get
 	/// verified has somewhere to go instead of a dead end.
 	pub support_email: String,
+	/// `KYC_CASE_TTL_SECS` — how long an attempt waiting on the USER counts as running
+	/// before both KYC routes treat it as abandoned (#91).
+	pub case_ttl_secs: i64,
 }
 
 /// The auth surface, mounted behind the conductor's `/api` prefix rewrites:
@@ -200,4 +204,9 @@ struct Inner {
 	kyc: Option<Arc<dyn KycProvider>>,
 	/// Human contact handed to a user whose verification cannot run right now.
 	support_email: String,
+	/// How long a KYC attempt whose next move is the user's counts as running. Read by
+	/// both KYC routes, so `/kyc/status` and `/kyc/start` can never disagree about which
+	/// cases are still alive — the disagreement #190 was about, arrived at from the other
+	/// end.
+	kyc_case_ttl_secs: i64,
 }
