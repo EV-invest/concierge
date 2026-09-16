@@ -142,6 +142,25 @@ ev::settings! {
 		/// property that makes the column safe to store at all.
 		#[secret]
 		kyc_identity_pepper: Option<String>,
+		/// How long a verification attempt whose next move is the USER's counts as
+		/// running. Past it both KYC routes treat the case as abandoned: `/kyc/status`
+		/// answers `case: null` and `/kyc/start` opens a fresh one, retiring the old row
+		/// in the same transaction (#91).
+		///
+		/// A day, because that is already generous against the thing it bounds: a Didit
+		/// session's own link expires well before it, so a `pending` case older than this
+		/// cannot be resumed at the vendor even if the user tries. Three such rows sat in
+		/// production for days after the user closed the tab — Didit sends no event for a
+		/// session nobody began, so nothing in this plane would ever have moved them, and
+		/// a tier-0 user in that state had their Start button disabled for good.
+		///
+		/// Configuration rather than a constant, unlike `START_MAX_PER_WINDOW` beside it:
+		/// this one is a guess about how long a person takes to photograph a passport,
+		/// and the answer is a number an operator watching real cases can improve. It is
+		/// NOT `required_in("production")` — a default that is wrong is a user waiting a
+		/// little too long, while a boot that refuses over an unset knob takes sign-in
+		/// down for the whole platform.
+		kyc_case_ttl_secs: i64 = "86400",
 	}
 }
 
@@ -205,6 +224,17 @@ mod tests {
 		assert_eq!(path, "/cabinet/owner-removal", "the cabinet serves /{{locale}}/cabinet/owner-removal/{{token}}");
 		assert!(!base.ends_with('/'), "the token is appended as `<base>/<token>`");
 		assert!(!base.contains('?'), "a query string would swallow the token segment");
+	}
+
+	/// The default has to be a duration a person can actually finish a verification in,
+	/// and it has to be POSITIVE: at zero every case is born stale, so every `/kyc/start`
+	/// would open a fresh billed vendor session and burn the per-user window cap in five
+	/// clicks. The composition root refuses a non-positive value at boot; this pins the
+	/// value nobody has to set.
+	#[test]
+	fn an_unset_case_ttl_is_a_day() {
+		let config = AppConfig::from_source(minimal_env).expect("boot");
+		assert_eq!(config.kyc_case_ttl_secs, 24 * 60 * 60);
 	}
 
 	#[test]

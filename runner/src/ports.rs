@@ -344,6 +344,31 @@ impl KycStatus {
 		}
 	}
 
+	/// Whether a case sitting in this status may be retired by `KYC_CASE_TTL_SECS` —
+	/// i.e. whether waiting on it is waiting on the USER.
+	///
+	/// `pending` in particular is the status a case is opened in and the one it never
+	/// leaves when the user closes the tab at the vendor: Didit sends no event for a
+	/// session nobody began, so nothing else in this plane would ever move that row
+	/// (#91). Without an age bound it stays RUNNING for ever, `start_gate` keeps handing
+	/// it back, and a tier-0 user whose row also carries no usable `redirect_url` can
+	/// neither continue nor start again — the cabinet's Start button is disabled by a
+	/// case no event will ever close.
+	///
+	/// `InReview` is deliberately NOT here. A human at the vendor is holding that case,
+	/// their queue is not the user's fault, and retiring one behind their back would open
+	/// a second billed session for an attempt that is about to be answered.
+	///
+	/// A DECIDED status is not abandonable either: it has stopped running, so there is
+	/// nothing left to retire.
+	pub fn is_abandonable(self) -> bool {
+		match self {
+			Self::Pending | Self::InProgress | Self::Resubmitted => true,
+			Self::InReview => false,
+			Self::Approved | Self::Declined | Self::Abandoned | Self::Expired | Self::KycExpired | Self::HeldDuplicate => false,
+		}
+	}
+
 	/// The level this verdict may RAISE a user to, if any.
 	///
 	/// Only an approval moves the level, and only upwards. Every failure mode —
@@ -498,6 +523,13 @@ pub enum CaseDecision {
 	/// and then failed to move the level. An ignored delivery asserts a state the case has
 	/// LEFT — acting on it would apply a verdict the vendor has already replaced.
 	///
+	/// A verdict landing on a case this plane retired as `abandoned` comes out here too,
+	/// and for the same reading rather than by analogy: the user walked away and opened
+	/// another attempt, so the state this delivery describes is one the case has LEFT.
+	/// It is not [`Self::Unknown`] — the case exists, the vendor is right to have sent
+	/// this, and a 404 would put it in a retry loop that can only ever end in a delivery
+	/// nobody accepted.
+	///
 	/// Carries the case as it actually stands, never the superseded verdict.
 	Ignored(KycCase),
 	/// The delivery's [`KycDecision::vendor_data`] names a different case than the one
@@ -518,6 +550,26 @@ pub enum CaseDecision {
 	/// No case for this `(provider, provider_ref)`. Also the shape of the legitimate
 	/// race where a webhook overtakes the transaction that opens the case.
 	Unknown,
+}
+
+/// An attempt that has just been opened at the vendor, as [`KycCaseRepository::open_case`]
+/// must write it.
+///
+/// A struct rather than seven positional arguments, because two of them are the same
+/// `&str` type and sit next to each other: `provider` and `provider_ref` swapped at a
+/// call site compile cleanly and produce a row the webhook can never look up.
+pub struct NewCase<'a> {
+	/// Minted by the CALLER, because it is also the correlation value handed to the
+	/// vendor and echoed back in `vendor_data`.
+	pub id: Uuid,
+	pub user_id: UserId,
+	pub provider: &'a str,
+	pub provider_ref: &'a str,
+	pub requested_tier: u32,
+	pub redirect_url: &'a str,
+	/// `KYC_CASE_TTL_SECS`: how old an abandonable running case of this user must be for
+	/// opening this one to retire it. See [`KycCaseRepository::open_case`].
+	pub ttl_secs: i64,
 }
 
 /// The caller's still-running attempt, as much of it as `/kyc/start` needs to hand the
@@ -554,9 +606,20 @@ pub struct StartGate {
 /// [`CaseDecision::Recorded`] and any number of [`CaseDecision::Redelivered`].
 #[async_trait]
 pub trait KycCaseRepository: Send + Sync {
-	/// Record a started attempt. `id` is minted by the caller because it is also the
-	/// correlation value handed to the vendor.
-	async fn open_case(&self, id: Uuid, user_id: UserId, provider: &str, provider_ref: &str, requested_tier: u32, redirect_url: &str) -> Result<(), DomainError>;
+	/// Record a started attempt.
+	///
+	/// This is also the ONE place a case is written to `abandoned`, and it must happen in
+	/// the SAME transaction as the insert: every attempt of this user that
+	/// [`KycStatus::is_abandonable`] and is older than `ttl_secs` is decided as
+	/// `abandoned` here, because opening a new case is the moment the user says the old
+	/// one is over. The read paths only IGNORE such a row (see [`Self::live_case`]) — a
+	/// read that rewrote a status would put a decision on a `GET`, and a polled `GET` at
+	/// that.
+	///
+	/// Both halves under one transaction so the table never shows the state where the old
+	/// case has been retired and the new one does not exist: a `/kyc/status` landing in
+	/// that window would tell a user mid-start that they have no attempt at all.
+	async fn open_case(&self, case: NewCase<'_>) -> Result<(), DomainError>;
 
 	/// Read what decides whether this caller may open ANOTHER case: their still-running
 	/// attempt, and how many they have opened in the last `window_secs`.
@@ -573,7 +636,7 @@ pub trait KycCaseRepository: Send + Sync {
 	/// here would mean holding a row across the vendor round trip. Where that
 	/// single-flight does not reach (a second replica), the window cap is what bounds the
 	/// race.
-	async fn start_gate(&self, user_id: UserId, window_secs: i64) -> Result<StartGate, DomainError>;
+	async fn start_gate(&self, user_id: UserId, window_secs: i64, ttl_secs: i64) -> Result<StartGate, DomainError>;
 
 	/// This caller's still-running attempt, if they are in one.
 	///
@@ -584,7 +647,15 @@ pub trait KycCaseRepository: Send + Sync {
 	/// copying it is what keeps "which statuses are still running" a single answer —
 	/// two lists here would let `/kyc/status` report a live case the start route no
 	/// longer considers live, which is precisely the disagreement #190 is about.
-	async fn live_case(&self, user_id: UserId) -> Result<Option<LiveCase>, DomainError>;
+	///
+	/// `ttl_secs` bounds how long an attempt whose next move is the USER's counts as
+	/// running: past it the case is ABANDONED in fact, and this read says so by ignoring
+	/// it (#91). The row is left exactly as it stands — a read decides nothing, and the
+	/// status is rewritten only when the user actually opens the next case
+	/// ([`Self::open_case`]). Statuses that are not [`KycStatus::is_abandonable`] —
+	/// `in_review`, where a human at the vendor is holding the case — never age out, at
+	/// any `ttl_secs`.
+	async fn live_case(&self, user_id: UserId, ttl_secs: i64) -> Result<Option<LiveCase>, DomainError>;
 
 	/// The highest tier any OTHER case of this user was approved for and still holds
 	/// `approved` status, if there is one.
@@ -616,6 +687,10 @@ pub trait KycCaseRepository: Send + Sync {
 	/// write it refuses. Answering [`CaseDecision::Mismatch`] is the contract — the
 	/// implementation must compare inside the transaction that holds the row, so that a
 	/// disagreeing delivery leaves the case exactly where it stood.
+	///
+	/// A case this plane retired as `abandoned` still EXISTS as far as the vendor is
+	/// concerned, so a late delivery about it is answered, never 404-ed — see
+	/// [`CaseDecision::Ignored`].
 	async fn record_decision(&self, provider: &str, decision: &KycDecision) -> Result<CaseDecision, DomainError>;
 }
 

@@ -47,7 +47,7 @@ use uuid::Uuid;
 
 use crate::{
 	infrastructure::users::AdminAction,
-	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus},
+	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus, NewCase},
 	web::{
 		WebState, now_secs,
 		routes::{CsrfOutcome, csrf_outcome},
@@ -277,7 +277,7 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	// balance is not a feature degrading — it is a fail-closed 503 on every user's
 	// verification, arriving as silence, because a polite "try later" is not something
 	// anyone files a ticket about.
-	let gate = st.kyc_cases.start_gate(user_id, START_WINDOW_SECS).await.map_err(|e| {
+	let gate = st.kyc_cases.start_gate(user_id, START_WINDOW_SECS, st.kyc_case_ttl_secs).await.map_err(|e| {
 		// Refusing here rather than proceeding: an unreadable gate is exactly the state in
 		// which we do not know whether spending a session is safe.
 		tracing::error!(error = %e, "kyc: could not read the start gate");
@@ -388,7 +388,15 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	}
 
 	st.kyc_cases
-		.open_case(case_id, user_id, provider.name(), &session.provider_ref, ENTRY_TIER, &session.redirect_url)
+		.open_case(NewCase {
+			id: case_id,
+			user_id,
+			provider: provider.name(),
+			provider_ref: &session.provider_ref,
+			requested_tier: ENTRY_TIER,
+			redirect_url: &session.redirect_url,
+			ttl_secs: st.kyc_case_ttl_secs,
+		})
 		.await
 		.map_err(|e| {
 			// Same screen as a vendor outage: our store being unreachable is no more the
@@ -454,6 +462,14 @@ pub struct StatusResponse {
 /// this route is for — the question it answers is "may the cabinet offer Start?", and
 /// only something in flight changes that answer. An operator's per-user case history is
 /// a different surface with a different audience.
+///
+/// `null` too for an attempt that aged past `KYC_CASE_TTL_SECS` while it was the USER's
+/// move, even though the row still says `pending`. Didit sends no event for a session
+/// nobody began, so such a row is moved by nothing, ever: three of them sat `pending` in
+/// production for days, and for a tier-0 user the cabinet's predicate — `level === 0 &&
+/// (case === null || case.resumable)` — turned one into a Start button disabled for good
+/// (#91). The row is not rewritten to say so, because a polled GET must not decide
+/// anything; the status is written when the user opens their next case.
 #[derive(Serialize)]
 pub struct CaseView {
 	/// The persisted vocabulary (`pending`, `in_progress`, `in_review`, `resubmitted`),
@@ -543,7 +559,7 @@ pub async fn status(State(st): State<WebState>, jar: CookieJar) -> Result<(Cooki
 		return Err(StatusError::Unauthenticated);
 	};
 
-	let live = st.kyc_cases.live_case(user_id).await.map_err(|e| {
+	let live = st.kyc_cases.live_case(user_id, st.kyc_case_ttl_secs).await.map_err(|e| {
 		tracing::error!(error = %e, %user_id, "kyc: could not read the caller's running case");
 		StatusError::Internal
 	})?;
@@ -649,11 +665,18 @@ pub async fn callback(State(st): State<WebState>, headers: HeaderMap, body: Byte
 			tracing::debug!(case_id = %case.id, status = case.status.as_str(), "kyc callback: redelivery — re-asserting the recorded verdict");
 			(case, true)
 		}
-		// Genuine, but describing a verdict the case has already moved past. 200: the
-		// delivery was handled correctly and there is nothing for the vendor to retry.
-		// NOT applied — a superseded verdict must not reach `apply`.
+		// Genuine, but describing a verdict the case has already moved past — an older
+		// word than the one stored, or one landing on a case this plane retired as
+		// `abandoned` once the user opened another attempt (#91). 200: the delivery was
+		// handled correctly and there is nothing for the vendor to retry. NOT applied — a
+		// superseded verdict must not reach `apply`.
+		//
+		// `info!` and no louder, on purpose. This is an ordinary consequence of a user
+		// walking away and coming back, not a fault: raising it to `warn!`/`error!` would
+		// route it to Sentry (`error_monitoring::tracing_layer`) and spend the one channel
+		// that wakes a human on the most routine thing this route sees.
 		CaseDecision::Ignored(case) => {
-			tracing::info!(case_id = %case.id, held = case.status.as_str(), superseded = decision.status.as_str(), "kyc callback: out-of-order delivery ignored");
+			tracing::info!(case_id = %case.id, held = case.status.as_str(), superseded = decision.status.as_str(), "kyc callback: superseded delivery ignored");
 			return Ok(Json(json!({ "ok": true, "ignored": "superseded", "status": case.status.as_str() })));
 		}
 		// Also the shape of the legitimate race where the webhook overtakes the insert

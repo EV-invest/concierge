@@ -268,6 +268,16 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			provider.name()
 		);
 	}
+	// Also the BOOT and not the first start. A non-positive TTL makes every case stale
+	// the instant it is written, so each `/kyc/start` would buy a new BILLED vendor
+	// session and the user would spend `START_MAX_PER_WINDOW` in five clicks — a
+	// misconfiguration that costs money and looks, from the outside, like verification
+	// simply never working.
+	ensure!(
+		config.kyc_case_ttl_secs > 0,
+		"KYC_CASE_TTL_SECS must be positive (got {}): a non-positive value abandons every case as soon as it is opened",
+		config.kyc_case_ttl_secs
+	);
 	let web_state = web::WebState::try_new(
 		auth_service.clone(),
 		config.public_origin.clone(),
@@ -279,6 +289,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			governance: governance_repo.clone(),
 			provider: kyc_provider,
 			support_email: config.support_email.clone(),
+			case_ttl_secs: config.kyc_case_ttl_secs,
 		},
 	)
 	.await

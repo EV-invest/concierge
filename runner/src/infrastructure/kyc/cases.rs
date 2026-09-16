@@ -8,7 +8,7 @@ use domain::{error::DomainError, users::UserId};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::ports::{CaseDecision, KycCase, KycCaseRepository, KycDecision, KycStatus, LiveCase, StartGate};
+use crate::ports::{CaseDecision, KycCase, KycCaseRepository, KycDecision, KycStatus, LiveCase, NewCase, StartGate};
 
 pub struct PgKycCases {
 	pool: PgPool,
@@ -34,26 +34,70 @@ fn status_from_column(raw: &str) -> Result<KycStatus, DomainError> {
 		.ok_or_else(|| DomainError::Repository(format!("kyc_cases.status holds an unknown value: {raw}")))
 }
 
-/// The `status` values a case is still MOVING through, derived from the enum rather than
-/// typed out: a running status missing from this list would read as finished, and the
-/// user would be sold a second vendor session for the attempt they are already in.
-fn running_statuses() -> Vec<&'static str> {
-	KycStatus::ALL.into_iter().filter(|s| !s.is_decided()).map(KycStatus::as_str).collect()
+/// The running `status` values a TTL may retire — the attempts whose next move is the
+/// user's. Derived from the enum rather than typed out, for the reason
+/// [`KycStatus::ALL`] exists: a hand-written list silently stops covering a variant
+/// somebody adds.
+fn abandonable_statuses() -> Vec<&'static str> {
+	KycStatus::ALL.into_iter().filter(|s| s.is_abandonable()).map(KycStatus::as_str).collect()
+}
+
+/// The running `status` values that run until the VENDOR says otherwise, however long
+/// that takes — today just `in_review`, where a human has the case. A status missing from
+/// this list would read as finished, and the user would be sold a second vendor session
+/// for an attempt somebody is in the middle of answering.
+fn held_statuses() -> Vec<&'static str> {
+	KycStatus::ALL.into_iter().filter(|s| !s.is_decided() && !s.is_abandonable()).map(KycStatus::as_str).collect()
 }
 
 #[async_trait]
 impl KycCaseRepository for PgKycCases {
-	async fn open_case(&self, id: Uuid, user_id: UserId, provider: &str, provider_ref: &str, requested_tier: u32, redirect_url: &str) -> Result<(), DomainError> {
+	async fn open_case(&self, case: NewCase<'_>) -> Result<(), DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+
+		// The one write that retires a stale attempt, and it is deliberately HERE rather
+		// than on the read paths or in a sweep: opening a new case is the user's own
+		// statement that the old one is over, so the row is decided by something they
+		// did. `decision_at` goes with the status because the `kyc_cases_decision_at`
+		// CHECK ties the two together — `abandoned` is a decided status, and a row
+		// claiming it without an instant fails the write rather than leaving "is this
+		// still running?" with two answers.
+		//
+		// Exactly the predicate `live_case` reads by, so what the status route already
+		// ignores is what gets written down. A case the user could still be in —
+		// `in_review`, or an abandonable one inside the TTL — is untouched.
+		let retired: Vec<Uuid> = sqlx::query_scalar(
+			"UPDATE kyc_cases SET status = $3, decision_at = now(), updated_at = now() \
+			 WHERE user_id = $1 AND status = ANY($2) AND created_at <= now() - make_interval(secs => $4) \
+			 RETURNING id",
+		)
+		.bind(case.user_id.raw())
+		.bind(abandonable_statuses())
+		.bind(KycStatus::Abandoned.as_str())
+		.bind(case.ttl_secs as f64)
+		.fetch_all(&mut *tx)
+		.await
+		.map_err(repo_err)?;
+
 		sqlx::query("INSERT INTO kyc_cases (id, user_id, provider, provider_ref, requested_tier, status, redirect_url) VALUES ($1, $2, $3, $4, $5, 'pending', $6)")
-			.bind(id)
-			.bind(user_id.raw())
-			.bind(provider)
-			.bind(provider_ref)
-			.bind(requested_tier as i32)
-			.bind(redirect_url)
-			.execute(&self.pool)
+			.bind(case.id)
+			.bind(case.user_id.raw())
+			.bind(case.provider)
+			.bind(case.provider_ref)
+			.bind(case.requested_tier as i32)
+			.bind(case.redirect_url)
+			.execute(&mut *tx)
 			.await
 			.map_err(repo_err)?;
+
+		tx.commit().await.map_err(repo_err)?;
+
+		if !retired.is_empty() {
+			// The only trace a retirement leaves outside the table. A support ticket
+			// about a Start button that did nothing is answered by this line naming the
+			// case that was holding it.
+			tracing::info!(user_id = %case.user_id, superseded_by = %case.id, retired = ?retired, "kyc: stale running cases retired as abandoned by the new start");
+		}
 		Ok(())
 	}
 
@@ -64,8 +108,8 @@ impl KycCaseRepository for PgKycCases {
 	/// any database lock — and the guarantee this gate offers is a bound on volume. Mutual
 	/// exclusion between two starts is the caller's, held in process around this read.
 	/// Keeping them separate keeps each one a query a reader can check by eye.
-	async fn start_gate(&self, user_id: UserId, window_secs: i64) -> Result<StartGate, DomainError> {
-		let live = self.live_case(user_id).await?;
+	async fn start_gate(&self, user_id: UserId, window_secs: i64, ttl_secs: i64) -> Result<StartGate, DomainError> {
+		let live = self.live_case(user_id, ttl_secs).await?;
 
 		let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM kyc_cases WHERE user_id = $1 AND created_at > now() - make_interval(secs => $2)")
 			.bind(user_id.raw())
@@ -80,13 +124,24 @@ impl KycCaseRepository for PgKycCases {
 	/// `created_at` leaves Postgres as epoch seconds rather than a timestamp: it is
 	/// answered to a browser, and converting here keeps the one time format this plane
 	/// publishes from depending on which type the adapter happened to bind.
-	async fn live_case(&self, user_id: UserId) -> Result<Option<LiveCase>, DomainError> {
+	async fn live_case(&self, user_id: UserId, ttl_secs: i64) -> Result<Option<LiveCase>, DomainError> {
+		// Two arms rather than one list plus an age test, because the two halves are
+		// different facts: a case somebody at the vendor is holding runs for as long as
+		// they take, and a case waiting on the USER runs for `ttl_secs` and is then
+		// abandoned in fact whatever the column still says (#91).
+		//
+		// Served by `kyc_cases_user_idx (user_id, created_at DESC)` exactly as before —
+		// the added predicates only narrow rows the index already hands over in order.
 		let row: Option<(Uuid, Option<String>, String, i32, i64)> = sqlx::query_as(
 			"SELECT id, redirect_url, status, requested_tier, EXTRACT(EPOCH FROM created_at)::bigint \
-			 FROM kyc_cases WHERE user_id = $1 AND status = ANY($2) ORDER BY created_at DESC LIMIT 1",
+			 FROM kyc_cases WHERE user_id = $1 \
+			 AND (status = ANY($2) OR (status = ANY($3) AND created_at > now() - make_interval(secs => $4))) \
+			 ORDER BY created_at DESC LIMIT 1",
 		)
 		.bind(user_id.raw())
-		.bind(running_statuses())
+		.bind(held_statuses())
+		.bind(abandonable_statuses())
+		.bind(ttl_secs as f64)
 		.fetch_optional(&self.pool)
 		.await
 		.map_err(repo_err)?;
@@ -166,6 +221,34 @@ impl KycCaseRepository for PgKycCases {
 		// was found by the vendor's own session id.
 		if !decision.vendor_data.is_empty() && decision.vendor_data != id.to_string() {
 			return Ok(CaseDecision::Mismatch(case(stored)));
+		}
+
+		// A case this plane RETIRED (#91): the attempt aged past `KYC_CASE_TTL_SECS` and
+		// the user opened another one, which is what wrote this status. The vendor knows
+		// nothing of that, so its delivery is genuine and is answered — but it describes a
+		// session the user has left, and the row it names was superseded by a case the
+		// user is actually in.
+		//
+		// `Ignored` and not `Redelivered`, even for a delivery that agrees with the
+		// stored word: the two arms differ in whether the caller may still ACT, and
+		// re-applying here is precisely what must not happen. A late `Approved` on a
+		// retired session would raise a level off an attempt the user walked away from,
+		// days after the vendor session it belongs to expired, and it would do so while
+		// the case the user IS in says something else. Nothing is lost that a human
+		// cannot recover: the verdict stays visible in the case's history, and
+		// `SetKycLevel` under `KycManage` is the path if it turns out to have been right.
+		//
+		// `abandoned` written by the VENDOR's own word reads the same way and is treated
+		// the same: Didit says it when the applicant walked away from the session, which
+		// is the state this branch is about however the row came to hold it.
+		//
+		// This is deliberately placed BEFORE the equality check below, so every late
+		// delivery on a retired case gets one answer rather than one per vendor word.
+		// It does not overlap the `is_decided` guard further down: that one refuses a
+		// RUNNING verdict on any decided case, while what is dangerous here is a decided
+		// one.
+		if stored == KycStatus::Abandoned {
+			return Ok(CaseDecision::Ignored(case(stored)));
 		}
 
 		if stored == decision.status {
