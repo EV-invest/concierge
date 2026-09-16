@@ -33,6 +33,7 @@ lettre.workspace = true
 prost.workspace = true
 redis.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -40,7 +41,9 @@ sqlx = { workspace = true, features = ["runtime-tokio", "tls-rustls", "postgres"
 subtle.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
-tonic.workspace = true
+# `tls-ring` terminates TLS on the bridge listener (banking#199 phase 2) — the pure-Rust
+# provider, matching the rustls-only stance and banking's signer seam. Never native-tls.
+tonic = { workspace = true, features = ["tls-ring"] }
 tonic-web.workspace = true
 # `util` supplies ServiceExt::oneshot, which the web tests drive the router through.
 tower = { workspace = true, features = ["util"] }

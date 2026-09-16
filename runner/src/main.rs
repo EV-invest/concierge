@@ -17,7 +17,7 @@ use color_eyre::{
 	eyre::{Context, ensure},
 };
 use concierge::{
-	bridge, config, directory, governance,
+	bridge, bridge_tls, config, directory, governance,
 	infrastructure::{
 		self,
 		email::transport::{EmailTransport, NoopTransport, SmtpTransport},
@@ -78,6 +78,10 @@ fn main() -> Result<()> {
 	});
 
 	let _otel_guard = init_tracing(&config.app_env);
+
+	// Before the runtime, like Sentry: the bridge TLS acceptor is built inside `run`
+	// and would panic without a process-level provider (see the function's docs).
+	bridge_tls::install_crypto_provider();
 
 	tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
@@ -189,6 +193,17 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// service-to-service seam authenticated by its own shared bridge service token, not
 	// a user access token.
 	let bridge = bridge::Bridge::new(pool.clone(), Some(config.bridge_service_token.clone()));
+
+	// The TLS listener for the same seam (banking#199, phase 2). Validated and READ here,
+	// before anything is served: a half-configured listener or an unreadable PEM is a
+	// boot refusal, never a listener quietly not started. Production without it is a
+	// WARN for now, because the rollout order puts the key material (rpi5.nix) and the
+	// Service/NetworkPolicy (devops) ahead of this release; it becomes a refusal once
+	// banking dials `https://` and nothing else.
+	let bridge_tls = bridge_tls::from_config(&config).context("bridge TLS listener misconfigured")?;
+	if config.app_env == "production" && bridge_tls.is_none() {
+		tracing::warn!("BRIDGE_TLS_BIND is unset in production: the money plane can reach the bridge only in cleartext on BIND, with no proof of who answered (EV-invest/banking#199)");
+	}
 
 	let platform_repo: Arc<dyn concierge::ports::PlatformConfigRepository> = Arc::new(infrastructure::platform::PgPlatform::new(pool.clone()));
 
@@ -303,6 +318,48 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.context("concierge auth web server error")
 	};
 
+	// The money plane's mail push. ONE adapter mounted on both listeners: the rate
+	// limiter and the dedupe are per-process state, and a second instance would let the
+	// cleartext and TLS ports each spend the whole budget.
+	let mail_relay = governance::MailRelay::new(
+		users.clone(),
+		governance_repo.clone(),
+		notification_repo.clone(),
+		governance_mail_limiter,
+		// The SAME secret the bridge uses. One trust relationship between the two
+		// planes, one secret to rotate — and banking presents this token on both
+		// seams, so a second variable could only ever drift out of step with it.
+		Some(config.bridge_service_token.clone()),
+		config.public_origin.clone(),
+	);
+
+	// The TLS listener serves ONLY what banking dials through `CONCIERGE_BRIDGE_ADDR`:
+	// the lifecycle pull and the mail push. No gRPC-Web, no `accept_http1` — nothing a
+	// browser reaches — and the same shared token checks inside the handlers, so TLS
+	// is added proof, not a replacement. Unconfigured ⇒ resolves at once and lets the
+	// `try_join!` below wait on the other two.
+	let tls_bridge = bridge.clone();
+	let tls_mail_relay = mail_relay.clone();
+	let bridge_tls_server = async {
+		let Some(listener) = bridge_tls else {
+			return Ok(());
+		};
+		if listener.is_mutual() {
+			tracing::info!(bind = %listener.bind, "bridge TLS listener up (mTLS: client certificate required)");
+		} else {
+			tracing::info!(bind = %listener.bind, "bridge TLS listener up");
+		}
+		Server::builder()
+			.tls_config(listener.tls_config())
+			.context("failed to build the bridge TLS acceptor")?
+			.layer(TraceLayer::new_for_grpc())
+			.add_service(UserEventsServer::new(tls_bridge))
+			.add_service(MailRelayServiceServer::new(tls_mail_relay))
+			.serve_with_shutdown(listener.bind, await_signal())
+			.await
+			.context("concierge bridge TLS server error")
+	};
+
 	let grpc_server = async {
 		Server::builder()
 			.accept_http1(true)
@@ -319,17 +376,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 				governance_repo.clone(),
 				governance_revisions.clone(),
 			)))
-			.add_service(MailRelayServiceServer::new(governance::MailRelay::new(
-				users.clone(),
-				governance_repo.clone(),
-				notification_repo.clone(),
-				governance_mail_limiter,
-				// The SAME secret the bridge uses. One trust relationship between the two
-				// planes, one secret to rotate — and banking presents this token on both
-				// seams, so a second variable could only ever drift out of step with it.
-				Some(config.bridge_service_token.clone()),
-				config.public_origin.clone(),
-			)))
+			.add_service(MailRelayServiceServer::new(mail_relay))
 			.add_service(auth.layer(GovernanceServiceServer::new(governance::Governance::new(
 				users.clone(),
 				break_glass.clone(),
@@ -345,7 +392,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.context("concierge gRPC server error")
 	};
 
-	tokio::try_join!(grpc_server, web_server)?;
+	tokio::try_join!(grpc_server, web_server, bridge_tls_server)?;
 	Ok(())
 }
 
