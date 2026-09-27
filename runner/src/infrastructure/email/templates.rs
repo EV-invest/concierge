@@ -717,6 +717,104 @@ pub fn fee_policy_notice(fund: &str, current: Option<&FeeTerms>, proposed: &FeeT
 	}
 }
 
+/// Who a cancelled-consent mail is written for. The relay decides it from the identity
+/// record — the subject whose money it was, or a staff member — and stores it with the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaymentOutcomeReader {
+	Subject,
+	Staff,
+}
+
+/// How a payment's consent died before the payment moved anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsentOutcome {
+	/// Five wrong codes on the consent page locked the link.
+	TokenBurned,
+	/// The consent was voided under the subject — sessions revoked, email changed.
+	Invalidated,
+}
+
+/// The money plane telling a payment's subject, or a staff member, that the payment was
+/// cancelled because its consent could no longer be given.
+///
+/// No code panel, no button and no link, in either part: nothing is left to decide, and a
+/// mail about an attacked consent link that offered a new link to click would teach the
+/// reader exactly the habit the attack relies on. `detail` is the money plane's one line
+/// of why; the relay refused it if it carried a link or a control character, and it is
+/// folded here again for rows that reached the queue some other way.
+pub fn payment_outcome(reader: PaymentOutcomeReader, outcome: ConsentOutcome, detail: &str, tier: &str, source: &str, destination: &str, amount: &str) -> RenderedEmail {
+	// Folded BEFORE either part is built — see `one_line`.
+	let (detail, tier, amount) = (one_line(detail), one_line(tier), one_line(amount));
+	let (source, destination) = (one_line(source), one_line(destination));
+
+	let (headline, lead, advice, footer, section): (&str, String, &[&str], &str, &str) = match (reader, outcome) {
+		(PaymentOutcomeReader::Subject, ConsentOutcome::TokenBurned) => (
+			"Your payment consent link was locked",
+			format!(
+				"Five wrong codes were entered on the consent page for a payment of {amount} from your account. The link has been locked, the payment was cancelled, and no money moved."
+			),
+			&[
+				"If it was not you who entered those codes, someone else has had access to the link in that email. Please secure your mailbox: change its password and sign out any device you do not recognise.",
+				"No action is needed to keep your funds safe — nothing can move on this payment any more.",
+			],
+			FOOTER_OUTCOME_SUBJECT,
+			"Payments",
+		),
+		(PaymentOutcomeReader::Subject, ConsentOutcome::Invalidated) => (
+			"A payment awaiting your consent was cancelled",
+			format!("A payment of {amount} from your account that was waiting for your consent was cancelled because {detail}, and no money moved."),
+			&["No action is needed to keep your funds safe. If the payment is still wanted, it will be opened again and you will be asked afresh."],
+			FOOTER_OUTCOME_SUBJECT,
+			"Payments",
+		),
+		(PaymentOutcomeReader::Staff, ConsentOutcome::TokenBurned) => (
+			"A payment consent was locked — five wrong codes",
+			"Five wrong codes were entered on the subject's consent page. The link has been locked, the payment was cancelled, and no money moved.".to_owned(),
+			&["The subject is told as well, and advised to secure their mailbox. If the payment is still wanted, it has to be opened again."],
+			FOOTER_OUTCOME_STAFF,
+			"Treasury",
+		),
+		(PaymentOutcomeReader::Staff, ConsentOutcome::Invalidated) => (
+			"A payment awaiting consent was cancelled",
+			format!("The payment below was cancelled because {detail}. It was waiting for its subject's consent, and no money moved."),
+			&["If the payment is still wanted, it has to be opened again."],
+			FOOTER_OUTCOME_STAFF,
+			"Treasury",
+		),
+	};
+
+	// Staff get the whole order, the subject only what identifies it: the tier is internal
+	// vocabulary, and the reason is already the subject's headline or their lead sentence.
+	let mut rows = vec![("Amount", amount.clone())];
+	if !source.is_empty() {
+		rows.push(("From", source.clone()));
+	}
+	if !destination.is_empty() {
+		rows.push(("To", destination.clone()));
+	}
+	if reader == PaymentOutcomeReader::Staff {
+		if !tier.is_empty() {
+			rows.push(("Type", tier.clone()));
+		}
+		rows.push(("Why", detail.clone()));
+	}
+
+	let mut inner = String::new();
+	inner.push_str(&eyebrow(section));
+	inner.push_str(&heading(headline));
+	inner.push_str(&paragraph(&lead));
+	inner.push_str(&detail_box(&rows));
+	for line in advice {
+		inner.push_str(&paragraph(line));
+	}
+
+	RenderedEmail {
+		subject: format!("{headline} — {amount}"),
+		html: shell(headline, &card(&inner), footer, "", section),
+		text: format!("{headline}\n\n{lead}\n\n{}\n{}\n\n—\n{footer}\n", fee_lines(&rows), advice.join("\n\n")),
+	}
+}
+
 /// The owners' alert about a vendor verdict that contradicts a level the account holds.
 ///
 /// Deliberately NOT a request to act on a link. There is no code and no button, because
@@ -777,6 +875,14 @@ const FOOTER_CONSENT: &str =
 /// The same, for a fee notice: the reader holds a position, not a seat.
 const FOOTER_NOTICE: &str =
 	"You are receiving this because you hold a position in this fund. Notice of a change to its fee terms cannot be switched off — it is the terms your holding is charged under.";
+
+/// The same, for a cancelled consent told to the person whose money it was.
+const FOOTER_OUTCOME_SUBJECT: &str =
+	"You are receiving this because it concerns a payment from your own account. Security mail cannot be switched off — if it could, muting it would be the first thing an attacker did.";
+
+/// The same, for a cancelled consent told to staff, who may hold no seat.
+const FOOTER_OUTCOME_STAFF: &str =
+	"You are receiving this because you hold a staff role on this platform. Security mail cannot be switched off — if it could, muting it would be the first thing an attacker did.";
 
 /// Says whose words follow. Carried by BOTH parts of the mail, so the HTML label and the
 /// text label cannot drift apart.
@@ -1565,6 +1671,96 @@ mod tests {
 			assert!(!mail.subject.contains('_') && !mail.html.contains("token_burned"), "{}", mail.subject);
 			assert!(mail.text.contains("Outcome: "), "the row still carries the plane's own token as the record");
 		}
+	}
+
+	fn consent_outcome_mail(reader: PaymentOutcomeReader, outcome: ConsentOutcome) -> RenderedEmail {
+		payment_outcome(
+			reader,
+			outcome,
+			"sessions revoked",
+			"external",
+			"Quy Nhon Fund — distributions",
+			"Your bank account ••4417",
+			"1 200.00 USDT",
+		)
+	}
+
+	/// The subject whose link burned is told what happened, that nothing moved, and what to
+	/// do if it was not them — about their MAILBOX, since that is where the link was. No
+	/// code, no button, no URL: there is nothing left to decide and nowhere to go.
+	#[test]
+	fn a_burned_consent_tells_the_subject_to_secure_their_mailbox() {
+		let mail = consent_outcome_mail(PaymentOutcomeReader::Subject, ConsentOutcome::TokenBurned);
+		assert_eq!(mail.subject, "Your payment consent link was locked — 1 200.00 USDT");
+		for part in [&mail.html, &mail.text] {
+			for expected in [
+				"Your payment consent link was locked",
+				"Five wrong codes",
+				"cancelled",
+				"no money moved",
+				"someone else has had access",
+				"secure your mailbox",
+				"No action is needed to keep your funds safe",
+				"1 200.00 USDT",
+			] {
+				assert!(part.contains(expected), "{expected}");
+			}
+			assert!(!part.contains("owner seat"), "the subject holds no seat");
+		}
+		assert!(!mail.html.contains("Type this code") && !mail.text.contains("Your code"), "no code panel");
+		assert!(!mail.html.contains("<a ") && !mail.text.contains("http"), "no link");
+	}
+
+	/// Staff get the order: what it was, from where to where, of which type — and the
+	/// headline that says why it died.
+	#[test]
+	fn a_burned_consent_gives_staff_the_order_details() {
+		let mail = consent_outcome_mail(PaymentOutcomeReader::Staff, ConsentOutcome::TokenBurned);
+		assert_eq!(mail.subject, "A payment consent was locked — five wrong codes — 1 200.00 USDT");
+		for part in [&mail.html, &mail.text] {
+			for expected in [
+				"A payment consent was locked — five wrong codes",
+				"1 200.00 USDT",
+				"Quy Nhon Fund — distributions",
+				"Your bank account ••4417",
+				"external",
+				"no money moved",
+			] {
+				assert!(part.contains(expected), "{expected}");
+			}
+			assert!(!part.contains("secure your mailbox"), "advice for the subject is not addressed to staff");
+		}
+		assert!(!mail.html.contains("Type this code") && !mail.html.contains("<a ") && !mail.text.contains("http"));
+	}
+
+	/// An invalidated consent names why in the money plane's one line, for both readers.
+	#[test]
+	fn an_invalidated_consent_says_why_to_both_readers() {
+		for reader in [PaymentOutcomeReader::Subject, PaymentOutcomeReader::Staff] {
+			let mail = consent_outcome_mail(reader, ConsentOutcome::Invalidated);
+			for part in [&mail.html, &mail.text] {
+				assert!(part.contains("was cancelled because sessions revoked"), "{part}");
+				assert!(part.contains("no money moved"));
+			}
+			assert!(!mail.html.contains("Type this code") && !mail.html.contains("<a ") && !mail.text.contains("http"));
+		}
+		let staff = consent_outcome_mail(PaymentOutcomeReader::Staff, ConsentOutcome::Invalidated);
+		assert!(staff.text.contains("To: Your bank account ••4417") && staff.text.contains("Type: external"));
+	}
+
+	/// The text part escapes nothing, so a newline in any field would forge a line.
+	#[test]
+	fn a_consent_outcome_folds_forged_lines() {
+		let mail = payment_outcome(
+			PaymentOutcomeReader::Staff,
+			ConsentOutcome::Invalidated,
+			"email changed\nAmount: 0",
+			"external",
+			"src",
+			"bank\nTo: attacker",
+			"1 USDT",
+		);
+		assert!(!mail.text.contains("\nAmount: 0") && !mail.text.contains("\nTo: attacker"), "{}", mail.text);
 	}
 
 	#[test]

@@ -952,6 +952,12 @@ const PAYMENT_TIERS: [&str; 3] = ["internal", "service", "external"];
 /// [`PAYMENT_TIERS`]: this word becomes the headline of the mail.
 const OUTCOMES: [&str; 7] = ["APPROVED", "REJECTED", "EXPIRED", "CANCELLED", "EXECUTED", "EXECUTION_FAILED", "TOKEN_BURNED"];
 
+/// How a payment's consent can die before the payment moves: burned on wrong codes, or
+/// voided under the subject (sessions revoked, email changed). Closed for the reason
+/// [`OUTCOMES`] is — it picks the headline — and kept apart from it: these are not
+/// consilium endings, and the two kinds' payloads must not be able to pass as each other.
+const CONSENT_OUTCOMES: [&str; 2] = ["TOKEN_BURNED", "INVALIDATED"];
+
 /// [`line`], plus: the word must be one of [`PAYMENT_TIERS`].
 fn payment_tier(value: &str) -> Result<String, Status> {
 	let tier = line(value, 16, "tier")?;
@@ -1034,7 +1040,7 @@ fn cabinet_path(raw: &str) -> Result<String, Status> {
 }
 
 /// Where the in-app trace of a mail addressed by IDENTITY — a payment consent, a fee
-/// policy notice — is filed.
+/// policy notice, the subject's copy of a cancelled consent — is filed.
 ///
 /// The mail is the security channel and cannot be muted; this is what the subject finds
 /// in the cabinet when that mail is late, filtered or lost. It is written REGARDLESS of
@@ -1080,6 +1086,13 @@ enum Recipient {
 	/// the rule is identity — and the address must be verified, because an unverified
 	/// one is one nobody has proved is theirs.
 	Subject(UserId),
+	/// A cancelled consent speaks to two people: the subject whose link was attacked or
+	/// voided, and the staff who opened or oversee the order — usually an admin, who holds
+	/// no seat. So the rule is the subject's identity OR a staff role (admin, owner), and
+	/// nobody else; an operator's role reaches no money decision, so it is not staff here.
+	/// Verified address either way. The mail carries no link and no code, so the widening
+	/// hands nobody a decision — only the news that a payment died.
+	SubjectOrStaff(UserId),
 }
 
 #[tonic::async_trait]
@@ -1315,6 +1328,56 @@ impl MailRelayService for MailRelay {
 				});
 				("fee_policy_notice", payload, Recipient::Subject(subject), Some(notice))
 			}
+			// A payment that died waiting for its subject's consent. Nothing here is a secret
+			// and nothing may become a link: the mail has no link of its own, so any the money
+			// plane smuggled in would be the only one in it.
+			Ok(GovernanceMailKind::PaymentOutcome) => {
+				let mail = req.payment_outcome.ok_or_else(|| Status::invalid_argument("payment_outcome is required for this kind"))?;
+				let outcome = line(&mail.outcome, 16, "outcome")?;
+				if !CONSENT_OUTCOMES.contains(&outcome.as_str()) {
+					return Err(Status::invalid_argument("outcome must be one of TOKEN_BURNED, INVALIDATED"));
+				}
+				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
+				// Only the subject's copy writes an inbox entry, but the key rule is the kind's,
+				// not the recipient's: one money-plane key must not be valid for one addressee
+				// and refused for the next.
+				if req.dedupe_key.chars().count() + INBOX_KEY_PREFIX.len() > 128 {
+					return Err(Status::invalid_argument(format!(
+						"dedupe_key must be at most {} characters for this kind",
+						128 - INBOX_KEY_PREFIX.len()
+					)));
+				}
+				// `detail` is woven into the platform's own sentence ("cancelled because …"),
+				// and `source`/`destination` are free text a person recognises — all three take
+				// the free-text link rule. `amount` repeats in the subject line and the inbox,
+				// so it takes the coarse one, as everywhere else.
+				let detail = no_url(&required_line(&mail.detail, 200, "detail")?, "detail")?;
+				let amount = no_link(&line(&mail.amount, 64, "amount")?, "amount")?;
+				// The request's user_id is the addressee. Whether they ARE the subject decides
+				// the copy and the inbox trace; whether they may be written to at all is decided
+				// against the resolved record below.
+				let to_subject = user_id == subject;
+				let notice = to_subject.then(|| InboxNotice {
+					title: if outcome == "TOKEN_BURNED" {
+						"Your payment consent link was locked".to_owned()
+					} else {
+						"A payment awaiting your consent was cancelled".to_owned()
+					},
+					body: format!(
+						"A payment of {amount} from your account was cancelled, and no money moved. What happened, and what to do about it, is in the message sent to your email address."
+					),
+				});
+				let payload = serde_json::json!({
+					"audience": if to_subject { "subject" } else { "staff" },
+					"outcome": outcome,
+					"detail": detail,
+					"tier": payment_tier(&mail.tier)?,
+					"source": no_url(&line(&mail.source, 160, "source")?, "source")?,
+					"destination": no_url(&line(&mail.destination, 160, "destination")?, "destination")?,
+					"amount": amount,
+				});
+				("payment_outcome", payload, Recipient::SubjectOrStaff(subject), notice)
+			}
 			_ => return Err(Status::invalid_argument("kind must be a known governance mail kind")),
 		};
 
@@ -1359,6 +1422,19 @@ impl MailRelayService for MailRelay {
 				// notification that is a nuisance; for a mail carrying a consent link AND the
 				// code that arms it, it hands the decision to whoever happens to hold the
 				// mailbox — which is the entire thing consent is supposed to rule out.
+				if !recipient.email_verified() {
+					return Err(Status::failed_precondition(format!("a {noun} may only be sent to a verified address")));
+				}
+			}
+			// The PERSISTED role, as for the owner rule: emergency access authorizes an
+			// operator for a session, it does not make them a correspondent of the money plane.
+			Recipient::SubjectOrStaff(subject) => {
+				let staff = matches!(recipient.role(), Role::Admin | Role::Owner);
+				if recipient.id() != subject && !staff {
+					return Err(Status::failed_precondition(format!(
+						"a {noun} may only be addressed to the person it names as its subject or to staff"
+					)));
+				}
 				if !recipient.email_verified() {
 					return Err(Status::failed_precondition(format!("a {noun} may only be sent to a verified address")));
 				}

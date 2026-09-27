@@ -158,6 +158,13 @@ service OwnerRemovalApprovalService {
 // is a consilium kind (a seated owner, verified address), FEE_POLICY_NOTICE is addressed by
 // identity to the one investor it is about.
 //
+// PAYMENT_OUTCOME — a payment that died while waiting for its subject's consent (the
+// consent link burned on wrong codes, or was invalidated when the subject's sessions were
+// revoked or their address changed) — speaks to two audiences at once, so it has the one
+// two-armed rule: the recipient must BE the payment's subject, or hold a staff role
+// (admin or owner) — the person who opened the order is usually an admin and holds no
+// seat. It carries no link and no code: there is nothing left to decide.
+//
 // This path deliberately bypasses notification preferences. `NotificationService.Emit`
 // is opt-out on both channels, and a security mail that a subscriber can silently
 // switch off is not a security mail.
@@ -566,6 +573,12 @@ enum GovernanceMailKind {
   // investor the payload names — and, like a consent, it leaves an in-app trace. It asks
   // for nothing and carries no code: it is notice. See FeePolicyNoticeMail.
   GOVERNANCE_MAIL_KIND_FEE_POLICY_NOTICE = 7;
+  // The money plane telling the subject of a payment, or a staff member, that the payment
+  // was cancelled before it moved anything because its consent could no longer be given:
+  // the consent link burned on wrong codes, or was invalidated. Addressed to the subject
+  // the payload names OR to an admin/owner, at a verified address; the subject's copy
+  // leaves an in-app trace like a consent. No link and no code. See PaymentOutcomeMail.
+  GOVERNANCE_MAIL_KIND_PAYMENT_OUTCOME = 8;
 }
 
 message SendGovernanceMailRequest {
@@ -582,6 +595,7 @@ message SendGovernanceMailRequest {
   PaymentApprovalMail payment_approval = 7;
   FeePolicyApprovalMail fee_policy_approval = 8;
   FeePolicyNoticeMail fee_policy_notice = 9;
+  PaymentOutcomeMail payment_outcome = 10;
 }
 
 message PayoutApprovalMail {
@@ -807,6 +821,41 @@ message FeePolicyNoticeMail {
   // Cabinet-relative path of the page showing the full terms, e.g. `/funds/qn/fees`.
   // Must start with a single `/`; empty means the cabinet's front page.
   string link = 6;
+}
+
+// A payment cancelled because its subject's consent could no longer be given.
+//
+// WHY NOT PayoutOutcomeMail. That one is the consilium's record and goes to seated owners
+// only; the people this one is FOR are the payment's subject — whose consent link was
+// attacked, or whose sessions were just revoked — and the staff member who opened the
+// order, who is usually an admin. Neither holds a seat.
+//
+// `subject_user_id` exists for the reason PaymentConsentMail gives, with one widening: the
+// relay accepts the request's user_id when it IS that subject, or when it names an admin or
+// an owner. Which of the two it was decides the copy (the subject is told what to do about
+// their mailbox; staff get the order's details) and whether an inbox trace is written (the
+// subject only).
+//
+// Nothing here is a secret and nothing can be a link: no URL, no code, and every free-text
+// field is refused if it carries a scheme or `www.`.
+message PaymentOutcomeMail {
+  // Concierge canonical id of the user whose money the payment would have moved.
+  string subject_user_id = 1;
+  // TOKEN_BURNED (five wrong codes on the consent page) or INVALIDATED (the consent was
+  // voided under the subject — sessions revoked, email changed). A closed set.
+  string outcome = 2;
+  // Why, in one line of the money plane's words: "five wrong codes", "sessions revoked",
+  // "email changed". Required; refused if it carries a control character or a link.
+  string detail = 3;
+  // internal | service | external — the consent kind's closed set.
+  string tier = 4;
+  // Where the money would have left from, in words a person recognises.
+  string source = 5;
+  // Where it would have landed, in words a person recognises.
+  string destination = 6;
+  // The amount, spelled by the money plane (`1 200.00 USDT`). Repeated in the subject line
+  // and in the subject's inbox, so it may not carry a link.
+  string amount = 7;
 }
 
 message SendGovernanceMailResponse {

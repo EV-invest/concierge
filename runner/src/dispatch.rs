@@ -218,6 +218,30 @@ pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_u
 			// joining onto the origin cannot leave it.
 			&format!("{}{}", cabinet_url.trim_end_matches('/'), text_field(payload, "link")),
 		)),
+		// Both words were chosen by the relay from closed sets; a row carrying anything else
+		// reached the queue some other way and is parked rather than guessed at — the two
+		// readers get different advice, and the wrong one is worse than none.
+		"payment_outcome" => {
+			let reader = match text_field(payload, "audience").as_str() {
+				"subject" => templates::PaymentOutcomeReader::Subject,
+				"staff" => templates::PaymentOutcomeReader::Staff,
+				_ => return None,
+			};
+			let outcome = match text_field(payload, "outcome").as_str() {
+				"TOKEN_BURNED" => templates::ConsentOutcome::TokenBurned,
+				"INVALIDATED" => templates::ConsentOutcome::Invalidated,
+				_ => return None,
+			};
+			Some(templates::payment_outcome(
+				reader,
+				outcome,
+				&text_field(payload, "detail"),
+				&text_field(payload, "tier"),
+				&text_field(payload, "source"),
+				&text_field(payload, "destination"),
+				&text_field(payload, "amount"),
+			))
+		}
 		_ => None,
 	}
 }
@@ -532,6 +556,40 @@ mod tests {
 			"effective_at": 1_785_143_640, "link": "/funds/quy-nhon/fees",
 		});
 		assert!(governance_mail("fee_policy_notice", &notice, "https://cabinet.example").is_none());
+	}
+
+	/// A cancelled consent renders for both readers and both endings, and carries nothing a
+	/// reader could act on: no code panel, no button, no URL in either part. A row whose
+	/// reader or ending this dispatcher does not know is parked, not guessed at.
+	#[test]
+	fn a_payment_outcome_renders_for_both_readers_and_carries_no_link() {
+		let row = |audience: &str, outcome: &str| {
+			serde_json::json!({
+				"audience": audience, "outcome": outcome, "detail": "sessions revoked",
+				"tier": "external", "source": "Quy Nhon Fund — distributions",
+				"destination": "Your bank account ••4417", "amount": "1 200.00 USDT",
+			})
+		};
+		for audience in ["subject", "staff"] {
+			for outcome in ["TOKEN_BURNED", "INVALIDATED"] {
+				let mail = governance_mail("payment_outcome", &row(audience, outcome), "https://cabinet.example").expect("renderable");
+				assert!(mail.subject.contains("1 200.00 USDT"), "{audience}/{outcome}: {}", mail.subject);
+				assert!(!mail.html.contains("<a ") && !mail.html.contains("href"), "{audience}/{outcome}: no link in the html");
+				assert!(!mail.html.contains("Type this code"), "{audience}/{outcome}: no code panel");
+				assert!(!mail.text.contains("http") && !mail.html.contains("cabinet.example"), "{audience}/{outcome}: no URL at all");
+			}
+		}
+		assert!(
+			governance_mail("payment_outcome", &row("owner", "TOKEN_BURNED"), "https://cabinet.example").is_none(),
+			"an unknown reader"
+		);
+		assert!(
+			governance_mail("payment_outcome", &row("subject", "EXECUTED"), "https://cabinet.example").is_none(),
+			"an unknown ending"
+		);
+		let mut no_reader = row("subject", "TOKEN_BURNED");
+		no_reader.as_object_mut().expect("object").remove("audience");
+		assert!(governance_mail("payment_outcome", &no_reader, "https://cabinet.example").is_none(), "no reader at all");
 	}
 
 	#[test]

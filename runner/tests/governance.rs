@@ -43,8 +43,8 @@ use domain::{
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
 	CancelOwnerRemovalRequest, FeePolicyApprovalMail, FeePolicyNoticeMail, FeeTerms, GovernanceMailKind, ListOwnersRequest, OpenOwnerAdmissionRequest, OpenOwnerRemovalRequest,
-	PaymentApprovalMail, PaymentConsentMail, PayoutApprovalMail, PayoutOutcomeMail, RemovalVote, ResignOwnershipRequest, SendGovernanceMailRequest, SetRoleRequest, SubmitPeerVoteRequest,
-	governance_service_server::GovernanceService, mail_relay_service_server::MailRelayService, user_directory_server::UserDirectory,
+	PaymentApprovalMail, PaymentConsentMail, PaymentOutcomeMail, PayoutApprovalMail, PayoutOutcomeMail, RemovalVote, ResignOwnershipRequest, SendGovernanceMailRequest, SetRoleRequest,
+	SubmitPeerVoteRequest, governance_service_server::GovernanceService, mail_relay_service_server::MailRelayService, user_directory_server::UserDirectory,
 };
 use sqlx::{Connection, PgConnection, PgPool, Row};
 use tonic::{Code, Request};
@@ -835,6 +835,7 @@ fn consent(addressee: UserId, subject: UserId) -> SendGovernanceMailRequest {
 		payment_approval: None,
 		fee_policy_approval: None,
 		fee_policy_notice: None,
+		payment_outcome: None,
 	}
 }
 
@@ -863,6 +864,7 @@ fn payout(addressee: UserId) -> SendGovernanceMailRequest {
 		payment_approval: None,
 		fee_policy_approval: None,
 		fee_policy_notice: None,
+		payment_outcome: None,
 	}
 }
 
@@ -1033,6 +1035,7 @@ fn payment_approval(addressee: UserId) -> SendGovernanceMailRequest {
 		}),
 		fee_policy_approval: None,
 		fee_policy_notice: None,
+		payment_outcome: None,
 	}
 }
 
@@ -1064,6 +1067,7 @@ fn payment_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGovernanc
 		payment_approval: None,
 		fee_policy_approval: None,
 		fee_policy_notice: None,
+		payment_outcome: None,
 	}
 }
 
@@ -1095,6 +1099,7 @@ fn fee_policy_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGovern
 		payment_approval: None,
 		fee_policy_approval: None,
 		fee_policy_notice: None,
+		payment_outcome: None,
 	}
 }
 
@@ -1126,6 +1131,7 @@ fn valuation_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGoverna
 		payment_approval: None,
 		fee_policy_approval: None,
 		fee_policy_notice: None,
+		payment_outcome: None,
 	}
 }
 
@@ -1765,6 +1771,7 @@ fn fee_policy_approval(addressee: UserId) -> SendGovernanceMailRequest {
 			code: "483012".into(),
 		}),
 		fee_policy_notice: None,
+		payment_outcome: None,
 	}
 }
 
@@ -1788,6 +1795,7 @@ fn fee_policy_notice(addressee: UserId, subject: UserId) -> SendGovernanceMailRe
 			effective_at: T0 + 30 * 86_400,
 			link: "/funds/quy-nhon/fees".into(),
 		}),
+		payment_outcome: None,
 	}
 }
 
@@ -2056,6 +2064,199 @@ async fn a_fund_named_with_a_bare_http_still_gets_its_fee_mail() {
 		}
 	}
 	assert_eq!(fx.inbox(investor).await.len(), 2, "a refused notice leaves no trace");
+}
+
+/// A payment that died waiting for its subject's consent. `addressee` is who the mail is
+/// sent TO; `subject` is whose money the payment would have moved — separate for the same
+/// reason as in [`consent`]: the rule under test is how they may differ.
+fn consent_outcome(addressee: UserId, subject: UserId, outcome: &str) -> SendGovernanceMailRequest {
+	SendGovernanceMailRequest {
+		kind: GovernanceMailKind::PaymentOutcome as i32,
+		user_id: addressee.to_string(),
+		dedupe_key: format!("payment-consent-outcome:{}", Uuid::new_v4()),
+		payout_approval: None,
+		payout_outcome: None,
+		payment_consent: None,
+		payment_approval: None,
+		fee_policy_approval: None,
+		fee_policy_notice: None,
+		payment_outcome: Some(PaymentOutcomeMail {
+			subject_user_id: subject.to_string(),
+			outcome: outcome.into(),
+			detail: "five wrong codes".into(),
+			tier: "external".into(),
+			source: "Quy Nhon Fund — distributions".into(),
+			destination: "Your bank account ••4417".into(),
+			amount: "1 200.00 USDT".into(),
+		}),
+	}
+}
+
+impl Fixture {
+	/// A provisioned user holding the `admin` role — staff, but no seat.
+	async fn admin(&self) -> UserId {
+		let id = self.user().await;
+		self.users.set_role(id, Role::Admin).await.expect("grant admin");
+		id
+	}
+}
+
+/// The subject whose consent link was attacked, or voided under them, is told — and the
+/// address is the identity record's, never the request's. Nothing secret rides along:
+/// there is nothing left to decide, so there is no link and no code to carry.
+#[tokio::test]
+async fn a_payment_outcome_reaches_its_subject() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	for outcome in ["TOKEN_BURNED", "INVALIDATED"] {
+		let request = consent_outcome(investor, investor, outcome);
+		let key = request.dedupe_key.clone();
+		assert!(
+			fx.relay().send_governance_mail(relayed(request)).await.expect("the subject may be told").into_inner().enqueued,
+			"{outcome}"
+		);
+		assert_eq!(fx.delivery(&key).await.expect("queued"), ("payment_outcome".to_owned(), fx.email_of(investor).await));
+		let payload = fx.payload(&key).await;
+		assert_eq!(payload["audience"], "subject", "the renderer is told which copy to write: {payload}");
+		assert_eq!(payload["outcome"], outcome);
+		for secret in ["code", "approval_url", "link"] {
+			assert!(payload.get(secret).is_none(), "{outcome}: no {secret} in a payload that decides nothing: {payload}");
+		}
+	}
+}
+
+/// The staff member who opened the order is usually an admin, and an admin holds no seat;
+/// an owner oversees the fund. Either may be told — with the staff copy.
+#[tokio::test]
+async fn a_payment_outcome_reaches_an_admin_and_an_owner() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	for staff in [fx.admin().await, fx.owner().await] {
+		let request = consent_outcome(staff, investor, "INVALIDATED");
+		let key = request.dedupe_key.clone();
+		assert!(fx.relay().send_governance_mail(relayed(request)).await.expect("staff may be told").into_inner().enqueued);
+		assert_eq!(fx.delivery(&key).await.expect("queued"), ("payment_outcome".to_owned(), fx.email_of(staff).await));
+		assert_eq!(fx.payload(&key).await["audience"], "staff");
+	}
+}
+
+/// Widening by role stops at staff. A plain investor who is not the subject has no standing
+/// in somebody else's payment — and neither has an operator, whose role reaches no money
+/// decision. Every recipient, subject or staff, must be at a verified address.
+#[tokio::test]
+async fn a_payment_outcome_refuses_anyone_else() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let stranger = fx.user().await;
+	let operator = fx.user().await;
+	fx.users.set_role(operator, Role::Operator).await.expect("grant operator");
+	let unverified_subject = fx.unverified_user().await;
+	let unverified_admin = fx.unverified_user().await;
+	fx.users.set_role(unverified_admin, Role::Admin).await.expect("grant admin");
+
+	for (addressee, subject, why) in [
+		(stranger, investor, "an investor who is not the subject"),
+		(operator, investor, "an operator"),
+		(unverified_subject, unverified_subject, "the subject at an unverified address"),
+		(unverified_admin, investor, "an admin at an unverified address"),
+	] {
+		let request = consent_outcome(addressee, subject, "TOKEN_BURNED");
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::FailedPrecondition, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+		assert!(fx.inbox(addressee).await.is_empty(), "{why}: nor traced");
+	}
+}
+
+/// The outcome is the headline, so it is a closed set of the two ways a consent can die;
+/// and nothing the money plane spells may carry a link — this mail has none of its own,
+/// and a tappable one in the platform's sentence would be the phishing line it lacks.
+#[tokio::test]
+async fn a_payment_outcome_refuses_what_it_cannot_show_safely() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let mutate = |edit: &dyn Fn(&mut PaymentOutcomeMail)| {
+		let mut request = consent_outcome(investor, investor, "TOKEN_BURNED");
+		edit(request.payment_outcome.as_mut().unwrap());
+		request
+	};
+	let mut long_key = consent_outcome(investor, investor, "TOKEN_BURNED");
+	long_key.dedupe_key = "k".repeat(128);
+	let mut no_payload = consent_outcome(investor, investor, "TOKEN_BURNED");
+	no_payload.payment_outcome = None;
+
+	for (request, why) in [
+		(mutate(&|m| m.outcome = "EXECUTED".into()), "a consilium outcome is not a consent outcome"),
+		(mutate(&|m| m.outcome = "token_burned".into()), "the set is spelled exactly"),
+		(mutate(&|m| m.outcome = String::new()), "no outcome at all"),
+		(mutate(&|m| m.detail = String::new()), "a cancellation nobody explained"),
+		(mutate(&|m| m.detail = "sessions revoked\nAmount: 0".into()), "a forged line"),
+		(mutate(&|m| m.detail = "email changed, see https://evil.example".into()), "a link in the detail"),
+		(mutate(&|m| m.detail = "go to www.evil.example".into()), "a bare host in the detail"),
+		(mutate(&|m| m.destination = "http://evil.example/claim".into()), "a link for a destination"),
+		(mutate(&|m| m.source = "www.evil.example".into()), "a host for a source"),
+		(mutate(&|m| m.amount = "1 USDT http evil.example".into()), "the bare word in the amount"),
+		(mutate(&|m| m.tier = "gold".into()), "an unrecognised tier"),
+		(mutate(&|m| m.subject_user_id = "not-a-uuid".into()), "a subject that is not an id"),
+		(long_key, "a key the inbox prefix would push past the column limit"),
+		(no_payload, "the kind without its payload"),
+	] {
+		let key = request.dedupe_key.clone();
+		let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
+		assert_eq!(err.code(), Code::InvalidArgument, "{why}: {err}");
+		assert!(fx.delivery(&key).await.is_none(), "{why}: nothing may be queued");
+	}
+	assert!(fx.inbox(investor).await.is_empty(), "nothing was queued, so nothing was traced");
+}
+
+/// The subject's copy leaves a trace in their inbox, like the consent it ends; the staff
+/// copy does not — an admin's inbox is not where an investor's payment is filed. The trace
+/// states the platform's words and the amount only: not the money plane's detail, not the
+/// two ends of the transfer.
+#[tokio::test]
+async fn a_payment_outcome_leaves_an_inbox_trace_for_the_subject_only() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let investor = fx.user().await;
+	let request = consent_outcome(investor, investor, "TOKEN_BURNED");
+	let key = request.dedupe_key.clone();
+	assert!(fx.relay().send_governance_mail(relayed(request.clone())).await.expect("first").into_inner().enqueued);
+
+	let inbox = fx.inbox(investor).await;
+	assert_eq!(inbox.len(), 1, "{inbox:?}");
+	let (topic, kind, title, body) = &inbox[0];
+	assert_eq!((topic.as_str(), kind.as_str()), ("account:money-movement", "payment_outcome"));
+	assert_eq!(title, "Your payment consent link was locked");
+	assert!(body.contains("1 200.00 USDT"), "the entry says which payment: {body}");
+	for foreign in ["five wrong codes", "Quy Nhon Fund — distributions", "Your bank account ••4417"] {
+		assert!(!body.contains(foreign), "the money plane's free text is not shown where it cannot be attributed: {foreign}");
+	}
+	assert_eq!(fx.inbox_keys(investor).await, vec![format!("governance:{key}")]);
+
+	assert!(!fx.relay().send_governance_mail(relayed(request)).await.expect("retry").into_inner().enqueued);
+	assert_eq!(fx.inbox(investor).await.len(), 1, "a retry adds nothing");
+
+	let admin = fx.admin().await;
+	assert!(
+		fx.relay()
+			.send_governance_mail(relayed(consent_outcome(admin, investor, "INVALIDATED")))
+			.await
+			.expect("staff may be told")
+			.into_inner()
+			.enqueued
+	);
+	assert!(fx.inbox(admin).await.is_empty(), "the staff copy leaves no inbox entry");
+	assert_eq!(fx.inbox(investor).await.len(), 1, "nor one in the subject's inbox on staff's behalf");
 }
 
 /// Pitfall 21/24's server half: the number the live feed emits moves on every write and
