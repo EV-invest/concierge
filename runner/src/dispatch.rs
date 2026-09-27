@@ -218,28 +218,30 @@ pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_u
 			// joining onto the origin cannot leave it.
 			&format!("{}{}", cabinet_url.trim_end_matches('/'), text_field(payload, "link")),
 		)),
-		// Both words were chosen by the relay from closed sets; a row carrying anything else
-		// reached the queue some other way and is parked rather than guessed at — the two
-		// readers get different advice, and the wrong one is worse than none.
+		// Every word was chosen by the relay from a closed set, and the ending and its reason
+		// were checked to agree; a row carrying anything else reached the queue some other
+		// way and is parked rather than guessed at — the two readers get different advice,
+		// and the wrong one is worse than none.
 		"payment_outcome" => {
 			let reader = match text_field(payload, "audience").as_str() {
 				"subject" => templates::PaymentOutcomeReader::Subject,
 				"staff" => templates::PaymentOutcomeReader::Staff,
 				_ => return None,
 			};
-			let outcome = match text_field(payload, "outcome").as_str() {
-				"TOKEN_BURNED" => templates::ConsentOutcome::TokenBurned,
-				"INVALIDATED" => templates::ConsentOutcome::Invalidated,
+			let outcome = match (text_field(payload, "outcome").as_str(), text_field(payload, "reason").as_str()) {
+				("TOKEN_BURNED", "WRONG_CODES") => templates::ConsentOutcome::TokenBurned,
+				("INVALIDATED", "SESSIONS_REVOKED") => templates::ConsentOutcome::Invalidated(templates::InvalidationReason::SessionsRevoked),
+				("INVALIDATED", "EMAIL_CHANGED") => templates::ConsentOutcome::Invalidated(templates::InvalidationReason::EmailChanged),
 				_ => return None,
 			};
 			Some(templates::payment_outcome(
 				reader,
 				outcome,
-				&text_field(payload, "detail"),
 				&text_field(payload, "tier"),
 				&text_field(payload, "source"),
 				&text_field(payload, "destination"),
 				&text_field(payload, "amount"),
+				&text_field(payload, "payment_id"),
 			))
 		}
 		_ => None,
@@ -558,36 +560,42 @@ mod tests {
 		assert!(governance_mail("fee_policy_notice", &notice, "https://cabinet.example").is_none());
 	}
 
-	/// A cancelled consent renders for both readers and both endings, and carries nothing a
+	/// A cancelled consent renders for both readers and every ending, and carries nothing a
 	/// reader could act on: no code panel, no button, no URL in either part. A row whose
-	/// reader or ending this dispatcher does not know is parked, not guessed at.
+	/// reader, ending or reason this dispatcher does not know — or whose reason does not
+	/// belong to its ending — is parked, not guessed at.
 	#[test]
 	fn a_payment_outcome_renders_for_both_readers_and_carries_no_link() {
-		let row = |audience: &str, outcome: &str| {
+		let row = |audience: &str, outcome: &str, reason: &str| {
 			serde_json::json!({
-				"audience": audience, "outcome": outcome, "detail": "sessions revoked",
+				"audience": audience, "outcome": outcome, "reason": reason,
 				"tier": "external", "source": "Quy Nhon Fund — distributions",
 				"destination": "Your bank account ••4417", "amount": "1 200.00 USDT",
+				"payment_id": "7d7a1f0e-3f0b-4c1e-9a55-2b6f1e0c9d42",
 			})
 		};
 		for audience in ["subject", "staff"] {
-			for outcome in ["TOKEN_BURNED", "INVALIDATED"] {
-				let mail = governance_mail("payment_outcome", &row(audience, outcome), "https://cabinet.example").expect("renderable");
-				assert!(mail.subject.contains("1 200.00 USDT"), "{audience}/{outcome}: {}", mail.subject);
-				assert!(!mail.html.contains("<a ") && !mail.html.contains("href"), "{audience}/{outcome}: no link in the html");
-				assert!(!mail.html.contains("Type this code"), "{audience}/{outcome}: no code panel");
-				assert!(!mail.text.contains("http") && !mail.html.contains("cabinet.example"), "{audience}/{outcome}: no URL at all");
+			for (outcome, reason) in [("TOKEN_BURNED", "WRONG_CODES"), ("INVALIDATED", "SESSIONS_REVOKED"), ("INVALIDATED", "EMAIL_CHANGED")] {
+				let mail = governance_mail("payment_outcome", &row(audience, outcome, reason), "https://cabinet.example").expect("renderable");
+				let at = format!("{audience}/{outcome}/{reason}");
+				assert!(mail.subject.contains("1 200.00 USDT"), "{at}: {}", mail.subject);
+				assert!(!mail.html.contains("<a ") && !mail.html.contains("href"), "{at}: no link in the html");
+				assert!(!mail.html.contains("Type this code"), "{at}: no code panel");
+				assert!(!mail.text.contains("http") && !mail.html.contains("cabinet.example"), "{at}: no URL at all");
+				assert!(!mail.text.contains(reason), "{at}: the closed word is phrased, never printed");
+				assert_eq!(mail.text.contains("7d7a1f0e"), audience == "staff", "{at}: the payment id is for staff only");
 			}
 		}
-		assert!(
-			governance_mail("payment_outcome", &row("owner", "TOKEN_BURNED"), "https://cabinet.example").is_none(),
-			"an unknown reader"
-		);
-		assert!(
-			governance_mail("payment_outcome", &row("subject", "EXECUTED"), "https://cabinet.example").is_none(),
-			"an unknown ending"
-		);
-		let mut no_reader = row("subject", "TOKEN_BURNED");
+		for (row, why) in [
+			(row("owner", "TOKEN_BURNED", "WRONG_CODES"), "an unknown reader"),
+			(row("subject", "EXECUTED", "WRONG_CODES"), "an unknown ending"),
+			(row("subject", "INVALIDATED", "five wrong codes"), "an unknown reason"),
+			(row("staff", "TOKEN_BURNED", "EMAIL_CHANGED"), "a reason that does not belong to its ending"),
+			(row("staff", "INVALIDATED", "WRONG_CODES"), "nor this one"),
+		] {
+			assert!(governance_mail("payment_outcome", &row, "https://cabinet.example").is_none(), "{why}");
+		}
+		let mut no_reader = row("subject", "TOKEN_BURNED", "WRONG_CODES");
 		no_reader.as_object_mut().expect("object").remove("audience");
 		assert!(governance_mail("payment_outcome", &no_reader, "https://cabinet.example").is_none(), "no reader at all");
 	}

@@ -890,14 +890,40 @@ pub trait GovernanceRepository: Send + Sync {
 	async fn revision(&self) -> Result<u64, DomainError>;
 
 	/// Queue one governance mail to a resolved recipient, bypassing notification
-	/// preferences. False when `dedupe_key` had already been accepted.
+	/// preferences. What happened to `dedupe_key` is the answer — see
+	/// [`GovernanceMailQueued`].
 	///
 	/// `recipient` and `email_verified` are the identity record's, read together: the
 	/// subscriber row this refreshes is what `emit` later consults before mailing, so
 	/// the flag written here decides whether ordinary notifications may go to the
 	/// address — it must be the record's, never assumed from the fact that a governance
 	/// mail was addressed to it.
-	async fn enqueue_mail(&self, user_id: Uuid, recipient: &str, email_verified: bool, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<bool, DomainError>;
+	async fn enqueue_mail(
+		&self,
+		user_id: Uuid,
+		recipient: &str,
+		email_verified: bool,
+		kind: &str,
+		dedupe_key: &str,
+		payload: &serde_json::Value,
+	) -> Result<GovernanceMailQueued, DomainError>;
+}
+
+/// What queueing a governance mail did with its `dedupe_key`.
+///
+/// Three answers, not "inserted or not": the key is unique across the WHOLE queue, so a
+/// key already present may be this very mail being retried — or somebody else's mail. The
+/// two used to be one `false`, and the relay wrote an inbox trace for whoever the new call
+/// named, so a spent key reused for another recipient put an entry in their inbox without
+/// queueing anything or spending their budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernanceMailQueued {
+	/// A new row: the mail will be sent.
+	Inserted,
+	/// The key already names this kind of mail to this recipient: an at-least-once retry.
+	SameMail,
+	/// The key already names a mail of another kind, or to another recipient.
+	Foreign,
 }
 
 /// Port for the one-shot genesis seeding of the owner registry.

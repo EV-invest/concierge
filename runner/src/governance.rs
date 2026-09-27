@@ -66,11 +66,11 @@ use uuid::Uuid;
 use crate::{
 	authz::BreakGlass,
 	infrastructure::{
-		email::templates::{fmt_ts, pct_change},
+		email::templates::{breaks_or_hides, fmt_ts, pct_change},
 		governance::{AdmissionRecord, Audit, InvitationRecord, RemovalRecord, SelfDecision, UserProposalRecord},
 	},
 	notification::{RateLimiter, now_secs},
-	ports::{GovernanceRepository, NotificationRepository, UserDirectoryRepository},
+	ports::{GovernanceMailQueued, GovernanceRepository, NotificationRepository, UserDirectoryRepository},
 	support::{authenticate_service, domain_to_status},
 };
 
@@ -874,8 +874,10 @@ fn line(value: &str, max_bytes: usize, field: &str) -> Result<String, Status> {
 	if value.len() > max_bytes {
 		return Err(Status::invalid_argument(format!("{field} must be at most {max_bytes} bytes")));
 	}
-	if value.chars().any(char::is_control) {
-		return Err(Status::invalid_argument(format!("{field} must not contain control characters")));
+	// The renderer's own predicate, so what is refused here and what is folded there are
+	// one rule: the controls, and the Unicode characters that break or hide a line.
+	if value.chars().any(breaks_or_hides) {
+		return Err(Status::invalid_argument(format!("{field} must not contain control or invisible characters")));
 	}
 	Ok(value.to_owned())
 }
@@ -952,11 +954,59 @@ const PAYMENT_TIERS: [&str; 3] = ["internal", "service", "external"];
 /// [`PAYMENT_TIERS`]: this word becomes the headline of the mail.
 const OUTCOMES: [&str; 7] = ["APPROVED", "REJECTED", "EXPIRED", "CANCELLED", "EXECUTED", "EXECUTION_FAILED", "TOKEN_BURNED"];
 
-/// How a payment's consent can die before the payment moves: burned on wrong codes, or
-/// voided under the subject (sessions revoked, email changed). Closed for the reason
-/// [`OUTCOMES`] is — it picks the headline — and kept apart from it: these are not
-/// consilium endings, and the two kinds' payloads must not be able to pass as each other.
-const CONSENT_OUTCOMES: [&str; 2] = ["TOKEN_BURNED", "INVALIDATED"];
+/// How a payment's consent died, and why, read as ONE pair: burned — only ever on wrong
+/// codes — or invalidated under the subject, because their sessions were revoked or their
+/// address changed. Closed words because this plane phrases them itself: the reason used to
+/// be the money plane's free text inside our own sentence ("cancelled because …"), and no
+/// link filter makes that safe — a bare domain, a phone number or a lookalike host all read
+/// as the platform telling the subject where to go. Kept apart from [`OUTCOMES`]: these are
+/// not consilium endings, and the two kinds' payloads must not pass as each other.
+fn consent_ending(outcome: &str, reason: &str) -> Result<(), Status> {
+	match (outcome, reason) {
+		("TOKEN_BURNED", "WRONG_CODES") | ("INVALIDATED", "SESSIONS_REVOKED" | "EMAIL_CHANGED") => Ok(()),
+		("TOKEN_BURNED" | "INVALIDATED", _) => Err(Status::invalid_argument(
+			"reason must be WRONG_CODES for TOKEN_BURNED, or SESSIONS_REVOKED or EMAIL_CHANGED for INVALIDATED",
+		)),
+		_ => Err(Status::invalid_argument("outcome must be one of TOKEN_BURNED, INVALIDATED")),
+	}
+}
+
+/// An amount that is money and nothing else: a number — digits, with spaces, no-break
+/// spaces, `.`, `,` or `'` grouping it, at most 32 characters and starting with a digit —
+/// then one ASCII space and an upper-case currency code of 2 to 10 letters and digits.
+///
+/// Stricter than [`no_link`] on purpose, for the kind whose amount is the only
+/// money-plane string in its subject line: a link filter still lets a bare domain, a
+/// phone number or a sentence through, and the subject line is the part a lock screen
+/// previews with no label saying whose words it is. The consent and approval kinds keep
+/// [`no_link`] for now; they are live contracts.
+fn money_amount(value: &str) -> Result<String, Status> {
+	let value = line(value, 64, "amount")?;
+	let refuse = || Status::invalid_argument("amount must be a number followed by a currency code, e.g. `1 200.00 USDT`");
+	let (number, currency) = value.rsplit_once(' ').ok_or_else(refuse)?;
+	let number_ok = number.starts_with(|c: char| c.is_ascii_digit())
+		&& number.chars().count() <= 32
+		&& number.chars().all(|c| c.is_ascii_digit() || matches!(c, ' ' | '\u{00A0}' | '\u{202F}' | '.' | ',' | '\''));
+	let currency_ok = (2..=10).contains(&currency.len()) && currency.starts_with(|c: char| c.is_ascii_uppercase()) && currency.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+	if !(number_ok && currency_ok) {
+		return Err(refuse());
+	}
+	Ok(value)
+}
+
+/// A kind that leaves an inbox trace files it under `governance:<dedupe_key>`, and the
+/// trace keeps its key under the CHECK on `notifications.dedupe_key` only if the money
+/// plane's key leaves room for the prefix. Checked per KIND, not per recipient: one key
+/// must not be valid for one addressee of a kind and refused for the next.
+fn inbox_key_room(dedupe_key: &str) -> Result<(), Status> {
+	if dedupe_key.chars().count() + INBOX_KEY_PREFIX.len() > 128 {
+		return Err(Status::invalid_argument(format!(
+			"dedupe_key must be at most {} characters for this kind",
+			128 - INBOX_KEY_PREFIX.len()
+		)));
+	}
+	Ok(())
+}
 
 /// [`line`], plus: the word must be one of [`PAYMENT_TIERS`].
 fn payment_tier(value: &str) -> Result<String, Status> {
@@ -1085,14 +1135,13 @@ enum Recipient {
 	/// whose money moves, the one whose fund is repriced. Role decides nothing here, so
 	/// the rule is identity — and the address must be verified, because an unverified
 	/// one is one nobody has proved is theirs.
-	Subject(UserId),
-	/// A cancelled consent speaks to two people: the subject whose link was attacked or
-	/// voided, and the staff who opened or oversee the order — usually an admin, who holds
-	/// no seat. So the rule is the subject's identity OR a staff role (admin, owner), and
-	/// nobody else; an operator's role reaches no money decision, so it is not staff here.
-	/// Verified address either way. The mail carries no link and no code, so the widening
-	/// hands nobody a decision — only the news that a payment died.
-	SubjectOrStaff(UserId),
+	///
+	/// `or_staff` widens it for exactly one kind: a cancelled consent also speaks to the
+	/// staff who opened or oversee the order — usually an admin, who holds no seat — so an
+	/// admin or an owner may be the recipient too. An operator's role reaches no money
+	/// decision, so it is not staff here. That mail carries no link and no code, so the
+	/// widening hands nobody a decision — only the news that a payment died.
+	Subject { subject: UserId, or_staff: bool },
 }
 
 #[tonic::async_trait]
@@ -1232,14 +1281,7 @@ impl MailRelayService for MailRelay {
 				// Read here and enforced against the RESOLVED record below, so the rule stays
 				// "the recipient IS the subject" rather than "two request fields agree".
 				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
-				// The inbox entry keeps its key under the CHECK on `notifications.dedupe_key`
-				// only if the money plane's key leaves room for the prefix.
-				if req.dedupe_key.chars().count() + INBOX_KEY_PREFIX.len() > 128 {
-					return Err(Status::invalid_argument(format!(
-						"dedupe_key must be at most {} characters for this kind",
-						128 - INBOX_KEY_PREFIX.len()
-					)));
-				}
+				inbox_key_room(&req.dedupe_key)?;
 				let initiator_email = address(&mail.initiator_email, "initiator_email")?;
 				// `amount` is the one payload field the inbox repeats, and the inbox cannot
 				// mark it as somebody else's text — so it must not be able to carry a link.
@@ -1266,7 +1308,7 @@ impl MailRelayService for MailRelay {
 					"approval_url": self.approval_link(&mail.approval_url)?,
 					"code": line(&mail.code, 64, "code")?,
 				});
-				("payment_consent", payload, Recipient::Subject(subject), Some(notice))
+				("payment_consent", payload, Recipient::Subject { subject, or_staff: false }, Some(notice))
 			}
 			// The consilium asked about a fund's FEE TERMS. Addressed like a payment
 			// approval — a seat, a verified address — and it carries the same link and
@@ -1298,12 +1340,7 @@ impl MailRelayService for MailRelay {
 				let mail = req.fee_policy_notice.ok_or_else(|| Status::invalid_argument("fee_policy_notice is required for this kind"))?;
 				let proposed = mail.proposed.as_ref().ok_or_else(|| Status::invalid_argument("proposed terms are required"))?;
 				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
-				if req.dedupe_key.chars().count() + INBOX_KEY_PREFIX.len() > 128 {
-					return Err(Status::invalid_argument(format!(
-						"dedupe_key must be at most {} characters for this kind",
-						128 - INBOX_KEY_PREFIX.len()
-					)));
-				}
+				inbox_key_room(&req.dedupe_key)?;
 				// The fund's name is the one money-plane string the inbox repeats — a notice
 				// that does not say WHICH fund says nothing — so, like the consent's amount,
 				// it must not be able to carry a link.
@@ -1326,39 +1363,33 @@ impl MailRelayService for MailRelay {
 					"effective_at": mail.effective_at,
 					"link": cabinet_path(&mail.link)?,
 				});
-				("fee_policy_notice", payload, Recipient::Subject(subject), Some(notice))
+				("fee_policy_notice", payload, Recipient::Subject { subject, or_staff: false }, Some(notice))
 			}
 			// A payment that died waiting for its subject's consent. Nothing here is a secret
-			// and nothing may become a link: the mail has no link of its own, so any the money
-			// plane smuggled in would be the only one in it.
+			// and no money-plane text reaches a sentence: the ending and its reason are closed
+			// words this plane phrases, the amount must read as money, and the two ends of the
+			// transfer are values in a box, refused if they carry a link.
 			Ok(GovernanceMailKind::PaymentOutcome) => {
 				let mail = req.payment_outcome.ok_or_else(|| Status::invalid_argument("payment_outcome is required for this kind"))?;
-				let outcome = line(&mail.outcome, 16, "outcome")?;
-				if !CONSENT_OUTCOMES.contains(&outcome.as_str()) {
-					return Err(Status::invalid_argument("outcome must be one of TOKEN_BURNED, INVALIDATED"));
-				}
 				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
-				// Only the subject's copy writes an inbox entry, but the key rule is the kind's,
-				// not the recipient's: one money-plane key must not be valid for one addressee
-				// and refused for the next.
-				if req.dedupe_key.chars().count() + INBOX_KEY_PREFIX.len() > 128 {
-					return Err(Status::invalid_argument(format!(
-						"dedupe_key must be at most {} characters for this kind",
-						128 - INBOX_KEY_PREFIX.len()
-					)));
-				}
-				// `detail` is woven into the platform's own sentence ("cancelled because …"),
-				// and `source`/`destination` are free text a person recognises — all three take
-				// the free-text link rule. `amount` repeats in the subject line and the inbox,
-				// so it takes the coarse one, as everywhere else.
-				let detail = no_url(&required_line(&mail.detail, 200, "detail")?, "detail")?;
-				let amount = no_link(&line(&mail.amount, 64, "amount")?, "amount")?;
+				// Before anything is judged about the recipient: staff are not told about a
+				// payment of nobody's money, and "is this the subject" is only a question once
+				// the subject is a user of this plane.
+				self.users
+					.find_by_id(subject)
+					.await
+					.map_err(domain_to_status)?
+					.ok_or_else(|| Status::not_found("subject is not a user of this plane"))?;
+				consent_ending(&mail.outcome, &mail.reason)?;
+				inbox_key_room(&req.dedupe_key)?;
+				let amount = money_amount(&mail.amount)?;
+				let payment_id = Uuid::parse_str(&mail.payment_id).map_err(|_| Status::invalid_argument("payment_id must be a UUID"))?;
 				// The request's user_id is the addressee. Whether they ARE the subject decides
 				// the copy and the inbox trace; whether they may be written to at all is decided
 				// against the resolved record below.
 				let to_subject = user_id == subject;
 				let notice = to_subject.then(|| InboxNotice {
-					title: if outcome == "TOKEN_BURNED" {
+					title: if mail.outcome == "TOKEN_BURNED" {
 						"Your payment consent link was locked".to_owned()
 					} else {
 						"A payment awaiting your consent was cancelled".to_owned()
@@ -1369,14 +1400,15 @@ impl MailRelayService for MailRelay {
 				});
 				let payload = serde_json::json!({
 					"audience": if to_subject { "subject" } else { "staff" },
-					"outcome": outcome,
-					"detail": detail,
+					"outcome": mail.outcome,
+					"reason": mail.reason,
 					"tier": payment_tier(&mail.tier)?,
 					"source": no_url(&line(&mail.source, 160, "source")?, "source")?,
 					"destination": no_url(&line(&mail.destination, 160, "destination")?, "destination")?,
 					"amount": amount,
+					"payment_id": payment_id.to_string(),
 				});
-				("payment_outcome", payload, Recipient::SubjectOrStaff(subject), notice)
+				("payment_outcome", payload, Recipient::Subject { subject, or_staff: true }, notice)
 			}
 			_ => return Err(Status::invalid_argument("kind must be a known governance mail kind")),
 		};
@@ -1408,15 +1440,24 @@ impl MailRelayService for MailRelay {
 					return Err(Status::failed_precondition("a consilium mail may only be sent to a verified address"));
 				}
 			}
-			Recipient::Subject(subject) => {
+			Recipient::Subject { subject, or_staff } => {
 				// Consent is personal: it is only worth anything from the person whose money
 				// moves, and that person is ordinarily an investor holding no seat. So the
 				// owner rule cannot be reused, and dropping it for everyone would hand a
 				// compromised money plane a branded security mail aimed at any address on the
 				// platform. Identity is the narrower rule that replaces it: this mail may
-				// reach exactly the one person the payload names, and nobody else.
-				if recipient.id() != subject {
-					return Err(Status::failed_precondition(format!("a {noun} may only be addressed to the person it names as its subject")));
+				// reach exactly the one person the payload names — or, for the one kind that
+				// also speaks to staff, an admin or an owner by PERSISTED role: emergency
+				// access authorizes an operator for a session, it does not make them a
+				// correspondent of the money plane.
+				let staff = or_staff && matches!(recipient.role(), Role::Admin | Role::Owner);
+				if recipient.id() != subject && !staff {
+					let whom = if or_staff {
+						"the person it names as its subject or to staff"
+					} else {
+						"the person it names as its subject"
+					};
+					return Err(Status::failed_precondition(format!("a {noun} may only be addressed to {whom}")));
 				}
 				// An unverified address is one nobody has proved belongs to this person. For a
 				// notification that is a nuisance; for a mail carrying a consent link AND the
@@ -1426,29 +1467,24 @@ impl MailRelayService for MailRelay {
 					return Err(Status::failed_precondition(format!("a {noun} may only be sent to a verified address")));
 				}
 			}
-			// The PERSISTED role, as for the owner rule: emergency access authorizes an
-			// operator for a session, it does not make them a correspondent of the money plane.
-			Recipient::SubjectOrStaff(subject) => {
-				let staff = matches!(recipient.role(), Role::Admin | Role::Owner);
-				if recipient.id() != subject && !staff {
-					return Err(Status::failed_precondition(format!(
-						"a {noun} may only be addressed to the person it names as its subject or to staff"
-					)));
-				}
-				if !recipient.email_verified() {
-					return Err(Status::failed_precondition(format!("a {noun} may only be sent to a verified address")));
-				}
-			}
 		}
 
-		let enqueued = self
+		let queued = self
 			.governance
 			.enqueue_mail(user_id.raw(), recipient.email().as_str(), recipient.email_verified(), kind, &req.dedupe_key, &payload)
 			.await
 			.map_err(domain_to_status)?;
-		if enqueued {
-			self.limiter.record(&budget_key);
-		}
+		let enqueued = match queued {
+			GovernanceMailQueued::Inserted => {
+				self.limiter.record(&budget_key);
+				true
+			}
+			GovernanceMailQueued::SameMail => false,
+			// Not a retry: the key is unique across the queue and names somebody else's mail,
+			// or another kind. Answering `enqueued: false` here and tracing anyway is what let
+			// one spent key put entries in any inbox without queueing or spending anything.
+			GovernanceMailQueued::Foreign => return Err(Status::already_exists("dedupe_key already belongs to another mail")),
+		};
 
 		// The inbox trace, written AFTER the mail is queued and never in its way: the
 		// queue row is the security channel and the thing the money plane retries on; the
@@ -1631,5 +1667,66 @@ mod tests {
 		assert_eq!(bounded("0x1234", 128, "address").unwrap(), "0x1234");
 		assert!(bounded(&"a".repeat(128), 128, "address").is_ok());
 		assert!(bounded(&"a".repeat(129), 128, "address").is_err());
+	}
+
+	/// A line refuses what breaks it or hides part of it, not only the C0/C1 controls:
+	/// a mail client ends a line at U+2028/U+2029 too, and a zero-width or bidi character
+	/// makes the text say something other than what it shows.
+	#[test]
+	fn a_line_refuses_unicode_breaks_and_invisible_characters() {
+		for bad in [
+			"a\nb", "a\u{2028}b", "a\u{2029}b", "a\u{200B}b", "a\u{200F}b", "a\u{202A}b", "a\u{202E}b", "a\u{2060}b", "a\u{2064}b", "a\u{2066}b", "a\u{2069}b", "a\u{FEFF}b",
+		] {
+			assert!(line(bad, 64, "f").is_err(), "{bad:?}");
+		}
+		for good in ["Quy Nhon Fund — distributions", "1\u{00A0}200 USDT", "Your bank account ••4417", "Zürich"] {
+			assert!(line(good, 64, "f").is_ok(), "{good:?}");
+		}
+	}
+
+	/// An amount lands in the subject line, so it is money and nothing else: a number with
+	/// the usual separators, one space, a currency code.
+	#[test]
+	fn an_amount_is_money_and_nothing_else() {
+		for good in ["1 200.00 USDT", "0.5 BTC", "1\u{00A0}200,50 EUR", "1\u{202F}200 EUR", "12'000 CHF", "7 USDT0", "1 AB"] {
+			assert!(money_amount(good).is_ok(), "{good:?}");
+		}
+		for bad in [
+			"",
+			"USDT",
+			"1",
+			"USDT 1",
+			"1 usdt",
+			"1 U",
+			"1 ABCDEFGHIJK",
+			".5 BTC",
+			"1 USDT evil.example",
+			"1 USDT http",
+			"1 evil.example",
+			"call 555 USDT",
+			"1\tUSDT",
+			"1  USDT ",
+			"1 200 000 000 000 000 000 000 000 000 000 000 USDT",
+		] {
+			assert!(money_amount(bad).is_err(), "{bad:?}");
+		}
+	}
+
+	/// The two closed words are read together: each ending admits its own reasons only.
+	#[test]
+	fn a_consent_ending_and_its_reason_must_agree() {
+		for (outcome, reason) in [("TOKEN_BURNED", "WRONG_CODES"), ("INVALIDATED", "SESSIONS_REVOKED"), ("INVALIDATED", "EMAIL_CHANGED")] {
+			assert!(consent_ending(outcome, reason).is_ok(), "{outcome}/{reason}");
+		}
+		for (outcome, reason) in [
+			("TOKEN_BURNED", "SESSIONS_REVOKED"),
+			("TOKEN_BURNED", "EMAIL_CHANGED"),
+			("INVALIDATED", "WRONG_CODES"),
+			("INVALIDATED", ""),
+			("EXECUTED", "WRONG_CODES"),
+			("TOKEN_BURNED", "wrong_codes"),
+		] {
+			assert!(consent_ending(outcome, reason).is_err(), "{outcome}/{reason}");
+		}
 	}
 }

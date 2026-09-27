@@ -58,9 +58,11 @@ never calls `banking`:
    five wrong codes, or was INVALIDATED under the subject) is told to the subject the
    payload names OR to staff (`admin`/`owner`, persisted role — whoever opened the
    order is usually an admin with no seat), verified address either way. It carries no
-   link and no code, every free-text field refuses URLs, and only the subject's copy
-   leaves an inbox trace; the relay stores which reader it was (`audience`) and the
-   renderer writes a different mail for each.
+   link and no code; why the consent died is a closed word this plane phrases itself,
+   the amount must read as money, and only the subject's copy leaves an inbox trace. The
+   relay stores which reader it was (`audience`) and the renderer writes a different
+   mail for each. A `dedupe_key` names ONE mail (one kind, one recipient): reusing it for
+   another is refused `ALREADY_EXISTS`, so each copy of a kind needs its own key.
 
 Both seams are authenticated by the SAME shared bridge service token
 (`BRIDGE_SERVICE_TOKEN`), compared in constant time and mounted OUTSIDE the user

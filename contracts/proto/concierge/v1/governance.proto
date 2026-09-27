@@ -587,6 +587,12 @@ message SendGovernanceMailRequest {
   // the identity record, so the money plane cannot redirect a governance mail.
   string user_id = 2;
   // Idempotency key. The same key never sends twice.
+  //
+  // A key names ONE mail: one kind, to one recipient. Reusing a key for the same mail is a
+  // retry and answers `enqueued: false`; reusing it for a different recipient or kind is
+  // refused ALREADY_EXISTS, because the key is unique across the whole queue. So a kind
+  // told to several people — PAYMENT_OUTCOME to the subject and to each staff member —
+  // needs a key per copy.
   string dedupe_key = 3;
   // Typed fields the template consumes. Escaped at render; never interpreted as markup.
   PayoutApprovalMail payout_approval = 4;
@@ -836,26 +842,31 @@ message FeePolicyNoticeMail {
 // their mailbox; staff get the order's details) and whether an inbox trace is written (the
 // subject only).
 //
-// Nothing here is a secret and nothing can be a link: no URL, no code, and every free-text
-// field is refused if it carries a scheme or `www.`.
+// Nothing here is a secret and nothing can be a link: no URL, no code. Why the consent
+// died is a closed word the platform phrases itself, and the amount must read as money —
+// no money-plane text reaches a sentence of ours.
 message PaymentOutcomeMail {
   // Concierge canonical id of the user whose money the payment would have moved.
   string subject_user_id = 1;
   // TOKEN_BURNED (five wrong codes on the consent page) or INVALIDATED (the consent was
   // voided under the subject — sessions revoked, email changed). A closed set.
   string outcome = 2;
-  // Why, in one line of the money plane's words: "five wrong codes", "sessions revoked",
-  // "email changed". Required; refused if it carries a control character or a link.
-  string detail = 3;
+  // Why the consent died, as a closed word this plane turns into its own phrase:
+  // WRONG_CODES (the only reason for TOKEN_BURNED), SESSIONS_REVOKED or EMAIL_CHANGED (the
+  // two reasons for INVALIDATED). Any other word, or a pair that does not match, is refused.
+  string reason = 3;
   // internal | service | external — the consent kind's closed set.
   string tier = 4;
   // Where the money would have left from, in words a person recognises.
   string source = 5;
   // Where it would have landed, in words a person recognises.
   string destination = 6;
-  // The amount, spelled by the money plane (`1 200.00 USDT`). Repeated in the subject line
-  // and in the subject's inbox, so it may not carry a link.
+  // The amount, spelled by the money plane (`1 200.00 USDT`): digits with the usual
+  // separators, one ASCII space, an upper-case currency code. Repeated in the subject line
+  // and in the subject's inbox, so anything else is refused.
   string amount = 7;
+  // The payment's id, a UUID. Shown to staff so they can find the order; not to the subject.
+  string payment_id = 8;
 }
 
 message SendGovernanceMailResponse {

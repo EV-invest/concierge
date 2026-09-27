@@ -26,7 +26,7 @@ use domain::error::DomainError;
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
-use crate::ports::{NotificationDispatchRepository, NotificationRepository};
+use crate::ports::{GovernanceMailQueued, NotificationDispatchRepository, NotificationRepository};
 
 pub struct PgNotifications {
 	pool: PgPool,
@@ -601,8 +601,12 @@ pub(crate) async fn upsert_subscriber(conn: &mut PgConnection, user_id: Uuid, em
 /// warning that their own expulsion — or a payout — is being approved. So this writes
 /// straight to the queue and never consults `notification_subscriptions`.
 ///
-/// Returns false when `dedupe_key` had already been accepted, which is what makes the
-/// money plane's at-least-once relay safe to retry.
+/// Idempotent by `dedupe_key`, which is what makes the money plane's at-least-once relay
+/// safe to retry — and a key already present is told apart as the same mail (same
+/// subscriber, same kind) or a foreign one; see [`GovernanceMailQueued`]. The conflicting
+/// row is read after the insert yields to it: under READ COMMITTED an `ON CONFLICT DO
+/// NOTHING` has waited for the other writer to commit, and queue rows are never deleted,
+/// so it is there to read.
 pub(crate) async fn enqueue_governance_mail(
 	conn: &mut PgConnection,
 	subscriber_id: Uuid,
@@ -610,7 +614,7 @@ pub(crate) async fn enqueue_governance_mail(
 	kind: &str,
 	dedupe_key: &str,
 	payload: &serde_json::Value,
-) -> Result<bool, DomainError> {
+) -> Result<GovernanceMailQueued, DomainError> {
 	let inserted = sqlx::query(
 		"INSERT INTO notification_deliveries (notification_id, subscriber_id, kind, recipient, dedupe_key, payload) \
 		 VALUES (NULL, $1, $2, $3, $4, $5) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING RETURNING id",
@@ -623,5 +627,18 @@ pub(crate) async fn enqueue_governance_mail(
 	.fetch_optional(&mut *conn)
 	.await
 	.map_err(repo_err)?;
-	Ok(inserted.is_some())
+	if inserted.is_some() {
+		return Ok(GovernanceMailQueued::Inserted);
+	}
+	let (owner, owner_kind): (Uuid, String) = sqlx::query_as("SELECT subscriber_id, kind FROM notification_deliveries WHERE dedupe_key = $1")
+		.bind(dedupe_key)
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?
+		.ok_or_else(|| DomainError::Repository("a governance mail's dedupe key conflicted with a row that is not there".into()))?;
+	Ok(if owner == subscriber_id && owner_kind == kind {
+		GovernanceMailQueued::SameMail
+	} else {
+		GovernanceMailQueued::Foreign
+	})
 }
