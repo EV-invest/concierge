@@ -53,7 +53,14 @@ never calls `banking`:
    whose fund is repriced, traced in their inbox, and carries no code — its only
    link is a cabinet-relative path the dispatcher hangs off `CABINET_URL`, so the
    money plane names no host at all. Fee terms cross the wire as basis points and
-   closed vocabularies; the percentages are rendered here.
+   closed vocabularies; the percentages are rendered here. `PAYMENT_OUTCOME` is the
+   one two-armed rule: a payment that died waiting for consent (the link BURNED on
+   five wrong codes, or was INVALIDATED under the subject) is told to the subject the
+   payload names OR to staff (`admin`/`owner`, persisted role — whoever opened the
+   order is usually an admin with no seat), verified address either way. It carries no
+   link and no code, every free-text field refuses URLs, and only the subject's copy
+   leaves an inbox trace; the relay stores which reader it was (`audience`) and the
+   renderer writes a different mail for each.
 
 Both seams are authenticated by the SAME shared bridge service token
 (`BRIDGE_SERVICE_TOKEN`), compared in constant time and mounted OUTSIDE the user
