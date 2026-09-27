@@ -41,7 +41,7 @@ use uuid::Uuid;
 use crate::{
 	genesis::{GenesisOutcome, GenesisSubject, Resolution, Unseatable, UnseatableReason},
 	infrastructure::{notifications, users},
-	ports::{GovernanceRepository, OwnerGenesisRepository},
+	ports::{GovernanceMailQueued, GovernanceRepository, OwnerGenesisRepository},
 };
 
 /// Crockford base32 with `I`, `L`, `O` and `U` removed — the four a person mistypes or
@@ -1523,7 +1523,15 @@ impl GovernanceRepository for PgGovernance {
 		Ok(value.max(0) as u64)
 	}
 
-	async fn enqueue_mail(&self, user_id: Uuid, recipient: &str, email_verified: bool, kind: &str, dedupe_key: &str, payload: &serde_json::Value) -> Result<bool, DomainError> {
+	async fn enqueue_mail(
+		&self,
+		user_id: Uuid,
+		recipient: &str,
+		email_verified: bool,
+		kind: &str,
+		dedupe_key: &str,
+		payload: &serde_json::Value,
+	) -> Result<GovernanceMailQueued, DomainError> {
 		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
 		// The upsert OVERWRITES `email_verified`, and `emit` reads it back as "may this
 		// address be mailed". Hard-coding `true` here made every governance recipient
