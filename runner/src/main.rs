@@ -91,8 +91,6 @@ fn main() -> Result<()> {
 }
 
 async fn run(config: config::AppConfig) -> Result<()> {
-	infrastructure::config_drift::spawn(config::AppConfig::var_names());
-
 	// `OWNER_SUBJECTS`, pre-loaded from env. It does two things and then retires: it seeds
 	// the genesis roster below, and until the registry is populated it lets a listed
 	// subject authorize as an owner. Shared by every service that resolves or reports a
@@ -392,8 +390,10 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			.context("concierge gRPC server error")
 	};
 
-	tokio::try_join!(grpc_server, web_server, bridge_tls_server)?;
-	Ok(())
+	tokio::select! {
+		served = async { tokio::try_join!(grpc_server, web_server, bridge_tls_server) } => served.map(|_| ()),
+		never = config::AppConfig::watch_drift() => match never {},
+	}
 }
 
 /// The identity-verification vendor, or `None` when it is not configured.

@@ -13,10 +13,7 @@
 //!   the target's emailed token, and the seat change itself (written through the
 //!   `users` helpers, in the same transaction as the verdict).
 //! - [`email`] — the SMTP transport seam and the rendered messages that cross it.
-//! - [`config_drift`] — watches the mounted settings Secret and warns when the
-//!   values this process booted with stop matching it.
 
-pub mod config_drift;
 pub mod db;
 pub mod email;
 pub mod governance;

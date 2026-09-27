@@ -1708,9 +1708,9 @@ dependencies = [
 
 [[package]]
 name = "ev_lib"
-version = "0.7.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "715778aa8403e6b555e7fa4389bcff28252a5c585b4aa085909d02d922e3fd38"
+checksum = "76afd3b6d5ab1663841d4cb87ccf9d777714974a20ac8f66acad75f769ba1adf"
 dependencies = [
  "async-trait",
  "dioxus",
@@ -1725,6 +1725,7 @@ dependencies = [
  "sentry",
  "serde",
  "serde_json",
+ "tokio",
  "tonic 0.13.1",
  "tracing",
  "tracing-opentelemetry",
