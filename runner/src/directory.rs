@@ -609,7 +609,10 @@ impl UserDirectory for Directory {
 		if !authority.may_list() {
 			return Err(Status::permission_denied("a scope's grants are listed to a global admin or owner, or to the scope's own admin"));
 		}
-		let legal_names = authority.sees_legal_names();
+		// Names are staff's to see. A scope admin gets addresses and grants: anything that
+		// says who an address belongs to would turn a grant-then-list into an identity
+		// lookup (banking#447).
+		let names = authority.sees_legal_names();
 		let holders = self.scopes.holders(&scope).await.map_err(domain_to_status)?;
 		Ok(Response::new(ListScopedGrantsResponse {
 			holders: holders
@@ -617,8 +620,8 @@ impl UserDirectory for Directory {
 				.map(|holder| ScopeHolder {
 					grant: Some(grant_to_proto(holder.grant)),
 					email: holder.email.unwrap_or_default(),
-					legal_name: holder.legal_name.filter(|_| legal_names).unwrap_or_default(),
-					preferred_name: holder.preferred_name.unwrap_or_default(),
+					legal_name: holder.legal_name.filter(|_| names).unwrap_or_default(),
+					preferred_name: holder.preferred_name.filter(|_| names).unwrap_or_default(),
 				})
 				.collect(),
 		}))

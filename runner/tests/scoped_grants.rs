@@ -391,7 +391,10 @@ async fn the_roster_carries_each_holders_identity_and_is_visible_to_its_admin() 
 		.expect("the member is listed");
 	assert_eq!(row.email, fx.email_of(member).await);
 	assert_eq!(row.legal_name, "", "the legal name stays with staff");
-	assert_eq!(row.preferred_name, "Ada");
+	assert_eq!(
+		row.preferred_name, "",
+		"so does the chosen name: the roster must not tell a scope admin who an address belongs to"
+	);
 	let grant = row.grant.as_ref().unwrap();
 	assert_eq!(grant.role, "operator");
 	assert_eq!(grant.scope, fx.scope);
