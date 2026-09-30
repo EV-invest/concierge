@@ -8,8 +8,8 @@
 //! the banking plane's own grants, and scopes are never mirrored across the bridge.
 //!
 //! Who may hand a scope out is [`ScopeAuthority`]: a global `admin`/`owner` may grant
-//! anything, the `admin` of a scope may grant `operator`/`viewer` inside that scope and
-//! never touch an `admin` grant, and everyone else may do nothing. The last clause is the
+//! anything, the `admin` of a scope may grant `operator` inside that scope and never touch
+//! an `admin` grant, and everyone else may do nothing. The last clause is the
 //! point of the whole matrix — a scope admin who could mint scope admins could hand the
 //! scope to anyone and then be removed without the scope ever coming back.
 //!
@@ -81,10 +81,14 @@ impl fmt::Display for Scope {
 /// The role a user holds inside one scope, least→most privileged. What each one may DO
 /// inside the resource is the resource's own policy; this plane only decides who holds
 /// which.
+///
+/// There is deliberately no read-only `viewer`: it would be exactly an ordinary signed-in
+/// user (a global `investor`), who has no access to the service at all. A grant that
+/// opens nothing only suggests that it does, so migration 0024 removed the one 0023
+/// shipped.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeRole {
-	Viewer,
 	Operator,
 	Admin,
 }
@@ -92,7 +96,6 @@ pub enum ScopeRole {
 impl ScopeRole {
 	pub fn as_str(self) -> &'static str {
 		match self {
-			Self::Viewer => "viewer",
 			Self::Operator => "operator",
 			Self::Admin => "admin",
 		}
@@ -102,7 +105,6 @@ impl ScopeRole {
 	/// row never quietly grants or drops access.
 	pub fn parse(raw: &str) -> Result<Self, DomainError> {
 		match raw {
-			"viewer" => Ok(Self::Viewer),
 			"operator" => Ok(Self::Operator),
 			"admin" => Ok(Self::Admin),
 			// Echoed back to the caller, so bounded: the field is free input.
@@ -116,7 +118,7 @@ impl ScopeRole {
 pub enum ScopeAuthority {
 	/// A global role holding [`Permission::ScopeManage`]: any scope, any role.
 	Global,
-	/// The `admin` of this scope: `operator`/`viewer` grants inside it, never an `admin` one.
+	/// The `admin` of this scope: `operator` grants inside it, never an `admin` one.
 	ScopeAdmin,
 	/// Nothing.
 	None,
@@ -189,7 +191,7 @@ impl ScopeAuthority {
 mod tests {
 	use super::*;
 
-	const ALL_SCOPE_ROLES: [ScopeRole; 3] = [ScopeRole::Viewer, ScopeRole::Operator, ScopeRole::Admin];
+	const ALL_SCOPE_ROLES: [ScopeRole; 2] = [ScopeRole::Operator, ScopeRole::Admin];
 
 	#[test]
 	fn scope_admin_cannot_grant_admin() {
@@ -218,15 +220,11 @@ mod tests {
 	}
 
 	#[test]
-	fn scope_admin_manages_operators_and_viewers_only() {
+	fn scope_admin_manages_operators_only() {
 		let authority = ScopeAuthority::ScopeAdmin;
-		for requested in [ScopeRole::Viewer, ScopeRole::Operator] {
-			assert!(authority.may_grant(requested, None));
-			assert!(authority.may_grant(requested, Some(ScopeRole::Viewer)));
-			assert!(authority.may_grant(requested, Some(ScopeRole::Operator)));
-			assert!(!authority.may_grant(requested, Some(ScopeRole::Admin)), "an admin grant is not a scope admin's to move");
-		}
-		assert!(authority.may_revoke(ScopeRole::Viewer));
+		assert!(authority.may_grant(ScopeRole::Operator, None));
+		assert!(authority.may_grant(ScopeRole::Operator, Some(ScopeRole::Operator)));
+		assert!(!authority.may_grant(ScopeRole::Operator, Some(ScopeRole::Admin)), "an admin grant is not a scope admin's to move");
 		assert!(authority.may_revoke(ScopeRole::Operator));
 		assert!(!authority.may_revoke(ScopeRole::Admin));
 		assert!(authority.may_list());
@@ -249,7 +247,7 @@ mod tests {
 	#[test]
 	fn everyone_else_manages_nothing() {
 		for global in [Role::Investor, Role::Operator] {
-			for held in [None, Some(ScopeRole::Viewer), Some(ScopeRole::Operator)] {
+			for held in [None, Some(ScopeRole::Operator)] {
 				let authority = ScopeAuthority::resolve(global, held);
 				assert_eq!(authority, ScopeAuthority::None, "{global:?} holding {held:?}");
 				assert!(!authority.may_list());
@@ -301,6 +299,7 @@ mod tests {
 			assert_eq!(ScopeRole::parse(role.as_str()).unwrap(), role);
 		}
 		assert!(ScopeRole::parse("owner").is_err());
+		assert!(ScopeRole::parse("viewer").is_err(), "the read-only role was removed; it must not parse back");
 		assert!(ScopeRole::parse("Admin").is_err());
 	}
 }

@@ -227,7 +227,7 @@ fn scope_refused(actor: &ScopeActor, verb: &'static str, scope: &Scope, requeste
 /// The one refusal every scope write shares. Worded as the rule, so a scope admin who
 /// reached for an admin grant learns why without a second request.
 fn scope_denied() -> Status {
-	Status::permission_denied("scoped grants are managed by a global admin or owner, or by the scope's own admin for operator and viewer grants only")
+	Status::permission_denied("scoped grants are managed by a global admin or owner, or by the scope's own admin for operator grants only")
 }
 
 #[tonic::async_trait]
