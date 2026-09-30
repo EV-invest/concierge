@@ -22,6 +22,11 @@ use crate::{
 	jwks::JwksCache,
 };
 
+/// The ceiling on a relying party's access-token lifetime, whatever `AUTH_ACCESS_TTL_SECS`
+/// says. Such a token is held by a backend on another origin; the shorter it lives, the
+/// less a leak of one is worth.
+pub const MAX_CLIENT_ACCESS_TTL_SECS: u64 = 900;
+
 /// Signs the plane's first-party access and service tokens with the active key.
 ///
 /// The private key never appears in a `Debug` rendering: a leaked `Signer` in a log
@@ -60,6 +65,10 @@ impl Signer {
 	}
 
 	fn mint(&self, sub: &str, audience: &str, typ: TokenType, ttl_secs: u64, token_version: u64) -> Result<(String, u64), AuthError> {
+		self.mint_with_jti(sub, audience, typ, ttl_secs, token_version, uuid::Uuid::new_v4().to_string())
+	}
+
+	fn mint_with_jti(&self, sub: &str, audience: &str, typ: TokenType, ttl_secs: u64, token_version: u64, jti: String) -> Result<(String, u64), AuthError> {
 		let now = get_current_timestamp();
 		let exp = now + ttl_secs;
 		let claims = Claims {
@@ -69,7 +78,7 @@ impl Signer {
 			exp,
 			iat: now,
 			typ,
-			jti: Some(uuid::Uuid::new_v4().to_string()),
+			jti: Some(jti),
 			token_version,
 		};
 		let token = encode(&self.header(), &claims, &self.encoding).map_err(|_| AuthError::NotConfigured)?;
@@ -79,6 +88,16 @@ impl Signer {
 	/// Mint a client access token for a user. Returns `(token, exp_unix_secs)`.
 	pub fn mint_access(&self, user_id: &str, token_version: u64) -> Result<(String, u64), AuthError> {
 		self.mint(user_id, &self.client_audience, TokenType::Access, self.access_ttl_secs, token_version)
+	}
+
+	/// Mint a relying party's access token: `typ=access` under the CLIENT's audience, so
+	/// no verifier pinned to this plane's own audience (every RPC here but `GetMe`, and
+	/// the money plane's BFF) will take it. The `jti` is `<session_id>:<uuid>` — the
+	/// refresh family it was issued under, so the one RPC it reaches can refuse it the
+	/// moment that family is revoked rather than at its expiry.
+	pub fn mint_client_access(&self, user_id: &str, audience: &str, token_version: u64, session_id: &str) -> Result<(String, u64), AuthError> {
+		let ttl = self.access_ttl_secs.min(MAX_CLIENT_ACCESS_TTL_SECS);
+		self.mint_with_jti(user_id, audience, TokenType::Access, ttl, token_version, format!("{session_id}:{}", uuid::Uuid::new_v4()))
 	}
 
 	/// Mint an inter-service token for `service_name`. Returns `(token, exp_unix_secs)`.
@@ -237,6 +256,49 @@ mod tests {
 
 		// An access-only client policy must reject the service token.
 		assert!(verify_token(&token, &cache, &policy("concierge-services", vec![TokenType::Access])).is_err());
+	}
+
+	// A relying party's token (`aud=sa`) must be worthless to every verifier that is not
+	// the client's own: this plane's (pinned to `concierge`, what every RPC but GetMe and
+	// the cabinet BFF verify against) and the money plane's (`banking-core`). jsonwebtoken
+	// compares audiences exactly, so neither a prefix nor a superset sneaks through.
+	#[test]
+	fn a_client_token_verifies_only_under_its_own_audience() {
+		let mut cfg = config();
+		cfg.issuer = "https://auth.concierge.ev".into();
+		cfg.access_ttl_secs = 3600;
+		let signing = cfg.signing.clone().unwrap();
+		let signer = Signer::try_new(&signing, &cfg).unwrap();
+		let (cache, _) = load_jwks(&signing).unwrap();
+
+		let (token, exp) = signer.mint_client_access("user-123", "sa", 4, "session-1").unwrap();
+		let claims = verify_token(
+			&token,
+			&cache,
+			&VerifyPolicy {
+				issuer: "https://auth.concierge.ev".into(),
+				audiences: vec!["sa".into()],
+				allowed_types: vec![TokenType::Access],
+			},
+		)
+		.unwrap();
+		assert_eq!(claims.token_version, 4);
+		assert!(claims.jti.as_deref().is_some_and(|jti| jti.starts_with("session-1:")));
+		assert!(exp - claims.iat <= MAX_CLIENT_ACCESS_TTL_SECS, "capped whatever AUTH_ACCESS_TTL_SECS says");
+
+		for (issuer, audiences) in [
+			("https://auth.concierge.ev", vec!["concierge"]),
+			("https://auth.concierge.ev", vec!["concierge", "concierge-services"]),
+			("https://auth.banking.ev", vec!["banking-core"]),
+			("https://auth.concierge.ev", vec!["s"]),
+		] {
+			let policy = VerifyPolicy {
+				issuer: issuer.into(),
+				audiences: audiences.iter().map(|a| (*a).to_owned()).collect(),
+				allowed_types: vec![TokenType::Access, TokenType::Service],
+			};
+			assert!(verify_token(&token, &cache, &policy).is_err(), "aud=sa must not verify under {audiences:?}");
+		}
 	}
 
 	#[test]

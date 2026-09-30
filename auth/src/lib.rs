@@ -6,7 +6,8 @@
 //! # For the concierge runner
 //!
 //! - [`AuthService`] is the user/session issuance surface (`Exchange`/`Refresh`/
-//!   `Logout`/`ListSessions`/`RevokeSession`/`Jwks`). The runner mounts it as a
+//!   `Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party
+//!   `ExchangeCode`/`RefreshClientToken` over the [`ClientGrants`] port). The runner mounts it as a
 //!   tonic server. It owns the signing keys / JWKS / Google client / refresh store
 //!   and provisions users in process over the [`Provisioner`] channel (auth →
 //!   directory). Built [`AuthService::try_new`] with a signing key configured it
@@ -29,6 +30,7 @@
 //! never be a dependency of the wasm-safe `domain` crate.
 
 pub mod claims;
+pub mod clients;
 pub mod config;
 pub mod interceptor;
 pub mod jwks;
@@ -45,8 +47,9 @@ mod management;
 mod signer;
 
 pub use claims::{Claims, TokenType};
+pub use clients::{BoxFuture, ClientGrant, ClientGrantError, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation};
 pub use config::{AuthConfig, GoogleConfig, SigningConfig, VerifierConfig};
-pub use interceptor::{AuthLayer, Authenticate, claims_of, grpc_auth_layer};
+pub use interceptor::{AuthLayer, Authenticate, RestrictedCaller, claims_of, grpc_auth_layer};
 pub use jwks::{JwksCache, VerifyPolicy, verify_token};
 pub use provisioner::{ProvisionCommand, ProvisionRequest, ProvisionedUser, Provisioner, provisioner_channel};
 pub use service::AuthService;

@@ -14,6 +14,8 @@
 //!   `users` helpers, in the same transaction as the verdict).
 //! - [`scoped_grants`] — a user's role over one resource (`allocation:<service_id>`),
 //!   decided and audited inside the transaction that writes it.
+//! - [`relying_parties`] — the registry of first-party clients on other origins, their
+//!   one-time authorization codes and their refresh families (all secrets as digests).
 //! - [`email`] — the SMTP transport seam and the rendered messages that cross it.
 
 pub mod db;
@@ -22,5 +24,6 @@ pub mod governance;
 pub mod kyc;
 pub mod notifications;
 pub mod platform;
+pub mod relying_parties;
 pub mod scoped_grants;
 pub mod users;

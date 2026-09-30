@@ -22,7 +22,9 @@ use concierge::{
 		self,
 		email::transport::{EmailTransport, NoopTransport, SmtpTransport},
 	},
-	log, notification, platform, web,
+	log, notification, platform,
+	relying_party::{self, ClientTokenAuthenticator, RelyingParties},
+	web,
 };
 use ev::error_monitoring::{self, Config as SentryConfig};
 use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
@@ -39,7 +41,7 @@ use evconcierge_contracts::concierge::v1::{
 	user_directory_server::UserDirectoryServer,
 	user_events_server::UserEventsServer,
 };
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{Request, Response, Status, server::NamedService, transport::Server};
 use tonic_web::GrpcWebLayer;
 use tower::{Layer, ServiceBuilder};
 use tower_http::trace::TraceLayer;
@@ -157,7 +159,29 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// and the flag saying whether that authority is the register's or the environment's.
 	let (provisioner, provision_rx) = provisioner_channel();
 	tokio::spawn(directory::run_provisioner(provision_rx, users.clone(), break_glass.clone()));
-	let auth_service = AuthService::try_new(auth_config, provisioner).await.context("failed to build the auth service")?;
+
+	// Relying parties: first-party clients on other origins signing users in through this
+	// plane (`relying_party`). The registry is data (migration 0025 seeds `sa`); each
+	// client's secret comes from `RP_CLIENT_SECRET_<ID>` and is written to the registry as
+	// a digest here, so a rotation is an env change and a restart. Dev-only loopback
+	// redirect targets come from `RP_DEV_REDIRECT_URIS`, refused in production.
+	let scoped_grants: Arc<dyn concierge::ports::ScopedGrantRepository> = Arc::new(infrastructure::scoped_grants::PgScopedGrants::new(pool.clone()));
+	let dev_redirects = relying_party::parse_dev_redirects(&std::env::var("RP_DEV_REDIRECT_URIS").unwrap_or_default(), config.app_env == "production")?;
+	let relying_parties = Arc::new(RelyingParties::new(
+		Arc::new(infrastructure::relying_parties::PgRelyingParties::new(pool.clone())),
+		users.clone(),
+		scoped_grants.clone(),
+		break_glass.clone(),
+		dev_redirects,
+	));
+	let client_audiences = relying_parties
+		.sync_registry(|var| std::env::var(var).ok())
+		.await
+		.context("failed to load the relying-party registry")?;
+	let auth_service = AuthService::try_new(auth_config, provisioner)
+		.await
+		.context("failed to build the auth service")?
+		.with_client_grants(relying_parties.clone());
 
 	// Inbound verification choke point: a `Verifier` over this plane's own `Jwks` RPC.
 	// Built lazily so boot does not block on a self-dial; the first verify warms the
@@ -166,6 +190,15 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// directory/admin mutation can run unauthenticated. The JWKS is dialed at an
 	// override env, else this plane's own bind address (it serves its own JWKS
 	// in-process).
+	// A relying party's tokens are verified by a SECOND verifier, never by widening this
+	// one: the plane's verifier guards every RPC, and an audience added to it would open
+	// all of them. The client verifier is mounted on `GetMe` alone (below).
+	let client_verifier_config = VerifierConfig {
+		issuer: issuer.clone(),
+		audiences: client_audiences,
+		allowed_types: vec![evconcierge_auth::TokenType::Access],
+		jwks_grpc_endpoint: std::env::var("AUTH_JWKS_GRPC_ENDPOINT").unwrap_or_else(|_| format!("http://{}", config.bind)),
+	};
 	let verifier_config = VerifierConfig {
 		issuer,
 		audiences,
@@ -173,6 +206,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		jwks_grpc_endpoint: std::env::var("AUTH_JWKS_GRPC_ENDPOINT").unwrap_or_else(|_| format!("http://{}", config.bind)),
 	};
 	verifier_config.assert_plane().context("verifier config carries a cross-plane identity")?;
+	let verifier_config_audiences = verifier_config.audiences.clone();
 	let verifier = Verifier::try_new(verifier_config).context("failed to build the inbound token verifier")?;
 
 	// `tonic-web` (`GrpcWebLayer` + `accept_http1`) lets browser/WASM clients reach
@@ -184,7 +218,23 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// injects the verified `Claims`. `HealthService` (BFF liveness) and `AuthService`
 	// (the token-issuance surface: `Exchange`/`Refresh`/`Jwks`) are deliberately left
 	// UNWRAPPED — they are public.
-	let auth = grpc_auth_layer(verifier);
+	//
+	// The one exception is `UserDirectory.GetMe`, which ALSO admits a relying party's
+	// access token (`aud` = the client's audience) — by exact method path, so no other
+	// method of that service or any other opens to it. The plane's own verifier never
+	// learns those audiences, and the money plane pins its own, so such a token is
+	// refused everywhere else by construction.
+	ensure!(
+		client_verifier_config.audiences.iter().all(|aud| !verifier_config_audiences.contains(aud)),
+		"a relying party's audience collides with this plane's own — its tokens would open every RPC"
+	);
+	let auth = if client_verifier_config.audiences.is_empty() {
+		grpc_auth_layer(verifier)
+	} else {
+		let client_verifier = Verifier::try_new(client_verifier_config).context("failed to build the relying-party token verifier")?;
+		let get_me = format!("/{}/GetMe", <UserDirectoryServer<directory::Directory> as NamedService>::NAME);
+		grpc_auth_layer(verifier).with_restricted(ClientTokenAuthenticator::new(client_verifier, relying_parties.clone()), [get_me])
+	};
 
 	// The cross-plane bridge producer: the one-way identity→money seam the banking
 	// plane PULLS from. Mounted OUTSIDE the user `auth` layer — it is a
@@ -304,6 +354,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			support_email: config.support_email.clone(),
 			case_ttl_secs: config.kyc_case_ttl_secs,
 		},
+		Some(relying_parties),
 	)
 	.await
 	.context("failed to build the auth web state")?;
@@ -381,7 +432,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 				governance_repo,
 				governance_revisions,
 			))))
-			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), Arc::new(infrastructure::scoped_grants::PgScopedGrants::new(pool.clone())), break_glass.clone()))))
+			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), scoped_grants, break_glass.clone()))))
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))

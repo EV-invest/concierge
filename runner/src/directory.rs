@@ -233,11 +233,14 @@ fn scope_denied() -> Status {
 #[tonic::async_trait]
 impl UserDirectory for Directory {
 	async fn get_me(&self, request: Request<GetMeRequest>) -> Result<Response<UserProfile>, Status> {
+		// Read before `active_caller_id` borrows the request: whether a relying party (a
+		// backend on another origin) is asking, rather than the user's own session.
+		let relying_party = request.extensions().get::<evconcierge_auth::RestrictedCaller>().is_some();
 		let id = self.active_caller_id(&request).await?;
 		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
 		let mut profile = user_to_proto(&user, self.effective_role_of(&user).await);
 		profile.scopes = self.scopes.active_for_user(id).await.map_err(domain_to_status)?.into_iter().map(grant_to_proto).collect();
-		Ok(Response::new(profile))
+		Ok(Response::new(if relying_party { for_relying_party(profile) } else { profile }))
 	}
 
 	async fn update_profile(&self, request: Request<UpdateProfileRequest>) -> Result<Response<UserProfile>, Status> {
@@ -604,6 +607,23 @@ fn user_to_proto(user: &User, resolved: EffectiveRole) -> UserProfile {
 		suspended_by: user.suspension().map(Suspension::as_str).unwrap_or_default().to_owned(),
 		hold_expires_at: user.suspension().and_then(Suspension::hold_expires_at).unwrap_or_default(),
 		scopes: Vec::new(),
+	}
+}
+
+/// The profile a relying party receives: who the user is and what they may open, and
+/// nothing an identity document says about them. An ALLOWLIST, so a field added to
+/// `UserProfile` later stays out until somebody decides a client should see it.
+fn for_relying_party(profile: UserProfile) -> UserProfile {
+	UserProfile {
+		user_id: profile.user_id,
+		email: profile.email,
+		email_verified: profile.email_verified,
+		status: profile.status,
+		preferred_name: profile.preferred_name,
+		role: profile.role,
+		role_is_break_glass: profile.role_is_break_glass,
+		scopes: profile.scopes,
+		..UserProfile::default()
 	}
 }
 

@@ -23,6 +23,10 @@ tonic.workspace = true
 tower.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
+[features]
+# Integration suites of the runner open real refresh families without a Google exchange.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 

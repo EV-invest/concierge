@@ -21,3 +21,11 @@ pub fn report_unexpected(err: &crate::AuthError) {
 		report(err);
 	}
 }
+
+/// The relying-party flow's counterpart of [`report_unexpected`]: only a store failure
+/// is an incident; a refused client or grant is the caller's problem.
+pub fn report_client_grant(err: &crate::clients::ClientGrantError) {
+	if matches!(err, crate::clients::ClientGrantError::Unavailable(_)) {
+		report(err);
+	}
+}
