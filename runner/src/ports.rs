@@ -100,10 +100,34 @@ pub enum ScopeGrantOutcome {
 	/// target by id without being allowed to.
 	Denied,
 	/// The target account is disabled; a grant to it would wake up on reinstatement
-	/// without anyone having decided that.
+	/// without anyone having decided that. Said only to a global admin/owner.
 	TargetDisabled,
-	/// The email belongs to more than one account.
+	/// The email belongs to more than one account. Said only to a global admin/owner.
 	AmbiguousEmail,
+	/// A scope admin's address cannot be granted, for a reason they are not told: telling
+	/// "nobody holds it" from "several accounts do" from "that account is disabled" would
+	/// let anyone with one scope ask the plane about any address (banking#447). The cause
+	/// travels for the log line only.
+	Ungrantable(UngrantableAddress),
+}
+
+/// Why a scope admin's address could not be granted — for the operator's log, never for
+/// the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UngrantableAddress {
+	NoAccount,
+	SharedByAccounts,
+	AccountNotActive,
+}
+
+impl UngrantableAddress {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::NoAccount => "no_account",
+			Self::SharedByAccounts => "shared_by_accounts",
+			Self::AccountNotActive => "account_not_active",
+		}
+	}
 }
 
 /// What [`ScopedGrantRepository::revoke`] did.
@@ -143,8 +167,11 @@ pub trait ScopedGrantRepository: Send + Sync {
 
 	/// Give `target` the role `role` on `scope`, replacing any role they hold there. The
 	/// actor's persisted role and status, their grant, and the target's current role are
-	/// all read inside the write transaction. `NotFound` for an unknown target — but only
-	/// once the actor has been found to hold some authority over the scope.
+	/// all read inside the write transaction. For a global admin/owner, `NotFound` for an
+	/// unknown target, [`ScopeGrantOutcome::AmbiguousEmail`] and
+	/// [`ScopeGrantOutcome::TargetDisabled`]; for a scope admin all three collapse into
+	/// [`ScopeGrantOutcome::Ungrantable`]. Either way only once the actor has been found to
+	/// hold some authority over the scope.
 	async fn grant(&self, target: &ScopeTarget, scope: &Scope, role: ScopeRole, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeGrantOutcome, DomainError>;
 
 	/// Take `target`'s grant on `scope` away, decided the same way as [`Self::grant`].

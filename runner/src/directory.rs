@@ -70,9 +70,13 @@ use crate::{
 		users::{AdminAction, AdminUserRow, Reinstatement},
 	},
 	notification::now_secs,
-	ports::{RoleChange, ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository, UserDirectoryRepository},
+	ports::{RoleChange, ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository, UngrantableAddress, UserDirectoryRepository},
 	support::domain_to_status,
 };
+
+/// The one answer a scope admin gets for an address that cannot be granted, whatever
+/// the reason (see [`ScopeGrantOutcome::Ungrantable`]).
+const UNGRANTABLE_ADDRESS: &str = "this address cannot be granted access";
 
 /// The user directory/profile service, backed by the [`UserDirectoryRepository`]
 /// port. Cheaply cloneable (the repo and the emergency-access rule are behind `Arc`s).
@@ -222,6 +226,13 @@ fn parse_scope_target(user_id: Option<&str>, email: Option<&str>) -> Result<Scop
 fn scope_refused(actor: &ScopeActor, verb: &'static str, scope: &Scope, requested: Option<ScopeRole>) -> Status {
 	tracing::warn!(actor = %actor.id, verb, scope = %scope, requested = requested.map(ScopeRole::as_str), "scoped grant refused");
 	scope_denied()
+}
+
+/// A scope admin's grant to an address that cannot be granted, logged with the reason
+/// they are not told. Ids, scope and the category — never the address.
+fn scope_ungrantable(actor: &ScopeActor, scope: &Scope, why: UngrantableAddress) -> Status {
+	tracing::warn!(actor = %actor.id, scope = %scope, outcome = why.as_str(), "scoped grant to an ungrantable address");
+	Status::failed_precondition(UNGRANTABLE_ADDRESS)
 }
 
 /// The one refusal every scope write shares. Worded as the rule, so a scope admin who
@@ -530,6 +541,7 @@ impl UserDirectory for Directory {
 			// account), not a statement about the caller's authority.
 			ScopeGrantOutcome::TargetDisabled => Err(Status::failed_precondition("the account is disabled; reinstate it before granting it access")),
 			ScopeGrantOutcome::AmbiguousEmail => Err(Status::failed_precondition("this email belongs to more than one account; a global admin can grant by user_id")),
+			ScopeGrantOutcome::Ungrantable(why) => Err(scope_ungrantable(&actor, &scope, why)),
 		}
 	}
 
