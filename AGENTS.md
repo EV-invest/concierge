@@ -476,6 +476,19 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   single act deliberately — containing a rogue operator must never be the slower path.
   The refusal is decided INSIDE the write transaction from the row held `FOR UPDATE`,
   the same TOCTOU argument as the `owner` refusal beside it.
+- **Scoped grants are access to ONE resource, and never money.** `scoped_grants`
+  (`domain::scopes`, `infrastructure::scoped_grants`) holds a user's `viewer`/`operator`/
+  `admin` role over `allocation:<service_id>` — a vertical's panel. Rights over an
+  allocation's MONEY are banking's own grants, so scopes never cross the bridge. A global
+  `admin`/`owner` (`Permission::ScopeManage`) grants anything; a scope's `admin` grants
+  `operator`/`viewer` inside that scope and never touches an `admin` grant in either
+  direction — one who could mint scope admins could hand the scope away for good. The
+  actor's authority is read INSIDE the write transaction (their own grant `FOR SHARE`,
+  the target's `users` row `FOR UPDATE` first), and a caller with no authority is denied
+  before learning whether the target exists. One active row per (user, scope) at the
+  column; a role change revokes the old row and inserts a new one, and each change
+  writes `scope_granted`/`scope_revoked` to `admin_action` in the same transaction.
+  `GetMe.scopes` is the caller's active grants only — a global role is not folded in.
 - **The USER consilia pass on a MAJORITY, the OWNER consilia on unanimity**, and the
   asymmetry is argued in `domain::governance::majority`. Unanimity guards the owner
   roster because a minority able to add owners by majority grows itself into a majority;
