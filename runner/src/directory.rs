@@ -56,7 +56,7 @@ use evconcierge_contracts::concierge::v1::{
 	AdminUserSummary, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, GrantScopeRequest, GrantScopeResponse, HoldUserRequest, HoldUserResponse,
 	ListScopedGrantsRequest, ListScopedGrantsResponse, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse, RevokeScopeRequest, RevokeScopeResponse,
 	RevokeTokensRequest, RevokeTokensResponse, ScopeHolder, ScopedGrant, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
-	user_directory_server::UserDirectory,
+	grant_scope_request, revoke_scope_request, user_directory_server::UserDirectory,
 };
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
@@ -70,7 +70,7 @@ use crate::{
 		users::{AdminAction, AdminUserRow, Reinstatement},
 	},
 	notification::now_secs,
-	ports::{RoleChange, ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopedGrantRepository, UserDirectoryRepository},
+	ports::{RoleChange, ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository, UserDirectoryRepository},
 	support::domain_to_status,
 };
 
@@ -93,9 +93,13 @@ impl Directory {
 	/// global permission, so whether they may act is the repository's call, made from
 	/// their grant inside the transaction.
 	async fn scope_actor<T>(&self, request: &Request<T>) -> Result<ScopeActor, Status> {
-		let role = crate::authz::caller_role(self.users.as_ref(), &self.break_glass, request).await?;
+		let resolved = crate::authz::caller_role(self.users.as_ref(), &self.break_glass, request).await?;
 		let id = self.acting_operator(request).await?;
-		Ok(ScopeActor { id, role })
+		Ok(ScopeActor {
+			id,
+			role: resolved.role,
+			elevated: resolved.break_glass,
+		})
 	}
 
 	/// The authenticated caller's own user id (from the access-token `sub`), gated on live
@@ -202,6 +206,22 @@ fn require_reason(raw: &str) -> Result<String, Status> {
 
 fn parse_scope(raw: &str) -> Result<Scope, Status> {
 	Scope::parse(raw).map_err(domain_to_status)
+}
+
+/// A request's `oneof target`, parsed. Both request types carry the same pair.
+fn parse_scope_target(user_id: Option<&str>, email: Option<&str>) -> Result<ScopeTarget, Status> {
+	match (user_id, email) {
+		(Some(raw), _) => parse_target_id(raw).map(ScopeTarget::Id),
+		(None, Some(raw)) => Email::parse(raw).map(ScopeTarget::Email).map_err(domain_to_status),
+		(None, None) => Err(Status::invalid_argument("target is required: user_id or email")),
+	}
+}
+
+/// A refused scope write, logged: an operator probing the edge of their scope is the
+/// signal worth keeping. Ids and the scope only — never the address they typed.
+fn scope_refused(actor: &ScopeActor, verb: &'static str, scope: &Scope, requested: Option<ScopeRole>) -> Status {
+	tracing::warn!(actor = %actor.id, verb, scope = %scope, requested = requested.map(ScopeRole::as_str), "scoped grant refused");
+	scope_denied()
 }
 
 /// The one refusal every scope write shares. Worded as the rule, so a scope admin who
@@ -492,13 +512,21 @@ impl UserDirectory for Directory {
 		let actor = self.scope_actor(&request).await?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
-		let target = parse_target_id(&req.user_id)?;
+		let target = match &req.target {
+			Some(grant_scope_request::Target::UserId(raw)) => parse_scope_target(Some(raw), None),
+			Some(grant_scope_request::Target::Email(raw)) => parse_scope_target(None, Some(raw)),
+			None => parse_scope_target(None, None),
+		}?;
 		let scope = parse_scope(&req.scope)?;
 		let role = ScopeRole::parse(&req.role).map_err(domain_to_status)?;
 		let action = AdminAction::by(actor.id, "scope_granted", &audit).with_reason(&req.reason);
-		match self.scopes.grant(target, &scope, role, &actor, &action, now_secs()).await.map_err(domain_to_status)? {
+		match self.scopes.grant(&target, &scope, role, &actor, &action, now_secs()).await.map_err(domain_to_status)? {
 			ScopeGrantOutcome::Granted(grant) => Ok(Response::new(GrantScopeResponse { grant: Some(grant_to_proto(grant)) })),
-			ScopeGrantOutcome::Denied => Err(scope_denied()),
+			ScopeGrantOutcome::Denied => Err(scope_refused(&actor, "grant", &scope, Some(role))),
+			// FAILED_PRECONDITION, as for a hold: a state that can change (reinstate the
+			// account), not a statement about the caller's authority.
+			ScopeGrantOutcome::TargetDisabled => Err(Status::failed_precondition("the account is disabled; reinstate it before granting it access")),
+			ScopeGrantOutcome::AmbiguousEmail => Err(Status::failed_precondition("this email belongs to more than one account; a global admin can grant by user_id")),
 		}
 	}
 
@@ -506,22 +534,28 @@ impl UserDirectory for Directory {
 		let actor = self.scope_actor(&request).await?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
-		let target = parse_target_id(&req.user_id)?;
+		let target = match &req.target {
+			Some(revoke_scope_request::Target::UserId(raw)) => parse_scope_target(Some(raw), None),
+			Some(revoke_scope_request::Target::Email(raw)) => parse_scope_target(None, Some(raw)),
+			None => parse_scope_target(None, None),
+		}?;
 		let scope = parse_scope(&req.scope)?;
 		let action = AdminAction::by(actor.id, "scope_revoked", &audit).with_reason(&req.reason);
-		match self.scopes.revoke(target, &scope, &actor, &action, now_secs()).await.map_err(domain_to_status)? {
+		match self.scopes.revoke(&target, &scope, &actor, &action, now_secs()).await.map_err(domain_to_status)? {
 			ScopeRevokeOutcome::Revoked => Ok(Response::new(RevokeScopeResponse {})),
 			ScopeRevokeOutcome::NotHeld => Err(Status::not_found("the user holds no active grant on this scope")),
-			ScopeRevokeOutcome::Denied => Err(scope_denied()),
+			ScopeRevokeOutcome::Denied => Err(scope_refused(&actor, "revoke", &scope, None)),
 		}
 	}
 
 	async fn list_scoped_grants(&self, request: Request<ListScopedGrantsRequest>) -> Result<Response<ListScopedGrantsResponse>, Status> {
 		let actor = self.scope_actor(&request).await?;
 		let scope = parse_scope(&request.get_ref().scope)?;
-		if !self.scopes.authority(&actor, &scope).await.map_err(domain_to_status)?.may_list() {
+		let authority = self.scopes.authority(&actor, &scope).await.map_err(domain_to_status)?;
+		if !authority.may_list() {
 			return Err(Status::permission_denied("a scope's grants are listed to a global admin or owner, or to the scope's own admin"));
 		}
+		let legal_names = authority.sees_legal_names();
 		let holders = self.scopes.holders(&scope).await.map_err(domain_to_status)?;
 		Ok(Response::new(ListScopedGrantsResponse {
 			holders: holders
@@ -529,7 +563,7 @@ impl UserDirectory for Directory {
 				.map(|holder| ScopeHolder {
 					grant: Some(grant_to_proto(holder.grant)),
 					email: holder.email.unwrap_or_default(),
-					legal_name: holder.legal_name.unwrap_or_default(),
+					legal_name: holder.legal_name.filter(|_| legal_names).unwrap_or_default(),
 					preferred_name: holder.preferred_name.unwrap_or_default(),
 				})
 				.collect(),

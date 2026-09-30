@@ -62,25 +62,54 @@ pub enum RoleChange {
 	WouldGrantAdmin,
 }
 
-/// Who is acting on a scope's grants: their id (the grant's `granted_by`) and the
-/// global role the RBAC gate resolved for them, emergency access included.
+/// Who is acting on a scope's grants.
 pub struct ScopeActor {
+	/// The grant's `granted_by`.
 	pub id: UserId,
+	/// The global role the RBAC gate resolved. Only the lock-free precheck trusts it; the
+	/// write re-reads the persisted role under the actor's row lock.
 	pub role: Role,
+	/// Whether emergency access elevates this caller (`authz::Elevation::elevates`). It is
+	/// the one part of the effective role no row records, so it travels explicitly.
+	pub elevated: bool,
+}
+
+/// Whose grant: by id, or by the address a scope admin already knows. A scope admin may
+/// not address by id (`ScopeAuthority::may_address_by_id`).
+pub enum ScopeTarget {
+	Id(UserId),
+	Email(Email),
+}
+
+impl ScopeTarget {
+	/// For a NOT_FOUND message — the caller's own input, echoed back.
+	pub fn describe(&self) -> String {
+		match self {
+			Self::Id(id) => id.to_string(),
+			Self::Email(email) => email.as_str().to_owned(),
+		}
+	}
 }
 
 /// What [`ScopedGrantRepository::grant`] did.
 pub enum ScopeGrantOutcome {
 	/// The grant now in effect — new, replaced, or already held with that role.
 	Granted(ScopedGrantRecord),
-	/// The actor may not make this grant (`ScopeAuthority::may_grant`).
+	/// The actor may not make this grant (`ScopeAuthority::may_grant`), or addressed the
+	/// target by id without being allowed to.
 	Denied,
+	/// The target account is disabled; a grant to it would wake up on reinstatement
+	/// without anyone having decided that.
+	TargetDisabled,
+	/// The email belongs to more than one account.
+	AmbiguousEmail,
 }
 
 /// What [`ScopedGrantRepository::revoke`] did.
 pub enum ScopeRevokeOutcome {
 	Revoked,
-	/// The target holds no active grant on the scope.
+	/// The target holds no active grant on the scope — including an id or email that
+	/// names no account, so a revoke is never an existence oracle.
 	NotHeld,
 	/// The actor may not take this grant away (`ScopeAuthority::may_revoke`).
 	Denied,
@@ -107,17 +136,18 @@ pub enum KycLevelChange {
 /// revoked rows.
 #[async_trait]
 pub trait ScopedGrantRepository: Send + Sync {
-	/// The actor's say over `scope` right now — for reads, which need no lock.
+	/// The actor's say over `scope` right now, from their persisted record — for reads,
+	/// which need no lock.
 	async fn authority(&self, actor: &ScopeActor, scope: &Scope) -> Result<ScopeAuthority, DomainError>;
 
 	/// Give `target` the role `role` on `scope`, replacing any role they hold there. The
-	/// actor's authority and the target's current role are both read inside the write
-	/// transaction. `NotFound` for an unknown target — but only once the actor has been
-	/// found to hold some authority over the scope.
-	async fn grant(&self, target: UserId, scope: &Scope, role: ScopeRole, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeGrantOutcome, DomainError>;
+	/// actor's persisted role and status, their grant, and the target's current role are
+	/// all read inside the write transaction. `NotFound` for an unknown target — but only
+	/// once the actor has been found to hold some authority over the scope.
+	async fn grant(&self, target: &ScopeTarget, scope: &Scope, role: ScopeRole, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeGrantOutcome, DomainError>;
 
 	/// Take `target`'s grant on `scope` away, decided the same way as [`Self::grant`].
-	async fn revoke(&self, target: UserId, scope: &Scope, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeRevokeOutcome, DomainError>;
+	async fn revoke(&self, target: &ScopeTarget, scope: &Scope, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeRevokeOutcome, DomainError>;
 
 	/// Every active grant `user` holds, ordered by scope.
 	async fn active_for_user(&self, user: UserId) -> Result<Vec<ScopedGrantRecord>, DomainError>;

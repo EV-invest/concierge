@@ -229,7 +229,7 @@ impl Elevation<'_> {
 /// Authorize `request` for `permission`, or return a gRPC `PermissionDenied`/
 /// `Unauthenticated`.
 pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, break_glass: &BreakGlass, request: &Request<T>, permission: Permission) -> Result<(), Status> {
-	let role = caller_role(users, break_glass, request).await?;
+	let role = caller_role(users, break_glass, request).await?.role;
 	if grants(role, permission) {
 		Ok(())
 	} else {
@@ -238,22 +238,25 @@ pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, break_gl
 }
 
 /// The global role the plane acts on for the caller, after the live-record gate and with
-/// emergency access applied — for a surface whose rule is not a single [`Permission`]
-/// (a scope's own admin acts without one). Refuses exactly as [`require_permission`] does
-/// for a caller it cannot resolve.
-pub async fn caller_role<T>(users: &dyn UserDirectoryRepository, break_glass: &BreakGlass, request: &Request<T>) -> Result<Role, Status> {
+/// emergency access applied (and flagged) — for a surface whose rule is not a single
+/// [`Permission`] (a scope's own admin acts without one). Refuses exactly as
+/// [`require_permission`] does for a caller it cannot resolve.
+pub async fn caller_role<T>(users: &dyn UserDirectoryRepository, break_glass: &BreakGlass, request: &Request<T>) -> Result<EffectiveRole, Status> {
 	let caller = caller_gate(users, request).await?;
 	// Elevation is applied AFTER the live-record gate, so DisableUser and RevokeTokens
 	// bite an environment-listed principal too — it grants a role, never an exemption
 	// from status/revocation.
 	let elevation = break_glass.snapshot(users).await;
 	let role = if let Some(record) = caller.record {
-		elevation.role_of(record.role, &caller.sub).role
+		elevation.role_of(record.role, &caller.sub)
 	} else if elevation.elevates(&caller.sub) {
 		// Emergency bootstrap: while the registry is empty a listed subject holds Owner
 		// even with no persisted record, so the console stays reachable before anyone's
 		// first sign-in has minted a row.
-		Role::Owner
+		EffectiveRole {
+			role: Role::Owner,
+			break_glass: true,
+		}
 	} else if caller.id.is_none() {
 		return Err(Status::unauthenticated("subject is not a user id"));
 	} else {

@@ -80,6 +80,8 @@ service UserDirectory {
   // the bridge. Echoes the grant now in effect; re-granting the role already held is a
   // no-op.
   //
+  // A disabled account is refused FAILED_PRECONDITION: reinstate it first.
+  //
   // Who may: a global admin/owner — any scope, any role. The scope's own `admin` —
   // `operator`/`viewer` inside that scope, and never an `admin` grant in either
   // direction (neither minting one nor moving an existing one). Anyone else:
@@ -93,7 +95,9 @@ service UserDirectory {
   rpc RevokeScope(RevokeScopeRequest) returns (RevokeScopeResponse);
 
   // The active grants on one scope, with each holder's email and names, for the
-  // cabinet's "Access" tab. Global admin/owner, or the scope's `admin`.
+  // cabinet's "Access" tab. Global admin/owner, or the scope's `admin` — who gets
+  // `legal_name` empty: the team sees each other's email and chosen name, the legal
+  // name stays with staff.
   rpc ListScopedGrants(ListScopedGrantsRequest) returns (ListScopedGrantsResponse);
 }
 
@@ -283,7 +287,16 @@ message SetRoleResponse {
 }
 
 message GrantScopeRequest {
-  string user_id = 1;
+  // Who receives the grant. A scope's admin must name them by `email` (an exact,
+  // case-insensitive match on the account's address): addressing by `user_id` is for a
+  // global admin/owner only and is PERMISSION_DENIED otherwise, because ids of other
+  // users are visible to a scope admin and granting one would reveal its owner's
+  // address through the roster. An email no account holds is NOT_FOUND; one held by
+  // several accounts is FAILED_PRECONDITION (grant by user_id as a global admin).
+  oneof target {
+    string user_id = 1;
+    string email = 5;
+  }
   string scope = 2;
   // viewer/operator/admin.
   string role = 3;
@@ -296,7 +309,14 @@ message GrantScopeResponse {
 }
 
 message RevokeScopeRequest {
-  string user_id = 1;
+  // Whose grant. Either form, for a scope admin too: the answer depends only on
+  // whether that person holds a grant in the caller's own scope, which the caller can
+  // already list — so a user_id reveals nothing new, and it is the key the roster
+  // hands back. An id or email with no active grant here is NOT_FOUND, alike.
+  oneof target {
+    string user_id = 1;
+    string email = 4;
+  }
   string scope = 2;
   // Recorded verbatim on the audit row.
   string reason = 3;
@@ -312,7 +332,8 @@ message ListScopedGrantsRequest {
 message ScopeHolder {
   ScopedGrant grant = 1;
   string email = 2;
-  // Empty until the user sets them (see UserProfile).
+  // Empty until the user sets them (see UserProfile). `legal_name` is also empty for a
+  // caller who is only the scope's admin.
   string legal_name = 3;
   string preferred_name = 4;
 }
