@@ -29,7 +29,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::users::{AdminAction, record_action};
-use crate::ports::{ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository};
+use crate::ports::{ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository, UngrantableAddress};
 
 /// One active grant, parsed back into domain types.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,17 +281,33 @@ impl ScopedGrantRepository for PgScopedGrants {
 		if matches!(target, ScopeTarget::Id(_)) && !authority.may_address_by_id() {
 			return Ok(ScopeGrantOutcome::Denied);
 		}
+		// A role the actor may not hand out to ANYONE is refused before the address is
+		// looked at: refused for a real account and answered "cannot be granted" for a
+		// missing one would be the oracle below by another door.
+		if !authority.may_grant(role, None) {
+			return Ok(ScopeGrantOutcome::Denied);
+		}
+		// Only staff learn why an address cannot be granted. A scope admin hears one answer
+		// for all three, or GrantScope becomes a lookup of whether an address has an
+		// account, how many, and whether it is in good standing (banking#447).
+		let told_why = authority == ScopeAuthority::Global;
 		let (target_id, target_standing) = match (resolved, target_id, target_standing) {
-			(Resolved::Ambiguous, ..) => return Ok(ScopeGrantOutcome::AmbiguousEmail),
+			(Resolved::Ambiguous, ..) if told_why => return Ok(ScopeGrantOutcome::AmbiguousEmail),
+			(Resolved::Ambiguous, ..) => return Ok(ScopeGrantOutcome::Ungrantable(UngrantableAddress::SharedByAccounts)),
 			(_, Some(id), Some(standing)) => (id, standing),
-			_ =>
+			_ if told_why =>
 				return Err(DomainError::NotFound {
 					entity: "user",
 					id: target.describe(),
 				}),
+			_ => return Ok(ScopeGrantOutcome::Ungrantable(UngrantableAddress::NoAccount)),
 		};
 		if target_standing.status != UserStatus::Active {
-			return Ok(ScopeGrantOutcome::TargetDisabled);
+			return Ok(if told_why {
+				ScopeGrantOutcome::TargetDisabled
+			} else {
+				ScopeGrantOutcome::Ungrantable(UngrantableAddress::AccountNotActive)
+			});
 		}
 		let current = active_grant(&mut tx, target_id, scope, RowLock::Update).await?;
 		let current_role = current.as_ref().map(|row| ScopeRole::parse(&row.role)).transpose()?;
@@ -348,7 +364,9 @@ impl ScopedGrantRepository for PgScopedGrants {
 			return Ok(ScopeRevokeOutcome::Denied);
 		}
 		// Either addressing form is fine for a scope admin here: the outcome depends only
-		// on a grant in their own scope, which they can already list.
+		// on a grant in their own scope, which they can already list. That is also why an
+		// unknown, shared or disabled address needs no collapsing like `grant`'s: all of
+		// them are the one `NotHeld`.
 		let Some(target_id) = target_id else {
 			return Ok(ScopeRevokeOutcome::NotHeld);
 		};

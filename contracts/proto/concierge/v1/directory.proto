@@ -80,26 +80,31 @@ service UserDirectory {
   // the bridge. Echoes the grant now in effect; re-granting the role already held is a
   // no-op.
   //
-  // A disabled account is refused FAILED_PRECONDITION: reinstate it first.
-  //
   // Who may: a global admin/owner — any scope, any role. The scope's own `admin` —
   // `operator` inside that scope, and never an `admin` grant in either direction
   // (neither minting one nor moving an existing one). Anyone else: PERMISSION_DENIED.
   // A malformed scope or role is INVALID_ARGUMENT — including `viewer`, which no longer
-  // exists: a read-only holder is just an ordinary user and gets no grant. An unknown
-  // user_id is NOT_FOUND, reported only to a caller who holds some authority over the
-  // scope.
+  // exists: a read-only holder is just an ordinary user and gets no grant.
+  //
+  // To a global admin/owner: an unknown user or address is NOT_FOUND; an address held by
+  // several accounts, or a disabled/held account, is FAILED_PRECONDITION with the reason.
+  // To a scope admin all three are the SAME FAILED_PRECONDITION ("this address cannot be
+  // granted access"), so a grant never tells them whether, or how, an address is known.
+  //
+  // A caller without global authority gets a budget of GrantScope + RevokeScope calls
+  // per hour (refusals included); past it, RESOURCE_EXHAUSTED.
   rpc GrantScope(GrantScopeRequest) returns (GrantScopeResponse);
 
   // Take a user's grant on a scope away. Same authority rule as GrantScope: a scope
   // admin may revoke `operator` grants in their scope, never an `admin` one.
-  // NOT_FOUND when the user holds no active grant there.
+  // NOT_FOUND when the user holds no active grant there — including an address nobody,
+  // or several accounts, hold. Shares GrantScope's per-hour budget.
   rpc RevokeScope(RevokeScopeRequest) returns (RevokeScopeResponse);
 
   // The active grants on one scope, with each holder's email and names, for the
   // cabinet's "Access" tab. Global admin/owner, or the scope's `admin` — who gets
-  // `legal_name` empty: the team sees each other's email and chosen name, the legal
-  // name stays with staff.
+  // `legal_name` AND `preferred_name` empty: the team sees each other's email and grant,
+  // and nothing that says who an address belongs to.
   rpc ListScopedGrants(ListScopedGrantsRequest) returns (ListScopedGrantsResponse);
 }
 
@@ -334,8 +339,8 @@ message ListScopedGrantsRequest {
 message ScopeHolder {
   ScopedGrant grant = 1;
   string email = 2;
-  // Empty until the user sets them (see UserProfile). `legal_name` is also empty for a
-  // caller who is only the scope's admin.
+  // Empty until the user sets them (see UserProfile). Both are also empty for a caller
+  // who is only the scope's admin.
   string legal_name = 3;
   string preferred_name = 4;
 }

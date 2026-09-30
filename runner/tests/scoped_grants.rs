@@ -391,7 +391,10 @@ async fn the_roster_carries_each_holders_identity_and_is_visible_to_its_admin() 
 		.expect("the member is listed");
 	assert_eq!(row.email, fx.email_of(member).await);
 	assert_eq!(row.legal_name, "", "the legal name stays with staff");
-	assert_eq!(row.preferred_name, "Ada");
+	assert_eq!(
+		row.preferred_name, "",
+		"so does the chosen name: the roster must not tell a scope admin who an address belongs to"
+	);
 	let grant = row.grant.as_ref().unwrap();
 	assert_eq!(grant.role, "operator");
 	assert_eq!(grant.scope, fx.scope);
@@ -485,7 +488,11 @@ async fn a_scope_admin_must_address_a_grant_by_email_not_by_id() {
 	assert_eq!(fx.my_scopes(staffer).await, vec![(fx.scope.clone(), "operator".into())]);
 
 	let unknown = grant_scope_request::Target::Email(format!("nobody-{}@scopes.example.com", Uuid::new_v4().simple()));
-	assert_eq!(code(fx.grant_to(scope_admin, unknown, &fx.scope, "operator").await), Code::NotFound, "an address nobody holds");
+	assert_eq!(
+		code(fx.grant_to(scope_admin, unknown, &fx.scope, "operator").await),
+		Code::FailedPrecondition,
+		"an address nobody holds, answered like any other address that cannot be granted"
+	);
 
 	// A global admin keeps both forms.
 	let other = fx.user("other").await;
@@ -600,4 +607,175 @@ async fn the_write_decides_from_the_actors_persisted_role_not_the_gates() {
 	};
 	let outcome = repo.grant(&target_ref, &scope, ScopeRole::Operator, &actor, &action, 0).await.unwrap();
 	assert!(matches!(outcome, ScopeGrantOutcome::Granted(_)), "break-glass elevation still counts inside the transaction");
+}
+
+impl Fixture {
+	/// Two accounts on one address, returned as that address.
+	async fn shared_email(&self) -> String {
+		let email = format!("shared-{}@scopes.example.com", Uuid::new_v4().simple());
+		for _ in 0..2 {
+			let subject = AuthSubject::parse(&format!("scopes-shared-{}", Uuid::new_v4())).unwrap();
+			self.users.provision(subject, Email::parse(&email).unwrap(), true).await.unwrap();
+		}
+		email
+	}
+
+	async fn disabled_email(&self) -> String {
+		let user = self.user("disabled").await;
+		self.users.disable_user(user).await.unwrap();
+		self.email_of(user).await
+	}
+
+	async fn held_email(&self, by: UserId) -> String {
+		let user = self.user("held").await;
+		let action = AdminAction {
+			actor: Some(by),
+			action: "held",
+			..AdminAction::default()
+		};
+		self.users.hold_user(user, &action, by, 0).await.unwrap();
+		self.email_of(user).await
+	}
+
+	async fn scope_admin(&self) -> UserId {
+		let global = self.global_admin().await;
+		let admin = self.user("scope-admin").await;
+		self.grant(global, admin, &self.scope, "admin").await.unwrap();
+		admin
+	}
+}
+
+fn unknown_email() -> String {
+	format!("nobody-{}@scopes.example.com", Uuid::new_v4().simple())
+}
+
+fn answer(result: Result<(), tonic::Status>) -> (Code, String) {
+	match result {
+		Ok(()) => (Code::Ok, String::new()),
+		Err(status) => (status.code(), status.message().to_owned()),
+	}
+}
+
+/// banking#447: a scope admin's GrantScope by email was an oracle — NOT_FOUND for an
+/// address nobody holds, and two different FAILED_PRECONDITION texts for a shared
+/// address and a disabled account. Every one of those must now read the same.
+#[tokio::test]
+async fn a_scope_admin_cannot_tell_a_missing_address_from_a_shared_or_disabled_one() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let scope_admin = fx.scope_admin().await;
+	let global = fx.global_admin().await;
+	let addresses = [
+		("unknown", unknown_email()),
+		("shared", fx.shared_email().await),
+		("disabled", fx.disabled_email().await),
+		("held", fx.held_email(global).await),
+	];
+	for (what, email) in addresses {
+		let got = answer(fx.grant_to(scope_admin, grant_scope_request::Target::Email(email), &fx.scope, "operator").await);
+		assert_eq!(
+			got,
+			(Code::FailedPrecondition, "this address cannot be granted access".to_owned()),
+			"{what}: one answer for every address that cannot be granted"
+		);
+	}
+	let holders: i64 = sqlx::query_scalar("SELECT count(*) FROM scoped_grants WHERE scope = $1 AND revoked_at IS NULL")
+		.bind(&fx.scope)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(holders, 1, "nothing but the scope admin's own grant");
+
+	// Reaching for an admin grant is refused on the ROLE, before the address is looked
+	// at — otherwise PERMISSION_DENIED for a real account against the answer above for a
+	// missing one would be the same oracle by another door.
+	let real = fx.email_of(fx.user("real").await).await;
+	let for_real = answer(fx.grant_to(scope_admin, grant_scope_request::Target::Email(real), &fx.scope, "admin").await);
+	let for_nobody = answer(fx.grant_to(scope_admin, grant_scope_request::Target::Email(unknown_email()), &fx.scope, "admin").await);
+	assert_eq!(for_real.0, Code::PermissionDenied);
+	assert_eq!(for_real, for_nobody, "an admin grant is refused alike for a real and a missing address");
+}
+
+/// Staff are entitled to know which account an address names, so they keep the answers
+/// that say what to do next.
+#[tokio::test]
+async fn a_global_admin_still_hears_why_an_address_cannot_be_granted() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let global = fx.global_admin().await;
+	let unknown = answer(fx.grant_to(global, grant_scope_request::Target::Email(unknown_email()), &fx.scope, "operator").await);
+	let shared = answer(fx.grant_to(global, grant_scope_request::Target::Email(fx.shared_email().await), &fx.scope, "operator").await);
+	let disabled = answer(fx.grant_to(global, grant_scope_request::Target::Email(fx.disabled_email().await), &fx.scope, "operator").await);
+
+	assert_eq!(unknown.0, Code::NotFound);
+	assert_eq!(shared.0, Code::FailedPrecondition);
+	assert!(shared.1.contains("more than one account"), "{}", shared.1);
+	assert_eq!(disabled.0, Code::FailedPrecondition);
+	assert!(disabled.1.contains("disabled"), "{}", disabled.1);
+}
+
+#[tokio::test]
+async fn a_scope_admin_revoking_by_email_hears_one_not_found_for_everything() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let scope_admin = fx.scope_admin().await;
+	let outsider = fx.email_of(fx.user("outsider").await).await;
+	let addresses = [
+		("unknown", unknown_email()),
+		("shared", fx.shared_email().await),
+		("disabled", fx.disabled_email().await),
+		("an account with no grant here", outsider),
+	];
+	let mut answers = Vec::new();
+	for (what, email) in addresses {
+		let got = answer(fx.revoke_target(scope_admin, revoke_scope_request::Target::Email(email), &fx.scope).await);
+		assert_eq!(got.0, Code::NotFound, "{what}");
+		answers.push(got);
+	}
+	answers.dedup();
+	assert_eq!(answers.len(), 1, "one text for all of them: {answers:?}");
+}
+
+/// Twenty scope writes an hour is a busy afternoon of onboarding; a script walking a
+/// list of addresses hits the ceiling long before it has learned anything.
+#[tokio::test]
+async fn a_scope_admin_gets_twenty_scope_writes_an_hour() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let scope_admin = fx.scope_admin().await;
+	let member = fx.user("member").await;
+	// Grants and revokes share one budget, and a refused write spends it too: the
+	// probing this bounds is made of refusals.
+	for round in 0..10 {
+		fx.grant(scope_admin, member, &fx.scope, "operator").await.unwrap_or_else(|err| panic!("grant {round}: {err}"));
+		fx.revoke(scope_admin, member, &fx.scope).await.unwrap_or_else(|err| panic!("revoke {round}: {err}"));
+	}
+	assert_eq!(code(fx.grant(scope_admin, member, &fx.scope, "operator").await), Code::ResourceExhausted, "the 21st write");
+	assert_eq!(code(fx.revoke(scope_admin, member, &fx.scope).await), Code::ResourceExhausted, "revokes are counted with grants");
+	assert_eq!(
+		code(fx.grant_to(scope_admin, grant_scope_request::Target::Email(unknown_email()), &fx.scope, "operator").await),
+		Code::ResourceExhausted,
+		"and the limit answers before the address is looked at"
+	);
+	assert!(fx.my_scopes(member).await.is_empty(), "the refused grant wrote nothing");
+
+	// The budget is the actor's own: another scope admin is untouched.
+	let other = fx.scope_admin().await;
+	fx.grant(other, member, &fx.scope, "operator").await.expect("a different actor has their own budget");
+}
+
+#[tokio::test]
+async fn a_global_admin_is_not_rate_limited_on_scope_writes() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let global = fx.global_admin().await;
+	let member = fx.user("member").await;
+	for round in 0..30 {
+		fx.grant(global, member, &fx.scope, "operator").await.unwrap_or_else(|err| panic!("grant {round}: {err}"));
+	}
 }

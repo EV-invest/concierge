@@ -42,13 +42,13 @@
 //! we don't control, so the large-err lint does not apply in this module.
 #![allow(clippy::result_large_err)]
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use domain::{
 	authz::{Permission, Role},
 	error::DomainError,
 	governance::MAX_REASON_CHARS,
-	scopes::{Scope, ScopeRole},
+	scopes::{Scope, ScopeAuthority, ScopeRole},
 	users::{AuthSubject, Email, MAX_KYC_LEVEL, ProfileFields, Suspension, User, UserId, UserStatus},
 };
 use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser};
@@ -69,10 +69,21 @@ use crate::{
 		scoped_grants::ScopedGrantRecord,
 		users::{AdminAction, AdminUserRow, Reinstatement},
 	},
-	notification::now_secs,
-	ports::{RoleChange, ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository, UserDirectoryRepository},
+	notification::{RateLimiter, now_secs},
+	ports::{RoleChange, ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository, UngrantableAddress, UserDirectoryRepository},
 	support::domain_to_status,
 };
+
+/// Scope writes (`GrantScope` + `RevokeScope`, one budget) a caller without global
+/// authority may make per [`SCOPE_WRITE_RATE_WINDOW`]. The defaults of
+/// `SCOPE_WRITE_RATE_LIMIT`/`SCOPE_WRITE_RATE_WINDOW_SECS`; `main` wires the configured
+/// values through [`Directory::with_scope_write_limiter`].
+pub const SCOPE_WRITE_RATE_LIMIT: u32 = 20;
+pub const SCOPE_WRITE_RATE_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// The one answer a scope admin gets for an address that cannot be granted, whatever
+/// the reason (see [`ScopeGrantOutcome::Ungrantable`]).
+const UNGRANTABLE_ADDRESS: &str = "this address cannot be granted access";
 
 /// The user directory/profile service, backed by the [`UserDirectoryRepository`]
 /// port. Cheaply cloneable (the repo and the emergency-access rule are behind `Arc`s).
@@ -81,11 +92,41 @@ pub struct Directory {
 	users: Arc<dyn UserDirectoryRepository>,
 	scopes: Arc<dyn ScopedGrantRepository>,
 	break_glass: Arc<BreakGlass>,
+	/// Per-actor budget for scope writes by anyone short of global authority. Every
+	/// attempt spends it, refusals included: the probing it bounds is made of refusals.
+	scope_writes: Arc<RateLimiter>,
 }
 
 impl Directory {
 	pub fn new(users: Arc<dyn UserDirectoryRepository>, scopes: Arc<dyn ScopedGrantRepository>, break_glass: Arc<BreakGlass>) -> Self {
-		Self { users, scopes, break_glass }
+		Self {
+			users,
+			scopes,
+			break_glass,
+			scope_writes: Arc::new(RateLimiter::new(SCOPE_WRITE_RATE_WINDOW, SCOPE_WRITE_RATE_LIMIT)),
+		}
+	}
+
+	/// Replace the scope-write budget (the configured one, in `main`).
+	pub fn with_scope_write_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+		self.scope_writes = limiter;
+		self
+	}
+
+	/// Spend one unit of a scope writer's budget, or refuse. A global admin/owner is not
+	/// counted: they can already read every account through `ListUsers`, so a ceiling
+	/// on them would bound no oracle and only get in the way of bulk onboarding. The
+	/// gate's role decides who is global — the write re-checks authority, but a stale
+	/// "global" there costs at most an unmetered refusal.
+	fn charge_scope_write(&self, actor: &ScopeActor, verb: &'static str) -> Result<(), Status> {
+		if ScopeAuthority::resolve(actor.role, None) == ScopeAuthority::Global {
+			return Ok(());
+		}
+		if self.scope_writes.check(&actor.id.to_string()) {
+			return Ok(());
+		}
+		tracing::warn!(actor = %actor.id, verb, "scope write rate limit exceeded");
+		Err(Status::resource_exhausted("too many scoped grant changes; try again later"))
 	}
 
 	/// The caller as a scope actor: their id and the global role the RBAC gate resolves
@@ -222,6 +263,13 @@ fn parse_scope_target(user_id: Option<&str>, email: Option<&str>) -> Result<Scop
 fn scope_refused(actor: &ScopeActor, verb: &'static str, scope: &Scope, requested: Option<ScopeRole>) -> Status {
 	tracing::warn!(actor = %actor.id, verb, scope = %scope, requested = requested.map(ScopeRole::as_str), "scoped grant refused");
 	scope_denied()
+}
+
+/// A scope admin's grant to an address that cannot be granted, logged with the reason
+/// they are not told. Ids, scope and the category — never the address.
+fn scope_ungrantable(actor: &ScopeActor, scope: &Scope, why: UngrantableAddress) -> Status {
+	tracing::warn!(actor = %actor.id, scope = %scope, outcome = why.as_str(), "scoped grant to an ungrantable address");
+	Status::failed_precondition(UNGRANTABLE_ADDRESS)
 }
 
 /// The one refusal every scope write shares. Worded as the rule, so a scope admin who
@@ -513,6 +561,7 @@ impl UserDirectory for Directory {
 
 	async fn grant_scope(&self, request: Request<GrantScopeRequest>) -> Result<Response<GrantScopeResponse>, Status> {
 		let actor = self.scope_actor(&request).await?;
+		self.charge_scope_write(&actor, "grant")?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
 		let target = match &req.target {
@@ -530,11 +579,13 @@ impl UserDirectory for Directory {
 			// account), not a statement about the caller's authority.
 			ScopeGrantOutcome::TargetDisabled => Err(Status::failed_precondition("the account is disabled; reinstate it before granting it access")),
 			ScopeGrantOutcome::AmbiguousEmail => Err(Status::failed_precondition("this email belongs to more than one account; a global admin can grant by user_id")),
+			ScopeGrantOutcome::Ungrantable(why) => Err(scope_ungrantable(&actor, &scope, why)),
 		}
 	}
 
 	async fn revoke_scope(&self, request: Request<RevokeScopeRequest>) -> Result<Response<RevokeScopeResponse>, Status> {
 		let actor = self.scope_actor(&request).await?;
+		self.charge_scope_write(&actor, "revoke")?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
 		let target = match &req.target {
@@ -558,7 +609,10 @@ impl UserDirectory for Directory {
 		if !authority.may_list() {
 			return Err(Status::permission_denied("a scope's grants are listed to a global admin or owner, or to the scope's own admin"));
 		}
-		let legal_names = authority.sees_legal_names();
+		// Names are staff's to see. A scope admin gets addresses and grants: anything that
+		// says who an address belongs to would turn a grant-then-list into an identity
+		// lookup (banking#447).
+		let names = authority.sees_legal_names();
 		let holders = self.scopes.holders(&scope).await.map_err(domain_to_status)?;
 		Ok(Response::new(ListScopedGrantsResponse {
 			holders: holders
@@ -566,8 +620,8 @@ impl UserDirectory for Directory {
 				.map(|holder| ScopeHolder {
 					grant: Some(grant_to_proto(holder.grant)),
 					email: holder.email.unwrap_or_default(),
-					legal_name: holder.legal_name.filter(|_| legal_names).unwrap_or_default(),
-					preferred_name: holder.preferred_name.unwrap_or_default(),
+					legal_name: holder.legal_name.filter(|_| names).unwrap_or_default(),
+					preferred_name: holder.preferred_name.filter(|_| names).unwrap_or_default(),
 				})
 				.collect(),
 		}))

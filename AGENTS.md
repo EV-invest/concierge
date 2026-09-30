@@ -491,10 +491,21 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   are visible to them (`granted_by`), and granting a bare id then reading the roster
   would make them a lookup service for anyone's address. Revoking takes either form —
   the answer depends only on a grant in their own scope, which they can list — and the
-  roster they see carries email and preferred name but no `legal_name`. An email held by
-  several accounts names nobody (a grant answers `FAILED_PRECONDITION`, a revoke
-  `NOT_FOUND`), and a disabled account is not
-  granted access (`FAILED_PRECONDITION`, reinstate first). The write re-decides
+  roster they see carries email and grant only: no `legal_name`, no `preferred_name`.
+  An email held by several accounts names nobody, and a disabled or held account is not
+  granted access. A global admin/owner hears which (`NOT_FOUND` for no account,
+  `FAILED_PRECONDITION` with the reason otherwise); a scope admin hears ONE
+  `FAILED_PRECONDITION("this address cannot be granted access")` for all three, and a
+  revoke answers one `NOT_FOUND` for everything — otherwise a grant is an oracle for
+  whether an address has an account and in what standing (banking#447). The adapter
+  collapses them (`ScopeGrantOutcome::Ungrantable`, cause kept for the log only), and a
+  scope admin's `admin` request is refused on the role before the address is looked up,
+  so PERMISSION_DENIED is not a second door. Anyone short of global authority also has a
+  per-actor budget of `SCOPE_WRITE_RATE_LIMIT` (20) grant+revoke calls per
+  `SCOPE_WRITE_RATE_WINDOW_SECS` (hour), refusals included, else `RESOURCE_EXHAUSTED`;
+  global admins/owners are not counted — they can read every account through
+  `ListUsers` anyway. The limiter is the in-process `notification::RateLimiter`, so the
+  budget is per replica and resets on restart. The write re-decides
   everything inside its transaction: the `users` rows of target and actor are locked
   `FOR UPDATE` in one statement ordered by id (no deadlock between two actors), the
   actor's role and status are RE-READ from that row — the RPC gate's copy only feeds a
@@ -504,7 +515,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   active row per (user, scope) at the column; a role change revokes the old row and
   inserts a new one, and each change writes `scope_granted`/`scope_revoked` to
   `admin_action` in the same transaction; a refusal is logged at `warn!` (ids and
-  scope, never the address).
+  scope, and for an ungrantable address its category — never the address).
   `GetMe.scopes` is the caller's active grants only — a global role is not folded in.
 - **This plane is the identity provider of first-party clients on OTHER origins, and a
   client's token opens exactly one RPC.** A relying party (`relying_party`, registry
