@@ -365,7 +365,7 @@ fn fail(st: &super::Inner, jar: CookieJar, return_to: &str, reason: &str) -> (Co
 }
 
 /// Best-effort client IP for the device metadata stored on the refresh-token family.
-fn client_ip(headers: &HeaderMap) -> String {
+pub(super) fn client_ip(headers: &HeaderMap) -> String {
 	if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
 		let first = xff.split(',').next().unwrap_or("").trim();
 		if !first.is_empty() {

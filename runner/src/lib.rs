@@ -23,6 +23,9 @@
 //!                     `NotificationRepository`, `NotificationDispatchRepository`)
 //!   infrastructure  — driven adapters (Postgres control plane + the port implementations)
 //!   support         — cross-module gRPC plumbing (domain-error → Status mapping)
+//!   relying_party   — this plane as the IdP of first-party clients on other origins:
+//!                     the registry, one-time codes and client refresh families behind
+//!                     `/auth/authorize` and `AuthService.ExchangeCode`
 //!   web             — the site-level auth HTTP surface (login/callback/session cookies)
 //!   notification    — the notification plane: subscribers, the in-app inbox, queued email
 //!   dispatch        — the background loops: draining the outbound email queue, and the
@@ -43,5 +46,6 @@ pub mod log;
 pub mod notification;
 pub mod platform;
 pub mod ports;
+pub mod relying_party;
 pub mod support;
 pub mod web;

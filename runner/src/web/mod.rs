@@ -16,6 +16,7 @@
 //! modules) minus everything banking: the money-plane pair is the cabinet's own
 //! concern, minted zone-side from the verified access token.
 
+mod authorize;
 mod kyc;
 mod oauth;
 mod routes;
@@ -41,6 +42,7 @@ use time::Duration;
 
 use crate::{
 	ports::{GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
+	relying_party::RelyingParties,
 	web::{oauth::OAuthTxStore, single_flight::KeyedLocks},
 };
 
@@ -97,7 +99,9 @@ pub struct WebState {
 	inner: Arc<Inner>,
 }
 impl WebState {
-	pub async fn try_new(auth: AuthService, public_origin: String, secure_cookies: bool, kyc: KycDeps) -> color_eyre::Result<Self> {
+	/// `relying_parties` is `None` where no client flow is mounted; `/auth/authorize` then
+	/// answers 503 with a page, never a redirect.
+	pub async fn try_new(auth: AuthService, public_origin: String, secure_cookies: bool, kyc: KycDeps, relying_parties: Option<Arc<RelyingParties>>) -> color_eyre::Result<Self> {
 		Ok(Self {
 			inner: Arc::new(Inner {
 				auth,
@@ -114,6 +118,7 @@ impl WebState {
 				kyc: kyc.provider,
 				support_email: kyc.support_email,
 				kyc_case_ttl_secs: kyc.case_ttl_secs,
+				relying_parties,
 			}),
 		})
 	}
@@ -151,6 +156,11 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/session", get(routes::session))
 		.route("/auth/logout", post(routes::logout))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
+		// The relying-party code flow's front door. It needs no CSRF token: it changes
+		// nothing a cross-site request could exploit — it only ever redirects to an
+		// address registered for the client, carrying a code that is useless without the
+		// PKCE verifier the client kept.
+		.route("/auth/authorize", get(authorize::authorize))
 		// Identity verification. `/kyc/callback/didit` is PUBLIC — it is reached by the
 		// vendor, not a browser, and authenticates itself with an HMAC over the body.
 		// Publicly both are seen under the conductor's `/api` prefix.
@@ -209,4 +219,6 @@ struct Inner {
 	/// cases are still alive — the disagreement #190 was about, arrived at from the other
 	/// end.
 	kyc_case_ttl_secs: i64,
+	/// The relying-party registry and policy behind `/auth/authorize`.
+	relying_parties: Option<Arc<RelyingParties>>,
 }

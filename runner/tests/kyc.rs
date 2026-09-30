@@ -266,6 +266,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 			support_email: SUPPORT.to_string(),
 			case_ttl_secs: CASE_TTL_SECS,
 		},
+		None,
 	)
 	.await
 	.expect("build the web state");
