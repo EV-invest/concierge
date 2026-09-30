@@ -105,7 +105,8 @@ impl ScopeRole {
 			"viewer" => Ok(Self::Viewer),
 			"operator" => Ok(Self::Operator),
 			"admin" => Ok(Self::Admin),
-			other => Err(DomainError::Validation(format!("unknown scope role: {other}"))),
+			// Echoed back to the caller, so bounded: the field is free input.
+			other => Err(DomainError::Validation(format!("unknown scope role: {}", other.chars().take(32).collect::<String>()))),
 		}
 	}
 }
@@ -161,6 +162,27 @@ impl ScopeAuthority {
 			Self::None => false,
 		}
 	}
+
+	/// Whether the caller may name a grant's target by user id. A scope admin may not:
+	/// ids of other staff are visible (every grant carries `granted_by`), and granting a
+	/// bare id and then reading the scope's roster would turn a scope admin into a
+	/// lookup service for anyone's address. They name the person by the email they
+	/// already know instead.
+	pub fn may_address_by_id(self) -> bool {
+		match self {
+			Self::Global => true,
+			Self::ScopeAdmin | Self::None => false,
+		}
+	}
+
+	/// Whether the roster shows holders' legal names. A scope's team sees each other's
+	/// email and chosen name; the legal name is KYC-grade data and stays with staff.
+	pub fn sees_legal_names(self) -> bool {
+		match self {
+			Self::Global => true,
+			Self::ScopeAdmin | Self::None => false,
+		}
+	}
 }
 
 #[cfg(test)]
@@ -175,6 +197,24 @@ mod tests {
 		assert_eq!(authority, ScopeAuthority::ScopeAdmin);
 		assert!(!authority.may_grant(ScopeRole::Admin, None), "a scope admin must not mint another scope admin");
 		assert!(!authority.may_grant(ScopeRole::Admin, Some(ScopeRole::Operator)), "nor promote an operator to admin");
+	}
+
+	#[test]
+	fn only_a_global_manager_addresses_by_id_or_reads_legal_names() {
+		assert!(ScopeAuthority::Global.may_address_by_id());
+		assert!(!ScopeAuthority::ScopeAdmin.may_address_by_id(), "a scope admin addressing by id is a PII oracle");
+		assert!(!ScopeAuthority::None.may_address_by_id());
+		assert!(ScopeAuthority::Global.sees_legal_names());
+		assert!(!ScopeAuthority::ScopeAdmin.sees_legal_names());
+		assert!(!ScopeAuthority::None.sees_legal_names());
+	}
+
+	#[test]
+	fn an_unknown_scope_role_is_echoed_bounded() {
+		let Err(DomainError::Validation(message)) = ScopeRole::parse(&"x".repeat(10_000)) else {
+			panic!("an unknown role is a validation error");
+		};
+		assert!(message.len() < 64, "{message}");
 	}
 
 	#[test]
