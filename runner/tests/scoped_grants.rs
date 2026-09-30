@@ -13,15 +13,22 @@ use std::sync::Arc;
 use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
-	infrastructure::{db, scoped_grants::PgScopedGrants, users::PgUsers},
-	ports::UserDirectoryRepository,
+	infrastructure::{
+		db,
+		scoped_grants::PgScopedGrants,
+		users::{AdminAction, PgUsers},
+	},
+	ports::{ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository, UserDirectoryRepository},
 };
 use domain::{
 	authz::Role,
+	scopes::{Scope, ScopeRole},
 	users::{AuthSubject, Email, ProfileFields, UserId},
 };
 use evconcierge_auth::{Claims, TokenType};
-use evconcierge_contracts::concierge::v1::{GetMeRequest, GrantScopeRequest, ListScopedGrantsRequest, RevokeScopeRequest, user_directory_server::UserDirectory};
+use evconcierge_contracts::concierge::v1::{
+	GetMeRequest, GrantScopeRequest, ListScopedGrantsRequest, RevokeScopeRequest, grant_scope_request, revoke_scope_request, user_directory_server::UserDirectory,
+};
 use sqlx::PgPool;
 use tonic::{Code, Request};
 use uuid::Uuid;
@@ -57,12 +64,18 @@ fn fresh_scope() -> String {
 
 impl Fixture {
 	async fn user(&self, tag: &str) -> UserId {
-		let subject = AuthSubject::parse(&format!("scopes-{tag}-{}", Uuid::new_v4())).unwrap();
-		self.users
-			.provision(subject, Email::parse(&format!("{tag}@scopes.example.com")).unwrap(), true)
+		let unique = Uuid::new_v4();
+		let subject = AuthSubject::parse(&format!("scopes-{tag}-{unique}")).unwrap();
+		let email = Email::parse(&format!("{tag}-{}@scopes.example.com", &unique.simple().to_string()[..12])).unwrap();
+		self.users.provision(subject, email, true).await.unwrap().id()
+	}
+
+	async fn email_of(&self, user: UserId) -> String {
+		sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+			.bind(user.raw())
+			.fetch_one(&self.pool)
 			.await
-			.unwrap()
-			.id()
+			.expect("read email")
 	}
 
 	async fn global_admin(&self) -> UserId {
@@ -71,9 +84,20 @@ impl Fixture {
 		id
 	}
 
+	/// Grant by EMAIL — the one form every manager may use.
 	async fn grant(&self, actor: UserId, target: UserId, scope: &str, role: &str) -> Result<(), tonic::Status> {
+		let email = self.email_of(target).await;
+		self.grant_to(actor, grant_scope_request::Target::Email(email), scope, role).await
+	}
+
+	/// Grant by USER ID — a global manager's form only.
+	async fn grant_by_id(&self, actor: UserId, target: UserId, scope: &str, role: &str) -> Result<(), tonic::Status> {
+		self.grant_to(actor, grant_scope_request::Target::UserId(target.to_string()), scope, role).await
+	}
+
+	async fn grant_to(&self, actor: UserId, target: grant_scope_request::Target, scope: &str, role: &str) -> Result<(), tonic::Status> {
 		let request = GrantScopeRequest {
-			user_id: target.to_string(),
+			target: Some(target),
 			scope: scope.into(),
 			role: role.into(),
 			reason: "itest".into(),
@@ -82,8 +106,12 @@ impl Fixture {
 	}
 
 	async fn revoke(&self, actor: UserId, target: UserId, scope: &str) -> Result<(), tonic::Status> {
+		self.revoke_target(actor, revoke_scope_request::Target::UserId(target.to_string()), scope).await
+	}
+
+	async fn revoke_target(&self, actor: UserId, target: revoke_scope_request::Target, scope: &str) -> Result<(), tonic::Status> {
 		let request = RevokeScopeRequest {
-			user_id: target.to_string(),
+			target: Some(target),
 			scope: scope.into(),
 			reason: String::new(),
 		};
@@ -275,14 +303,14 @@ async fn everyone_else_is_denied_before_learning_whether_the_target_exists() {
 
 	for outsider in [investor, console_operator, scope_operator] {
 		assert_eq!(code(fx.grant(outsider, target, &fx.scope, "viewer").await), Code::PermissionDenied);
-		assert_eq!(code(fx.grant(outsider, nobody, &fx.scope, "viewer").await), Code::PermissionDenied, "not NOT_FOUND");
+		assert_eq!(code(fx.grant_by_id(outsider, nobody, &fx.scope, "viewer").await), Code::PermissionDenied, "not NOT_FOUND");
 		assert_eq!(code(fx.revoke(outsider, scope_operator, &fx.scope).await), Code::PermissionDenied);
 		assert_eq!(code(fx.list(outsider, &fx.scope).await), Code::PermissionDenied);
 	}
 	assert!(fx.history(target).await.is_empty());
 
 	assert_eq!(
-		code(fx.grant(global, nobody, &fx.scope, "viewer").await),
+		code(fx.grant_by_id(global, nobody, &fx.scope, "viewer").await),
 		Code::NotFound,
 		"an unknown user, to someone entitled to know"
 	);
@@ -304,13 +332,17 @@ async fn malformed_scopes_roles_and_ids_are_invalid_argument() {
 	for role in ["", "owner", "Admin"] {
 		assert_eq!(code(fx.grant(global, member, &fx.scope, role).await), Code::InvalidArgument, "role {role:?}");
 	}
-	let bad_id = GrantScopeRequest {
-		user_id: "not-a-uuid".into(),
+	let bad_id = grant_scope_request::Target::UserId("not-a-uuid".into());
+	assert_eq!(code(fx.grant_to(global, bad_id, &fx.scope, "viewer").await), Code::InvalidArgument);
+	let bad_email = grant_scope_request::Target::Email("nobody".into());
+	assert_eq!(code(fx.grant_to(global, bad_email, &fx.scope, "viewer").await), Code::InvalidArgument);
+	let no_target = GrantScopeRequest {
+		target: None,
 		scope: fx.scope.clone(),
 		role: "viewer".into(),
 		reason: String::new(),
 	};
-	assert_eq!(code(fx.directory.grant_scope(as_user(global, bad_id)).await), Code::InvalidArgument);
+	assert_eq!(code(fx.directory.grant_scope(as_user(global, no_target)).await), Code::InvalidArgument);
 }
 
 #[tokio::test]
@@ -343,15 +375,23 @@ async fn the_roster_carries_each_holders_identity_and_is_visible_to_its_admin() 
 		.iter()
 		.find(|holder| holder.grant.as_ref().unwrap().user_id == member.to_string())
 		.expect("the member is listed");
-	assert_eq!(row.email, "roster-member@scopes.example.com");
-	assert_eq!(row.legal_name, "Ada Lovelace");
+	assert_eq!(row.email, fx.email_of(member).await);
+	assert_eq!(row.legal_name, "", "the legal name stays with staff");
 	assert_eq!(row.preferred_name, "Ada");
 	let grant = row.grant.as_ref().unwrap();
 	assert_eq!(grant.role, "viewer");
 	assert_eq!(grant.scope, fx.scope);
 	assert_eq!(grant.granted_by, scope_admin.to_string());
 
-	assert_eq!(fx.list(global, &fx.scope).await.unwrap().len(), 2, "a global admin sees it too");
+	let as_staff = fx
+		.directory
+		.list_scoped_grants(as_user(global, ListScopedGrantsRequest { scope: fx.scope.clone() }))
+		.await
+		.unwrap()
+		.into_inner();
+	let staff_row = as_staff.holders.iter().find(|holder| holder.grant.as_ref().unwrap().user_id == member.to_string()).unwrap();
+	assert_eq!(staff_row.legal_name, "Ada Lovelace", "a global admin sees the legal name");
+	assert_eq!(staff_row.preferred_name, "Ada");
 	fx.revoke(scope_admin, member, &fx.scope).await.unwrap();
 	assert_eq!(fx.list(global, &fx.scope).await.unwrap().len(), 1, "a revoked grant leaves the roster");
 }
@@ -396,4 +436,147 @@ async fn the_table_itself_refuses_a_second_active_grant_and_a_malformed_scope() 
 	assert!(duplicate.to_string().contains("scoped_grants_active_idx"), "{duplicate}");
 	let malformed = insert("allocation:Nope".into()).await.expect_err("the scope format is a column rule too");
 	assert!(malformed.to_string().contains("scoped_grants_scope_format"), "{malformed}");
+}
+
+#[tokio::test]
+async fn a_scope_admin_must_address_a_grant_by_email_not_by_id() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let global = fx.global_admin().await;
+	let scope_admin = fx.user("scope-admin").await;
+	let staffer = fx.user("staffer").await;
+	fx.grant(global, scope_admin, &fx.scope, "admin").await.unwrap();
+
+	// The bare-id route is the PII oracle: grant a viewer to an id seen in `granted_by`,
+	// then read the address off the roster.
+	assert_eq!(code(fx.grant_by_id(scope_admin, global, &fx.scope, "viewer").await), Code::PermissionDenied, "not a staffer's id");
+	assert_eq!(code(fx.grant_by_id(scope_admin, staffer, &fx.scope, "viewer").await), Code::PermissionDenied, "not anyone's id");
+	assert_eq!(
+		code(fx.grant_by_id(scope_admin, UserId::from_raw(Uuid::new_v4()), &fx.scope, "viewer").await),
+		Code::PermissionDenied,
+		"nor an unknown one"
+	);
+	assert!(fx.history(staffer).await.is_empty(), "a refused id grant writes nothing");
+	assert_eq!(fx.list(scope_admin, &fx.scope).await.unwrap().len(), 1, "the roster holds only the scope admin");
+
+	fx.grant(scope_admin, staffer, &fx.scope, "viewer").await.expect("by email, the address they already know");
+	assert_eq!(fx.my_scopes(staffer).await, vec![(fx.scope.clone(), "viewer".into())]);
+
+	let unknown = grant_scope_request::Target::Email(format!("nobody-{}@scopes.example.com", Uuid::new_v4().simple()));
+	assert_eq!(code(fx.grant_to(scope_admin, unknown, &fx.scope, "viewer").await), Code::NotFound, "an address nobody holds");
+
+	// A global admin keeps both forms.
+	let other = fx.user("other").await;
+	fx.grant_by_id(global, other, &fx.scope, "operator").await.expect("a global admin may address by id");
+}
+
+#[tokio::test]
+async fn a_scope_admin_revokes_by_either_form_and_learns_nothing_from_a_stranger_id() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let global = fx.global_admin().await;
+	let scope_admin = fx.user("scope-admin").await;
+	let first = fx.user("first").await;
+	let second = fx.user("second").await;
+	let stranger = fx.user("stranger").await;
+	fx.grant(global, scope_admin, &fx.scope, "admin").await.unwrap();
+	fx.grant(scope_admin, first, &fx.scope, "viewer").await.unwrap();
+	fx.grant(scope_admin, second, &fx.scope, "viewer").await.unwrap();
+
+	fx.revoke(scope_admin, first, &fx.scope).await.expect("by the id the roster hands back");
+	let by_email = revoke_scope_request::Target::Email(fx.email_of(second).await);
+	fx.revoke_target(scope_admin, by_email, &fx.scope).await.expect("by email");
+	assert_eq!(fx.list(scope_admin, &fx.scope).await.unwrap().len(), 1);
+
+	// A real account outside the scope and an id nobody holds answer alike.
+	assert_eq!(code(fx.revoke(scope_admin, stranger, &fx.scope).await), Code::NotFound);
+	assert_eq!(code(fx.revoke(scope_admin, UserId::from_raw(Uuid::new_v4()), &fx.scope).await), Code::NotFound);
+}
+
+#[tokio::test]
+async fn a_disabled_account_is_not_granted_access() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let global = fx.global_admin().await;
+	let target = fx.user("disabled").await;
+	fx.users.disable_user(target).await.unwrap();
+
+	assert_eq!(code(fx.grant(global, target, &fx.scope, "viewer").await), Code::FailedPrecondition);
+	assert_eq!(code(fx.grant_by_id(global, target, &fx.scope, "viewer").await), Code::FailedPrecondition);
+	assert!(fx.history(target).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_email_shared_by_two_accounts_names_nobody() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let global = fx.global_admin().await;
+	let email = format!("shared-{}@scopes.example.com", Uuid::new_v4().simple());
+	for _ in 0..2 {
+		let subject = AuthSubject::parse(&format!("scopes-shared-{}", Uuid::new_v4())).unwrap();
+		fx.users.provision(subject, Email::parse(&email).unwrap(), true).await.unwrap();
+	}
+	let target = grant_scope_request::Target::Email(email.to_uppercase());
+	assert_eq!(code(fx.grant_to(global, target, &fx.scope, "viewer").await), Code::FailedPrecondition);
+	let holders: i64 = sqlx::query_scalar("SELECT count(*) FROM scoped_grants WHERE scope = $1")
+		.bind(&fx.scope)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(holders, 0);
+}
+
+/// The RPC gate resolves the actor's role before the write transaction opens. A demotion
+/// or a suspension committed in between must be SEEN by the write, which re-reads the
+/// actor's row under its lock — so the adapter is driven here with a deliberately stale
+/// gate role, the state that window produces.
+#[tokio::test]
+async fn the_write_decides_from_the_actors_persisted_role_not_the_gates() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let repo = PgScopedGrants::new(fx.pool.clone());
+	let scope = Scope::parse(&fx.scope).unwrap();
+	let target = fx.user("target").await;
+	let target_ref = ScopeTarget::Id(target);
+
+	let demoted = fx.user("demoted").await;
+	let stale = ScopeActor {
+		id: demoted,
+		role: Role::Admin,
+		elevated: false,
+	};
+	let action = AdminAction {
+		actor: Some(demoted),
+		action: "scope_granted",
+		..AdminAction::default()
+	};
+	let outcome = repo.grant(&target_ref, &scope, ScopeRole::Viewer, &stale, &action, 0).await.unwrap();
+	assert!(matches!(outcome, ScopeGrantOutcome::Denied), "the gate said admin, the row says investor");
+	assert!(matches!(repo.revoke(&target_ref, &scope, &stale, &action, 0).await.unwrap(), ScopeRevokeOutcome::Denied));
+
+	let suspended = fx.global_admin().await;
+	fx.users.disable_user(suspended).await.unwrap();
+	let suspended_actor = ScopeActor {
+		id: suspended,
+		role: Role::Admin,
+		elevated: false,
+	};
+	let outcome = repo.grant(&target_ref, &scope, ScopeRole::Viewer, &suspended_actor, &action, 0).await.unwrap();
+	assert!(matches!(outcome, ScopeGrantOutcome::Denied), "a disabled actor acts with nothing");
+	assert!(fx.history(target).await.is_empty());
+
+	// Emergency access is the one elevation no row records, so it is carried explicitly.
+	let elevated = fx.user("elevated").await;
+	let actor = ScopeActor {
+		id: elevated,
+		role: Role::Owner,
+		elevated: true,
+	};
+	let outcome = repo.grant(&target_ref, &scope, ScopeRole::Viewer, &actor, &action, 0).await.unwrap();
+	assert!(matches!(outcome, ScopeGrantOutcome::Granted(_)), "break-glass elevation still counts inside the transaction");
 }
