@@ -477,12 +477,15 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   The refusal is decided INSIDE the write transaction from the row held `FOR UPDATE`,
   the same TOCTOU argument as the `owner` refusal beside it.
 - **Scoped grants are access to ONE resource, and never money.** `scoped_grants`
-  (`domain::scopes`, `infrastructure::scoped_grants`) holds a user's `viewer`/`operator`/
-  `admin` role over `allocation:<service_id>` — a vertical's panel. Rights over an
-  allocation's MONEY are banking's own grants, so scopes never cross the bridge. A global
-  `admin`/`owner` (`Permission::ScopeManage`) grants anything; a scope's `admin` grants
-  `operator`/`viewer` inside that scope and never touches an `admin` grant in either
-  direction — one who could mint scope admins could hand the scope away for good. A
+  (`domain::scopes`, `infrastructure::scoped_grants`) holds a user's `operator`/`admin`
+  role over `allocation:<service_id>` — a vertical's panel. There is no `viewer`: a
+  read-only holder would be an ordinary user (global `investor`), who gets no access to
+  the service, so `viewer` is refused as an unknown role (`INVALID_ARGUMENT`); 0024
+  deleted the rows 0023 allowed. Rights over an allocation's MONEY are banking's own
+  grants, so scopes never cross the bridge. A global `admin`/`owner`
+  (`Permission::ScopeManage`) grants anything; a scope's `admin` grants `operator`
+  inside that scope and never touches an `admin` grant in either direction — one who
+  could mint scope admins could hand the scope away for good. A
   scope admin also names a grant's target only by EMAIL, never by user id: ids of staff
   are visible to them (`granted_by`), and granting a bare id then reading the roster
   would make them a lookup service for anyone's address. Revoking takes either form —
