@@ -476,6 +476,32 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   single act deliberately — containing a rogue operator must never be the slower path.
   The refusal is decided INSIDE the write transaction from the row held `FOR UPDATE`,
   the same TOCTOU argument as the `owner` refusal beside it.
+- **Scoped grants are access to ONE resource, and never money.** `scoped_grants`
+  (`domain::scopes`, `infrastructure::scoped_grants`) holds a user's `viewer`/`operator`/
+  `admin` role over `allocation:<service_id>` — a vertical's panel. Rights over an
+  allocation's MONEY are banking's own grants, so scopes never cross the bridge. A global
+  `admin`/`owner` (`Permission::ScopeManage`) grants anything; a scope's `admin` grants
+  `operator`/`viewer` inside that scope and never touches an `admin` grant in either
+  direction — one who could mint scope admins could hand the scope away for good. A
+  scope admin also names a grant's target only by EMAIL, never by user id: ids of staff
+  are visible to them (`granted_by`), and granting a bare id then reading the roster
+  would make them a lookup service for anyone's address. Revoking takes either form —
+  the answer depends only on a grant in their own scope, which they can list — and the
+  roster they see carries email and preferred name but no `legal_name`. An email held by
+  several accounts names nobody (a grant answers `FAILED_PRECONDITION`, a revoke
+  `NOT_FOUND`), and a disabled account is not
+  granted access (`FAILED_PRECONDITION`, reinstate first). The write re-decides
+  everything inside its transaction: the `users` rows of target and actor are locked
+  `FOR UPDATE` in one statement ordered by id (no deadlock between two actors), the
+  actor's role and status are RE-READ from that row — the RPC gate's copy only feeds a
+  lock-free precheck that can refuse early — emergency access travels as an explicit
+  flag because no row records it, and the actor's own grant is held `FOR SHARE`. A
+  caller with no authority is denied before learning whether the target exists. One
+  active row per (user, scope) at the column; a role change revokes the old row and
+  inserts a new one, and each change writes `scope_granted`/`scope_revoked` to
+  `admin_action` in the same transaction; a refusal is logged at `warn!` (ids and
+  scope, never the address).
+  `GetMe.scopes` is the caller's active grants only — a global role is not folded in.
 - **The USER consilia pass on a MAJORITY, the OWNER consilia on unanimity**, and the
   asymmetry is argued in `domain::governance::majority`. Unanimity guards the owner
   roster because a minority able to add owners by majority grows itself into a majority;

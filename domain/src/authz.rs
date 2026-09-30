@@ -80,6 +80,9 @@ pub enum Permission {
 	PlatformRead,
 	/// Mutate platform config.
 	PlatformManage,
+	/// Grant/revoke ANY scoped grant (`domain::scopes`), any role, any scope. A scope's
+	/// own admin manages part of one scope without this; see `ScopeAuthority`.
+	ScopeManage,
 }
 
 /// The role→permission policy (pure). The RBAC matrix, read as separation of duties:
@@ -136,12 +139,15 @@ mod tests {
 		assert!(grants(Role::Operator, Permission::PlatformRead));
 		assert!(!grants(Role::Operator, Permission::UserSuspend));
 		assert!(!grants(Role::Operator, Permission::RoleGrant));
+		assert!(!grants(Role::Operator, Permission::ScopeManage));
 		// Admin: every mutation except granting roles.
 		assert!(grants(Role::Admin, Permission::UserSuspend));
 		assert!(grants(Role::Admin, Permission::KycManage));
 		assert!(grants(Role::Admin, Permission::PlatformManage));
+		assert!(grants(Role::Admin, Permission::ScopeManage));
 		assert!(!grants(Role::Admin, Permission::RoleGrant));
 		// Owner: everything.
 		assert!(grants(Role::Owner, Permission::RoleGrant));
+		assert!(grants(Role::Owner, Permission::ScopeManage));
 	}
 }

@@ -381,7 +381,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 				governance_repo,
 				governance_revisions,
 			))))
-			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), break_glass.clone()))))
+			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), Arc::new(infrastructure::scoped_grants::PgScopedGrants::new(pool.clone())), break_glass.clone()))))
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))

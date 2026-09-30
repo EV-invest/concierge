@@ -15,9 +15,9 @@ use std::{net::TcpListener, time::Duration};
 
 use evconcierge_auth::{Verifier, grpc_auth_layer};
 use evconcierge_contracts::concierge::v1::{
-	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, HoldUserRequest, HoldUserResponse, ListUsersRequest, ListUsersResponse,
-	ReinstateUserRequest, ReinstateUserResponse, RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest,
-	UserProfile,
+	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, GrantScopeRequest, GrantScopeResponse, HoldUserRequest, HoldUserResponse,
+	ListScopedGrantsRequest, ListScopedGrantsResponse, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse, RevokeScopeRequest, RevokeScopeResponse,
+	RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
 	health_service_client::HealthServiceClient,
 	health_service_server::{HealthService, HealthServiceServer},
 	user_directory_client::UserDirectoryClient,
@@ -82,6 +82,18 @@ impl UserDirectory for Directory {
 
 	async fn set_role(&self, _request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
 		Err(Status::unimplemented("UserDirectory.SetRole is not implemented"))
+	}
+
+	async fn grant_scope(&self, _request: Request<GrantScopeRequest>) -> Result<Response<GrantScopeResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.GrantScope is not implemented"))
+	}
+
+	async fn revoke_scope(&self, _request: Request<RevokeScopeRequest>) -> Result<Response<RevokeScopeResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.RevokeScope is not implemented"))
+	}
+
+	async fn list_scoped_grants(&self, _request: Request<ListScopedGrantsRequest>) -> Result<Response<ListScopedGrantsResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.ListScopedGrants is not implemented"))
 	}
 }
 
