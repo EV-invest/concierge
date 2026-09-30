@@ -87,7 +87,7 @@ retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
 | `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
-| `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation with reuse detection · `Exchange`/`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`) provisioning users to the directory over an in-process `Provisioner` channel, **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
+| `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation with reuse detection · `Exchange`/`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port) provisioning users to the directory over an in-process `Provisioner` channel, **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
 | **Design** — operator (admin) surface over this plane | [§ Design](#design) |
@@ -430,7 +430,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   wrong one of the right length). That is the bridge service token
   (`support::authenticate_service`), the Didit webhook HMAC (`infrastructure::kyc::didit`),
   the consilium self-decision code (`infrastructure::governance`), the refresh-token secret
-  (`evconcierge_auth::management`) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
+  (`evconcierge_auth::management`), a relying party's client secret and refresh secret
+  (`relying_party`, both compared as fixed-width digests) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
   Whether any one of them is a practical timing oracle is not the test — a plane that
   states this discipline and then has one check quietly doing `!=` (#52) is a plane whose
   next reader takes the exception for the rule. The CSRF check is also the STRICTER of the
@@ -505,6 +506,38 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `admin_action` in the same transaction; a refusal is logged at `warn!` (ids and
   scope, never the address).
   `GetMe.scopes` is the caller's active grants only — a global role is not folded in.
+- **This plane is the identity provider of first-party clients on OTHER origins, and a
+  client's token opens exactly one RPC.** A relying party (`relying_party`, registry
+  `rp_clients` from `0025`; the Service-Arb panel `sa` is seeded) runs authorization code +
+  PKCE S256: `GET /auth/authorize` (publicly `/api/auth/authorize`, under the conductor's
+  existing `/api/auth/*` rewrite) → `AuthService.ExchangeCode` / `RefreshClientToken`,
+  called by the client's backend with its secret. `/auth/authorize` settles the client and
+  the redirect_uri FIRST, byte for byte against the registry (no prefix, no wildcard), and
+  answers anything else with a page on this origin — never a redirect; only then do errors
+  travel back as `error=…&state=…`. With no session it sends the browser through the
+  ordinary `/api/auth/login?returnTo=` (a same-origin path), so the Google client never
+  learns a client exists. A code is 256 random bits stored as a digest, lives
+  `CODE_TTL_SECS` (60), is bound to client, redirect_uri, PKCE challenge, user and
+  `token_version`, and is BURNED on its first presentation, matching or not; a second
+  presentation marks it replayed and revokes every session it opened. The client's
+  `access_policy` (`public` | `scope:<scope>`, `domain::clients`) is re-read at authorize,
+  at the exchange and on EVERY refresh; `scope:` admits an active grant on the scope (any
+  scope role) or a global `admin`/`owner` (emergency access counting as the role it
+  grants), and a refusal on refresh revokes the session. Client refresh families live in
+  Postgres (`rp_sessions`), not Redis, because a replayed code has to find what it bought.
+  The access token is `typ=access`, `aud=<client audience>` (the CHECK keeps any
+  `concierge*`/`banking*` audience out of the registry), at most 15 min, and its `jti` is
+  `<session>:<uuid>`. It is admitted by a SECOND verifier mounted on the auth layer as
+  `with_restricted(…, ["/concierge.v1.UserDirectory/GetMe"])` — by exact method path,
+  after the plane's verifier has refused it — and that path re-checks the session is live,
+  so revocation is immediate there. The plane's own verifier never learns a client
+  audience: widening it would open every RPC. Secrets are env, not migration:
+  `RP_CLIENT_SECRET_<CLIENT_ID>` (≥32 chars) is written to `rp_clients.secret_hash` as a
+  SHA-256 at boot and cleared when unset, and a client with no secret obtains nothing.
+  `RP_DEV_REDIRECT_URIS` (`client=http://localhost:<port>/…`, loopback only) adds dev
+  redirect targets and refuses to boot in production. Sign-ins are recorded by
+  `rp_codes`/`rp_sessions` and `tracing`, not `admin_action` (nobody acted on anyone); a
+  replay or a reused refresh token is `error!` → Sentry.
 - **The USER consilia pass on a MAJORITY, the OWNER consilia on unanimity**, and the
   asymmetry is argued in `domain::governance::majority`. Unanimity guards the owner
   roster because a minority able to add owners by majority grows itself into a majority;
