@@ -12,13 +12,14 @@
 use std::sync::Arc;
 
 use evconcierge_contracts::concierge::v1::{
-	ExchangeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, RefreshRequest, RevokeSessionRequest, RevokeSessionResponse,
-	Session, TokenResponse, UserSummary, auth_service_server::AuthService as AuthServiceRpc,
+	ClientTokenResponse, ExchangeCodeRequest, ExchangeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse,
+	RefreshClientTokenRequest, RefreshRequest, RevokeSessionRequest, RevokeSessionResponse, Session, TokenResponse, UserSummary, auth_service_server::AuthService as AuthServiceRpc,
 };
 use tonic::{Request, Response, Status};
 
 use crate::{
 	AuthError,
+	clients::{ClientGrant, ClientGrants, ClientRefresh, CodeRedemption},
 	config::AuthConfig,
 	google::GoogleOauth,
 	management::{IssuedRefresh, RefreshInspect, RefreshStore, SessionBounds},
@@ -31,6 +32,9 @@ use crate::{
 #[derive(Clone)]
 pub struct AuthService {
 	engine: Arc<AuthEngine>,
+	/// The relying-party seam. `None` ⇒ `ExchangeCode`/`RefreshClientToken` answer
+	/// UNAVAILABLE, the same inert posture as an unconfigured signer.
+	client_grants: Option<Arc<dyn ClientGrants>>,
 }
 
 impl AuthService {
@@ -49,6 +53,7 @@ impl AuthService {
 		};
 		let google = config.google.as_ref().map(GoogleOauth::new);
 		Ok(Self {
+			client_grants: None,
 			engine: Arc::new(AuthEngine {
 				signer,
 				google,
@@ -73,6 +78,7 @@ impl AuthService {
 		// no signer issuance short-circuits at `NotConfigured` before reaching it.
 		drop(rx);
 		Self {
+			client_grants: None,
 			engine: Arc::new(AuthEngine {
 				signer: None,
 				google: None,
@@ -86,6 +92,26 @@ impl AuthService {
 				},
 			}),
 		}
+	}
+
+	/// Serve the relying-party code flow (`ExchangeCode`/`RefreshClientToken`) through
+	/// `grants` — the runner's Postgres-backed registry, codes and refresh families.
+	pub fn with_client_grants(mut self, grants: Arc<dyn ClientGrants>) -> Self {
+		self.client_grants = Some(grants);
+		self
+	}
+
+	/// Mint the access half of a relying party's pair for a decision the port made.
+	fn client_token_response(&self, grant: ClientGrant) -> Result<ClientTokenResponse, AuthError> {
+		let signer = self.engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
+		let (access_token, access_exp) = signer.mint_client_access(&grant.user_id, &grant.audience, grant.token_version, &grant.session_id)?;
+		Ok(ClientTokenResponse {
+			access_token,
+			access_expires_at: access_exp as i64,
+			refresh_token: grant.refresh_token,
+			refresh_expires_at: grant.refresh_expires_at as i64,
+			user_id: grant.user_id,
+		})
 	}
 
 	/// The user's CURRENT principal snapshot, read live from the directory — the
@@ -270,6 +296,40 @@ impl AuthServiceRpc for AuthService {
 		};
 		engine.refresh.revoke_by_id(&user_id, &req.session_id).await?;
 		Ok(Response::new(RevokeSessionResponse {}))
+	}
+
+	async fn exchange_code(&self, request: Request<ExchangeCodeRequest>) -> Result<Response<ClientTokenResponse>, Status> {
+		// Checked BEFORE the port is reached: redeeming burns the code, and a code burned
+		// by a plane that then cannot sign the answer is a login lost for nothing.
+		self.engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
+		let grants = self.client_grants.as_ref().ok_or(AuthError::NotConfigured)?;
+		let req = request.into_inner();
+		let grant = grants
+			.redeem(CodeRedemption {
+				client_id: req.client_id,
+				client_secret: req.client_secret,
+				code: req.code,
+				redirect_uri: req.redirect_uri,
+				code_verifier: req.code_verifier,
+			})
+			.await
+			.inspect_err(crate::telemetry::report_client_grant)?;
+		Ok(Response::new(self.client_token_response(grant)?))
+	}
+
+	async fn refresh_client_token(&self, request: Request<RefreshClientTokenRequest>) -> Result<Response<ClientTokenResponse>, Status> {
+		self.engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
+		let grants = self.client_grants.as_ref().ok_or(AuthError::NotConfigured)?;
+		let req = request.into_inner();
+		let grant = grants
+			.refresh(ClientRefresh {
+				client_id: req.client_id,
+				client_secret: req.client_secret,
+				refresh_token: req.refresh_token,
+			})
+			.await
+			.inspect_err(crate::telemetry::report_client_grant)?;
+		Ok(Response::new(self.client_token_response(grant)?))
 	}
 
 	async fn jwks(&self, _request: Request<JwksRequest>) -> Result<Response<JwksResponse>, Status> {

@@ -44,6 +44,25 @@ service AuthService {
   // unknown-`kid` miss. Carries only public key material.
   rpc Jwks(JwksRequest) returns (JwksResponse);
 
+  // Redeem a one-time authorization code for a RELYING PARTY's own token pair — the
+  // back half of the code flow a first-party client on another origin (the Service-Arb
+  // panel) runs against `GET /auth/authorize` (publicly `evinvest.ltd/api/auth/authorize`).
+  // Called server-to-server by the client's backend, authenticated by its client
+  // secret. The code is single-use, lives 60s, and is bound to the client, the exact
+  // redirect_uri and the PKCE (S256) challenge sent to authorize; presenting a code
+  // twice is refused AND revokes every token issued off it.
+  //
+  // The access token is `typ=access` with `aud=<the client's audience>` (e.g. `sa`) and
+  // a TTL of at most 15 minutes. It opens exactly one RPC in this plane —
+  // `UserDirectory.GetMe` — and is refused (UNAUTHENTICATED) everywhere else, here and
+  // on the money plane. The refresh token is opaque and bound to the client.
+  rpc ExchangeCode(ExchangeCodeRequest) returns (ClientTokenResponse);
+
+  // Rotate a relying party's refresh token. The client's access policy is re-checked
+  // on EVERY rotation, so a revoked scope ends the session at the next refresh rather
+  // than at the family's deadline; presenting a rotated-out token revokes the family.
+  rpc RefreshClientToken(RefreshClientTokenRequest) returns (ClientTokenResponse);
+
   // Reserved for later auth slices, declared here to lock the namespace:
   //   rpc Introspect(IntrospectRequest) returns (IntrospectResponse);
   //   rpc MintServiceToken(MintServiceTokenRequest) returns (TokenResponse);
@@ -133,6 +152,35 @@ message UserSummary {
   // register's: it disappears the moment the fund has its first persisted owner, and it
   // seats nobody. A client MUST render it as a warning, never as ownership.
   bool role_is_break_glass = 6;
+}
+
+message ExchangeCodeRequest {
+  string client_id = 1;
+  string client_secret = 2;
+  // The `code` query parameter the browser brought back to the redirect_uri.
+  string code = 3;
+  // The redirect_uri sent to authorize, byte for byte.
+  string redirect_uri = 4;
+  // The PKCE verifier whose S256 challenge was sent to authorize.
+  string code_verifier = 5;
+}
+
+message RefreshClientTokenRequest {
+  string client_id = 1;
+  string client_secret = 2;
+  string refresh_token = 3;
+}
+
+// A relying party's token pair. Expiries are unix SECONDS. Deliberately carries no
+// profile: the client reads that from `UserDirectory.GetMe` with the access token, and
+// GetMe is also what it re-checks `scopes` against on every request.
+message ClientTokenResponse {
+  string access_token = 1;
+  int64 access_expires_at = 2;
+  string refresh_token = 3;
+  int64 refresh_expires_at = 4;
+  // The concierge user id — the access token's `sub`.
+  string user_id = 5;
 }
 
 message JwksRequest {}
