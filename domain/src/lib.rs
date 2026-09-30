@@ -21,6 +21,8 @@ pub mod error;
 
 pub mod governance;
 
+pub mod scopes;
+
 pub mod users;
 
 /// Re-export of the `architecture` feature of the external `ev` crate — the
