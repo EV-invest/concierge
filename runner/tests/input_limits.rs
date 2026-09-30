@@ -14,6 +14,7 @@ use concierge::{
 	infrastructure::{
 		db,
 		platform::PgPlatform,
+		scoped_grants::PgScopedGrants,
 		users::{AdminAction, PgUsers},
 	},
 	platform::Platform,
@@ -117,11 +118,11 @@ fn profile(phone: &str, base_currency: &str) -> UpdateProfileRequest {
 
 #[tokio::test]
 async fn update_profile_rejects_junk_with_invalid_argument() {
-	let Some((users, _, _)) = setup().await else {
+	let Some((users, _, pool)) = setup().await else {
 		return;
 	};
 	let (sub, break_glass) = admin(&users).await;
-	let directory = Directory::new(users, break_glass);
+	let directory = Directory::new(users, Arc::new(PgScopedGrants::new(pool.clone())), break_glass);
 
 	let err = directory.update_profile(request_with(&sub, profile("https://t.me/junk", ""))).await.unwrap_err();
 	assert_eq!(err.code(), Code::InvalidArgument);
@@ -142,12 +143,12 @@ async fn update_profile_rejects_junk_with_invalid_argument() {
 
 #[tokio::test]
 async fn set_kyc_level_is_bounded() {
-	let Some((users, _, _)) = setup().await else {
+	let Some((users, _, pool)) = setup().await else {
 		return;
 	};
 	let (sub, break_glass) = admin(&users).await;
 	let target = subject_of(&users, "kyc-target").await;
-	let directory = Directory::new(users, break_glass);
+	let directory = Directory::new(users, Arc::new(PgScopedGrants::new(pool.clone())), break_glass);
 
 	let err = directory
 		.set_kyc_level(request_with(
@@ -205,7 +206,7 @@ async fn an_operator_cannot_set_their_own_kyc_level() {
 	// below include 0, and `admin()` provisions at 0.
 	users.raise_kyc_level_to(actor, 1, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
 	let before = traces_of(&pool, actor).await;
-	let directory = Directory::new(users.clone(), break_glass);
+	let directory = Directory::new(users.clone(), Arc::new(PgScopedGrants::new(pool.clone())), break_glass);
 
 	for level in [1, 3, 0, 4] {
 		let err = directory
@@ -335,11 +336,11 @@ async fn kyc_level_out_of_range_is_refused_by_the_store() {
 
 #[tokio::test]
 async fn list_users_validates_filters_and_truncates_query() {
-	let Some((users, _, _)) = setup().await else {
+	let Some((users, _, pool)) = setup().await else {
 		return;
 	};
 	let (sub, break_glass) = admin(&users).await;
-	let directory = Directory::new(users, break_glass);
+	let directory = Directory::new(users, Arc::new(PgScopedGrants::new(pool.clone())), break_glass);
 	let list = |query: &str, role: &str, status: &str| ListUsersRequest {
 		query: query.into(),
 		role: role.into(),

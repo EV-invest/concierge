@@ -29,6 +29,7 @@ use concierge::{
 		db,
 		governance::{PgGovernance, SelfDecision},
 		notifications::PgNotifications,
+		scoped_grants::PgScopedGrants,
 		users::PgUsers,
 	},
 	notification::RateLimiter,
@@ -208,12 +209,16 @@ impl Fixture {
 
 	/// The directory service over the same adapter, with no emergency allowlist.
 	fn directory(&self) -> Directory {
-		Directory::new(self.users.clone(), Arc::new(BreakGlass::new(Vec::new())))
+		Directory::new(self.users.clone(), Arc::new(PgScopedGrants::new(self.pool.clone())), Arc::new(BreakGlass::new(Vec::new())))
 	}
 
 	/// The directory service as an `OWNER_SUBJECTS`-listed operator sees it.
 	fn directory_with_break_glass(&self, subject: UserId) -> Directory {
-		Directory::new(self.users.clone(), Arc::new(BreakGlass::new(vec![subject.to_string()])))
+		Directory::new(
+			self.users.clone(),
+			Arc::new(PgScopedGrants::new(self.pool.clone())),
+			Arc::new(BreakGlass::new(vec![subject.to_string()])),
+		)
 	}
 
 	/// The consilium service as an `OWNER_SUBJECTS`-listed operator sees it.

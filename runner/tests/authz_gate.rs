@@ -26,6 +26,7 @@ use concierge::{
 	directory::{self, Directory},
 	infrastructure::{
 		db,
+		scoped_grants::PgScopedGrants,
 		users::{AdminAction, PgUsers},
 	},
 	ports::UserDirectoryRepository,
@@ -346,7 +347,7 @@ async fn malformed_admin_target_user_id_is_invalid_argument() {
 	// malformed TARGET field is bad input (code 3), never UNAUTHENTICATED — a code 16 here
 	// reads as an expired session to the console.
 	let sub = Uuid::new_v4().to_string();
-	let directory = Directory::new(fx.port(), Arc::new(BreakGlass::new(vec![sub.clone()])));
+	let directory = Directory::new(fx.port(), Arc::new(PgScopedGrants::new(fx.pool.clone())), Arc::new(BreakGlass::new(vec![sub.clone()])));
 
 	let bad_read = directory
 		.get_user(request_with(access_claims(&sub, 0), GetUserRequest { user_id: "123-not-a-uuid".into() }))
@@ -380,7 +381,7 @@ async fn read_surfaces_report_the_role_and_whether_it_is_break_glass() {
 	let elevated = fx.provision("surfaced").await;
 	let plain = fx.provision("plain").await;
 	let sub = elevated.to_string();
-	let directory = Directory::new(fx.port(), Arc::new(BreakGlass::new(vec![sub.clone()])));
+	let directory = Directory::new(fx.port(), Arc::new(PgScopedGrants::new(fx.pool.clone())), Arc::new(BreakGlass::new(vec![sub.clone()])));
 
 	// GetMe: the caller's own profile shows the same authority the gate grants, labelled.
 	let me = directory.get_me(request_with(access_claims(&sub, 0), GetMeRequest {})).await.unwrap().into_inner();

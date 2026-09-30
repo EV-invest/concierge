@@ -27,6 +27,7 @@ use concierge::{
 	infrastructure::{
 		db,
 		governance::{Audit, PgGovernance},
+		scoped_grants::PgScopedGrants,
 		users::{AdminAction, PgUsers},
 	},
 	ports::{GovernanceRepository, UserDirectoryRepository},
@@ -120,7 +121,7 @@ impl Fixture {
 	}
 
 	fn directory(&self) -> Directory {
-		Directory::new(self.users.clone(), Arc::new(BreakGlass::new(Vec::new())))
+		Directory::new(self.users.clone(), Arc::new(PgScopedGrants::new(self.pool.clone())), Arc::new(BreakGlass::new(Vec::new())))
 	}
 
 	fn service(&self) -> Governance {

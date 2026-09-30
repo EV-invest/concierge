@@ -74,6 +74,27 @@ service UserDirectory {
   // ROLE_CHANGED across the cross-plane bridge so the money plane mirrors it. Echoes
   // the role now in effect.
   rpc SetRole(SetRoleRequest) returns (SetRoleResponse);
+
+  // Give a user a role over ONE resource (`allocation:<service_id>`), replacing the role
+  // they hold there if any. Non-money access only — a vertical's panel; it never crosses
+  // the bridge. Echoes the grant now in effect; re-granting the role already held is a
+  // no-op.
+  //
+  // Who may: a global admin/owner — any scope, any role. The scope's own `admin` —
+  // `operator`/`viewer` inside that scope, and never an `admin` grant in either
+  // direction (neither minting one nor moving an existing one). Anyone else:
+  // PERMISSION_DENIED. A malformed scope or role is INVALID_ARGUMENT; an unknown user_id
+  // is NOT_FOUND, reported only to a caller who holds some authority over the scope.
+  rpc GrantScope(GrantScopeRequest) returns (GrantScopeResponse);
+
+  // Take a user's grant on a scope away. Same authority rule as GrantScope: a scope
+  // admin may revoke `operator`/`viewer` grants in their scope, never an `admin` one.
+  // NOT_FOUND when the user holds no active grant there.
+  rpc RevokeScope(RevokeScopeRequest) returns (RevokeScopeResponse);
+
+  // The active grants on one scope, with each holder's email and names, for the
+  // cabinet's "Access" tab. Global admin/owner, or the scope's `admin`.
+  rpc ListScopedGrants(ListScopedGrantsRequest) returns (ListScopedGrantsResponse);
 }
 
 message GetMeRequest {}
@@ -116,6 +137,24 @@ message UserProfile {
   string suspended_by = 19;
   // Unix SECONDS an "admin_hold" lapses. 0 when nothing lapses.
   int64 hold_expires_at = 20;
+  // The caller's ACTIVE scoped grants. Filled by GetMe only — every other RPC returning
+  // a UserProfile leaves it empty, so an empty list elsewhere means "not reported", not
+  // "holds none". A global role is NOT folded in here: a panel that admits global
+  // admins/owners reads `role` above for that.
+  repeated ScopedGrant scopes = 21;
+}
+
+// A user's role over one resource.
+message ScopedGrant {
+  string user_id = 1;
+  // `allocation:<service_id>`, service_id in [a-z0-9_]{1,64}.
+  string scope = 2;
+  // viewer/operator/admin.
+  string role = 3;
+  // Who made this grant (user id).
+  string granted_by = 4;
+  // Unix SECONDS.
+  int64 granted_at = 5;
 }
 
 // The caller's editable profile, full-replace. Same 10 fields as the editable part of
@@ -241,4 +280,44 @@ message SetRoleRequest {
 message SetRoleResponse {
   // The role now in effect (echoes the applied role).
   string role = 1;
+}
+
+message GrantScopeRequest {
+  string user_id = 1;
+  string scope = 2;
+  // viewer/operator/admin.
+  string role = 3;
+  // Recorded verbatim on the audit row.
+  string reason = 4;
+}
+
+message GrantScopeResponse {
+  ScopedGrant grant = 1;
+}
+
+message RevokeScopeRequest {
+  string user_id = 1;
+  string scope = 2;
+  // Recorded verbatim on the audit row.
+  string reason = 3;
+}
+
+message RevokeScopeResponse {}
+
+message ListScopedGrantsRequest {
+  string scope = 1;
+}
+
+// One holder of a scope, with enough identity to render the row.
+message ScopeHolder {
+  ScopedGrant grant = 1;
+  string email = 2;
+  // Empty until the user sets them (see UserProfile).
+  string legal_name = 3;
+  string preferred_name = 4;
+}
+
+message ListScopedGrantsResponse {
+  // Oldest grant first.
+  repeated ScopeHolder holders = 1;
 }
