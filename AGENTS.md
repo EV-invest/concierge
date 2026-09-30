@@ -530,10 +530,25 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `<session>:<uuid>`. It is admitted by a SECOND verifier mounted on the auth layer as
   `with_restricted(…, ["/concierge.v1.UserDirectory/GetMe"])` — by exact method path,
   after the plane's verifier has refused it — and that path re-checks the session is live,
-  so revocation is immediate there. The plane's own verifier never learns a client
+  so revocation is immediate there. The layer marks such a caller (`RestrictedCaller`) and
+  `GetMe` answers it from an ALLOWLIST — id, email (+verified), status, preferred name,
+  role (+break-glass flag), scopes — never legal name, phone, birth date, nationality, tax
+  residence, address or KYC level. An outage of that second verifier stays UNAVAILABLE.
+  The plane's own verifier never learns a client
   audience: widening it would open every RPC. Secrets are env, not migration:
   `RP_CLIENT_SECRET_<CLIENT_ID>` (≥32 chars) is written to `rp_clients.secret_hash` as a
-  SHA-256 at boot and cleared when unset, and a client with no secret obtains nothing.
+  SHA-256 at boot when set; a boot WITHOUT it keeps the stored digest (one replica's
+  config slip must not sign the client out everywhere — switch a client off with
+  `disabled_at`), and a client that never had a secret obtains nothing.
+  **Single logout**: `/auth/authorize` checks the browser's refresh family first-hand
+  (`AuthService::live_family`) — the web session's cached access token outlives a
+  sign-out elsewhere — and stamps it on the code and the session it opens
+  (`upstream_family`). `Logout`, `RevokeSession` (only a family the caller owns) and every
+  revoke-all path (`revoke_all`, refresh reuse, a suspension, a `token_version` bump)
+  call `ClientGrants::upstream_revoked`, which expires the codes and revokes the sessions
+  (`upstream_revoked`) in one transaction, codes first. Best-effort: a failure there is
+  reported to Sentry, not returned. A wrong refresh secret presented by the right client
+  for a live session revokes it (`refresh_reuse`), not only a rotated-out one.
   `RP_DEV_REDIRECT_URIS` (`client=http://localhost:<port>/…`, loopback only) adds dev
   redirect targets and refuses to boot in production. Sign-ins are recorded by
   `rp_codes`/`rp_sessions` and `tracing`, not `admin_action` (nobody acted on anyone); a
