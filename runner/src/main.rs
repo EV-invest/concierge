@@ -308,6 +308,10 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		std::time::Duration::from_secs(config.governance_mail_rate_window_secs),
 		config.governance_mail_rate_limit,
 	));
+	let scope_write_limiter = Arc::new(notification::RateLimiter::new(
+		std::time::Duration::from_secs(config.scope_write_rate_window_secs),
+		config.scope_write_rate_limit,
+	));
 
 	// The site-level auth HTTP surface: the conductor rewrites the shared origin's
 	// `/api/auth/*` + `/api/callback/auth/*` here, so login/session cookies land
@@ -432,7 +436,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 				governance_repo,
 				governance_revisions,
 			))))
-			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), scoped_grants, break_glass.clone()))))
+			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), scoped_grants, break_glass.clone()).with_scope_write_limiter(scope_write_limiter))))
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))

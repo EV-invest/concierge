@@ -735,3 +735,44 @@ async fn a_scope_admin_revoking_by_email_hears_one_not_found_for_everything() {
 	answers.dedup();
 	assert_eq!(answers.len(), 1, "one text for all of them: {answers:?}");
 }
+
+/// Twenty scope writes an hour is a busy afternoon of onboarding; a script walking a
+/// list of addresses hits the ceiling long before it has learned anything.
+#[tokio::test]
+async fn a_scope_admin_gets_twenty_scope_writes_an_hour() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let scope_admin = fx.scope_admin().await;
+	let member = fx.user("member").await;
+	// Grants and revokes share one budget, and a refused write spends it too: the
+	// probing this bounds is made of refusals.
+	for round in 0..10 {
+		fx.grant(scope_admin, member, &fx.scope, "operator").await.unwrap_or_else(|err| panic!("grant {round}: {err}"));
+		fx.revoke(scope_admin, member, &fx.scope).await.unwrap_or_else(|err| panic!("revoke {round}: {err}"));
+	}
+	assert_eq!(code(fx.grant(scope_admin, member, &fx.scope, "operator").await), Code::ResourceExhausted, "the 21st write");
+	assert_eq!(code(fx.revoke(scope_admin, member, &fx.scope).await), Code::ResourceExhausted, "revokes are counted with grants");
+	assert_eq!(
+		code(fx.grant_to(scope_admin, grant_scope_request::Target::Email(unknown_email()), &fx.scope, "operator").await),
+		Code::ResourceExhausted,
+		"and the limit answers before the address is looked at"
+	);
+	assert!(fx.my_scopes(member).await.is_empty(), "the refused grant wrote nothing");
+
+	// The budget is the actor's own: another scope admin is untouched.
+	let other = fx.scope_admin().await;
+	fx.grant(other, member, &fx.scope, "operator").await.expect("a different actor has their own budget");
+}
+
+#[tokio::test]
+async fn a_global_admin_is_not_rate_limited_on_scope_writes() {
+	let Some(fx) = setup().await else {
+		return;
+	};
+	let global = fx.global_admin().await;
+	let member = fx.user("member").await;
+	for round in 0..30 {
+		fx.grant(global, member, &fx.scope, "operator").await.unwrap_or_else(|err| panic!("grant {round}: {err}"));
+	}
+}
