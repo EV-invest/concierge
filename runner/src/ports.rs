@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use domain::{
 	architecture::{Reader, Repository},
 	authz::Role,
+	clients::AccessPolicy,
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	scopes::{Scope, ScopeAuthority, ScopeRole},
@@ -154,6 +155,146 @@ pub trait ScopedGrantRepository: Send + Sync {
 
 	/// Every active grant on `scope`, with each holder's identity, oldest first.
 	async fn holders(&self, scope: &Scope) -> Result<Vec<ScopeHolderRecord>, DomainError>;
+}
+
+/// A registered relying party (`rp_clients`).
+#[derive(Clone, Debug)]
+pub struct ClientRecord {
+	pub client_id: String,
+	/// The `aud` its access tokens carry.
+	pub audience: String,
+	/// Exact redirect URIs. Compared byte for byte, never by prefix.
+	pub redirect_uris: Vec<String>,
+	pub access_policy: AccessPolicy,
+	/// SHA-256 of the client secret; `None` until the operator sets one, and a client
+	/// without one can obtain no token.
+	pub secret_hash: Option<Vec<u8>>,
+	pub disabled: bool,
+}
+
+/// A one-time authorization code to store (`rp_codes`). Only its digest is persisted.
+pub struct NewCode<'a> {
+	pub code_hash: &'a [u8],
+	pub client_id: &'a str,
+	pub redirect_uri: &'a str,
+	pub code_challenge: &'a str,
+	pub user: UserId,
+	pub token_version: u64,
+	pub issued_at: i64,
+	pub expires_at: i64,
+	pub client_ip: &'a str,
+	pub user_agent: &'a str,
+}
+
+/// A presented code, as the client presented it (the verifier already hashed to the
+/// challenge it must match).
+pub struct CodeClaim<'a> {
+	pub code_hash: &'a [u8],
+	pub client_id: &'a str,
+	pub redirect_uri: &'a str,
+	pub challenge_of_verifier: &'a str,
+	pub now: i64,
+}
+
+/// What [`RelyingPartyRepository::claim_code`] found. Every arm but `Unknown` has burned
+/// the code.
+pub enum CodeOutcome {
+	Redeemed {
+		user: UserId,
+		token_version: u64,
+	},
+	Unknown,
+	Expired,
+	/// Bound to another client, redirect_uri or PKCE challenge.
+	Mismatch,
+	/// Presented after it was already redeemed; the sessions it opened are now revoked.
+	Replayed {
+		client_id: String,
+		user: UserId,
+		revoked_sessions: u64,
+	},
+}
+
+/// A refresh family to open for a redeemed code (`rp_sessions`).
+pub struct NewSession<'a> {
+	pub id: Uuid,
+	pub client_id: &'a str,
+	pub user: UserId,
+	pub code_hash: &'a [u8],
+	pub secret_hash: &'a [u8],
+	pub token_version: u64,
+	pub now: i64,
+	pub expires_at: i64,
+	pub absolute_expires_at: i64,
+}
+
+/// A refresh family as stored.
+pub struct SessionRow {
+	pub client_id: String,
+	pub user: UserId,
+	pub current_hash: Vec<u8>,
+	pub prev_hash: Option<Vec<u8>>,
+	pub token_version: u64,
+	pub expires_at: i64,
+	pub absolute_expires_at: i64,
+	pub revoked: bool,
+}
+
+/// Why a family was revoked — the `rp_sessions_revoked_reason` vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionRevocation {
+	/// A rotated-out refresh secret was presented: theft.
+	RefreshReuse,
+	/// The user no longer passes the client's policy, or the account is suspended.
+	AccessDenied,
+	/// The user's `token_version` moved past the family's ("revoke all").
+	TokensRevoked,
+}
+
+impl SessionRevocation {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::RefreshReuse => "refresh_reuse",
+			Self::AccessDenied => "access_denied",
+			Self::TokensRevoked => "tokens_revoked",
+		}
+	}
+}
+
+/// Relying parties: the client registry, one-time codes and refresh families. Each
+/// method is internally atomic.
+#[async_trait]
+pub trait RelyingPartyRepository: Send + Sync {
+	async fn client(&self, client_id: &str) -> Result<Option<ClientRecord>, DomainError>;
+
+	/// Every registered client, for the boot's secret sync and verifier audiences.
+	async fn clients(&self) -> Result<Vec<ClientRecord>, DomainError>;
+
+	/// Store (or clear) a client's secret digest. Returns whether it changed.
+	async fn set_secret_hash(&self, client_id: &str, secret_hash: Option<&[u8]>, now: i64) -> Result<bool, DomainError>;
+
+	/// Store a code, reaping ones long past their expiry.
+	async fn issue_code(&self, code: NewCode<'_>) -> Result<(), DomainError>;
+
+	/// Burn a presented code and say what it was — or, if it was already burned, mark it
+	/// replayed and revoke the families it opened.
+	async fn claim_code(&self, claim: CodeClaim<'_>) -> Result<CodeOutcome, DomainError>;
+
+	/// Open a family for a redeemed code. `false` when the code was replayed since it was
+	/// claimed — nothing is opened then.
+	async fn open_session(&self, session: NewSession<'_>) -> Result<bool, DomainError>;
+
+	async fn session(&self, id: Uuid) -> Result<Option<SessionRow>, DomainError>;
+
+	/// Rotate a family from `presented_hash` to `next_hash`. `false` when the family moved
+	/// on or was revoked since it was read.
+	async fn rotate_session(&self, id: Uuid, presented_hash: &[u8], next_hash: &[u8], expires_at: i64, now: i64) -> Result<bool, DomainError>;
+
+	async fn revoke_session(&self, id: Uuid, reason: SessionRevocation, now: i64) -> Result<(), DomainError>;
+
+	/// Whether an access token issued under family `id` for `audience` may still be
+	/// honoured: the family is live and belongs to a client with that audience.
+	async fn session_live(&self, id: Uuid, audience: &str, now: i64) -> Result<bool, DomainError>;
 }
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).
