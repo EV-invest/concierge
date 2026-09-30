@@ -451,6 +451,8 @@ async fn the_table_itself_refuses_a_second_active_grant_and_a_malformed_scope() 
 	assert!(duplicate.to_string().contains("scoped_grants_active_idx"), "{duplicate}");
 	let malformed = insert("allocation:Nope".into(), "operator").await.expect_err("the scope format is a column rule too");
 	assert!(malformed.to_string().contains("scoped_grants_scope_format"), "{malformed}");
+	let viewer = insert(fresh_scope(), "viewer").await.expect_err("the removed role is refused by the column too");
+	assert!(viewer.to_string().contains("scoped_grants_role"), "{viewer}");
 }
 
 #[tokio::test]
