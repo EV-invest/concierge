@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::{
 	relying_party::{Admission, Requester, is_s256_challenge},
-	web::{WebState, routes::client_ip},
+	web::{WebState, routes::client_ip, session::Fresh},
 };
 
 /// The public path of this route — what `returnTo` must name for the login to come back.
@@ -58,7 +58,8 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 	let client = match relying_parties.resolve(client_id, redirect_uri).await {
 		Ok(Some(client)) => client,
 		Ok(None) => {
-			tracing::warn!(client_id = %client_id.chars().take(32).collect::<String>(), "relying party: authorize refused an unregistered client or redirect_uri");
+			// Debug, not Display: the caller's own string, and it may carry newlines.
+			tracing::warn!(client_id = ?client_id.chars().take(32).collect::<String>(), "relying party: authorize refused an unregistered client or redirect_uri");
 			return page(StatusCode::BAD_REQUEST, "This sign-in link is not valid.");
 		}
 		Err(err) => {
@@ -67,16 +68,18 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		}
 	};
 
-	// The redirect_uri is the client's own from here on.
-	let back = Back {
-		redirect_uri,
-		state: q.state.as_deref().filter(|s| s.len() <= MAX_STATE_LEN),
-	};
-	if q.state.as_deref().is_some_and(|s| s.len() > MAX_STATE_LEN) {
+	// The redirect_uri is the client's own from here on. `state` is REQUIRED: it is the
+	// client's only defence against a code injected into its callback, and a client that
+	// forgot it is better told so now than left open.
+	let state = q.state.as_deref().filter(|s| !s.is_empty() && s.len() <= MAX_STATE_LEN);
+	let back = Back { redirect_uri, state };
+	if state.is_none() {
 		return back.error("invalid_request");
 	}
-	if q.response_type.as_deref().is_some_and(|t| t != "code") {
-		return back.error("unsupported_response_type");
+	match q.response_type.as_deref() {
+		Some("code") => {}
+		None => return back.error("invalid_request"),
+		Some(_) => return back.error("unsupported_response_type"),
 	}
 	let Some(code_challenge) = q.code_challenge.as_deref().filter(|c| is_s256_challenge(c)) else {
 		return back.error("invalid_request");
@@ -85,49 +88,86 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 		return back.error("invalid_request");
 	}
 
-	let fresh = match jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
-		Some(id) => match st.sessions.fresh(&id, &st.auth).await {
-			Ok(fresh) => fresh,
+	let session_id = jar.get(&st.cookies.session).map(|c| c.value().to_string());
+	let live = match session_id.as_deref() {
+		Some(id) => match live_session(st, id).await {
+			Ok(live) => live,
 			Err(err) => {
-				tracing::error!(error = ?err, "relying party: session store failed at authorize");
+				tracing::error!(error = ?err, "relying party: session unreadable at authorize");
 				return back.error("temporarily_unavailable");
 			}
 		},
 		None => None,
 	};
-	let Some(fresh) = fresh else {
+	let Some((fresh, upstream_family)) = live else {
 		// Coming back from a sign-in that failed or was cancelled: send the refusal to the
 		// client rather than start the login again, which would loop.
 		if q.auth_error.is_some() {
 			return back.error("access_denied");
 		}
-		return redirect(&login_url(client_id, redirect_uri, q.state.as_deref(), code_challenge, q.response_type.as_deref()));
+		return redirect(&login_url(client_id, redirect_uri, state, code_challenge));
 	};
+	// The session view may have rotated the access token; the browser gets the new one
+	// exactly as `/auth/session` hands it out, whatever this route answers.
+	let jar = jar.add(st.cookies.server_cookie(st.cookies.access.clone(), fresh.access_token, fresh.remaining_secs));
 
 	let Ok(user) = Uuid::parse_str(&fresh.user.user_id).map(UserId::from_raw) else {
-		return back.error("access_denied");
+		return (jar, back.error("access_denied")).into_response();
 	};
 	let token_version = match relying_parties.admit(user, &client).await {
 		Ok(Admission::Admitted { token_version }) => token_version,
 		Ok(Admission::Denied) => {
 			tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: authorize denied by the access policy");
-			return back.error("access_denied");
+			return (jar, back.error("access_denied")).into_response();
 		}
 		Err(err) => {
 			tracing::error!(%err, "relying party: policy unreadable at authorize");
-			return back.error("temporarily_unavailable");
+			return (jar, back.error("temporarily_unavailable")).into_response();
 		}
 	};
 	let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
 	let ip = client_ip(&headers);
-	match relying_parties
-		.issue_code(&client, redirect_uri, code_challenge, user, token_version, Requester { client_ip: &ip, user_agent })
-		.await
-	{
+	let requester = Requester {
+		upstream_family: &upstream_family,
+		client_ip: &ip,
+		user_agent,
+	};
+	let answer = match relying_parties.issue_code(&client, redirect_uri, code_challenge, user, token_version, requester).await {
 		Ok(code) => back.with(&[("code", &code)]),
 		Err(err) => {
 			tracing::error!(%err, "relying party: code store failed at authorize");
 			back.error("temporarily_unavailable")
+		}
+	};
+	(jar, answer).into_response()
+}
+
+/// The browser's `evinvest.ltd` session and the refresh family behind it, or `None` when
+/// there is no session to act on.
+///
+/// `WebSessions::fresh` alone is not enough: it asks upstream only when the stored access
+/// token is about to lapse, so a session signed out from another device or revoked from
+/// the console still reads as live here for up to the access TTL. Handing out a new
+/// credential on that is exactly what the revocation was meant to stop, so the family is
+/// checked first-hand, and a dead one takes the locker entry with it.
+async fn live_session(st: &super::Inner, session_id: &str) -> color_eyre::Result<Option<(Fresh, String)>> {
+	let Some(fresh) = st.sessions.fresh(session_id, &st.auth).await? else {
+		return Ok(None);
+	};
+	// Read AFTER `fresh`, which may have rotated it.
+	let Some(refresh_token) = st.sessions.refresh_token(session_id).await? else {
+		return Ok(None);
+	};
+	match st
+		.auth
+		.live_family(&refresh_token)
+		.await
+		.map_err(|err| color_eyre::eyre::eyre!("refresh family unreadable: {err}"))?
+	{
+		Some(family) => Ok(Some((fresh, family))),
+		None => {
+			st.sessions.forget(session_id).await?;
+			Ok(None)
 		}
 	}
 }
@@ -159,12 +199,11 @@ impl Back<'_> {
 /// The login URL that brings the browser back to this exact authorize request. Rebuilt
 /// from the parsed parameters, never copied from the raw query, so nothing the caller
 /// added rides along.
-fn login_url(client_id: &str, redirect_uri: &str, state: Option<&str>, code_challenge: &str, response_type: Option<&str>) -> String {
+fn login_url(client_id: &str, redirect_uri: &str, state: Option<&str>, code_challenge: &str) -> String {
 	let mut back = form_urlencoded::Serializer::new(String::new());
-	back.append_pair("client_id", client_id).append_pair("redirect_uri", redirect_uri);
-	if let Some(response_type) = response_type {
-		back.append_pair("response_type", response_type);
-	}
+	back.append_pair("client_id", client_id)
+		.append_pair("redirect_uri", redirect_uri)
+		.append_pair("response_type", "code");
 	if let Some(state) = state {
 		back.append_pair("state", state);
 	}
@@ -174,12 +213,21 @@ fn login_url(client_id: &str, redirect_uri: &str, state: Option<&str>, code_chal
 	format!("{LOGIN_PATH}?{login}")
 }
 
-/// A 302 that no cache keeps: the Location carries a one-time code.
+/// A 302 that no cache keeps and no Referer repeats: the Location carries a one-time
+/// code, and the page it lands on must not learn it from this hop either.
 fn redirect(location: &str) -> Response {
 	let Ok(location) = HeaderValue::from_str(location) else {
 		return page(StatusCode::BAD_REQUEST, "This sign-in link is not valid.");
 	};
-	(StatusCode::FOUND, [(header::LOCATION, location), (header::CACHE_CONTROL, HeaderValue::from_static("no-store"))]).into_response()
+	(
+		StatusCode::FOUND,
+		[
+			(header::LOCATION, location),
+			(header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+			(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer")),
+		],
+	)
+		.into_response()
 }
 
 /// An error page on THIS origin. The text is fixed: nothing from the request is echoed.
@@ -188,5 +236,16 @@ fn page(status: StatusCode, message: &'static str) -> Response {
 		"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Sign-in</title></head>\
 		 <body><main><h1>Sign-in could not continue</h1><p>{message}</p><p><a href=\"/\">Go to evinvest.ltd</a></p></main></body></html>"
 	);
-	(status, [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], Html(body)).into_response()
+	// Never framed: a page on this origin that a client could embed is a page it could
+	// dress up. No Referer either — the request URL carries the client's parameters.
+	(
+		status,
+		[
+			(header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+			(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer")),
+			(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'")),
+		],
+		Html(body),
+	)
+		.into_response()
 }

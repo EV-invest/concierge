@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
 	AuthError,
-	clients::{ClientGrant, ClientGrants, ClientRefresh, CodeRedemption},
+	clients::{ClientGrant, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation},
 	config::AuthConfig,
 	google::GoogleOauth,
 	management::{IssuedRefresh, RefreshInspect, RefreshStore, SessionBounds},
@@ -112,6 +112,47 @@ impl AuthService {
 			refresh_expires_at: grant.refresh_expires_at as i64,
 			user_id: grant.user_id,
 		})
+	}
+
+	/// The id of the refresh family `refresh_token` currently holds, or `None` when it is
+	/// not that family's current secret (revoked, expired, rotated out, unknown).
+	///
+	/// A web session's stored access token keeps verifying until its short TTL runs out
+	/// and the session view only asks upstream when it refreshes, so a surface that hands
+	/// out a NEW credential (`/auth/authorize`) asks this first: a cabinet session signed
+	/// out elsewhere must not mint a relying-party sign-in.
+	pub async fn live_family(&self, refresh_token: &str) -> Result<Option<String>, AuthError> {
+		let engine = &self.engine;
+		match engine.refresh.inspect(refresh_token, engine.session_bounds).await? {
+			RefreshInspect::Current { .. } => engine.refresh.family_id_of(refresh_token).await,
+			RefreshInspect::Reuse { .. } | RefreshInspect::Invalid => Ok(None),
+		}
+	}
+
+	/// Open a refresh family without a Google exchange, for integration suites that need
+	/// a real `evinvest.ltd` session to exist. Returns the refresh token.
+	#[cfg(feature = "test-support")]
+	pub async fn open_family_for_tests(&self, user_id: &str, token_version: u64) -> Result<String, AuthError> {
+		let engine = &self.engine;
+		Ok(engine.refresh.issue(user_id, token_version, engine.session_bounds, "itest".into(), String::new()).await?.token)
+	}
+
+	/// Single logout: end what the relying parties were handed on the authority of the
+	/// families just revoked. Best-effort by design — the upstream revocation has already
+	/// happened and failing the caller now would not undo it — so a failure is reported
+	/// (Sentry) rather than returned.
+	async fn end_client_sessions(&self, revocation: UpstreamRevocation) {
+		let Some(grants) = self.client_grants.as_ref() else { return };
+		if let Err(err) = grants.upstream_revoked(revocation).await {
+			crate::telemetry::report(&err);
+		}
+	}
+
+	/// Revoke every family of `user_id`, here and at the relying parties.
+	async fn revoke_user_everywhere(&self, user_id: &str) -> Result<(), AuthError> {
+		self.engine.refresh.revoke_user(user_id).await?;
+		self.end_client_sessions(UpstreamRevocation::User { user_id: user_id.to_owned() }).await;
+		Ok(())
 	}
 
 	/// The user's CURRENT principal snapshot, read live from the directory — the
@@ -209,7 +250,7 @@ impl AuthServiceRpc for AuthService {
 		let user_id = match engine.refresh.inspect(&req.refresh_token, engine.session_bounds).await? {
 			RefreshInspect::Current { user_id } => user_id,
 			RefreshInspect::Reuse { user_id } => {
-				engine.refresh.revoke_user(&user_id).await?;
+				self.revoke_user_everywhere(&user_id).await?;
 				return Err(AuthError::InvalidToken.into());
 			}
 			RefreshInspect::Invalid => return Err(AuthError::InvalidToken.into()),
@@ -219,7 +260,7 @@ impl AuthServiceRpc for AuthService {
 		// alert too, not just render UNAVAILABLE.
 		let summary = engine.provisioner.lookup(user_id).await.inspect_err(crate::telemetry::report_unexpected)?;
 		if summary.is_disabled() {
-			engine.refresh.revoke_user(&summary.user_id).await?;
+			self.revoke_user_everywhere(&summary.user_id).await?;
 			return Err(Status::permission_denied("user is disabled"));
 		}
 
@@ -229,7 +270,7 @@ impl AuthServiceRpc for AuthService {
 		// in Postgres; refuse to mint and drop the family. (A pure comparison, so running it
 		// after the rotation is safe — the family is dropped on mismatch regardless.)
 		if summary.token_version > rotated.token_version_snapshot {
-			engine.refresh.revoke_user(&summary.user_id).await?;
+			self.revoke_user_everywhere(&summary.user_id).await?;
 			return Err(Status::unauthenticated("tokens revoked"));
 		}
 
@@ -253,9 +294,14 @@ impl AuthServiceRpc for AuthService {
 			if let Err(err) = engine.provisioner.revoke_all(user_id.clone()).await {
 				crate::telemetry::report(&err);
 			}
-			engine.refresh.revoke_user(&user_id).await?;
+			self.revoke_user_everywhere(&user_id).await?;
 		} else {
+			// Read before the revoke, which is what makes the id unreadable.
+			let family_id = engine.refresh.family_id_of(&req.refresh_token).await?;
 			engine.refresh.revoke(&req.refresh_token).await?;
+			if let Some(family_id) = family_id {
+				self.end_client_sessions(UpstreamRevocation::Family { user_id, family_id }).await;
+			}
 		}
 		Ok(Response::new(LogoutResponse {}))
 	}
@@ -294,7 +340,11 @@ impl AuthServiceRpc for AuthService {
 		let RefreshInspect::Current { user_id, .. } = engine.refresh.inspect(&req.refresh_token, engine.session_bounds).await? else {
 			return Err(AuthError::InvalidToken.into());
 		};
-		engine.refresh.revoke_by_id(&user_id, &req.session_id).await?;
+		// Only a family the caller actually owned: `session_id` is caller input, and passing
+		// it on unchecked would let anyone end another user's relying-party sessions.
+		if engine.refresh.revoke_by_id(&user_id, &req.session_id).await? {
+			self.end_client_sessions(UpstreamRevocation::Family { user_id, family_id: req.session_id }).await;
+		}
 		Ok(Response::new(RevokeSessionResponse {}))
 	}
 

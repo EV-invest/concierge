@@ -79,6 +79,17 @@ impl From<ClientGrantError> for tonic::Status {
 	}
 }
 
+/// An `evinvest.ltd` sign-out that must also end the relying-party sessions it
+/// authorized — single logout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpstreamRevocation {
+	/// One refresh family of the user ended (Logout, RevokeSession).
+	Family { user_id: String, family_id: String },
+	/// Every family of the user ended (revoke-all, refresh reuse, a suspension, a
+	/// `token_version` bump seen at refresh).
+	User { user_id: String },
+}
+
 /// The runner's side of the relying-party flow. Implemented over Postgres by the runner
 /// and handed to [`AuthService::with_client_grants`](crate::AuthService::with_client_grants).
 pub trait ClientGrants: Send + Sync {
@@ -88,4 +99,8 @@ pub trait ClientGrants: Send + Sync {
 
 	/// Rotate a refresh token after re-checking the user against the client's policy.
 	fn refresh(&self, refresh: ClientRefresh) -> BoxFuture<'_, Result<ClientGrant, ClientGrantError>>;
+
+	/// End the client sessions (and outstanding codes) an upstream sign-out took the
+	/// authority of.
+	fn upstream_revoked(&self, revocation: UpstreamRevocation) -> BoxFuture<'_, Result<(), ClientGrantError>>;
 }

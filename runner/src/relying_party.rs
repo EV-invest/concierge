@@ -30,7 +30,7 @@ use domain::{
 	error::DomainError,
 	users::{UserId, UserStatus},
 };
-use evconcierge_auth::{AuthError, Authenticate, BoxFuture, Claims, ClientGrant, ClientGrantError, ClientGrants, ClientRefresh, CodeRedemption, Verifier};
+use evconcierge_auth::{AuthError, Authenticate, BoxFuture, Claims, ClientGrant, ClientGrantError, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation, Verifier};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -148,6 +148,8 @@ pub enum Admission {
 
 /// Where a browser at `/auth/authorize` came from, for the code row.
 pub struct Requester<'a> {
+	/// The `evinvest.ltd` refresh family the browser is signed in with.
+	pub upstream_family: &'a str,
 	pub client_ip: &'a str,
 	pub user_agent: &'a str,
 }
@@ -182,7 +184,7 @@ impl RelyingParties {
 	}
 
 	/// The boot's half of the registry: write every client's secret digest from
-	/// `RP_CLIENT_SECRET_<ID>` (clearing it when unset), refuse a registered redirect that
+	/// `RP_CLIENT_SECRET_<ID>` when it is set, refuse a registered redirect that
 	/// could send a code anywhere unexpected, and hand back the audiences the inbound
 	/// verifier must admit on `GetMe`.
 	pub async fn sync_registry(&self, secret_of: impl Fn(&str) -> Option<String>) -> Result<Vec<String>> {
@@ -198,12 +200,16 @@ impl RelyingParties {
 					"{var} is shorter than {MIN_CLIENT_SECRET_LEN} characters — generate one with `openssl rand -base64 48`"
 				);
 			}
-			let digest = secret.as_deref().map(|s| sha256(s.as_bytes()));
-			let changed = self.repo.set_secret_hash(&client.client_id, digest.as_ref().map(|d| d.as_slice()), now).await?;
-			match (&digest, changed) {
-				(None, _) => tracing::warn!(client_id = %client.client_id, "relying party has no secret ({var} unset): it can obtain no token"),
-				(Some(_), true) => tracing::info!(client_id = %client.client_id, "relying party secret set from {var}"),
-				(Some(_), false) => {}
+			// An unset variable writes NOTHING: replicas boot one by one, and one missing the
+			// variable must not clear the digest the others serve with — that would sign the
+			// client out everywhere on a config slip. Switching a client off is `disabled_at`.
+			match secret {
+				Some(secret) =>
+					if self.repo.set_secret_hash(&client.client_id, Some(sha256(secret.as_bytes()).as_slice()), now).await? {
+						tracing::info!(client_id = %client.client_id, "relying party secret set from {var}");
+					},
+				None if client.secret_hash.is_some() => tracing::warn!(client_id = %client.client_id, "{var} is unset on this replica: keeping the stored client secret"),
+				None => tracing::warn!(client_id = %client.client_id, "relying party has no secret ({var} unset): it can obtain no token"),
 			}
 			if !client.disabled {
 				audiences.push(client.audience);
@@ -260,6 +266,7 @@ impl RelyingParties {
 				code_challenge,
 				user,
 				token_version,
+				upstream_family: from.upstream_family,
 				issued_at: now,
 				expires_at: now + CODE_TTL_SECS,
 				client_ip: truncate(from.client_ip, 64),
@@ -285,7 +292,8 @@ impl RelyingParties {
 		// Both sides are 32-byte digests, so the length guard `ct_eq` needs is implicit.
 		let presented = sha256(secret.as_bytes());
 		if client.disabled || stored.len() != presented.len() || !bool::from(stored.ct_eq(&presented)) {
-			tracing::warn!(client_id = %truncate(client_id, 32), "relying party: client authentication failed");
+			// Debug, not Display: this is the caller's own string and may carry newlines.
+			tracing::warn!(client_id = ?truncate(client_id, 32), "relying party: client authentication failed");
 			return Err(ClientGrantError::InvalidClient);
 		}
 		Ok(client)
@@ -374,11 +382,14 @@ impl RelyingParties {
 
 		let presented = sha256(secret.as_bytes());
 		if !bool::from(session.current_hash.as_slice().ct_eq(&presented)) {
+			// ANY wrong secret, not only the rotated-out one. The client has proved it is
+			// the client and names a real, live family of its own, so it holds the session
+			// id; a secret that does not match means somebody has the id without the
+			// credential — a leaked handle being guessed at. Ending the family costs the
+			// user one sign-in; letting the guessing go on costs nothing to the guesser.
 			let reused = session.prev_hash.as_deref().is_some_and(|prev| bool::from(prev.ct_eq(&presented)));
-			if reused {
-				self.repo.revoke_session(session_id, SessionRevocation::RefreshReuse, now).await.map_err(unavailable)?;
-				tracing::error!(client_id = %client.client_id, user_id = %session.user, %session_id, "relying party: rotated-out refresh token presented — session revoked");
-			}
+			self.repo.revoke_session(session_id, SessionRevocation::RefreshReuse, now).await.map_err(unavailable)?;
+			tracing::error!(client_id = %client.client_id, user_id = %session.user, %session_id, reused, "relying party: wrong refresh secret for a live session — session revoked");
 			return Err(ClientGrantError::InvalidGrant);
 		}
 
@@ -446,6 +457,24 @@ impl ClientGrants for RelyingParties {
 
 	fn refresh(&self, refresh: ClientRefresh) -> BoxFuture<'_, Result<ClientGrant, ClientGrantError>> {
 		Box::pin(self.rotate_refresh(refresh))
+	}
+
+	fn upstream_revoked(&self, revocation: UpstreamRevocation) -> BoxFuture<'_, Result<(), ClientGrantError>> {
+		Box::pin(async move {
+			let (user_id, family) = match &revocation {
+				UpstreamRevocation::Family { user_id, family_id } => (user_id, Some(family_id.as_str())),
+				UpstreamRevocation::User { user_id } => (user_id, None),
+			};
+			// A family of a principal that is not a user id cannot have signed anybody in.
+			let Ok(user) = Uuid::parse_str(user_id).map(UserId::from_raw) else {
+				return Ok(());
+			};
+			let ended = self.repo.revoke_upstream(user, family, now_secs()).await.map_err(unavailable)?;
+			if ended > 0 {
+				tracing::info!(user_id = %user, ended, whole_account = family.is_none(), "relying party: upstream sign-out ended client sessions");
+			}
+			Ok(())
+		})
 	}
 }
 

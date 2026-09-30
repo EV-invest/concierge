@@ -11,18 +11,24 @@
 --                 carry, and who may be signed into it (`access_policy`, mirroring
 --                 `domain::clients::AccessPolicy::parse`). The client SECRET is not
 --                 here: `secret_hash` is written at boot from the operator's
---                 `RP_CLIENT_SECRET_<CLIENT_ID>` and cleared when that is unset, so a
---                 secret never passes through a migration or a repository.
+--                 `RP_CLIENT_SECRET_<CLIENT_ID>` whenever that is set, so a secret
+--                 never passes through a migration or a repository. A boot WITHOUT
+--                 the variable leaves the stored digest alone (one misconfigured
+--                 replica must not sign the client out everywhere); a client is
+--                 switched off with `disabled_at`.
 --   rp_codes    — one row per authorization code: SHA-256 of the code (never the code),
 --                 bound to client, redirect_uri, PKCE challenge, user and the user's
---                 token_version, 60s to live, single-use. `redeemed_at` burns it;
+--                 token_version, and the `evinvest.ltd` refresh family the browser was
+--                 signed in with (`upstream_family`), 60s to live, single-use. `redeemed_at` burns it;
 --                 `replayed_at` records that it was presented AGAIN, which is also what
 --                 stops a family being opened off it afterwards. Rows are reaped a day
 --                 past expiry, by the insert path — a replay later than that is simply
 --                 an unknown code.
 --   rp_sessions — a client's refresh family, one per redeemed code: the current and
 --                 previous secret (hashes), rotated on use; presenting the previous one
---                 is theft and revokes the family. Kept after revocation or expiry as the
+--                 is theft and revokes the family. It inherits the code's
+--                 `upstream_family`, so signing out of `evinvest.ltd` (Logout,
+--                 RevokeSession, revoke-all) ends it too. Kept after revocation or expiry as the
 --                 record of who was signed into which client, and when.
 --
 -- The audience CHECK keeps a client from ever being minted this plane's or the money
@@ -63,6 +69,8 @@ CREATE TABLE rp_codes (
     code_challenge  TEXT NOT NULL,
     user_id         UUID NOT NULL REFERENCES users (id),
     token_version   BIGINT NOT NULL,
+    -- The id of the `evinvest.ltd` session (refresh family) that authorized the code.
+    upstream_family TEXT NOT NULL,
     issued_at       BIGINT NOT NULL,
     expires_at      BIGINT NOT NULL,
     redeemed_at     BIGINT,
@@ -78,6 +86,8 @@ CREATE TABLE rp_codes (
 
 -- The reaper's range scan.
 CREATE INDEX rp_codes_expires_idx ON rp_codes (expires_at);
+-- An upstream sign-out expires the user's outstanding codes.
+CREATE INDEX rp_codes_user_idx ON rp_codes (user_id);
 
 CREATE TABLE rp_sessions (
     id                   UUID PRIMARY KEY,
@@ -88,6 +98,7 @@ CREATE TABLE rp_sessions (
     current_hash         BYTEA NOT NULL,
     prev_hash            BYTEA,
     token_version        BIGINT NOT NULL,
+    upstream_family      TEXT NOT NULL,
     created_at           BIGINT NOT NULL,
     last_used_at         BIGINT NOT NULL,
     expires_at           BIGINT NOT NULL,
@@ -98,7 +109,7 @@ CREATE TABLE rp_sessions (
     user_agent           TEXT NOT NULL DEFAULT '',
     CONSTRAINT rp_sessions_hash_len CHECK (octet_length(current_hash) = 32 AND (prev_hash IS NULL OR octet_length(prev_hash) = 32)),
     CONSTRAINT rp_sessions_revocation CHECK ((revoked_at IS NULL) = (revoked_reason IS NULL)),
-    CONSTRAINT rp_sessions_revoked_reason CHECK (revoked_reason IN ('refresh_reuse', 'code_replay', 'access_denied', 'tokens_revoked')),
+    CONSTRAINT rp_sessions_revoked_reason CHECK (revoked_reason IN ('refresh_reuse', 'code_replay', 'access_denied', 'tokens_revoked', 'upstream_revoked')),
     CONSTRAINT rp_sessions_client_ip_len CHECK (char_length(client_ip) <= 64),
     CONSTRAINT rp_sessions_user_agent_len CHECK (char_length(user_agent) <= 256)
 );

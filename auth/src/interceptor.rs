@@ -63,6 +63,12 @@ impl<A> AuthLayer<A> {
 	}
 }
 
+/// Inserted into the request extensions beside the [`Claims`] when it was the
+/// RESTRICTED authenticator that admitted the caller — a relying party's token, not this
+/// plane's. The one handler it reaches uses it to answer with less.
+#[derive(Clone, Copy, Debug)]
+pub struct RestrictedCaller;
+
 type RestrictedAuthenticate = Arc<dyn Fn(String) -> BoxFuture<'static, Result<Claims, AuthError>> + Send + Sync>;
 
 /// A secondary authenticator and the only method paths it may open.
@@ -127,16 +133,25 @@ where
 			let Some(token) = bearer_token(req.headers()) else {
 				return Ok(status_response(&AuthError::MissingToken));
 			};
-			let outcome = match (authenticator.authenticate(token.clone()).await, restricted) {
+			let (outcome, via_restricted) = match (authenticator.authenticate(token.clone()).await, restricted) {
 				// The primary refusal is what a caller sees when the secondary refuses too:
 				// a token that is neither this plane's nor a client's is just an invalid
 				// token, and naming the second policy would say which methods have one.
-				(Err(primary), Some(secondary)) => secondary(token).await.map_err(|_| primary),
-				(outcome, _) => outcome,
+				// Except an outage: "could not decide" must stay retryable, not read as a
+				// verdict on the token.
+				(Err(primary), Some(secondary)) => match secondary(token).await {
+					Ok(claims) => (Ok(claims), true),
+					Err(AuthError::Unavailable) => (Err(AuthError::Unavailable), false),
+					Err(_) => (Err(primary), false),
+				},
+				(outcome, _) => (outcome, false),
 			};
 			match outcome {
 				Ok(claims) => {
 					req.extensions_mut().insert(claims);
+					if via_restricted {
+						req.extensions_mut().insert(RestrictedCaller);
+					}
 					inner.call(req).await
 				}
 				Err(err) => {
@@ -170,4 +185,80 @@ fn status_response(err: &AuthError) -> http::Response<Body> {
 	// give it an empty body.
 	let (parts, ()) = status.into_http::<()>().into_parts();
 	http::Response::from_parts(parts, Body::empty())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::TokenType;
+
+	/// An authenticator with a fixed answer.
+	#[derive(Clone)]
+	struct Fixed(fn() -> Result<Claims, AuthError>);
+
+	impl Authenticate for Fixed {
+		async fn authenticate(&self, _token: String) -> Result<Claims, AuthError> {
+			(self.0)()
+		}
+	}
+
+	fn claims() -> Result<Claims, AuthError> {
+		Ok(Claims {
+			iss: "iss".into(),
+			sub: "user".into(),
+			aud: "sa".into(),
+			exp: u64::MAX,
+			iat: 0,
+			typ: TokenType::Access,
+			jti: None,
+			token_version: 0,
+		})
+	}
+
+	/// The wrapped service: answers 200 and says whether the caller was marked restricted.
+	#[derive(Clone)]
+	struct Inner;
+
+	impl Service<http::Request<()>> for Inner {
+		type Error = std::convert::Infallible;
+		type Future = std::future::Ready<Result<http::Response<Body>, Self::Error>>;
+		type Response = http::Response<Body>;
+
+		fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn call(&mut self, req: http::Request<()>) -> Self::Future {
+			let restricted = req.extensions().get::<RestrictedCaller>().is_some();
+			std::future::ready(Ok(http::Response::builder().header("x-restricted", restricted.to_string()).body(Body::empty()).unwrap()))
+		}
+	}
+
+	async fn call(secondary: fn() -> Result<Claims, AuthError>, path: &str) -> http::Response<Body> {
+		let layer = AuthLayer::new(Fixed(|| Err(AuthError::InvalidToken))).with_restricted(Fixed(secondary), ["/pkg.Svc/Allowed"]);
+		let request = http::Request::builder().uri(path).header(http::header::AUTHORIZATION, "Bearer t").body(()).unwrap();
+		layer.layer(Inner).call(request).await.unwrap()
+	}
+
+	fn grpc_status(response: &http::Response<Body>) -> Option<&str> {
+		response.headers().get("grpc-status").and_then(|v| v.to_str().ok())
+	}
+
+	#[tokio::test]
+	async fn the_restricted_authenticator_admits_only_its_paths_and_marks_the_caller() {
+		let admitted = call(claims, "/pkg.Svc/Allowed").await;
+		assert_eq!(admitted.headers()["x-restricted"], "true");
+
+		let elsewhere = call(claims, "/pkg.Svc/Other").await;
+		assert_eq!(grpc_status(&elsewhere), Some("16"), "UNAUTHENTICATED off the allowlist");
+	}
+
+	#[tokio::test]
+	async fn an_outage_in_the_restricted_authenticator_stays_unavailable() {
+		let outage = call(|| Err(AuthError::Unavailable), "/pkg.Svc/Allowed").await;
+		assert_eq!(grpc_status(&outage), Some("14"), "an outage is retryable, not a verdict on the token");
+
+		let refused = call(|| Err(AuthError::InvalidToken), "/pkg.Svc/Allowed").await;
+		assert_eq!(grpc_status(&refused), Some("16"));
+	}
 }

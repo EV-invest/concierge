@@ -180,6 +180,9 @@ pub struct NewCode<'a> {
 	pub code_challenge: &'a str,
 	pub user: UserId,
 	pub token_version: u64,
+	/// The `evinvest.ltd` refresh family the browser was signed in with; the session
+	/// the code opens inherits it, so signing out there ends it.
+	pub upstream_family: &'a str,
 	pub issued_at: i64,
 	pub expires_at: i64,
 	pub client_ip: &'a str,
@@ -249,6 +252,8 @@ pub enum SessionRevocation {
 	AccessDenied,
 	/// The user's `token_version` moved past the family's ("revoke all").
 	TokensRevoked,
+	/// The `evinvest.ltd` session it was authorized by ended — single logout.
+	UpstreamRevoked,
 }
 
 impl SessionRevocation {
@@ -257,6 +262,7 @@ impl SessionRevocation {
 			Self::RefreshReuse => "refresh_reuse",
 			Self::AccessDenied => "access_denied",
 			Self::TokensRevoked => "tokens_revoked",
+			Self::UpstreamRevoked => "upstream_revoked",
 		}
 	}
 }
@@ -291,6 +297,11 @@ pub trait RelyingPartyRepository: Send + Sync {
 	async fn rotate_session(&self, id: Uuid, presented_hash: &[u8], next_hash: &[u8], expires_at: i64, now: i64) -> Result<bool, DomainError>;
 
 	async fn revoke_session(&self, id: Uuid, reason: SessionRevocation, now: i64) -> Result<(), DomainError>;
+
+	/// Single logout: expire `user`'s outstanding codes and revoke their live sessions —
+	/// those authorized by `upstream_family`, or all of them when it is `None`. Returns
+	/// how many sessions ended.
+	async fn revoke_upstream(&self, user: UserId, upstream_family: Option<&str>, now: i64) -> Result<u64, DomainError>;
 
 	/// Whether an access token issued under family `id` for `audience` may still be
 	/// honoured: the family is live and belongs to a client with that audience.

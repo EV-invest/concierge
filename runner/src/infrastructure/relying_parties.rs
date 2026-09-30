@@ -141,8 +141,8 @@ impl RelyingPartyRepository for PgRelyingParties {
 			.await
 			.map_err(repo_err)?;
 		sqlx::query(
-			"INSERT INTO rp_codes (code_hash, client_id, redirect_uri, code_challenge, user_id, token_version, issued_at, expires_at, client_ip, user_agent)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+			"INSERT INTO rp_codes (code_hash, client_id, redirect_uri, code_challenge, user_id, token_version, upstream_family, issued_at, expires_at, client_ip, user_agent)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
 		)
 		.bind(code.code_hash)
 		.bind(code.client_id)
@@ -150,6 +150,7 @@ impl RelyingPartyRepository for PgRelyingParties {
 		.bind(code.code_challenge)
 		.bind(code.user.raw())
 		.bind(code.token_version as i64)
+		.bind(code.upstream_family)
 		.bind(code.issued_at)
 		.bind(code.expires_at)
 		.bind(code.client_ip)
@@ -224,10 +225,15 @@ impl RelyingPartyRepository for PgRelyingParties {
 	}
 
 	async fn open_session(&self, session: NewSession<'_>) -> Result<bool, DomainError> {
+		// `FOR SHARE` is what makes the two guards below hold: a replay (`claim_code`) or an
+		// upstream sign-out (`revoke_upstream`) that has the code row locked but not yet
+		// committed is WAITED for, and the row re-read after it — instead of this insert
+		// reading the pre-commit version and opening a session nothing then revokes.
 		let opened = sqlx::query(
-			"INSERT INTO rp_sessions (id, client_id, user_id, code_hash, current_hash, token_version, created_at, last_used_at, expires_at, absolute_expires_at, client_ip, user_agent)
-			 SELECT $1, $2, $3, $4, $5, $6, $7, $7, $8, $9, c.client_ip, c.user_agent
-			 FROM rp_codes c WHERE c.code_hash = $4 AND c.replayed_at IS NULL",
+			"INSERT INTO rp_sessions (id, client_id, user_id, code_hash, current_hash, token_version, upstream_family, created_at, last_used_at, expires_at, absolute_expires_at, client_ip, user_agent)
+			 SELECT $1, $2, $3, $4, $5, $6, c.upstream_family, $7, $7, $8, $9, c.client_ip, c.user_agent
+			 FROM rp_codes c WHERE c.code_hash = $4 AND c.replayed_at IS NULL AND c.expires_at > $7
+			 FOR SHARE OF c",
 		)
 		.bind(session.id)
 		.bind(session.client_id)
@@ -292,6 +298,34 @@ impl RelyingPartyRepository for PgRelyingParties {
 			.await
 			.map_err(repo_err)?;
 		Ok(())
+	}
+
+	async fn revoke_upstream(&self, user: UserId, upstream_family: Option<&str>, now: i64) -> Result<u64, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		// Codes FIRST, and every code of the family, spent or not: `open_session` takes
+		// the code row `FOR SHARE` and requires it unexpired, so a redemption racing this
+		// either lands before the sessions UPDATE below (which then sees it) or waits for
+		// this commit and finds its code expired.
+		sqlx::query("UPDATE rp_codes SET expires_at = LEAST(expires_at, $3) WHERE user_id = $1 AND ($2::TEXT IS NULL OR upstream_family = $2)")
+			.bind(user.raw())
+			.bind(upstream_family)
+			.bind(now)
+			.execute(&mut *tx)
+			.await
+			.map_err(repo_err)?;
+		let revoked = sqlx::query(
+			"UPDATE rp_sessions SET revoked_at = $3, revoked_reason = 'upstream_revoked'
+			 WHERE user_id = $1 AND ($2::TEXT IS NULL OR upstream_family = $2) AND revoked_at IS NULL",
+		)
+		.bind(user.raw())
+		.bind(upstream_family)
+		.bind(now)
+		.execute(&mut *tx)
+		.await
+		.map_err(repo_err)?
+		.rows_affected();
+		tx.commit().await.map_err(repo_err)?;
+		Ok(revoked)
 	}
 
 	async fn session_live(&self, id: Uuid, audience: &str, now: i64) -> Result<bool, DomainError> {
