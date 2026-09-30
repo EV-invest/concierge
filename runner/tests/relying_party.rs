@@ -221,6 +221,7 @@ impl Fx {
 				user,
 				token_version,
 				Requester {
+					upstream_family: &format!("fam-{}", Uuid::new_v4()),
 					client_ip: "203.0.113.7",
 					user_agent: "itest",
 				},
@@ -597,8 +598,10 @@ async fn a_revoked_session_ends_its_access_token_at_get_me() {
 // ─── /auth/authorize ─────────────────────────────────────────────────────────────
 
 async fn router(fx: &Fx) -> Router {
+	// The fixture's own issuance service, so the families `signed_in_browser` opens are
+	// the ones the route checks.
 	let state = web::WebState::try_new(
-		AuthService::unconfigured(),
+		fx.auth.clone(),
 		"https://evinvest.test".to_string(),
 		false,
 		KycDeps {
@@ -620,6 +623,7 @@ async fn router(fx: &Fx) -> Router {
 struct Answer {
 	status: StatusCode,
 	location: Option<String>,
+	headers: axum::http::HeaderMap,
 }
 
 async fn get(router: &Router, uri: &str, cookie: Option<&str>) -> Answer {
@@ -631,6 +635,7 @@ async fn get(router: &Router, uri: &str, cookie: Option<&str>) -> Answer {
 	Answer {
 		status: response.status(),
 		location: response.headers().get(header::LOCATION).map(|v| v.to_str().unwrap().to_owned()),
+		headers: response.headers().clone(),
 	}
 }
 
@@ -652,16 +657,19 @@ fn params(location: &str) -> std::collections::HashMap<String, String> {
 	form_urlencoded::parse(query.as_bytes()).into_owned().collect()
 }
 
-/// A REAL session in the locker the router reads, as `kyc.rs` opens one.
-async fn session_cookie(user: UserId) -> Option<String> {
+/// A REAL `evinvest.ltd` session: a refresh family in the fixture's issuance store and a
+/// locker entry pointing at it, as a Google sign-in leaves them. Returns the cookie and
+/// the refresh token.
+async fn signed_in_browser(fx: &Fx, user: UserId) -> Option<(String, String)> {
 	std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty())?;
+	let refresh_token = fx.auth.open_family_for_tests(&user.to_string(), 0).await.expect("open a refresh family");
 	let sessions = web::WebSessions::from_env().await.expect("session store");
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 	let (id, ..) = sessions
 		.put(TokenResponse {
 			access_token: "access".into(),
 			access_expires_at: now + 900,
-			refresh_token: "family.secret".into(),
+			refresh_token: refresh_token.clone(),
 			refresh_expires_at: now + 3600,
 			user: Some(UserSummary {
 				user_id: user.to_string(),
@@ -675,7 +683,11 @@ async fn session_cookie(user: UserId) -> Option<String> {
 		.await
 		.expect("open session")
 		.expect("token pair carries a user");
-	Some(format!("ev_session={id}"))
+	Some((format!("ev_session={id}"), refresh_token))
+}
+
+async fn session_cookie(fx: &Fx, user: UserId) -> Option<String> {
+	signed_in_browser(fx, user).await.map(|(cookie, _)| cookie)
 }
 
 #[tokio::test]
@@ -753,7 +765,7 @@ async fn authorize_issues_a_code_only_to_users_the_policy_admits() {
 	let router = router(&fx).await;
 
 	let outsider = fx.user().await;
-	let Some(cookie) = session_cookie(outsider).await else {
+	let Some(cookie) = session_cookie(&fx, outsider).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
@@ -771,7 +783,7 @@ async fn authorize_issues_a_code_only_to_users_the_policy_admits() {
 	// A scope operator gets a code that redeems.
 	let operator = fx.user().await;
 	fx.grant_scope(operator).await;
-	let cookie = session_cookie(operator).await.unwrap();
+	let cookie = session_cookie(&fx, operator).await.unwrap();
 	let answer = get(&router, &uri, Some(&cookie)).await;
 	let location = answer.location.unwrap();
 	assert!(location.starts_with(&format!("{}?", fx.client.redirect_uri)), "{location}");
@@ -783,7 +795,267 @@ async fn authorize_issues_a_code_only_to_users_the_policy_admits() {
 	// A global admin without any grant gets one too.
 	let admin = fx.user().await;
 	fx.set_role(admin, "admin").await;
-	let cookie = session_cookie(admin).await.unwrap();
+	let cookie = session_cookie(&fx, admin).await.unwrap();
 	let back = params(&get(&router, &uri, Some(&cookie)).await.location.unwrap());
 	assert!(back.contains_key("code"), "a global admin passes a scope policy: {back:?}");
+}
+
+// ─── Security follow-ups (PR #100 review) ────────────────────────────────────────
+
+#[tokio::test]
+async fn get_me_on_a_client_token_carries_no_identity_document_fields() {
+	let fx = fixture!();
+	let (user, tokens) = fx.signed_in_operator().await;
+	sqlx::query(
+		"UPDATE users SET legal_name = 'Jane Q Public', preferred_name = 'Jane', phone = '+15550100', date_of_birth = '1990-01-01', nationality = 'DE', tax_residence = 'DE', residential_address = '1 Main St', kyc_level = 1 WHERE id = $1",
+	)
+	.bind(user.raw())
+	.execute(&fx.pool)
+	.await
+	.expect("fill the profile");
+	let mut directory = UserDirectoryClient::new(boot(&fx).await);
+
+	let me = directory.get_me(bearer(GetMeRequest {}, &tokens.access_token)).await.expect("GetMe").into_inner();
+	assert_eq!(me.user_id, user.to_string());
+	assert_eq!(me.preferred_name, "Jane");
+	assert_eq!(me.email, "rp@example.com");
+	assert!(!me.scopes.is_empty());
+	for (field, value) in [
+		("legal_name", &me.legal_name),
+		("phone", &me.phone),
+		("date_of_birth", &me.date_of_birth),
+		("nationality", &me.nationality),
+		("tax_residence", &me.tax_residence),
+		("residential_address", &me.residential_address),
+	] {
+		assert!(value.is_empty(), "{field} must not reach a relying party, got {value:?}");
+	}
+	assert_eq!(me.kyc_level, 0, "kyc_level must not reach a relying party");
+}
+
+#[tokio::test]
+async fn a_wrong_refresh_secret_for_a_real_session_revokes_it() {
+	let fx = fixture!();
+	let (_, tokens) = fx.signed_in_operator().await;
+	let session = fx.session_of(&tokens).await;
+
+	// The session id is right and the client proved itself; only the secret is wrong. That
+	// is somebody holding a handle they should not — not a stale retry.
+	let status = fx.refresh(&format!("{session}.{}", random(32))).await.expect_err("wrong secret");
+	assert_eq!(status.code(), Code::Unauthenticated);
+	assert_eq!(fx.revoked_reason(session).await.as_deref(), Some("refresh_reuse"));
+	fx.refresh(&tokens.refresh_token).await.expect_err("the family is gone");
+}
+
+#[tokio::test]
+async fn a_session_is_not_opened_off_a_code_whose_replay_is_still_committing() {
+	let fx = fixture!();
+	let user = fx.user().await;
+	fx.grant_scope(user).await;
+	let (code, _) = fx.code_for(user).await;
+	let code_hash = sha256(&code);
+
+	// The replaying transaction has marked the code but not committed yet.
+	let mut replay = fx.pool.begin().await.unwrap();
+	sqlx::query("SELECT 1 FROM rp_codes WHERE code_hash = $1 FOR UPDATE")
+		.bind(&code_hash)
+		.execute(&mut *replay)
+		.await
+		.unwrap();
+	sqlx::query("UPDATE rp_codes SET redeemed_at = 1, replayed_at = 1 WHERE code_hash = $1")
+		.bind(&code_hash)
+		.execute(&mut *replay)
+		.await
+		.unwrap();
+
+	let repo = fx.repo.clone();
+	let client_id = fx.client.id.clone();
+	let hash = code_hash.clone();
+	let opening = tokio::spawn(async move {
+		let secret = sha256("irrelevant");
+		repo.open_session(concierge::ports::NewSession {
+			id: Uuid::new_v4(),
+			client_id: &client_id,
+			user,
+			code_hash: &hash,
+			secret_hash: &secret,
+			token_version: 0,
+			now: 10,
+			expires_at: i64::MAX / 2,
+			absolute_expires_at: i64::MAX / 2,
+		})
+		.await
+	});
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	replay.commit().await.unwrap();
+
+	assert!(!opening.await.unwrap().unwrap(), "open_session must wait for the replay and then refuse");
+	let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM rp_sessions WHERE code_hash = $1")
+		.bind(&code_hash)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	assert_eq!(sessions, 0);
+}
+
+#[tokio::test]
+async fn state_and_response_type_are_required() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let good = authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48)));
+
+	for (uri, error) in [
+		(good.replace("&state=st-123", ""), "invalid_request"),
+		(good.replace("&state=st-123", "&state="), "invalid_request"),
+		(good.replace("&state=st-123", &format!("&state={}", "x".repeat(513))), "invalid_request"),
+		(good.replace("&response_type=code", ""), "invalid_request"),
+		(good.replace("response_type=code", "response_type=token"), "unsupported_response_type"),
+	] {
+		let answer = get(&router, &uri, None).await;
+		assert_eq!(answer.status, StatusCode::FOUND, "{uri}");
+		let location = answer.location.unwrap();
+		assert!(location.starts_with(&fx.client.redirect_uri), "{location}");
+		assert_eq!(params(&location)["error"], error, "{uri}");
+	}
+}
+
+#[tokio::test]
+async fn authorize_answers_leak_no_referrer_and_its_page_cannot_be_framed() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+
+	let page = get(&router, &authorize_uri("no_such_client", &fx.client.redirect_uri, "x"), None).await;
+	assert_eq!(page.headers[header::REFERRER_POLICY], "no-referrer");
+	assert!(page.headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("frame-ancestors 'none'"));
+
+	let redirect = get(&router, &authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48))), None).await;
+	assert_eq!(redirect.status, StatusCode::FOUND);
+	assert_eq!(redirect.headers[header::REFERRER_POLICY], "no-referrer");
+}
+
+fn logout(refresh_token: String, revoke_all: bool) -> Request<evconcierge_contracts::concierge::v1::LogoutRequest> {
+	Request::new(evconcierge_contracts::concierge::v1::LogoutRequest { refresh_token, revoke_all })
+}
+
+fn revoke_session(refresh_token: String, session_id: String) -> Request<evconcierge_contracts::concierge::v1::RevokeSessionRequest> {
+	Request::new(evconcierge_contracts::concierge::v1::RevokeSessionRequest { refresh_token, session_id })
+}
+
+#[tokio::test]
+async fn a_cabinet_session_revoked_upstream_does_not_authorize() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let operator = fx.user().await;
+	fx.grant_scope(operator).await;
+	let Some((cookie, refresh_token)) = signed_in_browser(&fx, operator).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let uri = authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&random(48)));
+	let answer = get(&router, &uri, Some(&cookie)).await;
+	assert!(params(answer.location.as_deref().unwrap()).contains_key("code"), "a live session authorizes");
+	assert!(
+		answer.headers.get_all(header::SET_COOKIE).iter().any(|c| c.to_str().unwrap().starts_with("ev_access=")),
+		"the access cookie is handed back"
+	);
+
+	// Signed out on another device: the family is gone, the locker entry is not.
+	AuthRpc::logout(&fx.auth, logout(refresh_token, false)).await.expect("logout");
+
+	let location = get(&router, &uri, Some(&cookie)).await.location.unwrap();
+	assert!(
+		location.starts_with("/api/auth/login?"),
+		"a signed-out session must be sent to sign in, not handed a code: {location}"
+	);
+	let session_id = cookie.trim_start_matches("ev_session=");
+	assert!(
+		web::WebSessions::from_env().await.unwrap().csrf(session_id).await.unwrap().is_none(),
+		"the dead locker entry is dropped"
+	);
+}
+
+/// Sign `user` into the client the way a browser does: through `/auth/authorize` on a
+/// real cabinet session, then the exchange. Returns the cabinet refresh token and the
+/// client's pair.
+async fn signed_into_client(fx: &Fx, router: &Router, user: UserId) -> Option<(String, ClientTokenResponse)> {
+	let (cookie, refresh_token) = signed_in_browser(fx, user).await?;
+	let verifier = random(48);
+	let answer = get(router, &authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&verifier)), Some(&cookie)).await;
+	let code = params(answer.location.as_deref().unwrap())["code"].clone();
+	Some((refresh_token, fx.exchange(&code, &verifier).await.expect("exchange")))
+}
+
+#[tokio::test]
+async fn signing_out_of_the_cabinet_signs_out_of_the_client() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let user = fx.user().await;
+	fx.grant_scope(user).await;
+	let Some((cabinet, client)) = signed_into_client(&fx, &router, user).await else {
+		eprintln!("skipped: REDIS_URL unset");
+		return;
+	};
+	// A second cabinet session of the same user, and a client session made through it.
+	let (_, other_client) = signed_into_client(&fx, &router, user).await.unwrap();
+
+	AuthRpc::logout(&fx.auth, logout(cabinet, false)).await.expect("logout");
+
+	assert!(!fx.session_live(&client).await, "the client session that cabinet session authorized ends");
+	assert_eq!(fx.revoked_reason(fx.session_of(&client).await).await.as_deref(), Some("upstream_revoked"));
+	assert!(fx.session_live(&other_client).await, "one authorized by ANOTHER cabinet session stays");
+}
+
+#[tokio::test]
+async fn revoking_a_cabinet_session_by_id_ends_its_client_sessions_and_only_the_owners() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let user = fx.user().await;
+	fx.grant_scope(user).await;
+	let Some((cabinet, client)) = signed_into_client(&fx, &router, user).await else {
+		eprintln!("skipped: REDIS_URL unset");
+		return;
+	};
+	let listed = AuthRpc::list_sessions(&fx.auth, Request::new(evconcierge_contracts::concierge::v1::ListSessionsRequest { refresh_token: cabinet }))
+		.await
+		.unwrap()
+		.into_inner();
+	let family = listed.sessions.iter().find(|s| s.current).unwrap().id.clone();
+
+	// Somebody else naming that family revokes nothing, here or at the client.
+	let (_, stranger) = signed_in_browser(&fx, fx.user().await).await.unwrap();
+	AuthRpc::revoke_session(&fx.auth, revoke_session(stranger, family.clone())).await.unwrap();
+	assert!(fx.session_live(&client).await, "a stranger's RevokeSession must not reach the owner's client sessions");
+
+	let (_, second_device) = signed_in_browser(&fx, user).await.unwrap();
+	AuthRpc::revoke_session(&fx.auth, revoke_session(second_device, family)).await.unwrap();
+	assert!(!fx.session_live(&client).await);
+	assert_eq!(fx.revoked_reason(fx.session_of(&client).await).await.as_deref(), Some("upstream_revoked"));
+}
+
+#[tokio::test]
+async fn revoke_all_ends_every_client_session_and_outstanding_code() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let user = fx.user().await;
+	fx.grant_scope(user).await;
+	let Some((cabinet, client)) = signed_into_client(&fx, &router, user).await else {
+		eprintln!("skipped: REDIS_URL unset");
+		return;
+	};
+	let (pending_code, verifier) = fx.code_for(user).await;
+
+	AuthRpc::logout(&fx.auth, logout(cabinet, true)).await.expect("logout everywhere");
+
+	assert!(!fx.session_live(&client).await);
+	fx.exchange(&pending_code, &verifier).await.expect_err("a code issued before the sign-out is dead too");
+}
+
+#[tokio::test]
+async fn a_replica_without_the_secret_variable_keeps_the_stored_secret() {
+	let fx = fixture!();
+	fx.rp.sync_registry(|_| None).await.expect("sync with no secrets in env");
+	let user = fx.user().await;
+	fx.grant_scope(user).await;
+	let (code, verifier) = fx.code_for(user).await;
+	fx.exchange(&code, &verifier).await.expect("the client still authenticates with the secret another replica set");
 }
