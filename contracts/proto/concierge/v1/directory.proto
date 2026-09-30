@@ -83,14 +83,16 @@ service UserDirectory {
   // A disabled account is refused FAILED_PRECONDITION: reinstate it first.
   //
   // Who may: a global admin/owner — any scope, any role. The scope's own `admin` —
-  // `operator`/`viewer` inside that scope, and never an `admin` grant in either
-  // direction (neither minting one nor moving an existing one). Anyone else:
-  // PERMISSION_DENIED. A malformed scope or role is INVALID_ARGUMENT; an unknown user_id
-  // is NOT_FOUND, reported only to a caller who holds some authority over the scope.
+  // `operator` inside that scope, and never an `admin` grant in either direction
+  // (neither minting one nor moving an existing one). Anyone else: PERMISSION_DENIED.
+  // A malformed scope or role is INVALID_ARGUMENT — including `viewer`, which no longer
+  // exists: a read-only holder is just an ordinary user and gets no grant. An unknown
+  // user_id is NOT_FOUND, reported only to a caller who holds some authority over the
+  // scope.
   rpc GrantScope(GrantScopeRequest) returns (GrantScopeResponse);
 
   // Take a user's grant on a scope away. Same authority rule as GrantScope: a scope
-  // admin may revoke `operator`/`viewer` grants in their scope, never an `admin` one.
+  // admin may revoke `operator` grants in their scope, never an `admin` one.
   // NOT_FOUND when the user holds no active grant there.
   rpc RevokeScope(RevokeScopeRequest) returns (RevokeScopeResponse);
 
@@ -153,7 +155,7 @@ message ScopedGrant {
   string user_id = 1;
   // `allocation:<service_id>`, service_id in [a-z0-9_]{1,64}.
   string scope = 2;
-  // viewer/operator/admin.
+  // operator/admin.
   string role = 3;
   // Who made this grant (user id).
   string granted_by = 4;
@@ -298,7 +300,7 @@ message GrantScopeRequest {
     string email = 5;
   }
   string scope = 2;
-  // viewer/operator/admin.
+  // operator/admin.
   string role = 3;
   // Recorded verbatim on the audit row.
   string reason = 4;
