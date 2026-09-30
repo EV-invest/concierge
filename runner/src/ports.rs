@@ -14,6 +14,10 @@
 //! method is one use case and is internally atomic, so the verdict, the seat change,
 //! the cross-plane `ROLE_CHANGED` and the audit row can never land apart.
 //!
+//! [`ScopedGrantRepository`] holds per-resource grants (`domain::scopes`). Each write
+//! decides the actor's authority inside its own transaction, for the same TOCTOU reason
+//! `set_role_outside_ownership` does, and returns a refusal as an ordinary answer.
+//!
 //! [`KycProvider`] is the DRIVING side of the same idea for identity verification: the
 //! vendor is behind a port so that swapping Didit for Sumsub costs one adapter and
 //! nothing else, and so that no vendor type is reachable from a handler.
@@ -25,6 +29,7 @@ use domain::{
 	authz::Role,
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
+	scopes::{Scope, ScopeAuthority, ScopeRole},
 	users::{AuthSubject, Email, ProfileFields, User, UserId},
 };
 use uuid::Uuid;
@@ -35,6 +40,7 @@ use crate::{
 		governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision, UserProposalRecord},
 		notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
 		platform::{FeatureFlagRow, PlatformConfigRow},
+		scoped_grants::{ScopeHolderRecord, ScopedGrantRecord},
 		users::{AdminAction, AdminUserRow, AuthzRecord, Reinstatement},
 	},
 };
@@ -56,6 +62,30 @@ pub enum RoleChange {
 	WouldGrantAdmin,
 }
 
+/// Who is acting on a scope's grants: their id (the grant's `granted_by`) and the
+/// global role the RBAC gate resolved for them, emergency access included.
+pub struct ScopeActor {
+	pub id: UserId,
+	pub role: Role,
+}
+
+/// What [`ScopedGrantRepository::grant`] did.
+pub enum ScopeGrantOutcome {
+	/// The grant now in effect — new, replaced, or already held with that role.
+	Granted(ScopedGrantRecord),
+	/// The actor may not make this grant (`ScopeAuthority::may_grant`).
+	Denied,
+}
+
+/// What [`ScopedGrantRepository::revoke`] did.
+pub enum ScopeRevokeOutcome {
+	Revoked,
+	/// The target holds no active grant on the scope.
+	NotHeld,
+	/// The actor may not take this grant away (`ScopeAuthority::may_revoke`).
+	Denied,
+}
+
 /// What [`UserDirectoryRepository::raise_kyc_level_to`] did.
 ///
 /// "Already holds it" is an ORDINARY answer and not an error: at-least-once webhook
@@ -71,6 +101,29 @@ pub enum KycLevelChange {
 	/// failure: an approval for tier 1 reaching someone who already holds tier 2 is a
 	/// correct delivery whose only correct effect is nothing.
 	AlreadyHolds(u32),
+}
+
+/// Per-resource grants. At most one ACTIVE grant per (user, scope); history is kept as
+/// revoked rows.
+#[async_trait]
+pub trait ScopedGrantRepository: Send + Sync {
+	/// The actor's say over `scope` right now — for reads, which need no lock.
+	async fn authority(&self, actor: &ScopeActor, scope: &Scope) -> Result<ScopeAuthority, DomainError>;
+
+	/// Give `target` the role `role` on `scope`, replacing any role they hold there. The
+	/// actor's authority and the target's current role are both read inside the write
+	/// transaction. `NotFound` for an unknown target — but only once the actor has been
+	/// found to hold some authority over the scope.
+	async fn grant(&self, target: UserId, scope: &Scope, role: ScopeRole, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeGrantOutcome, DomainError>;
+
+	/// Take `target`'s grant on `scope` away, decided the same way as [`Self::grant`].
+	async fn revoke(&self, target: UserId, scope: &Scope, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeRevokeOutcome, DomainError>;
+
+	/// Every active grant `user` holds, ordered by scope.
+	async fn active_for_user(&self, user: UserId) -> Result<Vec<ScopedGrantRecord>, DomainError>;
+
+	/// Every active grant on `scope`, with each holder's identity, oldest first.
+	async fn holders(&self, scope: &Scope) -> Result<Vec<ScopeHolderRecord>, DomainError>;
 }
 
 /// Persistence + read port for the [`User`] aggregate (the identity control plane).

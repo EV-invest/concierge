@@ -12,6 +12,8 @@
 //! - [`governance`] — the ownership consilium: proposals, the snapshotted peer set,
 //!   the target's emailed token, and the seat change itself (written through the
 //!   `users` helpers, in the same transaction as the verdict).
+//! - [`scoped_grants`] — a user's role over one resource (`allocation:<service_id>`),
+//!   decided and audited inside the transaction that writes it.
 //! - [`email`] — the SMTP transport seam and the rendered messages that cross it.
 
 pub mod db;
@@ -20,4 +22,5 @@ pub mod governance;
 pub mod kyc;
 pub mod notifications;
 pub mod platform;
+pub mod scoped_grants;
 pub mod users;
