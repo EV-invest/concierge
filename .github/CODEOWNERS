@@ -1,0 +1,16 @@
+# Identity, authorization and the cross-plane contract: a second pair of eyes on every change.
+/domain/src/authz.rs     @f33na
+/domain/src/scopes.rs    @f33na
+/domain/src/clients.rs   @f33na
+/domain/src/governance.rs @f33na
+/iam/                    @f33na
+/iam_derive/             @f33na
+/runner/src/authz.rs     @f33na
+/runner/src/directory.rs @f33na
+/runner/src/relying_party.rs @f33na
+/runner/src/genesis.rs   @f33na
+/runner/src/main.rs      @f33na
+/auth/src/interceptor.rs @f33na
+/runner/migrations/      @f33na
+/contracts/proto/        @f33na
+/.github/CODEOWNERS      @f33na
