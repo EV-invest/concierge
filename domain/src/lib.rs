@@ -23,6 +23,8 @@ pub mod error;
 
 pub mod governance;
 
+pub mod iam;
+
 pub mod scopes;
 
 pub mod users;

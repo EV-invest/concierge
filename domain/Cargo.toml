@@ -9,6 +9,7 @@ ev = { workspace = true, features = ["wasm"] }
 getrandom.workspace = true
 
 [dependencies]
+concierge_iam.workspace = true
 ev.workspace = true
 serde.workspace = true
 thiserror.workspace = true

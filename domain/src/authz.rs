@@ -8,20 +8,18 @@
 //! contract** — keep them byte-identical with banking's `domain::authz::Role`
 //! ([`role_strings_are_canonical`] guards this side; banking guards its own).
 //!
-//! [`Permission`] is **local** to this plane: concierge enforces identity/platform
-//! permissions, banking enforces money permissions — the two never share a set.
-//! [`grants`] is the pure policy (the RBAC "matrix") mapping a role to the
-//! permissions it holds; it carries the separation-of-duties intent (view ≠ act ≠
-//! grant) and is the single place the matrix is defined.
+//! A seat MEANS a set of permissions ([`Role::permissions`]): `concierge:*` and `iam:*`
+//! enforced here, `bank:*` enforced by the money plane. Every check asks [`Role::may`];
+//! nothing compares seats by rank.
 
+use concierge_iam::{Permission, alias};
 use serde::{Deserialize, Serialize};
 
 use crate::error::DomainError;
 
-/// The platform-wide user role, ordered least→most privileged. `Investor` is the
-/// default (every provisioned user); roles above it unlock the admin console and
-/// `Owner` additionally manages roles.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+/// The platform-wide seat. `Investor` is the default (every provisioned user). Written
+/// only by governance; what a seat may do is [`Role::permissions`].
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
 	#[default]
@@ -55,49 +53,224 @@ impl Role {
 			other => Err(DomainError::Validation(format!("unknown role: {other}"))),
 		}
 	}
+}
 
-	/// Whether this role may open the admin console at all (any non-investor).
-	pub fn is_operator(self) -> bool {
-		self >= Role::Operator
+/// `concierge:user:*` — list/read any user; suspend/reinstate; revoke sessions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+#[permission("concierge:user")]
+pub enum Users {
+	Read,
+	Suspend,
+	Revoke,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+#[permission("concierge:kyc")]
+pub enum Kyc {
+	Manage,
+}
+
+/// `concierge:role:grant` — `SetRole`, and voting in the consilia.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+#[permission("concierge:role")]
+pub enum Roles {
+	Grant,
+}
+
+/// Feature flags, maintenance, announcements, the client registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+#[permission("concierge:platform")]
+pub enum Platform {
+	Read,
+	Manage,
+}
+
+/// `iam:tenants:grant` — grant and revoke anything inside any tenant's namespace. Seats
+/// hold it and nothing can grant it, so who hands out access is decided by governance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+#[permission("iam:tenants")]
+pub enum Iam {
+	Grant,
+}
+
+/// The money plane's permissions. Defined here because a seat's meaning is this plane's to
+/// state; banking enforces them.
+pub mod bank {
+	use concierge_iam::Permission;
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:treasury")]
+	pub enum Treasury {
+		Read,
+	}
+
+	/// Any user's balance/wallet.
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:user_balance")]
+	pub enum UserBalance {
+		Read,
+	}
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:valuation")]
+	pub enum Valuation {
+		Post,
+	}
+
+	/// Register an investable product and drive its lifecycle.
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:allocation")]
+	pub enum Allocation {
+		Manage,
+	}
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:redemption")]
+	pub enum Redemption {
+		Settle,
+		Fail,
+	}
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:withdrawal")]
+	pub enum Withdrawal {
+		Dispatch,
+		Settle,
+		Fail,
+	}
+
+	/// Seed fund capital / record an off-rail deposit.
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:capital")]
+	pub enum Capital {
+		Manage,
+	}
+
+	/// The owners' governance of the platform's own money.
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:consilium")]
+	pub enum Consilium {
+		Manage,
+	}
+
+	/// Open a payment order (a proposal, never a move), read payment history.
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:payment")]
+	pub enum Payment {
+		Open,
+	}
+
+	/// The read-only kill switch.
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:operations")]
+	pub enum Operations {
+		Manage,
+	}
+
+	/// Unpark a parked outbox event.
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:outbox")]
+	pub enum Outbox {
+		Manage,
+	}
+
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:user")]
+	pub enum Users {
+		Revoke,
+		Suspend,
+	}
+
+	/// `rotate` supersedes a provably dead key; `migrate` retires a healthy one into the
+	/// enclave. Separate acts: holding one must not grant the other.
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:deposit_address")]
+	pub enum DepositAddress {
+		Rotate,
+		Migrate,
 	}
 }
 
-/// A capability in the IDENTITY/PLATFORM plane. Money capabilities live in the
-/// banking plane's own `Permission` — the sets are deliberately disjoint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Permission {
-	/// List/read any user (identities, KYC, sessions, roles).
-	UserRead,
-	/// Suspend / reinstate a user.
-	UserSuspend,
-	/// Revoke a user's sessions (bump `token_version`).
-	UserRevoke,
-	/// Set a user's KYC level.
-	KycManage,
-	/// Grant/change a user's role.
-	RoleGrant,
-	/// Read platform config (feature flags, maintenance, announcements, registry).
-	PlatformRead,
-	/// Mutate platform config.
-	PlatformManage,
-	/// Grant/revoke ANY scoped grant (`domain::scopes`), any role, any scope. A scope's
-	/// own admin manages part of one scope without this; see `ScopeAuthority`.
-	ScopeManage,
-}
+use bank::*;
 
-/// The role→permission policy (pure). The RBAC matrix, read as separation of duties:
-/// - `Investor` holds nothing (no console).
-/// - `Operator` may READ the console (users, platform config) but not mutate.
-/// - `Admin` may perform every identity/platform mutation EXCEPT granting roles.
-/// - `Owner` holds everything, including [`Permission::RoleGrant`].
-pub fn grants(role: Role, permission: Permission) -> bool {
-	use Permission::*;
-	use Role::*;
-	match role {
-		Investor => false,
-		Operator => matches!(permission, UserRead | PlatformRead),
-		Admin => !matches!(permission, RoleGrant),
-		Owner => true,
+// What a seat means, as separation of duties: an operator views and never acts, an admin
+// does every act except granting seats, an owner does everything.
+alias!(SEAT_OPERATOR = "seat:operator", [Users::Read, Platform::Read, Treasury::Read, UserBalance::Read]);
+alias!(
+	SEAT_ADMIN = "seat:admin",
+	[
+		Users::Read,
+		Users::Suspend,
+		Users::Revoke,
+		Kyc::Manage,
+		Platform::Read,
+		Platform::Manage,
+		Iam::Grant,
+		Treasury::Read,
+		UserBalance::Read,
+		Valuation::Post,
+		Allocation::Manage,
+		Redemption::Settle,
+		Redemption::Fail,
+		Withdrawal::Dispatch,
+		Withdrawal::Settle,
+		Withdrawal::Fail,
+		Capital::Manage,
+		Consilium::Manage,
+		Payment::Open,
+		Operations::Manage,
+		Outbox::Manage,
+		bank::Users::Revoke,
+		bank::Users::Suspend,
+		DepositAddress::Rotate,
+		DepositAddress::Migrate,
+	]
+);
+alias!(
+	SEAT_OWNER = "seat:owner",
+	[
+		Users::Read,
+		Users::Suspend,
+		Users::Revoke,
+		Kyc::Manage,
+		Roles::Grant,
+		Platform::Read,
+		Platform::Manage,
+		Iam::Grant,
+		Treasury::Read,
+		UserBalance::Read,
+		Valuation::Post,
+		Allocation::Manage,
+		Redemption::Settle,
+		Redemption::Fail,
+		Withdrawal::Dispatch,
+		Withdrawal::Settle,
+		Withdrawal::Fail,
+		Capital::Manage,
+		Consilium::Manage,
+		Payment::Open,
+		Operations::Manage,
+		Outbox::Manage,
+		bank::Users::Revoke,
+		bank::Users::Suspend,
+		DepositAddress::Rotate,
+		DepositAddress::Migrate,
+	]
+);
+
+impl Role {
+	/// The concrete permissions this seat holds: `concierge:*`, `iam:*` and `bank:*`.
+	pub fn permissions(self) -> &'static [&'static str] {
+		match self {
+			Self::Investor => &[],
+			Self::Operator => SEAT_OPERATOR.members,
+			Self::Admin => SEAT_ADMIN.members,
+			Self::Owner => SEAT_OWNER.members,
+		}
+	}
+
+	pub fn may(self, permission: impl Permission) -> bool {
+		self.permissions().contains(&permission.as_str())
 	}
 }
 
@@ -126,28 +299,22 @@ mod tests {
 	#[test]
 	fn default_role_is_investor() {
 		assert_eq!(Role::default(), Role::Investor);
-		assert!(!Role::Investor.is_operator());
-		assert!(Role::Operator.is_operator());
+		assert!(Role::Investor.permissions().is_empty());
 	}
 
 	#[test]
-	fn matrix_enforces_separation_of_duties() {
-		// Investor: nothing.
-		assert!(!grants(Role::Investor, Permission::UserRead));
-		// Operator: read only.
-		assert!(grants(Role::Operator, Permission::UserRead));
-		assert!(grants(Role::Operator, Permission::PlatformRead));
-		assert!(!grants(Role::Operator, Permission::UserSuspend));
-		assert!(!grants(Role::Operator, Permission::RoleGrant));
-		assert!(!grants(Role::Operator, Permission::ScopeManage));
-		// Admin: every mutation except granting roles.
-		assert!(grants(Role::Admin, Permission::UserSuspend));
-		assert!(grants(Role::Admin, Permission::KycManage));
-		assert!(grants(Role::Admin, Permission::PlatformManage));
-		assert!(grants(Role::Admin, Permission::ScopeManage));
-		assert!(!grants(Role::Admin, Permission::RoleGrant));
-		// Owner: everything.
-		assert!(grants(Role::Owner, Permission::RoleGrant));
-		assert!(grants(Role::Owner, Permission::ScopeManage));
+	fn seats_separate_duties() {
+		assert!(Role::Operator.may(Users::Read));
+		assert!(Role::Operator.may(Platform::Read));
+		assert!(Role::Operator.may(Treasury::Read));
+		assert!(!Role::Operator.may(Users::Suspend));
+		assert!(!Role::Operator.may(Iam::Grant));
+		assert!(!Role::Operator.may(Payment::Open), "an operator sees the treasury and never proposes from it");
+		assert!(Role::Admin.may(Iam::Grant));
+		assert!(Role::Admin.may(DepositAddress::Migrate));
+		assert!(!Role::Admin.may(Roles::Grant), "an admin never grants seats");
+		assert!(Role::Owner.may(Roles::Grant));
+		let owner: Vec<_> = Role::Owner.permissions().iter().filter(|p| **p != Roles::Grant.as_str()).collect();
+		assert_eq!(owner, Role::Admin.permissions().iter().collect::<Vec<_>>(), "an owner is an admin who also grants seats");
 	}
 }

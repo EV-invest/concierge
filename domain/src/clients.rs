@@ -11,7 +11,11 @@
 
 use std::fmt;
 
-use crate::{authz::Role, error::DomainError, scopes::Scope};
+use crate::{
+	authz::{Iam, Role},
+	error::DomainError,
+	scopes::Scope,
+};
 
 /// Who may be signed into a client.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,7 +23,7 @@ pub enum AccessPolicy {
 	/// Every active user.
 	Public,
 	/// Holders of an active grant on the scope — any scope role, since both `operator`
-	/// and `admin` work the service — plus the global `admin`/`owner`, who may grant
+	/// and `admin` work the service — plus the seats holding [`Iam::Grant`], who may grant
 	/// themselves that scope anyway, so refusing them would be ceremony.
 	Scope(Scope),
 }
@@ -45,7 +49,7 @@ impl AccessPolicy {
 	pub fn admits(&self, role: Role, scopes: &[Scope]) -> bool {
 		match self {
 			Self::Public => true,
-			Self::Scope(required) => role >= Role::Admin || scopes.contains(required),
+			Self::Scope(required) => role.may(Iam::Grant) || scopes.contains(required),
 		}
 	}
 }

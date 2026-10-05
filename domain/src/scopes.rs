@@ -20,7 +20,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	authz::{Permission, Role, grants},
+	authz::{Iam, Role},
 	error::DomainError,
 };
 
@@ -116,7 +116,7 @@ impl ScopeRole {
 /// How much say a caller has over the grants of ONE scope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScopeAuthority {
-	/// A global role holding [`Permission::ScopeManage`]: any scope, any role.
+	/// A seat holding [`Iam::Grant`]: any scope, any role.
 	Global,
 	/// The `admin` of this scope: `operator` grants inside it, never an `admin` one.
 	ScopeAdmin,
@@ -128,7 +128,7 @@ impl ScopeAuthority {
 	/// `held` must be the caller's grant on the scope being acted on — a grant on another
 	/// scope says nothing about this one.
 	pub fn resolve(global: Role, held: Option<ScopeRole>) -> Self {
-		if grants(global, Permission::ScopeManage) {
+		if global.may(Iam::Grant) {
 			Self::Global
 		} else if held == Some(ScopeRole::Admin) {
 			Self::ScopeAdmin
