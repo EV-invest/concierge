@@ -30,6 +30,7 @@ use domain::{
 	clients::AccessPolicy,
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
+	iam::{Catalog, Target},
 	scopes::{Scope, ScopeAuthority, ScopeRole},
 	users::{AuthSubject, Email, ProfileFields, User, UserId},
 };
@@ -39,9 +40,9 @@ use crate::{
 	genesis::{GenesisOutcome, GenesisSubject},
 	infrastructure::{
 		governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision, UserProposalRecord},
+		grants::{ScopeHolderRecord, ScopedGrantRecord},
 		notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
 		platform::{FeatureFlagRow, PlatformConfigRow},
-		scoped_grants::{ScopeHolderRecord, ScopedGrantRecord},
 		users::{AdminAction, AdminUserRow, AuthzRecord, Reinstatement},
 	},
 };
@@ -92,7 +93,7 @@ impl ScopeTarget {
 	}
 }
 
-/// What [`ScopedGrantRepository::grant`] did.
+/// What [`ScopedGrantRepository::grant_scope`] did.
 pub enum ScopeGrantOutcome {
 	/// The grant now in effect — new, replaced, or already held with that role.
 	Granted(ScopedGrantRecord),
@@ -130,7 +131,7 @@ impl UngrantableAddress {
 	}
 }
 
-/// What [`ScopedGrantRepository::revoke`] did.
+/// What [`ScopedGrantRepository::revoke_scope`] and [`GrantRepository::revoke`] did.
 pub enum ScopeRevokeOutcome {
 	Revoked,
 	/// The target holds no active grant on the scope — including an id or email that
@@ -163,7 +164,7 @@ pub enum KycLevelChange {
 pub trait ScopedGrantRepository: Send + Sync {
 	/// The actor's say over `scope` right now, from their persisted record — for reads,
 	/// which need no lock.
-	async fn authority(&self, actor: &ScopeActor, scope: &Scope) -> Result<ScopeAuthority, DomainError>;
+	async fn scope_authority(&self, actor: &ScopeActor, scope: &Scope) -> Result<ScopeAuthority, DomainError>;
 
 	/// Give `target` the role `role` on `scope`, replacing any role they hold there. The
 	/// actor's persisted role and status, their grant, and the target's current role are
@@ -172,16 +173,87 @@ pub trait ScopedGrantRepository: Send + Sync {
 	/// [`ScopeGrantOutcome::TargetDisabled`]; for a scope admin all three collapse into
 	/// [`ScopeGrantOutcome::Ungrantable`]. Either way only once the actor has been found to
 	/// hold some authority over the scope.
-	async fn grant(&self, target: &ScopeTarget, scope: &Scope, role: ScopeRole, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeGrantOutcome, DomainError>;
+	async fn grant_scope(&self, target: &ScopeTarget, scope: &Scope, role: ScopeRole, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeGrantOutcome, DomainError>;
 
-	/// Take `target`'s grant on `scope` away, decided the same way as [`Self::grant`].
-	async fn revoke(&self, target: &ScopeTarget, scope: &Scope, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeRevokeOutcome, DomainError>;
+	/// Take `target`'s grant on `scope` away, decided the same way as [`Self::grant_scope`].
+	async fn revoke_scope(&self, target: &ScopeTarget, scope: &Scope, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeRevokeOutcome, DomainError>;
 
 	/// Every active grant `user` holds, ordered by scope.
 	async fn active_for_user(&self, user: UserId) -> Result<Vec<ScopedGrantRecord>, DomainError>;
 
 	/// Every active grant on `scope`, with each holder's identity, oldest first.
-	async fn holders(&self, scope: &Scope) -> Result<Vec<ScopeHolderRecord>, DomainError>;
+	async fn scope_holders(&self, scope: &Scope) -> Result<Vec<ScopeHolderRecord>, DomainError>;
+}
+
+/// One grant of a target inside a tenant namespace (`grants`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantRecord {
+	pub id: i64,
+	pub user_id: UserId,
+	pub target: String,
+	pub granted_by: UserId,
+	pub granted_at: i64,
+	pub reason: Option<String>,
+}
+
+/// An active grant with the holder's identity beside it.
+pub struct GrantHolderRecord {
+	pub grant: GrantRecord,
+	pub email: Option<String>,
+	pub legal_name: Option<String>,
+	pub preferred_name: Option<String>,
+}
+
+/// What [`GrantRepository::grant`] did.
+pub enum GrantOutcome {
+	/// The grant now in effect — new, or already held.
+	Granted(GrantRecord),
+	/// The actor's seat does not hold `iam:tenants:grant`.
+	Denied,
+	/// No tenant owns the target's namespace.
+	UnknownTenant,
+	/// The tenant's current catalog defines nothing the target names.
+	UndefinedTarget,
+	TargetDisabled,
+	AmbiguousEmail,
+}
+
+/// What [`GrantRepository::publish`] did.
+pub enum PublishOutcome {
+	Published,
+	/// The stored catalog is this one.
+	Unchanged,
+	/// Older than the stored one, or the same version with different content.
+	Stale {
+		stored: u64,
+	},
+}
+
+/// Grants over tenant namespaces, and the catalogs that give them meaning. Only seats
+/// holding `iam:tenants:grant` write here, and every write re-reads the actor's seat
+/// under its row lock. The scope view over the same rows comes with it.
+#[async_trait]
+pub trait GrantRepository: ScopedGrantRepository {
+	/// `NotFound` for an unknown `user` (id or address), and only once the actor has been
+	/// found to hold the authority.
+	async fn grant(&self, user: &ScopeTarget, target: &Target, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<GrantOutcome, DomainError>;
+
+	async fn revoke(&self, user: &ScopeTarget, target: &Target, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeRevokeOutcome, DomainError>;
+
+	/// Every active grant inside `namespace`, oldest first. `None`: no such tenant.
+	async fn holders(&self, namespace: &str) -> Result<Option<Vec<GrantHolderRecord>>, DomainError>;
+
+	/// The active targets `user` holds, in every namespace.
+	async fn targets_of(&self, user: UserId) -> Result<Vec<Target>, DomainError>;
+
+	/// The current catalog of every tenant that has one, by namespace.
+	async fn catalogs(&self) -> Result<Vec<(String, Catalog)>, DomainError>;
+
+	/// The namespace of the tenant whose client's tokens carry `audience`.
+	async fn audience_namespace(&self, audience: &str) -> Result<Option<String>, DomainError>;
+
+	/// Store `catalog` as `namespace`'s, unless it is older than the stored one.
+	async fn publish(&self, namespace: &str, catalog: &Catalog, now: i64) -> Result<PublishOutcome, DomainError>;
 }
 
 /// A registered relying party (`rp_clients`).
@@ -197,6 +269,9 @@ pub struct ClientRecord {
 	/// without one can obtain no token.
 	pub secret_hash: Option<Vec<u8>>,
 	pub disabled: bool,
+	/// The tenant namespace whose catalog it publishes and whose permissions its tokens
+	/// read. `None`: it owns none.
+	pub namespace: Option<String>,
 }
 
 /// A one-time authorization code to store (`rp_codes`). Only its digest is persisted.
@@ -408,7 +483,7 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// choose — it comes back as [`DomainError::Validation`].
 	///
 	/// The ONE writer of the level, whoever decided it: the operator RPC under
-	/// `Permission::KycManage` and the identity provider's webhook ([`KycProvider`])
+	/// `Kyc::Manage` and the identity provider's webhook ([`KycProvider`])
 	/// both land here, so the event, the `user_outbox` row and the money plane's mirror
 	/// come out identical — and banking never learns that a KYC vendor exists.
 	async fn set_kyc_level(&self, id: UserId, level: u32, action: &AdminAction, now: i64) -> Result<User, DomainError>;
@@ -420,7 +495,7 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// [`Self::set_role_outside_ownership`]. Read on a separate connection, "is the
 	/// target above the current level?" is a TOCTOU window, and the vendor webhook is the
 	/// one caller that cannot avoid racing: an operator revoking a level under
-	/// `Permission::KycManage` commits in between, the webhook's stale read still says
+	/// `Kyc::Manage` commits in between, the webhook's stale read still says
 	/// `0 -> 2`, and it then blocks on the row only to write the level a human had just
 	/// taken away — a DOWNGRADE reversed by a vendor, which is the one thing the whole
 	/// KYC surface promises cannot happen. Holding the row across the comparison makes the
@@ -496,7 +571,7 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 /// vendor drifting apart in the meantime.
 ///
 /// Tier 3 is the ceiling of a human decision (`UserDirectory.SetKycLevel` under
-/// `Permission::KycManage`), and so is every downgrade.
+/// `Kyc::Manage`), and so is every downgrade.
 ///
 /// This is also the clamp that retires the cases opened while `/kyc/start` still took
 /// the tier from the request body: rows asking for 2 are already in the table, some of
@@ -642,7 +717,7 @@ impl KycStatus {
 	/// declined, abandoned, expired, aged-out — and every mid-flight state leaves it
 	/// exactly where it was: someone who holds tier 2 and fails an attempt at a higher
 	/// one must not be dropped to zero by a vendor. Downgrades are a human act under
-	/// `Permission::KycManage`, and there is no other path to one.
+	/// `Kyc::Manage`, and there is no other path to one.
 	pub fn grants_tier(self, requested: u32) -> Option<u32> {
 		match self {
 			Self::Approved => Some(requested.min(PROVIDER_MAX_TIER)),

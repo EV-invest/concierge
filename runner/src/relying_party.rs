@@ -28,16 +28,19 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use color_eyre::eyre::{Result, bail, ensure};
 use domain::{
 	error::DomainError,
+	iam::Catalog,
 	users::{UserId, UserStatus},
 };
-use evconcierge_auth::{AuthError, Authenticate, BoxFuture, Claims, ClientGrant, ClientGrantError, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation, Verifier};
+use evconcierge_auth::{
+	AuthError, Authenticate, BoxFuture, CatalogPublication, Claims, ClientGrant, ClientGrantError, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation, Verifier,
+};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
 	authz::BreakGlass,
-	ports::{ClientRecord, CodeClaim, CodeOutcome, NewCode, NewSession, RelyingPartyRepository, ScopedGrantRepository, SessionRevocation, UserDirectoryRepository},
+	ports::{ClientRecord, CodeClaim, CodeOutcome, GrantRepository, NewCode, NewSession, PublishOutcome, RelyingPartyRepository, SessionRevocation, UserDirectoryRepository},
 };
 
 /// A code is carried by a browser redirect and redeemed by the client's backend at once;
@@ -160,7 +163,7 @@ pub struct Requester<'a> {
 pub struct RelyingParties {
 	repo: Arc<dyn RelyingPartyRepository>,
 	users: Arc<dyn UserDirectoryRepository>,
-	scopes: Arc<dyn ScopedGrantRepository>,
+	grants: Arc<dyn GrantRepository>,
 	break_glass: Arc<BreakGlass>,
 	/// `RP_DEV_REDIRECT_URIS`, already refused in production.
 	dev_redirects: HashMap<String, Vec<String>>,
@@ -170,14 +173,14 @@ impl RelyingParties {
 	pub fn new(
 		repo: Arc<dyn RelyingPartyRepository>,
 		users: Arc<dyn UserDirectoryRepository>,
-		scopes: Arc<dyn ScopedGrantRepository>,
+		grants: Arc<dyn GrantRepository>,
 		break_glass: Arc<BreakGlass>,
 		dev_redirects: HashMap<String, Vec<String>>,
 	) -> Self {
 		Self {
 			repo,
 			users,
-			scopes,
+			grants,
 			break_glass,
 			dev_redirects,
 		}
@@ -244,7 +247,7 @@ impl RelyingParties {
 			return Ok(Admission::Denied);
 		}
 		let role = self.break_glass.snapshot(self.users.as_ref()).await.role_of(record.role, &user.to_string()).role;
-		let scopes: Vec<_> = self.scopes.active_for_user(user).await?.into_iter().map(|grant| grant.scope).collect();
+		let scopes: Vec<_> = self.grants.active_for_user(user).await?.into_iter().map(|grant| grant.scope).collect();
 		Ok(if client.access_policy.admits(role, &scopes) {
 			Admission::Admitted {
 				token_version: record.token_version,
@@ -297,6 +300,40 @@ impl RelyingParties {
 			return Err(ClientGrantError::InvalidClient);
 		}
 		Ok(client)
+	}
+
+	/// Store the catalog a client publishes for its tenant: every permission and alias in
+	/// the tenant's namespace, never older than what is stored. A rollback that republished
+	/// an older catalog would silently take away whatever the newer one granted.
+	async fn publish(&self, publication: CatalogPublication) -> Result<(), ClientGrantError> {
+		let client = self.authenticate_client(&publication.client_id, &publication.client_secret).await?;
+		let Some(namespace) = client.namespace else {
+			return Err(ClientGrantError::InvalidCatalog(format!("client {} owns no tenant namespace", client.client_id)));
+		};
+		let mut aliases = std::collections::BTreeMap::new();
+		for (name, members) in publication.aliases {
+			if aliases.insert(name.clone(), members.into_iter().collect()).is_some() {
+				return Err(ClientGrantError::InvalidCatalog(format!("alias `{name}` is published twice")));
+			}
+		}
+		let catalog = Catalog {
+			version: publication.version,
+			permissions: publication.permissions.into_iter().collect(),
+			aliases,
+		};
+		catalog.check(&namespace).map_err(ClientGrantError::InvalidCatalog)?;
+		match self.grants.publish(&namespace, &catalog, now_secs()).await.map_err(|err| match err {
+			DomainError::Validation(why) => ClientGrantError::InvalidCatalog(why),
+			other => unavailable(other),
+		})? {
+			PublishOutcome::Published => tracing::info!(client_id = %client.client_id, %namespace, version = catalog.version, "relying party: catalog published"),
+			PublishOutcome::Unchanged => {}
+			PublishOutcome::Stale { stored } => {
+				tracing::warn!(client_id = %client.client_id, %namespace, version = catalog.version, stored, "relying party: stale catalog refused");
+				return Err(ClientGrantError::StaleCatalog(format!("version {} does not supersede the stored {stored}", catalog.version)));
+			}
+		}
+		Ok(())
 	}
 
 	async fn redeem_code(&self, redemption: CodeRedemption) -> Result<ClientGrant, ClientGrantError> {
@@ -476,6 +513,10 @@ impl ClientGrants for RelyingParties {
 			Ok(())
 		})
 	}
+
+	fn publish_catalog(&self, publication: CatalogPublication) -> BoxFuture<'_, Result<(), ClientGrantError>> {
+		Box::pin(self.publish(publication))
+	}
 }
 
 /// The inbound authenticator for relying parties' access tokens, mounted as the
@@ -556,6 +597,7 @@ mod tests {
 			access_policy: domain::clients::AccessPolicy::Public,
 			secret_hash: None,
 			disabled: false,
+			namespace: None,
 		};
 		assert!(check_registered_redirects(&client("https://sa.evinvest.ltd/auth/callback")).is_ok());
 		for bad in ["http://sa.evinvest.ltd/cb", "https://sa.evinvest.ltd/cb#x", "https://u@sa.evinvest.ltd/cb", "https:///cb"] {

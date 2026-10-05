@@ -1,7 +1,7 @@
 //! `governance` module — the ownership plane's three gRPC faces.
 //!
 //! [`Governance`] is the signed-in consilium surface, mounted BEHIND the user auth
-//! layer and gated on [`Permission::RoleGrant`] — the existing Owner-only cell of the
+//! layer and gated on [`Roles::Grant`] — the existing Owner-only cell of the
 //! RBAC matrix, because taking a seat away is precisely a role change. No new
 //! permission and no second gate: the matrix stays defined in one place.
 //!
@@ -42,7 +42,7 @@ use std::{
 };
 
 use domain::{
-	authz::{Permission, Role},
+	authz::{Role, Roles},
 	governance::{
 		AdmissionId, AdmissionVote as DomainAdmissionVote, PAYOUT_MIN_OWNERS, ProposalState, ProposalVote as DomainProposalVote, RemovalId, RemovalState, UserProposalId, UserProposalKind,
 		Vote,
@@ -111,7 +111,7 @@ impl Governance {
 	/// a suspended or token-revoked principal even while their access token still
 	/// verifies.
 	async fn require_owner<T>(&self, request: &Request<T>) -> Result<(), Status> {
-		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, request, Permission::RoleGrant).await
+		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, request, Roles::Grant).await
 	}
 
 	/// The roster as the wire shows it. Deliberately NOT reached by re-entering

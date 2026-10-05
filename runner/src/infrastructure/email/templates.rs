@@ -840,7 +840,7 @@ pub fn payment_outcome(reader: PaymentOutcomeReader, outcome: ConsentOutcome, ti
 /// Deliberately NOT a request to act on a link. There is no code and no button, because
 /// the decision this mail exists to trigger — lowering somebody's KYC level — is one
 /// nobody should be able to make from an inbox. It says what happened and where to look;
-/// the act itself happens in the console under `Permission::KycManage`.
+/// the act itself happens in the console under `Kyc::Manage`.
 ///
 /// The affected account's address is printed because it is how an operator finds the
 /// person in the console, and it is an address the recipient already administers.

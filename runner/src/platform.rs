@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use domain::authz::Permission;
+use domain::authz::Platform as PlatformPermission;
 use evconcierge_auth::claims_of;
 use evconcierge_contracts::concierge::v1::{
 	FeatureFlag, GetPlatformConfigRequest, PlatformConfig, SetAnnouncementRequest, SetFeatureFlagRequest, SetMaintenanceModeRequest,
@@ -76,13 +76,13 @@ impl PlatformServiceRpc for Platform {
 	}
 
 	async fn set_maintenance_mode(&self, request: Request<SetMaintenanceModeRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, &request, PlatformPermission::Manage).await?;
 		self.config.set_maintenance(request.get_ref().enabled).await.map_err(domain_to_status)?;
 		Ok(Response::new(self.snapshot().await?))
 	}
 
 	async fn set_announcement(&self, request: Request<SetAnnouncementRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, &request, PlatformPermission::Manage).await?;
 		let req = request.into_inner();
 		// Empty title/body stays legal — that is how the banner is cleared; only the
 		// caps apply (the banner renders to every signed-in user).
@@ -97,7 +97,7 @@ impl PlatformServiceRpc for Platform {
 	}
 
 	async fn set_feature_flag(&self, request: Request<SetFeatureFlagRequest>) -> Result<Response<PlatformConfig>, Status> {
-		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, &request, Permission::PlatformManage).await?;
+		crate::authz::require_permission(self.users.as_ref(), &self.break_glass, &request, PlatformPermission::Manage).await?;
 		let req = request.into_inner();
 		if !is_flag_key(&req.key) {
 			return Err(Status::invalid_argument("flag key must be 1-64 characters of [a-z0-9_-] and start with a letter or digit"));
