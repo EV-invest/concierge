@@ -1,0 +1,25 @@
+[package]
+name = "concierge_iam"
+version = "0.1.0"
+edition = "2024"
+description = "Permission scopes of the EV identity plane: derived catalogs, concrete permission sets, patterns"
+license = "BlueOak-1.0.0"
+repository = "https://github.com/EV-invest/concierge"
+
+[features]
+# Collects every derived permission and alias into a `Catalog`. Off for wasm consumers, who only ask `may`.
+catalog = ["dep:inventory"]
+ts = ["catalog", "dep:ev", "dep:serde_json"]
+
+[dependencies]
+concierge_iam_derive = { workspace = true }
+ev = { workspace = true, features = ["ts_gen"], optional = true }
+inventory = { workspace = true, optional = true }
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
