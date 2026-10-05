@@ -1,0 +1,16 @@
+[package]
+name = "concierge_iam_derive"
+version = "0.1.0"
+edition = "2024"
+description = "#[derive(Permission)] for concierge_iam"
+license = "BlueOak-1.0.0"
+repository = "https://github.com/EV-invest/concierge"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+heck = "0.5"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

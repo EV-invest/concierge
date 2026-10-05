@@ -4,8 +4,9 @@ cargo-features = ["codegen-backend"]
 # `runner/` is the modular-monolith binary (composition root + the auth/directory/
 # notification/log modules); `auth` (verification flow + AuthService skeleton) and
 # `contracts` (proto → tonic stubs) are the crates downstream service repos import
-# by git; `domain` is the wasm-safe shared identity source of truth.
-members = ["auth", "contracts", "domain", "runner"]
+# by git; `domain` is the wasm-safe shared identity source of truth; `iam` (+ its derive)
+# is the permission-scope vocabulary every tenant service links from crates.io.
+members = ["auth", "contracts", "domain", "iam", "iam_derive", "runner"]
 resolver = "3"
 
 [workspace.dependencies]
