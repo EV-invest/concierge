@@ -157,7 +157,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
   banking's mirror). Two ENTRY POINTS reach it, and they differ in what they
   are allowed to decide and over whom. `users.set_kyc_level` is unconditional in
-  DIRECTION and belongs to the human path (`Permission::KycManage`), because a human is
+  DIRECTION and belongs to the human path (`Kyc::Manage`), because a human is
   precisely who may move a level DOWN. It is NOT unconditional in TARGET: nobody sets
   their own level, the same rule `HoldUser` carries below, and for the same reason —
   `KycManage` is held by `Admin` as well as `Owner`, and tier 1 is the floor for
@@ -183,7 +183,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   public, HMAC over the raw body, 300s replay window) lands in that same aggregate
   call, so banking never learns a vendor exists. A provider may only RAISE a level and
   never past `PROVIDER_MAX_TIER`; every tier above it and every downgrade are human
-  decisions under `Permission::KycManage` — somebody else's, when the account is the
+  decisions under `Kyc::Manage` — somebody else's, when the account is the
   operator's own. The identity a callback acts on comes from the
   stored `kyc_cases` row, NEVER from the request body; the body's echoed `vendor_data` is
   a CROSS-CHECK against that row and is decided inside the recording transaction, because
@@ -445,7 +445,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   dispatcher's sweep. Moving that wholesale to a quorum by mail would trade a ~30s brake
   for one that takes hours, and a broadcast made in those hours is irreversible; so
   `DisableUser` is retired (it refuses, naming both replacements) and splits into
-  `HoldUser` — one operator, `Permission::UserSuspend`, `users.suspended_by =
+  `HoldUser` — one operator, `Users::Suspend`, `users.suspended_by =
   'admin_hold'` with `hold_expires_at = now + HOLD_TTL_SECS` (24h) — and
   `GovernanceService.OpenUserSuspension`, the owners' proposal, which writes
   `suspended_by = 'governance'` and carries no deadline. One actor may stop money
@@ -478,14 +478,33 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   single act deliberately — containing a rogue operator must never be the slower path.
   The refusal is decided INSIDE the write transaction from the row held `FOR UPDATE`,
   the same TOCTOU argument as the `owner` refusal beside it.
-- **Scoped grants are access to ONE resource, and never money.** `scoped_grants`
-  (`domain::scopes`, `infrastructure::scoped_grants`) holds a user's `operator`/`admin`
+- **Every check asks for a permission; seats are governed, tenants' grants are not.** A
+  permission is `<namespace>:<resource…>:<action>` (`concierge_iam`), an alias a named set
+  of them. What a SEAT means is code (`domain::authz`, `SEAT_*` over `concierge:*`, `iam:*`,
+  `bank:*`) and who holds one is still only governance's to say; nothing compares seats by
+  rank. A TENANT (`tenants`, migration 0026) owns one namespace, and its relying party
+  publishes the catalog over it (`AuthService.PublishCatalog`, client secret, never older
+  than the stored version, everything inside the namespace). `GrantPermission` stores a
+  target inside a tenant namespace — alias, permission or `*` pattern — as named, so a
+  republished alias reaches every holder and a target the catalog dropped stays as an
+  orphaned row granting nothing. Only seats holding `iam:tenants:grant` grant, and nothing
+  grants that permission or anything in `iam`/`concierge`/`bank`/`seat`: no grant can reach a
+  seat's permissions or hand out granting. Such a seat holds every tenant permission, since
+  it could grant itself them. The write re-decides from the actor's row under `FOR UPDATE`
+  and audits `permission_granted`/`permission_revoked` in the same transaction.
+  `GetMe.permissions` is CONCRETE (no alias, no wildcard): to a relying party its own
+  tenant's namespace only, to a session the seat plus every tenant. `GrantScope`/`RevokeScope`
+  and `GetMe.scopes` are a compatibility view over the same rows — a scope is the tenant
+  whose `legacy_scope` it is, its roles that tenant's `operator`/`admin` aliases — and go
+  away with the clients that still speak them; `scoped_grants` is frozen since 0026.
+- **Scoped grants are access to ONE resource, and never money.** The scope view
+  (`domain::scopes`, `infrastructure::grants`) holds a user's `operator`/`admin`
   role over `allocation:<service_id>` — a vertical's panel. There is no `viewer`: a
   read-only holder would be an ordinary user (global `investor`), who gets no access to
   the service, so `viewer` is refused as an unknown role (`INVALID_ARGUMENT`); 0024
   deleted the rows 0023 allowed. Rights over an allocation's MONEY are banking's own
   grants, so scopes never cross the bridge. A global `admin`/`owner`
-  (`Permission::ScopeManage`) grants anything; a scope's `admin` grants `operator`
+  (`Iam::Grant`) grants anything; a scope's `admin` grants `operator`
   inside that scope and never touches an `admin` grant in either direction — one who
   could mint scope admins could hand the scope away for good. A
   scope admin also names a grant's target only by EMAIL, never by user id: ids of staff
@@ -544,7 +563,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   after the plane's verifier has refused it — and that path re-checks the session is live,
   so revocation is immediate there. The layer marks such a caller (`RestrictedCaller`) and
   `GetMe` answers it from an ALLOWLIST — id, email (+verified), status, preferred name,
-  role (+break-glass flag), scopes — never legal name, phone, birth date, nationality, tax
+  role (+break-glass flag), scopes, its tenant's permissions — never legal name, phone, birth date, nationality, tax
   residence, address or KYC level. An outage of that second verifier stays UNAVAILABLE.
   The plane's own verifier never learns a client
   audience: widening it would open every RPC. Secrets are env, not migration:

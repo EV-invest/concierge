@@ -2,8 +2,9 @@
 //! `GrantScope`, `RevokeScope`, `ListScopedGrants` and `GetMe.scopes`, against a REAL
 //! Postgres (no mocks, per the project rules).
 //!
-//! Every test mints its own users and its own scope (`allocation:itest_<random>`), so the
-//! suite shares a database with the others without reading their rows. No test here
+//! Every test mints its own users and its own scope (`allocation:itest_<random>`, served by
+//! a tenant of its own), so the suite shares a database with the others without reading
+//! their rows. No test here
 //! touches the owner registry: global authority is exercised through a persisted
 //! `admin`, and emergency access is off (empty `BreakGlass`), so a leftover owner from
 //! another suite cannot change an outcome here.
@@ -15,7 +16,7 @@ use concierge::{
 	directory::Directory,
 	infrastructure::{
 		db,
-		scoped_grants::PgScopedGrants,
+		grants::PgGrants,
 		users::{AdminAction, PgUsers},
 	},
 	ports::{ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository, UserDirectoryRepository},
@@ -49,17 +50,26 @@ async fn setup() -> Option<Fixture> {
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	let users: Arc<dyn UserDirectoryRepository> = Arc::new(PgUsers::new(pool.clone()));
-	let directory = Directory::new(users.clone(), Arc::new(PgScopedGrants::new(pool.clone())), Arc::new(BreakGlass::new(Vec::new())));
+	let directory = Directory::new(users.clone(), Arc::new(PgGrants::new(pool.clone())), Arc::new(BreakGlass::new(Vec::new())));
 	Some(Fixture {
 		users,
-		pool,
 		directory,
-		scope: fresh_scope(),
+		scope: fresh_scope(&pool).await,
+		pool,
 	})
 }
 
-fn fresh_scope() -> String {
-	format!("allocation:itest_{}", &Uuid::new_v4().simple().to_string()[..12])
+/// A scope, and the tenant whose `<namespace>:operator`/`:admin` its roles are.
+async fn fresh_scope(pool: &PgPool) -> String {
+	let tag = &Uuid::new_v4().simple().to_string()[..12];
+	let scope = format!("allocation:itest_{tag}");
+	sqlx::query("INSERT INTO tenants (id, namespace, legacy_scope, created_at) VALUES ($1, $1, $2, 0)")
+		.bind(format!("n_{tag}"))
+		.bind(&scope)
+		.execute(pool)
+		.await
+		.expect("register the scope's tenant");
+	scope
 }
 
 impl Fixture {
@@ -142,12 +152,15 @@ impl Fixture {
 
 	/// Every row ever written for `user` on the fixture's scope, active or not, oldest first.
 	async fn history(&self, user: UserId) -> Vec<(String, bool)> {
-		sqlx::query_as::<_, (String, bool)>("SELECT role, revoked_at IS NOT NULL FROM scoped_grants WHERE user_id = $1 AND scope = $2 ORDER BY id")
-			.bind(user.raw())
-			.bind(&self.scope)
-			.fetch_all(&self.pool)
-			.await
-			.expect("read scoped_grants")
+		sqlx::query_as::<_, (String, bool)>(
+			"SELECT split_part(g.target, ':', 2), g.revoked_at IS NOT NULL FROM grants g JOIN tenants t ON t.namespace = g.namespace \
+			 WHERE g.user_id = $1 AND t.legacy_scope = $2 ORDER BY g.id",
+		)
+		.bind(user.raw())
+		.bind(&self.scope)
+		.fetch_all(&self.pool)
+		.await
+		.expect("read grants")
 	}
 
 	async fn audit(&self, subject: UserId) -> Vec<(String, Option<Uuid>, serde_json::Value)> {
@@ -237,7 +250,7 @@ async fn a_scope_admin_manages_operators_in_their_own_scope_only() {
 	fx.grant(scope_admin, member, &fx.scope, "operator").await.unwrap();
 	assert_eq!(fx.my_scopes(member).await, vec![(fx.scope.clone(), "operator".into())]);
 
-	let elsewhere = fresh_scope();
+	let elsewhere = fresh_scope(&fx.pool).await;
 	assert_eq!(
 		code(fx.grant(scope_admin, member, &elsewhere, "operator").await),
 		Code::PermissionDenied,
@@ -421,7 +434,7 @@ async fn get_me_reports_only_the_callers_active_grants() {
 	let global = fx.global_admin().await;
 	let member = fx.user("member").await;
 	let other = fx.user("other").await;
-	let second = fresh_scope();
+	let second = fresh_scope(&fx.pool).await;
 	fx.grant(global, member, &fx.scope, "operator").await.unwrap();
 	fx.grant(global, member, &second, "admin").await.unwrap();
 	fx.grant(global, other, &fx.scope, "admin").await.unwrap();
@@ -435,27 +448,32 @@ async fn get_me_reports_only_the_callers_active_grants() {
 }
 
 #[tokio::test]
-async fn the_table_itself_refuses_a_second_active_grant_and_a_malformed_scope() {
+async fn the_table_itself_refuses_a_second_active_grant_and_a_malformed_target() {
 	let Some(fx) = setup().await else {
 		return;
 	};
 	let global = fx.global_admin().await;
 	let member = fx.user("member").await;
 	fx.grant(global, member, &fx.scope, "operator").await.unwrap();
-	let insert = |scope: String, role: &'static str| {
-		sqlx::query("INSERT INTO scoped_grants (user_id, scope, role, granted_by, granted_at) VALUES ($1, $2, $3, $4, 0)")
+	let namespace: String = sqlx::query_scalar("SELECT namespace FROM tenants WHERE legacy_scope = $1")
+		.bind(&fx.scope)
+		.fetch_one(&fx.pool)
+		.await
+		.unwrap();
+	let insert = |target: String| {
+		sqlx::query("INSERT INTO grants (user_id, namespace, target, granted_by, granted_at) VALUES ($1, $2, $3, $4, 0)")
 			.bind(member.raw())
-			.bind(scope)
-			.bind(role)
+			.bind(namespace.clone())
+			.bind(target)
 			.bind(global.raw())
 			.execute(&fx.pool)
 	};
-	let duplicate = insert(fx.scope.clone(), "operator").await.expect_err("one active grant per (user, scope)");
-	assert!(duplicate.to_string().contains("scoped_grants_active_idx"), "{duplicate}");
-	let malformed = insert("allocation:Nope".into(), "operator").await.expect_err("the scope format is a column rule too");
-	assert!(malformed.to_string().contains("scoped_grants_scope_format"), "{malformed}");
-	let viewer = insert(fresh_scope(), "viewer").await.expect_err("the removed role is refused by the column too");
-	assert!(viewer.to_string().contains("scoped_grants_role"), "{viewer}");
+	let duplicate = insert(format!("{namespace}:operator")).await.expect_err("one active grant per (user, target)");
+	assert!(duplicate.to_string().contains("grants_active_idx"), "{duplicate}");
+	let malformed = insert(format!("{namespace}:Nope")).await.expect_err("the target format is a column rule too");
+	assert!(malformed.to_string().contains("grants_target_format"), "{malformed}");
+	let foreign = insert("bank:payment:open".into()).await.expect_err("a target outside the row's namespace");
+	assert!(foreign.to_string().contains("grants_target_namespace"), "{foreign}");
 }
 
 #[tokio::test]
@@ -550,7 +568,7 @@ async fn an_email_shared_by_two_accounts_names_nobody() {
 	}
 	let target = grant_scope_request::Target::Email(email.to_uppercase());
 	assert_eq!(code(fx.grant_to(global, target, &fx.scope, "operator").await), Code::FailedPrecondition);
-	let holders: i64 = sqlx::query_scalar("SELECT count(*) FROM scoped_grants WHERE scope = $1")
+	let holders: i64 = sqlx::query_scalar("SELECT count(*) FROM grants g JOIN tenants t ON t.namespace = g.namespace WHERE t.legacy_scope = $1")
 		.bind(&fx.scope)
 		.fetch_one(&fx.pool)
 		.await
@@ -567,7 +585,7 @@ async fn the_write_decides_from_the_actors_persisted_role_not_the_gates() {
 	let Some(fx) = setup().await else {
 		return;
 	};
-	let repo = PgScopedGrants::new(fx.pool.clone());
+	let repo = PgGrants::new(fx.pool.clone());
 	let scope = Scope::parse(&fx.scope).unwrap();
 	let target = fx.user("target").await;
 	let target_ref = ScopeTarget::Id(target);
@@ -583,9 +601,9 @@ async fn the_write_decides_from_the_actors_persisted_role_not_the_gates() {
 		action: "scope_granted",
 		..AdminAction::default()
 	};
-	let outcome = repo.grant(&target_ref, &scope, ScopeRole::Operator, &stale, &action, 0).await.unwrap();
+	let outcome = repo.grant_scope(&target_ref, &scope, ScopeRole::Operator, &stale, &action, 0).await.unwrap();
 	assert!(matches!(outcome, ScopeGrantOutcome::Denied), "the gate said admin, the row says investor");
-	assert!(matches!(repo.revoke(&target_ref, &scope, &stale, &action, 0).await.unwrap(), ScopeRevokeOutcome::Denied));
+	assert!(matches!(repo.revoke_scope(&target_ref, &scope, &stale, &action, 0).await.unwrap(), ScopeRevokeOutcome::Denied));
 
 	let suspended = fx.global_admin().await;
 	fx.users.disable_user(suspended).await.unwrap();
@@ -594,7 +612,7 @@ async fn the_write_decides_from_the_actors_persisted_role_not_the_gates() {
 		role: Role::Admin,
 		elevated: false,
 	};
-	let outcome = repo.grant(&target_ref, &scope, ScopeRole::Operator, &suspended_actor, &action, 0).await.unwrap();
+	let outcome = repo.grant_scope(&target_ref, &scope, ScopeRole::Operator, &suspended_actor, &action, 0).await.unwrap();
 	assert!(matches!(outcome, ScopeGrantOutcome::Denied), "a disabled actor acts with nothing");
 	assert!(fx.history(target).await.is_empty());
 
@@ -605,7 +623,7 @@ async fn the_write_decides_from_the_actors_persisted_role_not_the_gates() {
 		role: Role::Owner,
 		elevated: true,
 	};
-	let outcome = repo.grant(&target_ref, &scope, ScopeRole::Operator, &actor, &action, 0).await.unwrap();
+	let outcome = repo.grant_scope(&target_ref, &scope, ScopeRole::Operator, &actor, &action, 0).await.unwrap();
 	assert!(matches!(outcome, ScopeGrantOutcome::Granted(_)), "break-glass elevation still counts inside the transaction");
 }
 
@@ -680,7 +698,7 @@ async fn a_scope_admin_cannot_tell_a_missing_address_from_a_shared_or_disabled_o
 			"{what}: one answer for every address that cannot be granted"
 		);
 	}
-	let holders: i64 = sqlx::query_scalar("SELECT count(*) FROM scoped_grants WHERE scope = $1 AND revoked_at IS NULL")
+	let holders: i64 = sqlx::query_scalar("SELECT count(*) FROM grants g JOIN tenants t ON t.namespace = g.namespace WHERE t.legacy_scope = $1 AND g.revoked_at IS NULL")
 		.bind(&fx.scope)
 		.fetch_one(&fx.pool)
 		.await

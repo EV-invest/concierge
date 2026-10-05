@@ -12,8 +12,8 @@ use std::sync::Mutex;
 use concierge::web::{PrincipalSource, WebSessions};
 use evconcierge_auth::{AuthError, AuthService};
 use evconcierge_contracts::concierge::v1::{
-	ClientTokenResponse, ExchangeCodeRequest, ExchangeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse,
-	RefreshClientTokenRequest, RefreshRequest, RevokeSessionRequest, RevokeSessionResponse, TokenResponse, UserSummary, auth_service_server::AuthService as AuthRpc,
+	ClientTokenResponse, ExchangeCodeRequest, ExchangeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, PublishCatalogRequest,
+	PublishCatalogResponse, RefreshClientTokenRequest, RefreshRequest, RevokeSessionRequest, RevokeSessionResponse, TokenResponse, UserSummary, auth_service_server::AuthService as AuthRpc,
 };
 use tonic::{Request, Response, Status};
 
@@ -92,6 +92,10 @@ impl AuthRpc for Directory {
 
 	async fn refresh_client_token(&self, _: Request<RefreshClientTokenRequest>) -> Result<Response<ClientTokenResponse>, Status> {
 		unreachable!("issuance is not part of a live principal read")
+	}
+
+	async fn publish_catalog(&self, _: Request<PublishCatalogRequest>) -> Result<Response<PublishCatalogResponse>, Status> {
+		unreachable!("publication is not part of a live principal read")
 	}
 
 	async fn jwks(&self, _: Request<JwksRequest>) -> Result<Response<JwksResponse>, Status> {

@@ -23,8 +23,7 @@ use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
 	infrastructure::{
-		db, governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, platform::PgPlatform, relying_parties::PgRelyingParties, scoped_grants::PgScopedGrants,
-		users::PgUsers,
+		db, governance::PgGovernance, grants::PgGrants, kyc::cases::PgKycCases, notifications::PgNotifications, platform::PgPlatform, relying_parties::PgRelyingParties, users::PgUsers,
 	},
 	platform::Platform,
 	ports::{ClientRecord, RelyingPartyRepository, UserDirectoryRepository},
@@ -115,7 +114,7 @@ async fn setup() -> Option<Fx> {
 	let rp = Arc::new(RelyingParties::new(
 		repo.clone(),
 		users.clone(),
-		Arc::new(PgScopedGrants::new(pool.clone())),
+		Arc::new(PgGrants::new(pool.clone())),
 		Arc::new(BreakGlass::new(Vec::new())),
 		Default::default(),
 	));
@@ -128,6 +127,12 @@ async fn setup() -> Option<Fx> {
 		redirect_uri: format!("https://rp-{tag}.test/auth/callback"),
 		secret: random(32),
 	};
+	sqlx::query("INSERT INTO tenants (id, namespace, legacy_scope, created_at) VALUES ($1, $1, $2, 0)")
+		.bind(format!("n_{tag}"))
+		.bind(&client.scope)
+		.execute(&pool)
+		.await
+		.expect("register the scope's tenant");
 	sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, access_policy, created_at) VALUES ($1, $2, $3, $4, 0)")
 		.bind(&client.id)
 		.bind(&client.audience)
@@ -165,19 +170,24 @@ impl Fx {
 		self.users.provision(subject, Email::parse("rp@example.com").unwrap(), true).await.expect("provision").id()
 	}
 
+	/// The tenant the client's scope maps onto: `n_` and the scope's random suffix.
+	fn namespace(&self) -> String {
+		format!("n_{}", self.client.scope.trim_start_matches("allocation:rp_"))
+	}
+
 	async fn grant_scope(&self, user: UserId) {
-		sqlx::query("INSERT INTO scoped_grants (user_id, scope, role, granted_by, granted_at) VALUES ($1, $2, 'operator', $1, 0)")
+		sqlx::query("INSERT INTO grants (user_id, namespace, target, granted_by, granted_at) VALUES ($1, $2, $2 || ':operator', $1, 0)")
 			.bind(user.raw())
-			.bind(&self.client.scope)
+			.bind(self.namespace())
 			.execute(&self.pool)
 			.await
 			.expect("grant scope");
 	}
 
 	async fn revoke_scope(&self, user: UserId) {
-		sqlx::query("UPDATE scoped_grants SET revoked_at = 1, revoked_by = user_id WHERE user_id = $1 AND scope = $2 AND revoked_at IS NULL")
+		sqlx::query("UPDATE grants SET revoked_at = 1, revoked_by = user_id WHERE user_id = $1 AND namespace = $2 AND revoked_at IS NULL")
 			.bind(user.raw())
-			.bind(&self.client.scope)
+			.bind(self.namespace())
 			.execute(&self.pool)
 			.await
 			.expect("revoke scope");
@@ -520,7 +530,7 @@ async fn boot(fx: &Fx) -> Channel {
 
 	let users: Arc<dyn UserDirectoryRepository> = fx.users.clone();
 	let break_glass = Arc::new(BreakGlass::new(Vec::new()));
-	let directory = Directory::new(users.clone(), Arc::new(PgScopedGrants::new(fx.pool.clone())), break_glass.clone());
+	let directory = Directory::new(users.clone(), Arc::new(PgGrants::new(fx.pool.clone())), break_glass.clone());
 	let platform = Platform::new(users, break_glass, Arc::new(PgPlatform::new(fx.pool.clone())));
 	let issuance = fx.auth.clone();
 	tokio::spawn(async move {
