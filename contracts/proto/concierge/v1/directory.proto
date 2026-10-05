@@ -106,6 +106,22 @@ service UserDirectory {
   // `legal_name` AND `preferred_name` empty: the team sees each other's email and grant,
   // and nothing that says who an address belongs to.
   rpc ListScopedGrants(ListScopedGrantsRequest) returns (ListScopedGrantsResponse);
+
+  // Grant a user a target inside a tenant's namespace: an alias (`sa:operator`), a
+  // permission (`sa:work:leads:read`) or a `*` pattern (`sa:work:*`). Held by the seats
+  // with `iam:tenants:grant`; nothing grants that permission, nor anything in the `iam`,
+  // `concierge`, `bank` or `seat` namespaces (INVALID_ARGUMENT). A target the tenant's
+  // catalog does not define grants nothing and is INVALID_ARGUMENT. An unknown user or
+  // address is NOT_FOUND; an address held by several accounts, or a disabled/held
+  // account, is FAILED_PRECONDITION with the reason. Re-granting what is held is a no-op.
+  rpc GrantPermission(GrantPermissionRequest) returns (GrantPermissionResponse);
+
+  // Take a grant away. NOT_FOUND when the user holds no active grant of that target.
+  rpc RevokePermission(RevokePermissionRequest) returns (RevokePermissionResponse);
+
+  // The active grants inside one tenant namespace, with each holder's identity. Same
+  // authority as GrantPermission.
+  rpc ListGrants(ListGrantsRequest) returns (ListGrantsResponse);
 }
 
 message GetMeRequest {}
@@ -148,11 +164,16 @@ message UserProfile {
   string suspended_by = 19;
   // Unix SECONDS an "admin_hold" lapses. 0 when nothing lapses.
   int64 hold_expires_at = 20;
-  // The caller's ACTIVE scoped grants. Filled by GetMe only — every other RPC returning
+  // The caller's ACTIVE scoped grants, as the `<tenant>:operator`/`:admin` grants of the tenant
+  // whose legacy scope this is. Filled by GetMe only — every other RPC returning
   // a UserProfile leaves it empty, so an empty list elsewhere means "not reported", not
   // "holds none". A global role is NOT folded in here: a panel that admits global
   // admins/owners reads `role` above for that.
   repeated ScopedGrant scopes = 21;
+  // What the caller may do, concrete: no alias, no wildcard. Filled by GetMe only. To a
+  // relying party, its tenant's namespace and nothing else; to a first-party session, the
+  // seat's permissions plus every tenant's.
+  repeated string permissions = 22;
 }
 
 // A user's role over one resource.
@@ -348,4 +369,60 @@ message ScopeHolder {
 message ListScopedGrantsResponse {
   // Oldest grant first.
   repeated ScopeHolder holders = 1;
+}
+
+// One grant of a target inside a tenant's namespace.
+message PermissionGrant {
+  int64 id = 1;
+  string user_id = 2;
+  string target = 3;
+  string granted_by = 4;
+  // Unix SECONDS.
+  int64 granted_at = 5;
+  string reason = 6;
+  // The tenant's current catalog defines nothing this target names: it grants nothing.
+  bool orphaned = 7;
+}
+
+message GrantPermissionRequest {
+  oneof subject {
+    string user_id = 1;
+    string email = 2;
+  }
+  string target = 3;
+  // Recorded on the grant and the audit row.
+  string reason = 4;
+}
+
+message GrantPermissionResponse {
+  PermissionGrant grant = 1;
+}
+
+message RevokePermissionRequest {
+  oneof subject {
+    string user_id = 1;
+    string email = 2;
+  }
+  string target = 3;
+  // Recorded on the audit row.
+  string reason = 4;
+}
+
+message RevokePermissionResponse {}
+
+message ListGrantsRequest {
+  // The tenant namespace (`sa`).
+  string namespace = 1;
+}
+
+message GrantHolder {
+  PermissionGrant grant = 1;
+  string email = 2;
+  string legal_name = 3;
+  string preferred_name = 4;
+}
+
+message ListGrantsResponse {
+  // Oldest grant first.
+  repeated GrantHolder holders = 1;
 }

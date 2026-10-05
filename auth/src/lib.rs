@@ -47,7 +47,7 @@ mod management;
 mod signer;
 
 pub use claims::{Claims, TokenType};
-pub use clients::{BoxFuture, ClientGrant, ClientGrantError, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation};
+pub use clients::{BoxFuture, CatalogPublication, ClientGrant, ClientGrantError, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation};
 pub use config::{AuthConfig, GoogleConfig, SigningConfig, VerifierConfig};
 pub use interceptor::{AuthLayer, Authenticate, RestrictedCaller, claims_of, grpc_auth_layer};
 pub use jwks::{JwksCache, VerifyPolicy, verify_token};

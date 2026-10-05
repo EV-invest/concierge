@@ -24,6 +24,7 @@ fn lifecycle_event_round_trips_with_full_envelope() {
 		email_verified: true,
 		token_version: 3,
 		role: "admin".to_string(),
+		permissions: vec!["bank:treasury:read".to_string()],
 	};
 
 	let decoded = UserLifecycleEvent::decode(event.encode_to_vec().as_slice()).expect("round trips");

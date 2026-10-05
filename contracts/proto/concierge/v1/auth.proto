@@ -65,6 +65,14 @@ service AuthService {
   // than at the family's deadline; presenting a rotated-out token revokes the family.
   rpc RefreshClientToken(RefreshClientTokenRequest) returns (ClientTokenResponse);
 
+  // A relying party publishes its tenant's catalog: the permissions and aliases its
+  // namespace defines. Authenticated by the client secret, like ExchangeCode. Refused
+  // (INVALID_ARGUMENT) when anything lies outside the tenant's namespace or an alias names
+  // a permission the catalog does not define; FAILED_PRECONDITION when `version` is older
+  // than the stored one, or equal with different content. Grants whose target the new
+  // catalog drops stay, grant nothing, and are listed as orphaned.
+  rpc PublishCatalog(PublishCatalogRequest) returns (PublishCatalogResponse);
+
   // Reserved for later auth slices, declared here to lock the namespace:
   //   rpc Introspect(IntrospectRequest) returns (IntrospectResponse);
   //   rpc MintServiceToken(MintServiceTokenRequest) returns (TokenResponse);
@@ -166,6 +174,23 @@ message ExchangeCodeRequest {
   // The PKCE verifier whose S256 challenge was sent to authorize.
   string code_verifier = 5;
 }
+
+message PublishCatalogRequest {
+  string client_id = 1;
+  string client_secret = 2;
+  // Monotonic per client (a build timestamp); at most 2^63-1.
+  uint64 version = 3;
+  repeated string permissions = 4;
+  repeated CatalogAlias aliases = 5;
+}
+
+message CatalogAlias {
+  // `<namespace>:<name>`.
+  string name = 1;
+  repeated string members = 2;
+}
+
+message PublishCatalogResponse {}
 
 message RefreshClientTokenRequest {
   string client_id = 1;

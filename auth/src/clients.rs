@@ -32,6 +32,16 @@ pub struct ClientRefresh {
 	pub refresh_token: String,
 }
 
+/// `PublishCatalog`'s inputs: the tenant catalog a client presents, unchecked.
+pub struct CatalogPublication {
+	pub client_id: String,
+	pub client_secret: String,
+	pub version: u64,
+	pub permissions: Vec<String>,
+	/// `(name, members)`.
+	pub aliases: Vec<(String, Vec<String>)>,
+}
+
 /// A decision to issue a relying party a token pair: the refresh half already exists
 /// server-side, and the access JWT is minted from the rest.
 pub struct ClientGrant {
@@ -63,6 +73,13 @@ pub enum ClientGrantError {
 	/// or outside the client's access policy.
 	#[error("access denied")]
 	AccessDenied,
+	/// The catalog defines something outside the client's tenant namespace, or is
+	/// malformed; the message names what.
+	#[error("invalid catalog: {0}")]
+	InvalidCatalog(String),
+	/// Older than the stored catalog, or the same version with different content.
+	#[error("stale catalog: {0}")]
+	StaleCatalog(String),
 	/// The plane could not decide (storage failure) — never the caller's fault.
 	#[error("relying party store unavailable: {0}")]
 	Unavailable(String),
@@ -74,6 +91,8 @@ impl From<ClientGrantError> for tonic::Status {
 			ClientGrantError::InvalidClient => tonic::Status::unauthenticated("invalid client"),
 			ClientGrantError::InvalidGrant => tonic::Status::unauthenticated("invalid grant"),
 			ClientGrantError::AccessDenied => tonic::Status::permission_denied("access denied"),
+			ClientGrantError::InvalidCatalog(why) => tonic::Status::invalid_argument(why),
+			ClientGrantError::StaleCatalog(why) => tonic::Status::failed_precondition(why),
 			ClientGrantError::Unavailable(_) => tonic::Status::unavailable("relying party store unavailable"),
 		}
 	}
@@ -103,4 +122,7 @@ pub trait ClientGrants: Send + Sync {
 	/// End the client sessions (and outstanding codes) an upstream sign-out took the
 	/// authority of.
 	fn upstream_revoked(&self, revocation: UpstreamRevocation) -> BoxFuture<'_, Result<(), ClientGrantError>>;
+
+	/// Authenticate the client and store its tenant's catalog.
+	fn publish_catalog(&self, publication: CatalogPublication) -> BoxFuture<'_, Result<(), ClientGrantError>>;
 }
