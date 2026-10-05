@@ -12,9 +12,9 @@ catalog = ["dep:inventory"]
 ts = ["catalog", "dep:ev", "dep:serde_json"]
 
 [dependencies]
-concierge_iam_derive = { version = "0.1.0", path = "../iam_derive" }
-ev = { version = "0.24.2", package = "ev_lib", default-features = false, features = ["ts_gen"], optional = true }
-inventory = { version = "0.3", optional = true }
+concierge_iam_derive = { workspace = true }
+ev = { workspace = true, features = ["ts_gen"], optional = true }
+inventory = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, optional = true }
 

@@ -162,7 +162,7 @@ impl Catalog {
 			Ts::Union {
 				name: "PERMISSIONS",
 				ty: "Permission",
-				items: self.permissions.iter().map(|p| &*p.clone().leak()).collect(),
+				items: self.permissions.iter().map(|p| &*p.clone().leak()).collect(), // Ts::Union takes &'static str; one-shot generator, never call in a loop
 			},
 			Ts::Value {
 				name: "ALIASES",
