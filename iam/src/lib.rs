@@ -14,19 +14,28 @@ pub trait Permission: Copy {
 	fn as_str(self) -> &'static str;
 }
 
+/// Longest permission, alias or pattern: long enough for any real name, short enough to stay a key.
+pub const MAX_NAME_CHARS: usize = 128;
+/// Bounds on one catalog: it is loaded and resolved on every `GetMe`.
+pub const MAX_PERMISSIONS: usize = 1024;
+pub const MAX_ALIASES: usize = 128;
+
 /// A named set of permissions, `<namespace>:<name>`. Two segments, so an alias can never be
-/// spelled like a permission, which has at least three.
+/// spelled like a permission, which has at least three. `delegates` are the aliases its
+/// holders may grant and revoke to others.
 #[derive(Clone, Copy, Debug)]
 pub struct Alias {
 	pub name: &'static str,
 	pub members: &'static [&'static str],
+	pub delegates: &'static [&'static str],
 }
 
 /// `alias!(pub SA_OPERATOR = "sa:operator", [Leads::Read, Leads::Edit]);`
+/// `alias!(pub SA_ADMIN = "sa:admin", [Sources::Manage], delegates [SA_OPERATOR]);`
 #[macro_export]
 macro_rules! alias {
-	($vis:vis $ident:ident = $name:literal, [$($member:expr),* $(,)?]) => {
-		$vis const $ident: $crate::Alias = $crate::Alias { name: $name, members: &[$($member.as_str()),*] };
+	($vis:vis $ident:ident = $name:literal, [$($member:expr),* $(,)?] $(, delegates [$($delegate:expr),* $(,)?])?) => {
+		$vis const $ident: $crate::Alias = $crate::Alias { name: $name, members: &[$($member.as_str()),*], delegates: &[$($($delegate.name),*)?] };
 		$crate::__submit! { $crate::Entry::Alias($ident) }
 	};
 }
@@ -59,6 +68,9 @@ pub struct Pattern(String);
 
 impl Pattern {
 	pub fn parse(raw: &str) -> Result<Self, String> {
+		if raw.chars().count() > MAX_NAME_CHARS {
+			return Err(format!("a permission pattern is at most {MAX_NAME_CHARS} characters"));
+		}
 		let segments: Vec<&str> = raw.split(':').collect();
 		let valid = segments.len() >= 2 && is_segment(segments[0]) && segments[1..].iter().all(|s| *s == "*" || is_segment(s));
 		match valid {
@@ -107,13 +119,20 @@ pub struct Catalog {
 	pub version: u64,
 	pub permissions: BTreeSet<String>,
 	pub aliases: BTreeMap<String, BTreeSet<String>>,
+	/// Alias → the aliases its holders may grant and revoke. Only aliases that delegate.
+	pub delegations: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Catalog {
 	/// Every permission is concrete and in `namespace`, every alias is `<namespace>:<name>`
-	/// and names only permissions of this catalog.
+	/// and names only permissions of this catalog, everything is within the size bounds,
+	/// and a delegated alias delegates nothing itself: a holder can never mint a peer, nor
+	/// someone who could mint them.
 	pub fn check(&self, namespace: &str) -> Result<(), String> {
-		let ours = |raw: &str| raw.split(':').next() == Some(namespace);
+		if self.permissions.len() > MAX_PERMISSIONS || self.aliases.len() > MAX_ALIASES {
+			return Err(format!("a catalog holds at most {MAX_PERMISSIONS} permissions and {MAX_ALIASES} aliases"));
+		}
+		let ours = |raw: &str| raw.chars().count() <= MAX_NAME_CHARS && raw.split(':').next() == Some(namespace);
 		for p in &self.permissions {
 			let segments: Vec<&str> = p.split(':').collect();
 			if segments.len() < 3 || !segments.iter().all(|s| is_segment(s)) || !ours(p) {
@@ -129,6 +148,14 @@ impl Catalog {
 				return Err(format!("alias `{name}` names `{stray}`, which this catalog does not define"));
 			}
 		}
+		for (name, delegates) in &self.delegations {
+			if !self.aliases.contains_key(name) || delegates.is_empty() {
+				return Err(format!("`{name}` delegates, but is no alias of this catalog or delegates nothing"));
+			}
+			if let Some(stray) = delegates.iter().find(|d| !self.aliases.contains_key(*d) || self.delegations.contains_key(*d)) {
+				return Err(format!("alias `{name}` delegates `{stray}`, which is no alias of this catalog or delegates itself"));
+			}
+		}
 		Ok(())
 	}
 
@@ -137,19 +164,30 @@ impl Catalog {
 	pub fn collect(namespace: &str, version: u64) -> Self {
 		let mut permissions = BTreeSet::new();
 		let mut aliases = BTreeMap::new();
+		let mut delegations = BTreeMap::new();
 		let ours = |raw: &str| raw.split(':').next() == Some(namespace);
 		for entry in inventory::iter::<Entry> {
 			match entry {
 				Entry::Permission(p) if ours(p) => assert!(permissions.insert((*p).to_owned()), "`{p}` is derived twice"),
-				Entry::Alias(a) if ours(a.name) => assert!(
-					aliases.insert(a.name.to_owned(), a.members.iter().map(|m| (*m).to_owned()).collect()).is_none(),
-					"alias `{}` is declared twice",
-					a.name
-				),
+				Entry::Alias(a) if ours(a.name) => {
+					assert!(
+						aliases.insert(a.name.to_owned(), a.members.iter().map(|m| (*m).to_owned()).collect()).is_none(),
+						"alias `{}` is declared twice",
+						a.name
+					);
+					if !a.delegates.is_empty() {
+						delegations.insert(a.name.to_owned(), a.delegates.iter().map(|d| (*d).to_owned()).collect());
+					}
+				}
 				_ => {}
 			}
 		}
-		let catalog = Self { version, permissions, aliases };
+		let catalog = Self {
+			version,
+			permissions,
+			aliases,
+			delegations,
+		};
 		catalog.check(namespace).unwrap_or_else(|e| panic!("{e}"));
 		catalog
 	}
@@ -245,11 +283,45 @@ mod tests {
 		}
 	}
 
+	fn named(pairs: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
+		pairs.iter().map(|(n, m)| ((*n).to_owned(), m.iter().map(|p| (*p).to_owned()).collect())).collect()
+	}
+
 	fn catalog(permissions: &[&str], aliases: &[(&str, &[&str])]) -> Catalog {
+		delegating(permissions, aliases, &[])
+	}
+
+	fn delegating(permissions: &[&str], aliases: &[(&str, &[&str])], delegations: &[(&str, &[&str])]) -> Catalog {
 		Catalog {
 			version: 1,
 			permissions: permissions.iter().map(|p| (*p).to_owned()).collect(),
-			aliases: aliases.iter().map(|(n, m)| ((*n).to_owned(), m.iter().map(|p| (*p).to_owned()).collect())).collect(),
+			aliases: named(aliases),
+			delegations: named(delegations),
+		}
+	}
+
+	#[test]
+	fn catalog_is_bounded() {
+		let many: Vec<String> = (0..=MAX_PERMISSIONS).map(|i| format!("sa:p:x{i}")).collect();
+		assert!(catalog(&many.iter().map(String::as_str).collect::<Vec<_>>(), &[]).check("sa").is_err());
+		let long = format!("sa:p:{}", "a".repeat(MAX_NAME_CHARS));
+		assert!(catalog(&[&long], &[]).check("sa").is_err());
+		assert!(Pattern::parse(&long).is_err());
+	}
+
+	#[test]
+	fn a_delegate_cannot_delegate() {
+		let p = &["sa:work:leads:read"][..];
+		let aliases: &[(&str, &[&str])] = &[("sa:admin", p), ("sa:operator", p), ("sa:lead", p)];
+		assert!(delegating(p, aliases, &[("sa:admin", &["sa:operator"]), ("sa:lead", &["sa:operator"])]).check("sa").is_ok());
+		for bad in [
+			delegating(p, aliases, &[("sa:admin", &["sa:admin"])]),
+			delegating(p, aliases, &[("sa:admin", &["sa:lead"]), ("sa:lead", &["sa:operator"])]),
+			delegating(p, aliases, &[("sa:admin", &["sa:gone"])]),
+			delegating(p, aliases, &[("sa:gone", &["sa:operator"])]),
+			delegating(p, aliases, &[("sa:admin", &[])]),
+		] {
+			assert!(bad.check("sa").is_err(), "{bad:?}");
 		}
 	}
 

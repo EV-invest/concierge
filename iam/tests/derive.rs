@@ -14,6 +14,7 @@ enum Sources {
 }
 
 alias!(SA_OPERATOR = "sa:operator", [Leads::Read, Leads::Edit]);
+alias!(SA_ADMIN = "sa:admin", [Leads::Read, Leads::Edit, Sources::Manage], delegates[SA_OPERATOR]);
 
 #[test]
 fn derived_names_and_may() {
@@ -33,7 +34,11 @@ fn catalog_collects_the_namespace() {
 		serde_json::json!({
 			"version": 7,
 			"permissions": ["sa:admin:sources:manage", "sa:work:leads:edit", "sa:work:leads:read"],
-			"aliases": { "sa:operator": ["sa:work:leads:edit", "sa:work:leads:read"] },
+			"aliases": {
+				"sa:admin": ["sa:admin:sources:manage", "sa:work:leads:edit", "sa:work:leads:read"],
+				"sa:operator": ["sa:work:leads:edit", "sa:work:leads:read"],
+			},
+			"delegations": { "sa:admin": ["sa:operator"] },
 		})
 	);
 	assert!(concierge_iam::Catalog::collect("bank", 1).permissions.is_empty());
