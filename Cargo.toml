@@ -65,6 +65,7 @@ smart-default = "^0.7"
 # Postgres control plane. Runtime queries (`sqlx::query*`, not the compile-time
 # macros) keep `cargo build` independent of a live database, mirroring banking.
 sqlx = "0.9.0"
+strum = { version = "0.27", features = ["derive"] }
 # Constant-time secret comparison for refresh-token rotation.
 subtle = "2.6"
 syn = "2"

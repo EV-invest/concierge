@@ -14,13 +14,15 @@
 
 use concierge_iam::{Permission, alias};
 use serde::{Deserialize, Serialize};
+use strum::{EnumString, IntoStaticStr, VariantArray};
 
 use crate::error::DomainError;
 
 /// The platform-wide seat. `Investor` is the default (every provisioned user). Written
 /// only by governance; what a seat may do is [`Role::permissions`].
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, EnumString, Eq, IntoStaticStr, PartialEq, Serialize, VariantArray)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Role {
 	#[default]
 	Investor,
@@ -33,25 +35,13 @@ impl Role {
 	/// The stored/wire discriminant. Part of the cross-plane bridge contract — do not
 	/// diverge from banking's `Role::as_str`.
 	pub fn as_str(self) -> &'static str {
-		match self {
-			Self::Investor => "investor",
-			Self::Operator => "operator",
-			Self::Admin => "admin",
-			Self::Owner => "owner",
-		}
+		self.into()
 	}
 
-	/// Parse the stored form back into the enum (persistence + bridge adapters). An
-	/// unrecognized value is a validation error rather than a silent default, so a bad
+	/// An unrecognized value is a validation error rather than a silent default, so a bad
 	/// row never quietly grants or drops privilege.
 	pub fn parse(raw: &str) -> Result<Self, DomainError> {
-		match raw {
-			"investor" => Ok(Self::Investor),
-			"operator" => Ok(Self::Operator),
-			"admin" => Ok(Self::Admin),
-			"owner" => Ok(Self::Owner),
-			other => Err(DomainError::Validation(format!("unknown role: {other}"))),
-		}
+		raw.parse().map_err(|_| DomainError::Validation(format!("unknown role: {raw}")))
 	}
 }
 
@@ -258,9 +248,11 @@ alias!(
 	]
 );
 
-impl Role {
-	pub const ALL: [Self; 4] = [Self::Investor, Self::Operator, Self::Admin, Self::Owner];
+/// Orders what each seat's `bank:*` set means across binaries: a running older binary must
+/// not overwrite a newer meaning. Bump it whenever any [`Role::bank_permissions`] changes.
+pub const SEAT_GENERATION: u32 = 1;
 
+impl Role {
 	/// The concrete permissions this seat holds: `concierge:*`, `iam:*` and `bank:*`.
 	pub fn permissions(self) -> &'static [&'static str] {
 		match self {
@@ -275,9 +267,11 @@ impl Role {
 		self.permissions().contains(&permission.as_str())
 	}
 
-	/// The `bank:*` part of [`Self::permissions`]: what the money plane mirrors.
+	/// The `bank:*` part of [`Self::permissions`], sorted: what the money plane mirrors.
 	pub fn bank_permissions(self) -> Vec<&'static str> {
-		self.permissions().iter().copied().filter(|p| p.starts_with("bank:")).collect()
+		let mut bank: Vec<_> = self.permissions().iter().copied().filter(|p| p.starts_with("bank:")).collect();
+		bank.sort_unstable();
+		bank
 	}
 }
 
@@ -297,7 +291,7 @@ mod tests {
 
 	#[test]
 	fn role_round_trips_and_rejects_unknown() {
-		for role in [Role::Investor, Role::Operator, Role::Admin, Role::Owner] {
+		for &role in Role::VARIANTS {
 			assert_eq!(Role::parse(role.as_str()).unwrap(), role);
 		}
 		assert!(Role::parse("superuser").is_err());
@@ -307,6 +301,42 @@ mod tests {
 	fn default_role_is_investor() {
 		assert_eq!(Role::default(), Role::Investor);
 		assert!(Role::Investor.permissions().is_empty());
+	}
+
+	#[test]
+	fn seat_bank_sets_are_pinned_to_their_generation() {
+		let seats: Vec<(&str, Vec<&str>)> = Role::VARIANTS.iter().map(|r| (r.as_str(), r.bank_permissions())).collect();
+		let staff = vec![
+			"bank:allocation:manage",
+			"bank:capital:manage",
+			"bank:consilium:manage",
+			"bank:deposit_address:migrate",
+			"bank:deposit_address:rotate",
+			"bank:operations:manage",
+			"bank:outbox:manage",
+			"bank:payment:open",
+			"bank:redemption:fail",
+			"bank:redemption:settle",
+			"bank:treasury:read",
+			"bank:user:revoke",
+			"bank:user:suspend",
+			"bank:user_balance:read",
+			"bank:valuation:post",
+			"bank:withdrawal:dispatch",
+			"bank:withdrawal:fail",
+			"bank:withdrawal:settle",
+		];
+		let pinned = vec![
+			("investor", vec![]),
+			("operator", vec!["bank:treasury:read", "bank:user_balance:read"]),
+			("admin", staff.clone()),
+			("owner", staff),
+		];
+		assert_eq!(
+			(SEAT_GENERATION, seats),
+			(1, pinned),
+			"a seat's bank:* set changed: bump SEAT_GENERATION, then pin the new sets and generation here"
+		);
 	}
 
 	#[test]
