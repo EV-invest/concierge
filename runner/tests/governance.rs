@@ -851,7 +851,7 @@ fn consent(addressee: UserId, subject: UserId) -> SendGovernanceMailRequest {
 			tier: "external".into(),
 			source: format!("investor {BANKING_INVESTOR}"),
 			destination: format!("{BANKING_EVM} on bep20"),
-			amount: "1 200.00 USDT".into(),
+			amount: "1200.5".into(),
 			reason: "Scheduled quarterly distribution".into(),
 			payload_hash: "9f2c1ab4de5607891122334455667788".into(),
 			expires_at: T0 + 86_400,
@@ -1059,6 +1059,7 @@ async fn payment_mails_refuse_a_host_an_address_or_a_number_to_call() {
 		"+44 20 7946 0000",
 		"mailto:support@evinvest.ltd",
 		"tel:+442079460000",
+		"0800 123 4567 EVINVEST",
 	];
 	let consent_with = |edit: &dyn Fn(&mut PaymentConsentMail)| {
 		let mut request = consent(investor, investor);
@@ -1101,6 +1102,8 @@ async fn payment_mails_accept_every_shape_banking_sends() {
 		format!("investor {BANKING_INVESTOR}"),
 		format!("investor {BANKING_INVESTOR} (a***@gmail.com)"),
 		"the fee allocation".to_owned(),
+		"the fee allocation (Fee allocation)".to_owned(),
+		"the fund allocation (Fund allocation)".to_owned(),
 		"the quy-nhon product".to_owned(),
 		"the quy-nhon product (Quy Nhon Fund)".to_owned(),
 		format!("{BANKING_EVM} on polygon"),
@@ -1115,9 +1118,24 @@ async fn payment_mails_accept_every_shape_banking_sends() {
 			assert!(fx.relay().send_governance_mail(relayed(request)).await.is_ok(), "consent to {end:?} of {amount:?}");
 		}
 	}
-	// The consilium kinds that borrow the approval mail, spelled as banking spells them.
+	let mut dividend = consent(investor, investor);
+	let mail = dividend.payment_consent.as_mut().unwrap();
+	(mail.source, mail.destination) = ("the fee allocation".into(), format!("investor {BANKING_INVESTOR} (a***@gmail.com)"));
+	assert!(fx.relay().send_governance_mail(relayed(dividend)).await.is_ok(), "a dividend's consent");
+	// The consilium kinds that borrow the approval mail, spelled as banking spells them —
+	// and a dividend, whose source is the fee allocation and whose destination is the
+	// investor `mail_destination` names by masked mailbox.
 	for (source, destination, amount) in [
 		("the fund allocation".to_owned(), "the quy-nhon product (Quy Nhon Fund)".to_owned(), "25000.75".to_owned()),
+		("the fee allocation".to_owned(), format!("investor {BANKING_INVESTOR} (a***@gmail.com)"), "310.25".to_owned()),
+		("the fund allocation".to_owned(), "the fee allocation (Fee allocation)".to_owned(), "12".to_owned()),
+		("the fee allocation".to_owned(), "the fund allocation (Fund allocation)".to_owned(), "12".to_owned()),
+		("the fund allocation".to_owned(), "the lighthttp-arb product (Light HTTP Arb)".to_owned(), "12".to_owned()),
+		(
+			"the lighthttp-arb allocation — new units".to_owned(),
+			format!("investor {BANKING_INVESTOR}"),
+			"3 units of lighthttp-arb".to_owned(),
+		),
 		("Quy Nhon Fund (quy-nhon) — NAV valuation".to_owned(), "AUM 125000.5 USDT".to_owned(), "125000.5".to_owned()),
 		(
 			"the fund allocation — new units".to_owned(),
@@ -1683,7 +1701,7 @@ async fn a_payment_consent_leaves_a_trace_in_the_subjects_inbox() {
 	let (topic, kind, title, body) = &inbox[0];
 	assert_eq!((topic.as_str(), kind.as_str()), ("account:money-movement", "payment_consent"));
 	assert_eq!(title, "A payment needs your consent");
-	for fact in ["ops@evinvest.ltd", "1 200.00 USDT"] {
+	for fact in ["ops@evinvest.ltd", "1200.5"] {
 		assert!(body.contains(fact), "the entry states who is asking and how much: {fact}");
 	}
 	assert!(!body.contains("483012") && !body.contains("/cabinet/payment-consent/"), "no secret and no link in the inbox");
@@ -1789,8 +1807,7 @@ async fn a_consent_inbox_entry_cannot_carry_a_link_or_squat_a_key() {
 		("see http://evil.example", "a link"),
 		("1 USDT (www.evil.example)", "a bare host"),
 		("1 USDT HTTPS://x", "case does not help"),
-		// The amount keeps the coarse rule the fund line does not: an amount has no
-		// business saying `http` at all, scheme or no scheme.
+		// No link filter on the amount any more: the shape is what refuses this.
 		("1 USDT http evil.example", "the bare word with no scheme"),
 	] {
 		let mut request = consent(investor, investor);
@@ -1822,7 +1839,7 @@ async fn a_subject_line_field_cannot_carry_a_link() {
 	let key = approval.dedupe_key.clone();
 	let err = fx.relay().send_governance_mail(relayed(approval)).await.unwrap_err();
 	assert_eq!(err.code(), Code::InvalidArgument);
-	assert_eq!(err.message(), "amount must not contain a link");
+	assert_eq!(err.message(), "amount must be a decimal or a decimal in units of an allocation");
 	assert!(fx.delivery(&key).await.is_none(), "nothing may be queued");
 
 	let payout_with = |edit: &dyn Fn(&mut PayoutApprovalMail)| {

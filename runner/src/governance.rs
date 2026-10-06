@@ -978,8 +978,8 @@ fn consent_ending(outcome: &str, reason: &str) -> Result<(), Status> {
 /// Stricter than [`no_link`] on purpose, for the kind whose amount is the only
 /// money-plane string in its subject line: a link filter still lets a bare domain, a
 /// phone number or a sentence through, and the subject line is the part a lock screen
-/// previews with no label saying whose words it is. The consent and approval kinds admit
-/// this form among the others the money plane sends them — see [`payment_amount`].
+/// previews with no label saying whose words it is. The consent and approval kinds do
+/// not take this form — see [`payment_amount`].
 fn money_amount(value: &str) -> Result<String, Status> {
 	let value = line(value, 64, "amount")?;
 	let refuse = || Status::invalid_argument("amount must be a number followed by a currency code, e.g. `1 200.00 USDT`");
@@ -994,46 +994,33 @@ fn money_amount(value: &str) -> Result<String, Status> {
 	Ok(value)
 }
 
-/// The amount of a payment consent or approval, in exactly the shapes the money plane
-/// spells it: a bare decimal (`Usdt::to_decimal_string`, which is what both kinds carry
-/// today), a decimal in units of an allocation (the holder-grant approval that borrows
-/// this kind), or [`money_amount`]'s number and currency code.
-///
-/// Not [`money_amount`] alone: the money plane sends no currency code on these two kinds,
-/// and an amount the relay refuses is a consent nobody is asked for. The link filter runs
-/// first so a link keeps the refusal it always had; the shape is what refuses the rest —
-/// a bare domain, an address, a phone number — which no link filter can name (#96).
+/// Not [`money_amount`]: the money plane sends these two kinds no currency code, and a
+/// number followed by any capitalised word is also how a phone number and a brand read in
+/// a subject line (`0800 123 4567 EVINVEST`). The shape alone refuses a bare domain, an
+/// address or a number to call, which no link filter can name (#96) — so there is none
+/// here, and a slug with `http` in it stays legal (banking#265).
 fn payment_amount(value: &str) -> Result<String, Status> {
-	let value = no_link(&line(value, 64, "amount")?, "amount")?;
+	let value = line(value, 64, "amount")?;
 	let in_units = value.split_once(" units of ").is_some_and(|(units, allocation)| decimal(units) && slug(allocation));
-	if decimal(&value) || in_units || money_amount(&value).is_ok() {
+	if decimal(&value) || in_units {
 		return Ok(value);
 	}
-	Err(Status::invalid_argument(
-		"amount must be a decimal, a decimal in units of an allocation, or a number and a currency code",
-	))
+	Err(Status::invalid_argument("amount must be a decimal or a decimal in units of an allocation"))
 }
 
-/// One end of a payment as the money plane labels it, and nothing else. These are the
-/// From and To rows of a mail that asks someone to release money, shown with no label
+/// The From and To rows of a mail that asks someone to release money, shown with no label
 /// saying whose words they are, so a value that is not one of the platform's own labels
-/// is refused rather than shown (#96). The shapes, as banking's piggybank builds them:
-///
-/// - `the fee allocation`, `the fund allocation`, `the <slug> product`, `investor <uuid>`
-///   — `party_label`;
-/// - `<address> on <network>` — `destination_label` of an external end;
-/// - `the <slug> product (<title>)`, `investor <uuid> (<masked mailbox>)` —
-///   `mail_destination`;
-/// - `AUM <decimal> USDT`, `<title> (<slug>) — NAV valuation`, `<slug> — NAV valuation`,
-///   `the <slug> allocation — new units`, `treasury arrival <tx ref> on <network>`,
-///   `depositor <uuid>[ (<masked mailbox>)]` — the consilium kinds that borrow this mail.
+/// is refused rather than shown (#96). The shapes are the ones banking's piggybank builds:
+/// `party_label`, `destination_label`, `mail_destination` and the consilium kinds that
+/// borrow this mail (valuation, holder grant, seed).
 ///
 /// One grammar for both fields: which shape lands in which is the money plane's to
 /// decide, and splitting it would only make a new pairing undeliverable.
 ///
 /// A product's TITLE and a seed's TX REF are free text on the money plane's side, so
 /// inside a recognised shape they are held only to [`no_url`]. Everything around them is
-/// closed.
+/// closed. A title or tx ref WITH a link is refused, and the money plane then has no mail
+/// to send for that payment — the input side is where that has to be stopped (banking#452).
 fn payment_end(value: &str, field: &str) -> Result<String, Status> {
 	let value = no_url(&line(value, 160, field)?, field)?;
 	if !is_payment_end(&value) {
@@ -1045,13 +1032,10 @@ fn payment_end(value: &str, field: &str) -> Result<String, Status> {
 }
 
 fn is_payment_end(value: &str) -> bool {
-	if matches!(value, "the fee allocation" | "the fund allocation") {
-		return true;
+	if let Some(name) = value.strip_prefix("the ").and_then(|rest| rest.strip_suffix(" allocation — new units")) {
+		return slug(name);
 	}
-	if let Some((name, kind)) = value.strip_prefix("the ").and_then(|rest| rest.split_once(' '))
-		&& slug(name)
-		&& (kind == "allocation — new units" || kind == "product" || kind.strip_prefix("product (").and_then(|t| t.strip_suffix(')')).is_some_and(free_text))
-	{
+	if titled_service(value) {
 		return true;
 	}
 	for prefix in ["investor ", "depositor "] {
@@ -1063,7 +1047,7 @@ fn is_payment_end(value: &str) -> bool {
 		return rest.strip_suffix(" USDT").is_some_and(decimal);
 	}
 	if let Some(rest) = value.strip_prefix("treasury arrival ") {
-		return rest.rsplit_once(" on ").is_some_and(|(tx_ref, network)| free_text(tx_ref) && NETWORKS.contains(&network));
+		return rest.rsplit_once(" on ").is_some_and(|(tx_ref, network)| free_text(tx_ref) && rail(network).is_some());
 	}
 	if let Some(rest) = value.strip_suffix(" — NAV valuation") {
 		return slug(rest)
@@ -1075,17 +1059,25 @@ fn is_payment_end(value: &str) -> bool {
 	value.rsplit_once(" on ").is_some_and(|(address, network)| chain_address(address, network))
 }
 
-/// The rails the money plane custodies on, as `Network::as_str` spells them.
-const NETWORKS: [&str; 4] = ["bep20", "trc20", "ton", "polygon"];
+/// A service's `party_label`, with the product title `mail_destination` appends whenever
+/// the registry has one — and it has one for `fee` and `fund` too, so the reserved
+/// spellings take a title like any product. The first ` (` ends the label: a slug cannot
+/// hold one, a title can.
+fn titled_service(value: &str) -> bool {
+	let label = match value.split_once(" (") {
+		Some((label, title)) if title.strip_suffix(')').is_some_and(free_text) => label,
+		Some(_) => return false,
+		None => value,
+	};
+	matches!(label, "the fee allocation" | "the fund allocation") || label.strip_prefix("the ").and_then(|rest| rest.strip_suffix(" product")).is_some_and(slug)
+}
 
-/// `Usdt::to_decimal_string`: digits, and at most one `.` with digits on both sides.
-/// Forty characters is a `u128` of base units at eighteen decimals.
+// Forty characters is a `u128` of base units at eighteen decimals.
 fn decimal(value: &str) -> bool {
 	let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
 	value.len() <= 40 && value.split_once('.').map_or_else(|| digits(value), |(int, frac)| digits(int) && digits(frac))
 }
 
-/// A `ServiceId`: 1-64 ASCII letters, digits, `-` and `_`.
 fn slug(value: &str) -> bool {
 	(1..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
@@ -1117,7 +1109,9 @@ fn person(value: &str) -> bool {
 /// lookalike-host hole in this one place a real address is shown: an IDN twin of our own
 /// domain cannot be written in it. The price, named on purpose: a subject whose own
 /// verified address has a Unicode domain gets no consent mail until the money plane
-/// sends the punycode form.
+/// sends the punycode form. Also stricter than banking's `Email::parse` on a single-label
+/// domain and an IP literal — both refused here; neither is a mailbox the platform
+/// verifies in practice.
 fn masked_mailbox(value: &str) -> bool {
 	let Some((local, domain)) = value.split_once("***@") else {
 		return false;
@@ -1132,21 +1126,40 @@ fn masked_mailbox(value: &str) -> bool {
 	local_ok && domain.len() <= 253 && domain.split('.').count() >= 2 && domain.split('.').all(label)
 }
 
+/// The address families behind `Network::as_str`. The one place a rail name is known, so
+/// a new rail is a compile error in [`chain_address`] rather than a name one check
+/// accepts and the other does not.
+#[derive(Clone, Copy)]
+enum Rail {
+	Evm,
+	Tron,
+	Ton,
+}
+
+fn rail(network: &str) -> Option<Rail> {
+	match network {
+		"bep20" | "polygon" => Some(Rail::Evm),
+		"trc20" => Some(Rail::Tron),
+		"ton" => Some(Rail::Ton),
+		_ => None,
+	}
+}
+
 /// An address on a rail, by the per-chain shape banking's `WalletAddress::parse` admits.
 fn chain_address(address: &str, network: &str) -> bool {
 	const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 	let hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
-	match network {
-		"bep20" | "polygon" => address.len() == 42 && address.strip_prefix("0x").is_some_and(hex),
-		"trc20" => address.len() == 34 && address.starts_with('T') && address.bytes().all(|b| BASE58.contains(&b)),
-		"ton" => {
+	match rail(network) {
+		Some(Rail::Evm) => address.len() == 42 && address.strip_prefix("0x").is_some_and(hex),
+		Some(Rail::Tron) => address.len() == 34 && address.starts_with('T') && address.bytes().all(|b| BASE58.contains(&b)),
+		Some(Rail::Ton) => {
 			let friendly = address.len() == 48 && address.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
 			let raw = address
 				.split_once(':')
 				.is_some_and(|(workchain, hash)| matches!(workchain, "0" | "-1") && hash.len() == 64 && hex(hash));
 			friendly || raw
 		}
-		_ => false,
+		None => false,
 	}
 }
 
@@ -1893,8 +1906,8 @@ mod tests {
 	}
 
 	/// What banking's piggybank actually puts in a consent's or an approval's `amount`:
-	/// `Usdt::to_decimal_string()` bare, `holder_grant_mail_amount` in units, and the
-	/// currency-coded form `mail_amount` uses for the outcome kind.
+	/// `Usdt::to_decimal_string()` bare and `holder_grant_mail_amount` in units — of a slug
+	/// that may well hold `http` (banking#265).
 	#[test]
 	fn a_payment_amount_admits_every_shape_banking_sends() {
 		for good in [
@@ -1904,8 +1917,8 @@ mod tests {
 			"340282366920938463463.374607431768211455",
 			"1500 units of fund",
 			"0.25 units of fee",
-			"1 200.00 USDT",
-			"12.5 USDT",
+			"3 units of lighthttp-arb",
+			"3 units of httpfund",
 		] {
 			assert!(payment_amount(good).is_ok(), "{good:?}");
 		}
@@ -1931,6 +1944,9 @@ mod tests {
 			"12.5 units of evil.example",
 			"12.5 units of fund call +44",
 			"units of fund",
+			"0800 123 4567 EVINVEST",
+			"1 200.00 USDT",
+			"12.5 USDT",
 		] {
 			assert!(payment_amount(bad).is_err(), "{bad:?}");
 		}
@@ -1951,6 +1967,9 @@ mod tests {
 			"the fund allocation".to_owned(),
 			"the quy-nhon_fund product".to_owned(),
 			"the quy-nhon product (Quy Nhon Fund)".to_owned(),
+			"the fee allocation (Fee allocation)".to_owned(),
+			"the fund allocation (Fund allocation)".to_owned(),
+			"the lighthttp-arb product".to_owned(),
 			"the realestate product (EV Real Estate — Đà Nẵng (phase 2))".to_owned(),
 			format!("investor {UUID}"),
 			format!("investor {UUID} (a***@gmail.com)"),
@@ -1998,6 +2017,10 @@ mod tests {
 			"the quy-nhon product (see https://evil.example)".to_owned(),
 			"the quy-nhon product ()".to_owned(),
 			"the evil allocation".to_owned(),
+			"the evil allocation (Evil)".to_owned(),
+			"the fund allocation (Fund allocation) — call +44 20 7946 0000".to_owned(),
+			"the fund allocation ()".to_owned(),
+			"the fund allocation (see www.evinvest-help.com)".to_owned(),
 			"investor not-a-uuid".to_owned(),
 			format!("investor {UUID} (support@evinvest-help.com)"),
 			format!("investor {UUID} (s***@\u{0435}vinvest.ltd)"),
