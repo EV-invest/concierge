@@ -732,6 +732,35 @@ async fn without_a_session_authorize_sends_the_browser_to_login_and_back() {
 }
 
 #[tokio::test]
+async fn select_account_goes_past_a_live_session_to_the_account_chooser() {
+	let fx = fixture!();
+	let router = router(&fx).await;
+	let Some(cookie) = session_cookie(&fx, fx.user().await).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let challenge = s256_challenge(&random(48));
+	let uri = format!("{}&prompt=select_account", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &challenge));
+
+	let location = get(&router, &uri, Some(&cookie)).await.location.unwrap();
+	assert!(
+		location.starts_with("/api/auth/login?returnTo="),
+		"a live session must not answer for another account: {location}"
+	);
+	let back = params(&params(&location)["returnTo"]);
+	assert_eq!(back["code_challenge"], challenge);
+	assert!(!back.contains_key("prompt"), "coming back from the chooser must authorize, not choose again");
+
+	// Any other prompt is not one this server keeps.
+	for prompt in ["none", "login", "consent", "select_account login"] {
+		let uri = format!("{}&prompt={}", authorize_uri(&fx.client.id, &fx.client.redirect_uri, &challenge), prompt.replace(' ', "+"));
+		let location = get(&router, &uri, Some(&cookie)).await.location.unwrap();
+		assert!(location.starts_with(&fx.client.redirect_uri), "{prompt}: {location}");
+		assert_eq!(params(&location)["error"], "invalid_request", "{prompt}");
+	}
+}
+
+#[tokio::test]
 async fn a_bad_pkce_challenge_goes_back_to_the_client_as_invalid_request() {
 	let fx = fixture!();
 	let router = router(&fx).await;
