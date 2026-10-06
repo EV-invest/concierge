@@ -7,7 +7,9 @@
 //! clients only ever see the concrete result.
 //!
 //! Seats never live in a tenant namespace and are never granted: the namespaces below are
-//! not a tenant's to claim, so no grant can reach a seat's permissions.
+//! not a tenant's to claim, so no grant can reach a seat's permissions. A tenant's own
+//! catalog may let the holders of an alias grant others (`Catalog::delegations`); nothing
+//! else grants inside it but a seat holding [`Iam::Grant`], and nobody grants to themselves.
 
 use std::collections::BTreeSet;
 
@@ -21,9 +23,6 @@ use crate::{
 
 pub const RESERVED_NAMESPACES: [&str; 4] = ["iam", "concierge", "bank", "seat"];
 
-/// Long enough for any real permission, short enough to stay a key.
-pub const MAX_TARGET_CHARS: usize = 128;
-
 /// What a grant names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
@@ -35,9 +34,6 @@ pub enum Target {
 
 impl Target {
 	pub fn parse(raw: &str) -> Result<Self, DomainError> {
-		if raw.chars().count() > MAX_TARGET_CHARS {
-			return Err(DomainError::Validation(format!("a grant target is at most {MAX_TARGET_CHARS} characters")));
-		}
 		let pattern = Pattern::parse(raw).map_err(DomainError::Validation)?;
 		if RESERVED_NAMESPACES.contains(&pattern.namespace()) {
 			return Err(DomainError::Validation(format!("`{}:*` is not grantable: only a tenant's namespace is", pattern.namespace())));
@@ -69,13 +65,18 @@ impl Target {
 }
 
 /// Everything `seat` and `targets` let a user do inside `catalog`'s namespace. A seat that
-/// may grant anything there holds all of it: refusing them would only make them grant it
-/// to themselves first.
-pub fn resolve<'c>(seat: Role, targets: &[Target], catalog: &'c Catalog) -> BTreeSet<&'c str> {
-	if seat.may(Iam::Grant) {
+/// may grant there holds all of it only in a tenant that says so
+/// (`tenants.granting_seats_hold_all`); elsewhere it holds what someone else granted it.
+pub fn resolve<'c>(seat: Role, granting_seats_hold_all: bool, targets: &[Target], catalog: &'c Catalog) -> BTreeSet<&'c str> {
+	if granting_seats_hold_all && seat.may(Iam::Grant) {
 		return catalog.permissions.iter().map(String::as_str).collect();
 	}
 	targets.iter().flat_map(|t| t.grants(catalog)).collect()
+}
+
+/// The aliases a holder of `targets` may grant and revoke in `catalog`'s namespace.
+pub fn delegable<'c>(targets: &[Target], catalog: &'c Catalog) -> BTreeSet<&'c str> {
+	targets.iter().filter_map(|t| catalog.delegations.get(t.as_str())).flatten().map(String::as_str).collect()
 }
 
 #[cfg(test)]
@@ -86,15 +87,22 @@ mod tests {
 		serde_json::from_value(serde_json::json!({
 			"version": 1,
 			"permissions": ["sa:work:leads:read", "sa:work:leads:edit", "sa:admin:sources:manage"],
-			"aliases": { "sa:operator": ["sa:work:leads:read", "sa:work:leads:edit"] },
+			"aliases": {
+				"sa:operator": ["sa:work:leads:read", "sa:work:leads:edit"],
+				"sa:admin": ["sa:admin:sources:manage"],
+			},
+			"delegations": { "sa:admin": ["sa:operator"] },
 		}))
 		.unwrap()
 	}
 
-	fn check(seat: Role, targets: &[&str], expected: &[&str]) {
-		let targets: Vec<Target> = targets.iter().map(|t| Target::parse(t).unwrap()).collect();
+	fn targets(raw: &[&str]) -> Vec<Target> {
+		raw.iter().map(|t| Target::parse(t).unwrap()).collect()
+	}
+
+	fn check(seat: Role, raw: &[&str], expected: &[&str]) {
 		let catalog = catalog();
-		assert_eq!(resolve(seat, &targets, &catalog), expected.iter().copied().collect(), "{seat:?} {targets:?}");
+		assert_eq!(resolve(seat, true, &targets(raw), &catalog), expected.iter().copied().collect(), "{seat:?} {raw:?}");
 	}
 
 	#[test]
@@ -110,6 +118,17 @@ mod tests {
 		check(Role::Investor, &["sa:gone", "sa:work:gone:*"], &[]);
 		check(Role::Operator, &[], &[]);
 		check(Role::Admin, &[], &["sa:admin:sources:manage", "sa:work:leads:edit", "sa:work:leads:read"]);
+		assert!(resolve(Role::Admin, false, &[], &catalog()).is_empty(), "a tenant that does not trust seats");
+	}
+
+	#[test]
+	fn delegation() {
+		let catalog = catalog();
+		assert_eq!(delegable(&targets(&["sa:admin"]), &catalog), ["sa:operator"].into());
+		assert!(
+			delegable(&targets(&["sa:operator", "sa:admin:*", "sa:*"]), &catalog).is_empty(),
+			"only the alias itself delegates"
+		);
 	}
 
 	#[test]
@@ -129,6 +148,6 @@ mod tests {
 		] {
 			assert!(Target::parse(raw).is_err(), "{raw:?}");
 		}
-		assert!(Target::parse(&format!("sa:{}", "a".repeat(MAX_TARGET_CHARS))).is_err());
+		assert!(Target::parse(&format!("sa:{}", "a".repeat(concierge_iam::MAX_NAME_CHARS))).is_err());
 	}
 }

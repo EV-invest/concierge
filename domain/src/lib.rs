@@ -17,15 +17,11 @@ pub mod auth;
 
 pub mod authz;
 
-pub mod clients;
-
 pub mod error;
 
 pub mod governance;
 
 pub mod iam;
-
-pub mod scopes;
 
 pub mod users;
 
