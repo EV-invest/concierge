@@ -12,6 +12,7 @@
 //! Signing in is not re-implemented: a browser with no session is sent to the ordinary
 //! `/api/auth/login` with `returnTo` pointing back here, which `safe_return_to` already
 //! admits (a same-origin path). The Google client never learns a relying party exists.
+//! `prompt=select_account` sends a signed-in browser the same way, to switch accounts.
 
 use axum::{
 	extract::{Query, State},
@@ -43,6 +44,9 @@ pub struct AuthorizeQuery {
 	state: Option<String>,
 	code_challenge: Option<String>,
 	code_challenge_method: Option<String>,
+	/// OIDC `prompt`: `select_account` alone, for a browser that may already be signed in
+	/// as somebody else.
+	prompt: Option<String>,
 	/// Set by the login callback when the sign-in itself failed or was cancelled.
 	auth_error: Option<String>,
 }
@@ -86,6 +90,12 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 	};
 	if q.code_challenge_method.as_deref() != Some("S256") {
 		return back.error("invalid_request");
+	}
+	match q.prompt.as_deref() {
+		None => {}
+		// Google's chooser is on every login; the way back drops `prompt`, so it authorizes.
+		Some("select_account") => return redirect(&login_url(client_id, redirect_uri, state, code_challenge)),
+		Some(_) => return back.error("invalid_request"),
 	}
 
 	let session_id = jar.get(&st.cookies.session).map(|c| c.value().to_string());

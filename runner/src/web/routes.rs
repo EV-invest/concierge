@@ -107,6 +107,13 @@ pub async fn callback(State(st): State<WebState>, jar: CookieJar, headers: Heade
 	};
 	match AuthRpc::exchange(&st.auth, tonic::Request::new(req)).await {
 		Ok(response) => {
+			// Signed in again, perhaps as another account: the browser's previous session ends here.
+			if let Some(previous) = jar.get(&st.cookies.session).map(|c| c.value().to_string())
+				&& let Err(e) = close(st, &previous).await
+			{
+				tracing::error!(error = ?e, "auth callback: previous session not closed");
+				return fail(st, jar, &return_to, "session");
+			}
 			let tokens = response.into_inner();
 			let access_token = tokens.access_token.clone();
 			let (id, csrf, max_age) = match st.sessions.put(tokens).await {
@@ -166,10 +173,16 @@ pub async fn logout(State(st): State<WebState>, jar: CookieJar, headers: HeaderM
 	if !verify_csrf(st, &jar, &headers).await? {
 		return Err((StatusCode::FORBIDDEN, "csrf check failed"));
 	}
-	if let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_string())
-		&& let Some(refresh) = st.sessions.forget(&id).await.map_err(store_err)?
-	{
-		// The session is already gone locally; an upstream blip must not block logout.
+	if let Some(id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) {
+		close(st, &id).await.map_err(store_err)?;
+	}
+	Ok((clear_session(st, jar), Json(json!({ "ok": true }))))
+}
+
+/// Drop a session and revoke its refresh family upstream.
+async fn close(st: &super::Inner, id: &str) -> color_eyre::Result<()> {
+	if let Some(refresh) = st.sessions.forget(id).await? {
+		// The session is already gone locally; an upstream blip must not keep it signed in here.
 		let _ = AuthRpc::logout(
 			&st.auth,
 			tonic::Request::new(cc::LogoutRequest {
@@ -179,7 +192,7 @@ pub async fn logout(State(st): State<WebState>, jar: CookieJar, headers: HeaderM
 		)
 		.await;
 	}
-	Ok((clear_session(st, jar), Json(json!({ "ok": true }))))
+	Ok(())
 }
 /// `GET /auth/sessions` — the caller's active sessions (refresh-token families),
 /// proven by the server-side refresh token (never exposed to the browser).

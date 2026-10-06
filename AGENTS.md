@@ -556,7 +556,10 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   answers anything else with a page on this origin — never a redirect; only then do errors
   travel back as `error=…&state=…`. With no session it sends the browser through the
   ordinary `/api/auth/login?returnTo=` (a same-origin path), so the Google client never
-  learns a client exists. A code is 256 random bits stored as a digest, lives
+  learns a client exists. `prompt` is `select_account` — the same trip for a browser already
+  signed in, to switch accounts — or the request is refused. A new sign-in closes the
+  browser's previous session and revokes its family, so its client sessions end with it
+  (single logout below). A code is 256 random bits stored as a digest, lives
   `CODE_TTL_SECS` (60), is bound to client, redirect_uri, PKCE challenge, user and
   `token_version`, and is BURNED on its first presentation, matching or not; a second
   presentation marks it replayed and revokes every session it opened. Every client signs
