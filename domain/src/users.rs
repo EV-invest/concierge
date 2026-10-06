@@ -505,6 +505,11 @@ impl User {
 		self.bump_and_emit(UserEvent::RoleChanged);
 	}
 
+	/// What the seat means changed under a user who kept it.
+	pub fn announce_permissions(&mut self) {
+		self.bump_and_emit(UserEvent::PermissionsChanged);
+	}
+
 	fn bump_and_emit(&mut self, event: UserEvent) {
 		self.row_version += 1;
 		self.pending.push(event);
@@ -615,6 +620,7 @@ pub enum UserEvent {
 	Reinstated,
 	KycChanged,
 	RoleChanged,
+	PermissionsChanged,
 }
 impl UserEvent {
 	/// The stored `user_outbox.kind` discriminant — the bridge `Kind`. Kept in lockstep
@@ -627,6 +633,7 @@ impl UserEvent {
 			Self::Reinstated => "REINSTATED",
 			Self::KycChanged => "KYC_CHANGED",
 			Self::RoleChanged => "ROLE_CHANGED",
+			Self::PermissionsChanged => "PERMISSIONS_CHANGED",
 		}
 	}
 }

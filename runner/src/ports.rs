@@ -538,6 +538,10 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// count that could include someone merely authorizing as an owner.
 	async fn owner_count(&self) -> Result<i64, DomainError>;
 
+	/// Announce `role`'s `bank:*` permissions (PERMISSIONS_CHANGED) to everyone holding it,
+	/// when they differ from the set last announced for it. Returns how many were told.
+	async fn announce_seat(&self, role: Role, now: i64) -> Result<u64, DomainError>;
+
 	/// The operator console's user list: filtered + paginated summaries plus the total
 	/// matching the filters.
 	async fn list(&self, query: &str, role: &str, status: &str, limit: i64, offset: i64) -> Result<(Vec<AdminUserRow>, i64), DomainError>;
@@ -588,7 +592,7 @@ pub struct KycSession {
 /// Deliberately a closed enum rather than the provider's string: a new vendor status
 /// must break the compile at the one place a status is turned into a decision
 /// ([`KycStatus::grants_tier`] and its caller), not become a silent no-op in production.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KycStatus {
 	/// The session exists but the user has not begun.
 	Pending,
@@ -1237,7 +1241,7 @@ pub trait GovernanceRepository: Send + Sync {
 /// two used to be one `false`, and the relay wrote an inbox trace for whoever the new call
 /// named, so a spent key reused for another recipient put an entry in their inbox without
 /// queueing anything or spending their budget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GovernanceMailQueued {
 	/// A new row: the mail will be sent.
 	Inserted,

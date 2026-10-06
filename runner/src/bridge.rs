@@ -69,6 +69,7 @@ struct OutboxRow {
 	email_verified: bool,
 	token_version: i64,
 	role: Option<String>,
+	permissions: Option<Vec<String>>,
 }
 
 impl OutboxRow {
@@ -86,7 +87,7 @@ impl OutboxRow {
 			token_version: self.token_version as u64,
 			// Absent (pre-role rows) → empty; the banking puller reads empty as 'investor'.
 			role: self.role.unwrap_or_default(),
-			permissions: Vec::new(),
+			permissions: self.permissions.unwrap_or_default(),
 		}
 	}
 }
@@ -99,7 +100,7 @@ impl UserEvents for Bridge {
 		let limit = (req.limit as i64).clamp(1, MAX_LIMIT);
 
 		let rows = sqlx::query_as::<_, OutboxRow>(
-			"SELECT position, user_id, kind, kyc_level, occurred_at, sequence, event_id, auth_subject, email, email_verified, token_version, role \
+			"SELECT position, user_id, kind, kyc_level, occurred_at, sequence, event_id, auth_subject, email, email_verified, token_version, role, permissions \
 			FROM user_outbox WHERE position > $1 ORDER BY position ASC LIMIT $2",
 		)
 		.bind(req.after_position)
@@ -128,6 +129,7 @@ fn kind_to_proto(kind: &str) -> Kind {
 		"SUSPENDED" => Kind::Suspended,
 		"REINSTATED" => Kind::Reinstated,
 		"KYC_CHANGED" => Kind::KycChanged,
+		"PERMISSIONS_CHANGED" => Kind::PermissionsChanged,
 		"SESSIONS_REVOKED" => Kind::SessionsRevoked,
 		"ROLE_CHANGED" => Kind::RoleChanged,
 		_ => Kind::Unspecified,
@@ -152,6 +154,7 @@ mod tests {
 			UserEvent::Reinstated,
 			UserEvent::KycChanged,
 			UserEvent::RoleChanged,
+			UserEvent::PermissionsChanged,
 		] {
 			assert_ne!(kind_to_proto(event.kind()), Kind::Unspecified, "unmapped bridge kind: {}", event.kind());
 		}
