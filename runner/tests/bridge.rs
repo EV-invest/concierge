@@ -10,6 +10,8 @@
 //! asserting ordered events, the advancing `next_position` cursor, and that a
 //! wrong/absent bridge token is rejected.
 
+mod common;
+
 use std::sync::Arc;
 
 use concierge::{
@@ -21,10 +23,10 @@ use concierge::{
 	ports::UserDirectoryRepository,
 };
 use domain::{
-	authz::Role,
-	users::{AuthSubject, Email},
+	authz::{Role, SEAT_GENERATION},
+	users::{AuthSubject, Email, UserId},
 };
-use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, UserLifecycleEvent, user_events_server::UserEvents, user_lifecycle_event::Kind};
+use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, user_events_server::UserEvents, user_lifecycle_event::Kind};
 use sqlx::PgPool;
 use tonic::{Request, metadata::MetadataValue};
 use uuid::Uuid;
@@ -32,7 +34,7 @@ use uuid::Uuid;
 const TOKEN: &str = "test-bridge-token";
 
 async fn setup() -> Option<(PgUsers, PgPool)> {
-	let url = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())?;
+	let url = common::database_url()?;
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	Some((PgUsers::new(pool.clone()), pool))
@@ -269,37 +271,178 @@ async fn first_position_for(pool: &PgPool, user_id: Uuid) -> i64 {
 		.expect("user has at least one outbox row")
 }
 
-#[tokio::test]
-async fn a_seat_carries_its_bank_permissions_across_and_a_redefinition_is_announced_once() {
-	let Some((repo, pool)) = setup().await else {
-		eprintln!("DATABASE_URL unset — skipping real-DB test");
-		return;
-	};
+/// Every row of `user`, oldest first, as the money plane reads it.
+async fn pulled(pool: &PgPool, user: UserId) -> Vec<(Kind, Option<Vec<String>>)> {
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
-	let start = sqlx::query_scalar::<_, i64>("SELECT COALESCE(max(position), 0) FROM user_outbox")
-		.fetch_one(&pool)
+	let events = bridge
+		.pull_user_lifecycle(authed(PullUserLifecycleRequest { after_position: 0, limit: 1000 }))
 		.await
-		.expect("read the outbox head");
-	let operator = repo.provision(unique_subject(), Email::parse("seat@example.com").unwrap(), true).await.unwrap();
-	repo.set_role(operator.id(), Role::Operator).await.unwrap();
-	let mine =
-		|events: Vec<UserLifecycleEvent>| -> Vec<(Kind, Vec<String>)> { events.into_iter().filter(|e| e.user_id == operator.id().to_string()).map(|e| (e.kind(), e.permissions)).collect() };
-	let pull = |after| bridge.pull_user_lifecycle(authed(PullUserLifecycleRequest { after_position: after, limit: 1000 }));
-	let seated: Vec<String> = Role::Operator.bank_permissions().into_iter().map(str::to_owned).collect();
-	let response = pull(start).await.unwrap().into_inner();
-	assert_eq!(
-		mine(response.events),
-		[(Kind::Created, vec![]), (Kind::RoleChanged, seated.clone())],
-		"every row carries what the seat means on the money plane"
-	);
+		.unwrap()
+		.into_inner()
+		.events;
+	events
+		.into_iter()
+		.filter(|e| e.user_id == user.to_string())
+		.map(|e| (e.kind(), e.seat_permissions.map(|s| s.bank)))
+		.collect()
+}
 
-	// The set last announced for the seat differs from what the code now says.
-	sqlx::query("INSERT INTO seat_meanings (role, bank_permissions, announced_at) VALUES ('operator', '{}', 0) ON CONFLICT (role) DO UPDATE SET bank_permissions = '{}'")
-		.execute(&pool)
+async fn operator(pool: &PgPool) -> UserId {
+	let repo = PgUsers::new(pool.clone());
+	let user = repo.provision(unique_subject(), Email::parse("seat@example.com").unwrap(), true).await.unwrap();
+	repo.set_role(user.id(), Role::Operator).await.unwrap();
+	user.id()
+}
+
+fn bank(role: Role) -> Option<Vec<String>> {
+	Some(role.bank_permissions().into_iter().map(str::to_owned).collect())
+}
+
+async fn seat_meaning(pool: &PgPool, role: Role) -> (Vec<String>, i32) {
+	sqlx::query_as("SELECT bank_permissions, generation FROM seat_meanings WHERE role = $1")
+		.bind(role.as_str())
+		.fetch_one(pool)
+		.await
+		.unwrap()
+}
+
+/// Replace a seat's meaning outright; an UPDATE would be skipped unless it raised the generation.
+async fn define_seat(pool: &PgPool, role: Role, bank: &[&str], generation: i32) {
+	sqlx::query("DELETE FROM seat_meanings WHERE role = $1").bind(role.as_str()).execute(pool).await.unwrap();
+	sqlx::query("INSERT INTO seat_meanings (role, bank_permissions, announced_at, generation) VALUES ($1, $2, 0, $3)")
+		.bind(role.as_str())
+		.bind(bank)
+		.bind(generation)
+		.execute(pool)
 		.await
 		.unwrap();
-	assert!(repo.announce_seat(Role::Operator, 0).await.unwrap() >= 1);
-	let response = pull(response.next_position).await.unwrap().into_inner();
-	assert_eq!(mine(response.events), [(Kind::PermissionsChanged, seated)], "everyone holding the seat hears it again");
-	assert_eq!(repo.announce_seat(Role::Operator, 0).await.unwrap(), 0, "and only once");
+}
+
+#[tokio::test]
+async fn the_database_stamps_every_row_whatever_the_writer_sent() {
+	let Some(url) = common::database_url() else { return };
+	let scratch = common::Scratch::create(&url).await;
+	let pool = &scratch.pool;
+	let user = operator(pool).await;
+	// What a pre-0027 binary writes (no `permissions`), then what a binary with a stale set writes.
+	for permissions in [None, Some(vec!["bank:stale".to_owned()])] {
+		let column = if permissions.is_some() { ", permissions" } else { "" };
+		let value = if permissions.is_some() { ", $3" } else { "" };
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject, email, email_verified, token_version, role{column}) \
+			 SELECT id, 'KYC_CHANGED', 0, 0, $2, auth_subject, email, email_verified, token_version, role{value} FROM users WHERE id = $1"
+		)))
+		.bind(user.raw())
+		.bind(100_i64)
+		.bind(permissions)
+		.execute(pool)
+		.await
+		.unwrap();
+	}
+	assert_eq!(
+		pulled(pool, user).await,
+		[
+			(Kind::Created, bank(Role::Investor)),
+			(Kind::RoleChanged, bank(Role::Operator)),
+			(Kind::KycChanged, bank(Role::Operator)),
+			(Kind::KycChanged, bank(Role::Operator)),
+		]
+	);
+	scratch.drop_database().await;
+}
+
+#[tokio::test]
+async fn a_row_written_before_the_set_was_stated_reads_as_unstated_not_empty() {
+	let Some(url) = common::database_url() else { return };
+	let scratch = common::Scratch::create(&url).await;
+	let pool = &scratch.pool;
+	let user = operator(pool).await;
+	sqlx::query("UPDATE user_outbox SET permissions = NULL WHERE user_id = $1 AND kind = 'CREATED'")
+		.bind(user.raw())
+		.execute(pool)
+		.await
+		.unwrap();
+	assert_eq!(pulled(pool, user).await, [(Kind::Created, None), (Kind::RoleChanged, bank(Role::Operator))]);
+	scratch.drop_database().await;
+}
+
+#[tokio::test]
+async fn an_older_binary_never_overwrites_a_newer_seat_meaning() {
+	let Some(url) = common::database_url() else { return };
+	let scratch = common::Scratch::create(&url).await;
+	let pool = &scratch.pool;
+	let user = operator(pool).await;
+	let newer = SEAT_GENERATION as i32 + 1;
+	sqlx::query("UPDATE seat_meanings SET bank_permissions = '{bank:newer}', generation = $1 WHERE role = 'operator'")
+		.bind(newer)
+		.execute(pool)
+		.await
+		.unwrap();
+
+	// v0.13.1's announce upsert, verbatim.
+	sqlx::query(
+		"INSERT INTO seat_meanings (role, bank_permissions, announced_at) VALUES ($1, $2, $3) \
+		 ON CONFLICT (role) DO UPDATE SET bank_permissions = EXCLUDED.bank_permissions, announced_at = EXCLUDED.announced_at \
+		 WHERE seat_meanings.bank_permissions IS DISTINCT FROM EXCLUDED.bank_permissions",
+	)
+	.bind("operator")
+	.bind(Role::Operator.bank_permissions())
+	.bind(0_i64)
+	.execute(pool)
+	.await
+	.unwrap();
+	db::migrate(pool).await.expect("an older binary boots beside a newer meaning");
+
+	assert_eq!(seat_meaning(pool, Role::Operator).await, (vec!["bank:newer".to_owned()], newer));
+	assert_eq!(
+		pulled(pool, user).await.last(),
+		Some(&(Kind::PermissionsChanged, Some(vec!["bank:newer".to_owned()]))),
+		"the money plane converges on the newest meaning, whichever binary boots"
+	);
+	scratch.drop_database().await;
+}
+
+#[tokio::test]
+async fn a_seat_redefined_without_a_new_generation_refuses_the_boot() {
+	let Some(url) = common::database_url() else { return };
+	let scratch = common::Scratch::create(&url).await;
+	define_seat(&scratch.pool, Role::Operator, &["bank:other"], SEAT_GENERATION as i32).await;
+	let err = db::migrate(&scratch.pool).await.expect_err("same generation, different set");
+	assert!(err.to_string().contains("bump SEAT_GENERATION"), "{err}");
+	scratch.drop_database().await;
+}
+
+#[tokio::test]
+async fn a_set_stated_in_another_order_is_the_same_set() {
+	let Some(url) = common::database_url() else { return };
+	let scratch = common::Scratch::create(&url).await;
+	let pool = &scratch.pool;
+	let mut reversed = Role::Operator.bank_permissions();
+	reversed.reverse();
+	define_seat(pool, Role::Operator, &reversed, 0).await;
+	let user = operator(pool).await;
+	db::migrate(pool).await.unwrap();
+	assert_eq!(seat_meaning(pool, Role::Operator).await.1, SEAT_GENERATION as i32);
+	assert_eq!(pulled(pool, user).await.iter().filter(|(kind, _)| *kind == Kind::PermissionsChanged).count(), 0);
+	scratch.drop_database().await;
+}
+
+#[tokio::test]
+async fn a_user_whose_last_row_is_unstated_is_told_once() {
+	let Some(url) = common::database_url() else { return };
+	let scratch = common::Scratch::create(&url).await;
+	let pool = &scratch.pool;
+	let user = operator(pool).await;
+	sqlx::query("UPDATE user_outbox SET permissions = NULL WHERE user_id = $1 AND kind = 'ROLE_CHANGED'")
+		.bind(user.raw())
+		.execute(pool)
+		.await
+		.unwrap();
+	db::migrate(pool).await.unwrap();
+	db::migrate(pool).await.unwrap();
+	assert_eq!(
+		pulled(pool, user).await,
+		[(Kind::Created, bank(Role::Investor)), (Kind::RoleChanged, None), (Kind::PermissionsChanged, bank(Role::Operator))]
+	);
+	scratch.drop_database().await;
 }

@@ -12,13 +12,15 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use color_eyre::eyre::ensure;
 use domain::{
 	architecture::{EmitsEvents, Reader, Repository},
-	authz::Role,
+	authz::{Role, SEAT_GENERATION},
 	error::DomainError,
 	users::{AuthSubject, Email, ProfileFields, Suspension, User, UserEvent, UserId, UserStatus},
 };
 use sqlx::{PgConnection, PgPool, Row};
+use strum::VariantArray;
 use uuid::Uuid;
 
 use crate::ports::{KycLevelChange, RoleChange, UserDirectoryRepository};
@@ -608,54 +610,6 @@ impl UserDirectoryRepository for PgUsers {
 		Ok(RoleChange::Applied(Box::new(user)))
 	}
 
-	/// One transaction under the outbox lock, so two booting replicas announce once.
-	async fn announce_seat(&self, role: Role, now: i64) -> Result<u64, DomainError> {
-		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		sqlx::query("SELECT pg_advisory_xact_lock($1)")
-			.bind(USER_OUTBOX_ADVISORY_LOCK)
-			.execute(&mut *tx)
-			.await
-			.map_err(repo_err)?;
-		let current = role.bank_permissions();
-		let announced: Option<Vec<String>> = sqlx::query_scalar("SELECT bank_permissions FROM seat_meanings WHERE role = $1")
-			.bind(role.as_str())
-			.fetch_optional(&mut *tx)
-			.await
-			.map_err(repo_err)?;
-		let unchanged = match &announced {
-			Some(announced) => *announced == current,
-			None => current.is_empty(),
-		};
-		let mut told = 0;
-		if !unchanged {
-			let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE role = $1 ORDER BY id")
-				.bind(role.as_str())
-				.fetch_all(&mut *tx)
-				.await
-				.map_err(repo_err)?;
-			for id in ids {
-				let mut user = load_for_update(&mut tx, UserId::from_raw(id)).await?;
-				user.announce_permissions();
-				update_row(&mut tx, &user).await?;
-				drain_outbox(&mut tx, &mut user).await?;
-				told += 1;
-			}
-		}
-		sqlx::query(
-			"INSERT INTO seat_meanings (role, bank_permissions, announced_at) VALUES ($1, $2, $3) \
-			 ON CONFLICT (role) DO UPDATE SET bank_permissions = EXCLUDED.bank_permissions, announced_at = EXCLUDED.announced_at \
-			 WHERE seat_meanings.bank_permissions IS DISTINCT FROM EXCLUDED.bank_permissions",
-		)
-		.bind(role.as_str())
-		.bind(&current)
-		.bind(now)
-		.execute(&mut *tx)
-		.await
-		.map_err(repo_err)?;
-		tx.commit().await.map_err(repo_err)?;
-		Ok(told)
-	}
-
 	/// Seats held, straight from the column the consilium decides on. Suspended owners
 	/// count: ownership is the role, and excluding them would let an admin shrink the
 	/// roster (and reopen emergency access) by suspending people.
@@ -862,8 +816,8 @@ pub(crate) async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Re
 	for (i, event) in events.into_iter().enumerate() {
 		let sequence = user.row_version() - (count - 1 - i as u64);
 		sqlx::query(
-			"INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject, email, email_verified, token_version, role, permissions) \
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+			"INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject, email, email_verified, token_version, role) \
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
 		)
 		.bind(user.id().raw())
 		.bind(event.kind())
@@ -875,7 +829,6 @@ pub(crate) async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Re
 		.bind(user.email_verified())
 		.bind(user.token_version() as i64)
 		.bind(user.role().as_str())
-		.bind(user.role().bank_permissions())
 		.execute(&mut *conn)
 		.await
 		.map_err(repo_err)?;
@@ -884,5 +837,67 @@ pub(crate) async fn drain_outbox(conn: &mut PgConnection, user: &mut User) -> Re
 }
 
 fn unix_now() -> i64 {
-	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_default()
+	SystemTime::now().duration_since(UNIX_EPOCH).expect("the clock is past 1970").as_secs() as i64
+}
+
+/// State this binary's seat meanings, then announce PERMISSIONS_CHANGED to every user whose
+/// last outbox row disagrees with the newest meaning of their seat. Runs on boot before
+/// anything writes the outbox: the stamping trigger (0028) refuses a seat with no meaning.
+pub(crate) async fn announce_seats(pool: &PgPool) -> color_eyre::Result<()> {
+	let now = unix_now();
+	let mut tx = pool.begin().await?;
+	for &role in Role::VARIANTS {
+		sqlx::query(
+			"INSERT INTO seat_meanings (role, bank_permissions, announced_at, generation) VALUES ($1, $2, $3, $4) \
+			 ON CONFLICT (role) DO UPDATE SET bank_permissions = EXCLUDED.bank_permissions, announced_at = EXCLUDED.announced_at, generation = EXCLUDED.generation",
+		)
+		.bind(role.as_str())
+		.bind(role.bank_permissions())
+		.bind(now)
+		.bind(SEAT_GENERATION as i32)
+		.execute(&mut *tx)
+		.await?;
+	}
+	// The row locks are what make a second booting replica converge only after this one committed.
+	let stated: Vec<(String, Vec<String>, i32)> = sqlx::query_as("SELECT role, bank_permissions, generation FROM seat_meanings ORDER BY role FOR UPDATE")
+		.fetch_all(&mut *tx)
+		.await?;
+	for (role, mut bank, generation) in stated {
+		if generation > SEAT_GENERATION as i32 {
+			tracing::warn!(role, generation, ours = SEAT_GENERATION, "a newer binary defined this seat; keeping its meaning");
+			continue;
+		}
+		bank.sort_unstable();
+		let mine = Role::parse(&role)?.bank_permissions();
+		ensure!(
+			bank == mine,
+			"seat {role} at generation {generation} means {bank:?} in the database but {mine:?} here: bump SEAT_GENERATION"
+		);
+	}
+
+	let stale: Vec<Uuid> = sqlx::query_scalar(
+		"UPDATE users SET row_version = row_version + 1 WHERE id IN ( \
+			SELECT u.id FROM users u \
+			JOIN seat_meanings s ON s.role = u.role \
+			CROSS JOIN LATERAL (SELECT o.permissions FROM user_outbox o WHERE o.user_id = u.id ORDER BY o.position DESC LIMIT 1) last \
+			WHERE last.permissions IS NULL OR NOT (last.permissions @> s.bank_permissions AND s.bank_permissions @> last.permissions) \
+		 ) RETURNING id",
+	)
+	.fetch_all(&mut *tx)
+	.await?;
+	if !stale.is_empty() {
+		sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(USER_OUTBOX_ADVISORY_LOCK).execute(&mut *tx).await?;
+		sqlx::query(
+			"INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject, email, email_verified, token_version, role) \
+			 SELECT id, $2, kyc_level, $3, row_version, auth_subject, email, email_verified, token_version, role FROM users WHERE id = ANY($1) ORDER BY id",
+		)
+		.bind(&stale)
+		.bind(UserEvent::PermissionsChanged.kind())
+		.bind(now)
+		.execute(&mut *tx)
+		.await?;
+		tracing::info!(told = stale.len(), "seat permissions announced to the money plane");
+	}
+	tx.commit().await?;
+	Ok(())
 }

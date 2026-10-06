@@ -323,7 +323,7 @@ async fn kyc_level_out_of_range_is_refused_by_the_store() {
 		assert!(err.to_string().contains("users_kyc_level_range"), "rejected by the range CHECK, not by accident: {err}");
 	}
 
-	let outbox = sqlx::query("INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject) VALUES ($1, 'KYC_CHANGED', 999, 0, 99, 'bypass')")
+	let outbox = sqlx::query("INSERT INTO user_outbox (user_id, kind, kyc_level, occurred_at, sequence, auth_subject, role) VALUES ($1, 'KYC_CHANGED', 999, 0, 99, 'bypass', 'investor')")
 		.bind(user.id().raw())
 		.execute(&pool)
 		.await

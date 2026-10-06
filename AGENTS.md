@@ -503,6 +503,20 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `permission_granted`/`permission_revoked` in the same transaction. `GetMe.permissions` is
   CONCRETE (no alias, no wildcard): to a relying party its own tenant's namespace only, to a
   session the seat plus every tenant.
+- **A seat's `bank:*` set crosses on every outbox row, and the DATABASE writes it.** During
+  a rollout or a rollback binaries of different ages write side by side, so the writing
+  binary never supplies `user_outbox.permissions`: a BEFORE INSERT trigger (0028) stamps it
+  from `seat_meanings` and refuses a seat that has no row there. `seat_meanings` is ordered
+  by `domain::authz::SEAT_GENERATION` — an update that does not raise the generation is
+  skipped, so an older binary cannot overwrite a newer meaning and does not crash-loop
+  trying. Changing any seat's `bank:*` set means bumping that generation (a unit test pins
+  both; a same-generation mismatch refuses the boot). The boot states the meanings inside
+  `db::migrate`, before anything writes, then announces PERMISSIONS_CHANGED to every user
+  whose LAST row disagrees with the newest meaning, which also repairs the NULL rows older
+  binaries wrote. Every boot-time and outbox write has to stay correct while an older
+  binary runs beside it. On the wire `seat_permissions` absent means "not stated" (a
+  pre-0027 row) and present-but-empty means "this seat holds no `bank:*`"; field 12
+  `permissions` cannot tell the two apart and is deprecated.
 - **A tenant may let an alias delegate, and a delegate is a narrow, blind granter.** A
   catalog's `delegations` names, per alias, the aliases its holders may grant and revoke
   (`sa:admin` → `sa:operator`), and an alias that is delegated may delegate nothing itself:

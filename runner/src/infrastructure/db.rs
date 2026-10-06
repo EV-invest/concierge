@@ -21,9 +21,10 @@ pub async fn connect_sized(database_url: &str, max_connections: u32) -> Result<P
 /// time) on startup. Idempotent. Author new migration FILES with the sqlx CLI
 /// (`sqlx migrate add --source runner/migrations --sequential <name>`), never by hand;
 /// the embedded runner here is interoperable with the CLI (same `_sqlx_migrations` table).
+/// Then states what each seat means, which the outbox needs before its first write.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
 	sqlx::migrate!().run(pool).await?;
-	Ok(())
+	super::users::announce_seats(pool).await
 }
 
 #[cfg(test)]
