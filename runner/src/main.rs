@@ -118,6 +118,18 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.await
 		.context("failed to seed the genesis owner registry")?;
 
+	// What a seat means is code; the money plane hears it again whenever a deploy changes it.
+	let seats: Arc<dyn concierge::ports::UserDirectoryRepository> = Arc::new(infrastructure::users::PgUsers::new(pool.clone()));
+	for role in domain::authz::Role::ALL {
+		let told = seats
+			.announce_seat(role, time::OffsetDateTime::now_utc().unix_timestamp())
+			.await
+			.context("failed to announce seat permissions")?;
+		if told > 0 {
+			tracing::info!(role = role.as_str(), told, "seat permissions announced to the money plane");
+		}
+	}
+
 	// Product-analytics capture (native PostHog). A `None` key makes capture a
 	// silent no-op, so this is safe to construct unconfigured.
 	let _analytics = ev::analytics::Analytics::new(config.posthog_key.clone(), config.posthog_host.clone());

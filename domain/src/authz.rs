@@ -259,6 +259,8 @@ alias!(
 );
 
 impl Role {
+	pub const ALL: [Self; 4] = [Self::Investor, Self::Operator, Self::Admin, Self::Owner];
+
 	/// The concrete permissions this seat holds: `concierge:*`, `iam:*` and `bank:*`.
 	pub fn permissions(self) -> &'static [&'static str] {
 		match self {
@@ -271,6 +273,11 @@ impl Role {
 
 	pub fn may(self, permission: impl Permission) -> bool {
 		self.permissions().contains(&permission.as_str())
+	}
+
+	/// The `bank:*` part of [`Self::permissions`]: what the money plane mirrors.
+	pub fn bank_permissions(self) -> Vec<&'static str> {
+		self.permissions().iter().copied().filter(|p| p.starts_with("bank:")).collect()
 	}
 }
 

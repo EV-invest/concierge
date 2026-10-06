@@ -20,8 +20,11 @@ use concierge::{
 	},
 	ports::UserDirectoryRepository,
 };
-use domain::users::{AuthSubject, Email};
-use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, user_events_server::UserEvents, user_lifecycle_event::Kind};
+use domain::{
+	authz::Role,
+	users::{AuthSubject, Email},
+};
+use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, UserLifecycleEvent, user_events_server::UserEvents, user_lifecycle_event::Kind};
 use sqlx::PgPool;
 use tonic::{Request, metadata::MetadataValue};
 use uuid::Uuid;
@@ -264,4 +267,39 @@ async fn first_position_for(pool: &PgPool, user_id: Uuid) -> i64 {
 		.fetch_one(pool)
 		.await
 		.expect("user has at least one outbox row")
+}
+
+#[tokio::test]
+async fn a_seat_carries_its_bank_permissions_across_and_a_redefinition_is_announced_once() {
+	let Some((repo, pool)) = setup().await else {
+		eprintln!("DATABASE_URL unset — skipping real-DB test");
+		return;
+	};
+	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
+	let start = sqlx::query_scalar::<_, i64>("SELECT COALESCE(max(position), 0) FROM user_outbox")
+		.fetch_one(&pool)
+		.await
+		.expect("read the outbox head");
+	let operator = repo.provision(unique_subject(), Email::parse("seat@example.com").unwrap(), true).await.unwrap();
+	repo.set_role(operator.id(), Role::Operator).await.unwrap();
+	let mine =
+		|events: Vec<UserLifecycleEvent>| -> Vec<(Kind, Vec<String>)> { events.into_iter().filter(|e| e.user_id == operator.id().to_string()).map(|e| (e.kind(), e.permissions)).collect() };
+	let pull = |after| bridge.pull_user_lifecycle(authed(PullUserLifecycleRequest { after_position: after, limit: 1000 }));
+	let seated: Vec<String> = Role::Operator.bank_permissions().into_iter().map(str::to_owned).collect();
+	let response = pull(start).await.unwrap().into_inner();
+	assert_eq!(
+		mine(response.events),
+		[(Kind::Created, vec![]), (Kind::RoleChanged, seated.clone())],
+		"every row carries what the seat means on the money plane"
+	);
+
+	// The set last announced for the seat differs from what the code now says.
+	sqlx::query("INSERT INTO seat_meanings (role, bank_permissions, announced_at) VALUES ('operator', '{}', 0) ON CONFLICT (role) DO UPDATE SET bank_permissions = '{}'")
+		.execute(&pool)
+		.await
+		.unwrap();
+	assert!(repo.announce_seat(Role::Operator, 0).await.unwrap() >= 1);
+	let response = pull(response.next_position).await.unwrap().into_inner();
+	assert_eq!(mine(response.events), [(Kind::PermissionsChanged, seated)], "everyone holding the seat hears it again");
+	assert_eq!(repo.announce_seat(Role::Operator, 0).await.unwrap(), 0, "and only once");
 }
