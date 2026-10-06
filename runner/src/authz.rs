@@ -236,7 +236,7 @@ pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, break_gl
 
 /// The global role the plane acts on for the caller, after the live-record gate and with
 /// emergency access applied (and flagged) — for a surface whose rule is not a single
-/// permission (a scope's own admin acts without one). Refuses exactly as
+/// permission (a delegate acts without one). Refuses exactly as
 /// [`require_permission`] does for a caller it cannot resolve.
 pub async fn caller_role<T>(users: &dyn UserDirectoryRepository, break_glass: &BreakGlass, request: &Request<T>) -> Result<EffectiveRole, Status> {
 	let caller = caller_gate(users, request).await?;

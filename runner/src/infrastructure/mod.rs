@@ -13,8 +13,7 @@
 //!   the target's emailed token, and the seat change itself (written through the
 //!   `users` helpers, in the same transaction as the verdict).
 //! - [`grants`] — grants over tenant namespaces and the tenants' published catalogs,
-//!   decided and audited inside the transaction that writes them; plus the
-//!   `allocation:<service_id>` scope view the old GrantScope/RevokeScope still speak.
+//!   decided and audited inside the transaction that writes them.
 //! - [`relying_parties`] — the registry of first-party clients on other origins, their
 //!   one-time authorization codes and their refresh families (all secrets as digests).
 //! - [`email`] — the SMTP transport seam and the rendered messages that cross it.

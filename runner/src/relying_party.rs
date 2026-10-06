@@ -4,16 +4,16 @@
 //! ```text
 //! browser → evinvest.ltd/api/auth/authorize?client_id&redirect_uri&state&code_challenge  (web::authorize)
 //!         → [no session] /api/auth/login?returnTo=<that authorize URL> → Google → back
-//!         → policy passes → 302 redirect_uri?code&state
+//!         → account active → 302 redirect_uri?code&state
 //! client backend → AuthService.ExchangeCode(client_id, secret, code, redirect_uri, verifier)
 //!                → access JWT (aud = client audience, ≤15 min) + refresh token
 //! client backend → UserDirectory.GetMe with that JWT — the ONE RPC it opens
 //! ```
 //!
-//! Everything a decision rests on is re-read at the moment it is made: the policy at
-//! authorize, again at the exchange (a code outlives neither a suspension nor a revoked
-//! scope, even inside its 60s), and again on every refresh. The client's own copy of a
-//! user's scopes is never trusted — GetMe hands it the current one.
+//! Every client signs in any ACTIVE account; what the user may do there is their tenant
+//! permissions, which GetMe hands the client fresh on every call — its own copy is never
+//! trusted. The account is re-read at authorize, again at the exchange (a code does not
+//! outlive a suspension, even inside its 60s), and again on every refresh.
 //!
 //! What is logged, and why it is `tracing` and not `admin_action`: that table answers
 //! "what was done TO this person, by whom", and a person signing themselves into a panel
@@ -38,10 +38,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use crate::{
-	authz::BreakGlass,
-	ports::{ClientRecord, CodeClaim, CodeOutcome, GrantRepository, NewCode, NewSession, PublishOutcome, RelyingPartyRepository, SessionRevocation, UserDirectoryRepository},
-};
+use crate::ports::{ClientRecord, CodeClaim, CodeOutcome, GrantRepository, NewCode, NewSession, PublishOutcome, RelyingPartyRepository, SessionRevocation, UserDirectoryRepository};
 
 /// A code is carried by a browser redirect and redeemed by the client's backend at once;
 /// a minute is generous for that and short for anyone who copies one out of a log.
@@ -55,6 +52,9 @@ pub const SESSION_MAX_SECS: i64 = 30 * 24 * 60 * 60;
 /// The shortest client secret the boot will store. Anything shorter was typed, not
 /// generated, and is guessable against an endpoint that answers per attempt.
 pub const MIN_CLIENT_SECRET_LEN: usize = 32;
+/// How far ahead of this plane's clock a catalog version may lie. A version nothing can
+/// supersede would leave the tenant unable even to narrow a compromised alias.
+const MAX_CATALOG_VERSION_LEAD_SECS: u64 = 24 * 60 * 60;
 
 /// The env var that carries a client's secret.
 pub fn secret_var(client_id: &str) -> String {
@@ -143,7 +143,7 @@ fn now_secs() -> i64 {
 	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// Whether a user passes a client's policy right now.
+/// Whether a user may be signed into a client right now.
 pub enum Admission {
 	Admitted { token_version: u64 },
 	Denied,
@@ -157,33 +157,20 @@ pub struct Requester<'a> {
 	pub user_agent: &'a str,
 }
 
-/// The relying-party application service: the registry lookups and policy for
+/// The relying-party application service: the registry lookups and admission for
 /// `/auth/authorize`, and the [`ClientGrants`] port behind `ExchangeCode` /
 /// `RefreshClientToken`.
 pub struct RelyingParties {
 	repo: Arc<dyn RelyingPartyRepository>,
 	users: Arc<dyn UserDirectoryRepository>,
 	grants: Arc<dyn GrantRepository>,
-	break_glass: Arc<BreakGlass>,
 	/// `RP_DEV_REDIRECT_URIS`, already refused in production.
 	dev_redirects: HashMap<String, Vec<String>>,
 }
 
 impl RelyingParties {
-	pub fn new(
-		repo: Arc<dyn RelyingPartyRepository>,
-		users: Arc<dyn UserDirectoryRepository>,
-		grants: Arc<dyn GrantRepository>,
-		break_glass: Arc<BreakGlass>,
-		dev_redirects: HashMap<String, Vec<String>>,
-	) -> Self {
-		Self {
-			repo,
-			users,
-			grants,
-			break_glass,
-			dev_redirects,
-		}
+	pub fn new(repo: Arc<dyn RelyingPartyRepository>, users: Arc<dyn UserDirectoryRepository>, grants: Arc<dyn GrantRepository>, dev_redirects: HashMap<String, Vec<String>>) -> Self {
+		Self { repo, users, grants, dev_redirects }
 	}
 
 	/// The boot's half of the registry: write every client's secret digest from
@@ -236,24 +223,13 @@ impl RelyingParties {
 		Ok((registered && !client.disabled).then_some(client))
 	}
 
-	/// Whether `user` passes `client`'s policy right now: an active account, and the
-	/// global role or an active scoped grant the policy asks for. Emergency access counts
-	/// as the role it grants, exactly as it does at the RBAC gate.
-	pub async fn admit(&self, user: UserId, client: &ClientRecord) -> Result<Admission, DomainError> {
-		let Some(record) = self.users.authz_record(user).await? else {
-			return Ok(Admission::Denied);
-		};
-		if record.status == UserStatus::Disabled {
-			return Ok(Admission::Denied);
-		}
-		let role = self.break_glass.snapshot(self.users.as_ref()).await.role_of(record.role, &user.to_string()).role;
-		let scopes: Vec<_> = self.grants.active_for_user(user).await?.into_iter().map(|grant| grant.scope).collect();
-		Ok(if client.access_policy.admits(role, &scopes) {
-			Admission::Admitted {
+	/// Whether `user` may be signed into a client right now: an active account.
+	pub async fn admit(&self, user: UserId) -> Result<Admission, DomainError> {
+		Ok(match self.users.authz_record(user).await? {
+			Some(record) if record.status != UserStatus::Disabled => Admission::Admitted {
 				token_version: record.token_version,
-			}
-		} else {
-			Admission::Denied
+			},
+			_ => Admission::Denied,
 		})
 	}
 
@@ -307,22 +283,32 @@ impl RelyingParties {
 	/// an older catalog would silently take away whatever the newer one granted.
 	async fn publish(&self, publication: CatalogPublication) -> Result<(), ClientGrantError> {
 		let client = self.authenticate_client(&publication.client_id, &publication.client_secret).await?;
-		let Some(namespace) = client.namespace else {
-			return Err(ClientGrantError::InvalidCatalog(format!("client {} owns no tenant namespace", client.client_id)));
-		};
+		let now = now_secs();
+		if publication.version > now.unsigned_abs() + MAX_CATALOG_VERSION_LEAD_SECS {
+			return Err(ClientGrantError::InvalidCatalog(format!(
+				"version {} is more than a day ahead of this plane's clock: it is the unix seconds of the build's commit",
+				publication.version
+			)));
+		}
 		let mut aliases = std::collections::BTreeMap::new();
-		for (name, members) in publication.aliases {
-			if aliases.insert(name.clone(), members.into_iter().collect()).is_some() {
-				return Err(ClientGrantError::InvalidCatalog(format!("alias `{name}` is published twice")));
+		let mut delegations = std::collections::BTreeMap::new();
+		for alias in publication.aliases {
+			if !alias.delegates.is_empty() {
+				delegations.insert(alias.name.clone(), alias.delegates.into_iter().collect());
+			}
+			if aliases.insert(alias.name.clone(), alias.members.into_iter().collect()).is_some() {
+				return Err(ClientGrantError::InvalidCatalog(format!("alias `{}` is published twice", alias.name)));
 			}
 		}
 		let catalog = Catalog {
 			version: publication.version,
 			permissions: publication.permissions.into_iter().collect(),
 			aliases,
+			delegations,
 		};
+		let namespace = client.namespace;
 		catalog.check(&namespace).map_err(ClientGrantError::InvalidCatalog)?;
-		match self.grants.publish(&namespace, &catalog, now_secs()).await.map_err(|err| match err {
+		match self.grants.publish(&namespace, &client.client_id, &catalog, now).await.map_err(|err| match err {
 			DomainError::Validation(why) => ClientGrantError::InvalidCatalog(why),
 			other => unavailable(other),
 		})? {
@@ -366,7 +352,7 @@ impl RelyingParties {
 			}
 		};
 
-		match self.admit(user, &client).await.map_err(unavailable)? {
+		match self.admit(user).await.map_err(unavailable)? {
 			Admission::Admitted { token_version: current } if current == token_version => {}
 			_ => {
 				tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: code redeemed but the user no longer passes");
@@ -432,7 +418,7 @@ impl RelyingParties {
 
 		// Decided BEFORE the rotation, so a refusal leaves nothing half-done; the refusal
 		// itself revokes, because a family whose user no longer passes has no future.
-		let token_version = match self.admit(session.user, &client).await.map_err(unavailable)? {
+		let token_version = match self.admit(session.user).await.map_err(unavailable)? {
 			Admission::Admitted { token_version } if token_version > session.token_version => {
 				self.repo.revoke_session(session_id, SessionRevocation::TokensRevoked, now).await.map_err(unavailable)?;
 				tracing::info!(client_id = %client.client_id, user_id = %session.user, %session_id, "relying party: tokens revoked since sign-in — session ended");
@@ -441,7 +427,7 @@ impl RelyingParties {
 			Admission::Admitted { token_version } => token_version,
 			Admission::Denied => {
 				self.repo.revoke_session(session_id, SessionRevocation::AccessDenied, now).await.map_err(unavailable)?;
-				tracing::info!(client_id = %client.client_id, user_id = %session.user, %session_id, "relying party: user no longer passes the access policy — session ended");
+				tracing::info!(client_id = %client.client_id, user_id = %session.user, %session_id, "relying party: account no longer active — session ended");
 				return Err(ClientGrantError::AccessDenied);
 			}
 		};
@@ -526,7 +512,7 @@ impl ClientGrants for RelyingParties {
 /// A signature and an unexpired `exp` are not enough here: such a token is held by a
 /// backend on another origin, and "revoke" has to mean now. Its `jti` names the refresh
 /// family it was minted under, and a family that is revoked (a replayed code, a reused
-/// refresh token, a lost scope, a token_version bump seen at refresh) ends it on the spot.
+/// refresh token, a suspension, a token_version bump seen at refresh) ends it on the spot.
 #[derive(Clone)]
 pub struct ClientTokenAuthenticator {
 	verifier: Verifier,
@@ -594,10 +580,9 @@ mod tests {
 			client_id: "sa".into(),
 			audience: "sa".into(),
 			redirect_uris: vec![uri.into()],
-			access_policy: domain::clients::AccessPolicy::Public,
 			secret_hash: None,
 			disabled: false,
-			namespace: None,
+			namespace: "sa".into(),
 		};
 		assert!(check_registered_redirects(&client("https://sa.evinvest.ltd/auth/callback")).is_ok());
 		for bad in ["http://sa.evinvest.ltd/cb", "https://sa.evinvest.ltd/cb#x", "https://u@sa.evinvest.ltd/cb", "https:///cb"] {

@@ -14,7 +14,7 @@
 //! method is one use case and is internally atomic, so the verdict, the seat change,
 //! the cross-plane `ROLE_CHANGED` and the audit row can never land apart.
 //!
-//! [`ScopedGrantRepository`] holds per-resource grants (`domain::scopes`). Each write
+//! [`GrantRepository`] holds grants over tenant namespaces (`domain::iam`). Each write
 //! decides the actor's authority inside its own transaction, for the same TOCTOU reason
 //! `set_role_outside_ownership` does, and returns a refusal as an ordinary answer.
 //!
@@ -27,11 +27,9 @@ use async_trait::async_trait;
 use domain::{
 	architecture::{Reader, Repository},
 	authz::Role,
-	clients::AccessPolicy,
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	iam::{Catalog, Target},
-	scopes::{Scope, ScopeAuthority, ScopeRole},
 	users::{AuthSubject, Email, ProfileFields, User, UserId},
 };
 use uuid::Uuid;
@@ -40,7 +38,6 @@ use crate::{
 	genesis::{GenesisOutcome, GenesisSubject},
 	infrastructure::{
 		governance::{AdmissionRecord, Audit, InvitationRecord, OwnerRow, RemovalRecord, SelfDecision, UserProposalRecord},
-		grants::{ScopeHolderRecord, ScopedGrantRecord},
 		notifications::{DeliveryJob, EmitOutcome, NotificationRow, SubscriberRow, SubscriptionRow},
 		platform::{FeatureFlagRow, PlatformConfigRow},
 		users::{AdminAction, AdminUserRow, AuthzRecord, Reinstatement},
@@ -64,26 +61,26 @@ pub enum RoleChange {
 	WouldGrantAdmin,
 }
 
-/// Who is acting on a scope's grants.
-pub struct ScopeActor {
+/// Who is granting.
+pub struct GrantActor {
 	/// The grant's `granted_by`.
 	pub id: UserId,
-	/// The global role the RBAC gate resolved. Only the lock-free precheck trusts it; the
-	/// write re-reads the persisted role under the actor's row lock.
+	/// The seat the RBAC gate resolved. Only the lock-free precheck and the rate limit
+	/// trust it; the write re-reads the persisted seat under the actor's row lock.
 	pub role: Role,
 	/// Whether emergency access elevates this caller (`authz::Elevation::elevates`). It is
 	/// the one part of the effective role no row records, so it travels explicitly.
 	pub elevated: bool,
 }
 
-/// Whose grant: by id, or by the address a scope admin already knows. A scope admin may
-/// not address by id (`ScopeAuthority::may_address_by_id`).
-pub enum ScopeTarget {
+/// Whose grant: by id, or by the address a delegate already knows. A delegate may not
+/// grant by id.
+pub enum GrantSubject {
 	Id(UserId),
 	Email(Email),
 }
 
-impl ScopeTarget {
+impl GrantSubject {
 	/// For a NOT_FOUND message — the caller's own input, echoed back.
 	pub fn describe(&self) -> String {
 		match self {
@@ -93,27 +90,43 @@ impl ScopeTarget {
 	}
 }
 
-/// What [`ScopedGrantRepository::grant_scope`] did.
-pub enum ScopeGrantOutcome {
-	/// The grant now in effect — new, replaced, or already held with that role.
-	Granted(ScopedGrantRecord),
-	/// The actor may not make this grant (`ScopeAuthority::may_grant`), or addressed the
-	/// target by id without being allowed to.
+/// The actor's say over one namespace's grants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantAuthority {
+	/// A seat holding `iam:tenants:grant`: any target, told why an address fails.
+	Seat,
+	/// The holder of an alias the catalog lets delegate: only what it delegates, by email,
+	/// told nothing about an address.
+	Delegate,
+	None,
+}
+
+/// What [`GrantRepository::grant`] did.
+pub enum GrantOutcome {
+	/// The grant now in effect — new, or already held.
+	Granted(GrantRecord),
+	/// The actor may not grant this target, or addressed the subject by id as a delegate.
 	Denied,
-	/// The target account is disabled; a grant to it would wake up on reinstatement
-	/// without anyone having decided that. Said only to a global admin/owner.
+	/// The subject is the actor.
+	ToSelf,
+	/// No tenant owns the target's namespace. Said only to a seat.
+	UnknownTenant,
+	/// The tenant's current catalog defines nothing the target names.
+	UndefinedTarget,
+	/// The account is disabled; a grant to it would wake up on reinstatement without
+	/// anyone having decided that. Said only to a seat.
 	TargetDisabled,
-	/// The email belongs to more than one account. Said only to a global admin/owner.
+	/// Said only to a seat.
 	AmbiguousEmail,
-	/// A scope admin's address cannot be granted, for a reason they are not told: telling
+	/// A delegate's address cannot be granted, for a reason they are not told: telling
 	/// "nobody holds it" from "several accounts do" from "that account is disabled" would
-	/// let anyone with one scope ask the plane about any address (banking#447). The cause
-	/// travels for the log line only.
+	/// let anyone with a delegating alias ask the plane about any address (banking#447).
+	/// The cause travels for the log line only.
 	Ungrantable(UngrantableAddress),
 }
 
-/// Why a scope admin's address could not be granted — for the operator's log, never for
-/// the caller.
+/// Why a delegate's address could not be granted — for the operator's log, never for the
+/// caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UngrantableAddress {
 	NoAccount,
@@ -131,13 +144,12 @@ impl UngrantableAddress {
 	}
 }
 
-/// What [`ScopedGrantRepository::revoke_scope`] and [`GrantRepository::revoke`] did.
-pub enum ScopeRevokeOutcome {
+/// What [`GrantRepository::revoke`] did.
+pub enum RevokeOutcome {
 	Revoked,
-	/// The target holds no active grant on the scope — including an id or email that
+	/// The subject holds no active grant of the target — including an id or email that
 	/// names no account, so a revoke is never an existence oracle.
 	NotHeld,
-	/// The actor may not take this grant away (`ScopeAuthority::may_revoke`).
 	Denied,
 }
 
@@ -156,33 +168,6 @@ pub enum KycLevelChange {
 	/// failure: an approval for tier 1 reaching someone who already holds tier 2 is a
 	/// correct delivery whose only correct effect is nothing.
 	AlreadyHolds(u32),
-}
-
-/// Per-resource grants. At most one ACTIVE grant per (user, scope); history is kept as
-/// revoked rows.
-#[async_trait]
-pub trait ScopedGrantRepository: Send + Sync {
-	/// The actor's say over `scope` right now, from their persisted record — for reads,
-	/// which need no lock.
-	async fn scope_authority(&self, actor: &ScopeActor, scope: &Scope) -> Result<ScopeAuthority, DomainError>;
-
-	/// Give `target` the role `role` on `scope`, replacing any role they hold there. The
-	/// actor's persisted role and status, their grant, and the target's current role are
-	/// all read inside the write transaction. For a global admin/owner, `NotFound` for an
-	/// unknown target, [`ScopeGrantOutcome::AmbiguousEmail`] and
-	/// [`ScopeGrantOutcome::TargetDisabled`]; for a scope admin all three collapse into
-	/// [`ScopeGrantOutcome::Ungrantable`]. Either way only once the actor has been found to
-	/// hold some authority over the scope.
-	async fn grant_scope(&self, target: &ScopeTarget, scope: &Scope, role: ScopeRole, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeGrantOutcome, DomainError>;
-
-	/// Take `target`'s grant on `scope` away, decided the same way as [`Self::grant_scope`].
-	async fn revoke_scope(&self, target: &ScopeTarget, scope: &Scope, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeRevokeOutcome, DomainError>;
-
-	/// Every active grant `user` holds, ordered by scope.
-	async fn active_for_user(&self, user: UserId) -> Result<Vec<ScopedGrantRecord>, DomainError>;
-
-	/// Every active grant on `scope`, with each holder's identity, oldest first.
-	async fn scope_holders(&self, scope: &Scope) -> Result<Vec<ScopeHolderRecord>, DomainError>;
 }
 
 /// One grant of a target inside a tenant namespace (`grants`).
@@ -204,18 +189,12 @@ pub struct GrantHolderRecord {
 	pub preferred_name: Option<String>,
 }
 
-/// What [`GrantRepository::grant`] did.
-pub enum GrantOutcome {
-	/// The grant now in effect — new, or already held.
-	Granted(GrantRecord),
-	/// The actor's seat does not hold `iam:tenants:grant`.
-	Denied,
-	/// No tenant owns the target's namespace.
-	UnknownTenant,
-	/// The tenant's current catalog defines nothing the target names.
-	UndefinedTarget,
-	TargetDisabled,
-	AmbiguousEmail,
+/// A tenant's current catalog and how it treats seats.
+pub struct TenantCatalog {
+	pub namespace: String,
+	/// `tenants.granting_seats_hold_all`.
+	pub granting_seats_hold_all: bool,
+	pub catalog: Catalog,
 }
 
 /// What [`GrantRepository::publish`] did.
@@ -229,16 +208,19 @@ pub enum PublishOutcome {
 	},
 }
 
-/// Grants over tenant namespaces, and the catalogs that give them meaning. Only seats
-/// holding `iam:tenants:grant` write here, and every write re-reads the actor's seat
-/// under its row lock. The scope view over the same rows comes with it.
+/// Grants over tenant namespaces, and the catalogs that give them meaning.
 #[async_trait]
-pub trait GrantRepository: ScopedGrantRepository {
-	/// `NotFound` for an unknown `user` (id or address), and only once the actor has been
-	/// found to hold the authority.
-	async fn grant(&self, user: &ScopeTarget, target: &Target, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<GrantOutcome, DomainError>;
+pub trait GrantRepository: Send + Sync {
+	/// The actor's say over `namespace` right now, from their persisted record — for reads,
+	/// which need no lock.
+	async fn authority(&self, actor: &GrantActor, namespace: &str) -> Result<GrantAuthority, DomainError>;
 
-	async fn revoke(&self, user: &ScopeTarget, target: &Target, actor: &ScopeActor, action: &AdminAction, now: i64) -> Result<ScopeRevokeOutcome, DomainError>;
+	/// The actor's seat and status, their own grants, and the subject's row are all read
+	/// inside the write transaction, and authority is settled before the subject is looked
+	/// at. `NotFound` for an unknown subject, said only to a seat.
+	async fn grant(&self, subject: &GrantSubject, target: &Target, actor: &GrantActor, action: &AdminAction, now: i64) -> Result<GrantOutcome, DomainError>;
+
+	async fn revoke(&self, subject: &GrantSubject, target: &Target, actor: &GrantActor, action: &AdminAction, now: i64) -> Result<RevokeOutcome, DomainError>;
 
 	/// Every active grant inside `namespace`, oldest first. `None`: no such tenant.
 	async fn holders(&self, namespace: &str) -> Result<Option<Vec<GrantHolderRecord>>, DomainError>;
@@ -246,14 +228,18 @@ pub trait GrantRepository: ScopedGrantRepository {
 	/// The active targets `user` holds, in every namespace.
 	async fn targets_of(&self, user: UserId) -> Result<Vec<Target>, DomainError>;
 
-	/// The current catalog of every tenant that has one, by namespace.
-	async fn catalogs(&self) -> Result<Vec<(String, Catalog)>, DomainError>;
+	/// The current catalog of every tenant that has one.
+	async fn catalogs(&self) -> Result<Vec<TenantCatalog>, DomainError>;
+
+	/// The current catalog of `namespace`. `None`: no tenant, or it never published.
+	async fn catalog(&self, namespace: &str) -> Result<Option<TenantCatalog>, DomainError>;
 
 	/// The namespace of the tenant whose client's tokens carry `audience`.
 	async fn audience_namespace(&self, audience: &str) -> Result<Option<String>, DomainError>;
 
-	/// Store `catalog` as `namespace`'s, unless it is older than the stored one.
-	async fn publish(&self, namespace: &str, catalog: &Catalog, now: i64) -> Result<PublishOutcome, DomainError>;
+	/// Keep `catalog` as `namespace`'s current one, published by `client_id`, unless it is
+	/// not newer than the stored one.
+	async fn publish(&self, namespace: &str, client_id: &str, catalog: &Catalog, now: i64) -> Result<PublishOutcome, DomainError>;
 }
 
 /// A registered relying party (`rp_clients`).
@@ -264,14 +250,12 @@ pub struct ClientRecord {
 	pub audience: String,
 	/// Exact redirect URIs. Compared byte for byte, never by prefix.
 	pub redirect_uris: Vec<String>,
-	pub access_policy: AccessPolicy,
 	/// SHA-256 of the client secret; `None` until the operator sets one, and a client
 	/// without one can obtain no token.
 	pub secret_hash: Option<Vec<u8>>,
 	pub disabled: bool,
-	/// The tenant namespace whose catalog it publishes and whose permissions its tokens
-	/// read. `None`: it owns none.
-	pub namespace: Option<String>,
+	/// The tenant namespace whose catalog it publishes and whose permissions its tokens read.
+	pub namespace: String,
 }
 
 /// A one-time authorization code to store (`rp_codes`). Only its digest is persisted.
