@@ -20,7 +20,9 @@
 
 use std::sync::Arc;
 
-use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, PullUserLifecycleResponse, UserLifecycleEvent, user_events_server::UserEvents, user_lifecycle_event::Kind};
+use evconcierge_contracts::concierge::v1::{
+	PullUserLifecycleRequest, PullUserLifecycleResponse, SeatPermissions, UserLifecycleEvent, user_events_server::UserEvents, user_lifecycle_event::Kind,
+};
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 
@@ -87,7 +89,8 @@ impl OutboxRow {
 			token_version: self.token_version as u64,
 			// Absent (pre-role rows) → empty; the banking puller reads empty as 'investor'.
 			role: self.role.unwrap_or_default(),
-			permissions: self.permissions.unwrap_or_default(),
+			permissions: self.permissions.clone().unwrap_or_default(),
+			seat_permissions: self.permissions.map(|bank| SeatPermissions { bank }),
 		}
 	}
 }

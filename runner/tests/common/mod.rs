@@ -59,3 +59,33 @@ pub fn assert_disposable_database() {
 		 Set {TEST_DB_MARKER}=1 to confirm the database is disposable — the nix dev shell already does."
 	);
 }
+
+/// A migrated database of its own, for a suite that rewrites state every writer reads
+/// (`seat_meanings`). Left behind if the test panics before [`Scratch::drop_database`].
+pub struct Scratch {
+	pub pool: sqlx::PgPool,
+	admin: sqlx::PgPool,
+	name: String,
+}
+impl Scratch {
+	pub async fn create(url: &str) -> Self {
+		let admin = sqlx::PgPool::connect(url).await.expect("connect to Postgres");
+		let name = format!("concierge_scratch_{}", uuid::Uuid::new_v4().simple());
+		sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+			.execute(&admin)
+			.await
+			.expect("create the scratch database");
+		let options: sqlx::postgres::PgConnectOptions = url.parse().expect("DATABASE_URL parses");
+		let pool = sqlx::PgPool::connect_with(options.database(&name)).await.expect("connect to the scratch database");
+		concierge::infrastructure::db::migrate(&pool).await.expect("apply migrations");
+		Self { pool, admin, name }
+	}
+
+	pub async fn drop_database(self) {
+		self.pool.close().await;
+		sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {} WITH (FORCE)", self.name)))
+			.execute(&self.admin)
+			.await
+			.expect("drop the scratch database");
+	}
+}

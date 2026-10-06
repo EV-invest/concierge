@@ -538,10 +538,6 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// count that could include someone merely authorizing as an owner.
 	async fn owner_count(&self) -> Result<i64, DomainError>;
 
-	/// Announce `role`'s `bank:*` permissions (PERMISSIONS_CHANGED) to everyone holding it,
-	/// when they differ from the set last announced for it. Returns how many were told.
-	async fn announce_seat(&self, role: Role, now: i64) -> Result<u64, DomainError>;
-
 	/// The operator console's user list: filtered + paginated summaries plus the total
 	/// matching the filters.
 	async fn list(&self, query: &str, role: &str, status: &str, limit: i64, offset: i64) -> Result<(Vec<AdminUserRow>, i64), DomainError>;
