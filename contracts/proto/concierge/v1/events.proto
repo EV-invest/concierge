@@ -51,8 +51,9 @@ message UserLifecycleEvent {
     // The user's platform access role changed. Carries the new role in `role` so the
     // money plane can mirror it and gate operator RPCs.
     ROLE_CHANGED = 6;
-    // What the user's seat means on the money plane was redefined while they kept it.
-    // The new set is in `permissions`, as on every row. Not emitted yet.
+    // The user's last row disagreed with what their seat now means on the money plane:
+    // the seat was redefined, or the row predates the set being stated. The set is in
+    // `seat_permissions`, as on every row.
     PERMISSIONS_CHANGED = 7;
   }
   Kind kind = 2;
@@ -95,8 +96,18 @@ message UserLifecycleEvent {
   // authoritative for ROLE_CHANGED — the money plane mirrors it to gate operator RPCs.
   string role = 11;
 
+  // DEPRECATED: read `seat_permissions`. Kept while consumers move over; empty here
+  // cannot tell "holds nothing" from "not stated".
+  repeated string permissions = 12;
+
   // The user's concrete `bank:*` permissions as of this row (no alias, no wildcard): a
   // snapshot on EVERY kind, like `role` and `kyc_level`, so the two can never disagree
-  // between rows. Not written yet: empty says nothing until it is.
-  repeated string permissions = 12;
+  // between rows. Absent: not stated for this row, keep what you have. Present with an
+  // empty `bank`: the seat holds no `bank:*`, and a consumer MUST apply it on every kind,
+  // a demotion included.
+  SeatPermissions seat_permissions = 13;
+}
+
+message SeatPermissions {
+  repeated string bank = 1;
 }

@@ -7,7 +7,7 @@
 //! distinct, non-colliding field numbers (a collision would mis-decode and drop a
 //! value). No DB, no services.
 
-use evconcierge_contracts::concierge::v1::{UserLifecycleEvent, user_lifecycle_event::Kind};
+use evconcierge_contracts::concierge::v1::{SeatPermissions, UserLifecycleEvent, user_lifecycle_event::Kind};
 use prost::Message;
 
 #[test]
@@ -25,6 +25,9 @@ fn lifecycle_event_round_trips_with_full_envelope() {
 		token_version: 3,
 		role: "admin".to_string(),
 		permissions: vec!["bank:treasury:read".to_string()],
+		seat_permissions: Some(SeatPermissions {
+			bank: vec!["bank:treasury:read".to_string()],
+		}),
 	};
 
 	let decoded = UserLifecycleEvent::decode(event.encode_to_vec().as_slice()).expect("round trips");
@@ -51,4 +54,18 @@ fn role_changed_kind_is_distinct() {
 	let decoded = UserLifecycleEvent::decode(event.encode_to_vec().as_slice()).expect("round trips");
 	assert_eq!(decoded.kind(), Kind::RoleChanged);
 	assert_eq!(decoded.role, "operator");
+}
+
+#[test]
+fn an_empty_seat_set_is_told_apart_from_an_unstated_one() {
+	let stated = UserLifecycleEvent {
+		seat_permissions: Some(SeatPermissions { bank: vec![] }),
+		..Default::default()
+	};
+	let unstated = UserLifecycleEvent::default();
+	assert_eq!(
+		UserLifecycleEvent::decode(stated.encode_to_vec().as_slice()).unwrap().seat_permissions,
+		Some(SeatPermissions { bank: vec![] })
+	);
+	assert_eq!(UserLifecycleEvent::decode(unstated.encode_to_vec().as_slice()).unwrap().seat_permissions, None);
 }
