@@ -51,9 +51,8 @@ message UserLifecycleEvent {
     // The user's platform access role changed. Carries the new role in `role` so the
     // money plane can mirror it and gate operator RPCs.
     ROLE_CHANGED = 6;
-    // The user's `bank:*` permissions changed: their seat moved, or what a seat means was
-    // redefined. Carries the new set in `permissions`. Not emitted yet: a consumer must
-    // accept it before this plane starts writing it.
+    // What the user's seat means on the money plane was redefined while they kept it.
+    // The new set is in `permissions`, as on every row. Not emitted yet.
     PERMISSIONS_CHANGED = 7;
   }
   Kind kind = 2;
@@ -96,8 +95,8 @@ message UserLifecycleEvent {
   // authoritative for ROLE_CHANGED — the money plane mirrors it to gate operator RPCs.
   string role = 11;
 
-  // The user's concrete `bank:*` permissions after the change (no alias, no wildcard).
-  // Authoritative for PERMISSIONS_CHANGED; empty on every other kind, which says nothing
-  // about what the user holds.
+  // The user's concrete `bank:*` permissions as of this row (no alias, no wildcard): a
+  // snapshot on EVERY kind, like `role` and `kyc_level`, so the two can never disagree
+  // between rows. Not written yet: empty says nothing until it is.
   repeated string permissions = 12;
 }

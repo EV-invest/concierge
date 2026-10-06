@@ -392,7 +392,7 @@ impl AuthServiceRpc for AuthService {
 				client_secret: req.client_secret,
 				version: req.version,
 				permissions: req.permissions,
-				aliases: req.aliases.into_iter().map(|alias| (alias.name, alias.members)).collect(),
+				aliases: req.aliases,
 			})
 			.await
 			.inspect_err(crate::telemetry::report_client_grant)?;

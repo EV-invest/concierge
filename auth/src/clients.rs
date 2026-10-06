@@ -2,8 +2,8 @@
 //! plane to serve `ExchangeCode` / `RefreshClientToken`, stated as a port.
 //!
 //! This crate owns the signing key and nothing else about a client: the registry, the
-//! one-time codes, the refresh families and the access policy (which reads the user
-//! directory and the scoped grants) are Postgres state in the runner. So the split is
+//! one-time codes, the refresh families and admission (which reads the user directory)
+//! are Postgres state in the runner. So the split is
 //! the one `Exchange` already has with the directory — the runner decides WHO gets a
 //! token pair and holds the refresh half; this crate mints the access JWT for the
 //! decision it is handed.
@@ -38,8 +38,7 @@ pub struct CatalogPublication {
 	pub client_secret: String,
 	pub version: u64,
 	pub permissions: Vec<String>,
-	/// `(name, members)`.
-	pub aliases: Vec<(String, Vec<String>)>,
+	pub aliases: Vec<evconcierge_contracts::concierge::v1::CatalogAlias>,
 }
 
 /// A decision to issue a relying party a token pair: the refresh half already exists

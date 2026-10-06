@@ -60,17 +60,20 @@ service AuthService {
   // revokes the client sessions that sign-in authorized. The refresh token is opaque and bound to the client.
   rpc ExchangeCode(ExchangeCodeRequest) returns (ClientTokenResponse);
 
-  // Rotate a relying party's refresh token. The client's access policy is re-checked
-  // on EVERY rotation, so a revoked scope ends the session at the next refresh rather
-  // than at the family's deadline; presenting a rotated-out token revokes the family.
+  // Rotate a relying party's refresh token. The account is re-checked on EVERY rotation,
+  // so a suspension ends the session at the next refresh rather than at the family's
+  // deadline; presenting a rotated-out token revokes the family.
   rpc RefreshClientToken(RefreshClientTokenRequest) returns (ClientTokenResponse);
 
   // A relying party publishes its tenant's catalog: the permissions and aliases its
   // namespace defines. Authenticated by the client secret, like ExchangeCode. Refused
-  // (INVALID_ARGUMENT) when anything lies outside the tenant's namespace or an alias names
-  // a permission the catalog does not define; FAILED_PRECONDITION when `version` is older
-  // than the stored one, or equal with different content. Grants whose target the new
-  // catalog drops stay, grant nothing, and are listed as orphaned.
+  // (INVALID_ARGUMENT) when anything lies outside the tenant's namespace, an alias names
+  // a permission the catalog does not define, a delegated alias delegates in turn, the
+  // catalog exceeds 1024 permissions or 128 aliases or a name exceeds 128 characters, or
+  // `version` lies more than a day ahead of this plane's clock; FAILED_PRECONDITION when
+  // `version` is older than the stored one, or equal with different content. Every
+  // published catalog is kept. Grants whose target the new catalog drops stay, grant
+  // nothing, and are listed as orphaned.
   rpc PublishCatalog(PublishCatalogRequest) returns (PublishCatalogResponse);
 
   // Reserved for later auth slices, declared here to lock the namespace:
@@ -178,7 +181,8 @@ message ExchangeCodeRequest {
 message PublishCatalogRequest {
   string client_id = 1;
   string client_secret = 2;
-  // Monotonic per client (a build timestamp); at most 2^63-1.
+  // Unix SECONDS of the commit the client was built from (nix `self.lastModified`):
+  // build time, not boot time, so a restarting older replica never supersedes a newer one.
   uint64 version = 3;
   repeated string permissions = 4;
   repeated CatalogAlias aliases = 5;
@@ -188,6 +192,8 @@ message CatalogAlias {
   // `<namespace>:<name>`.
   string name = 1;
   repeated string members = 2;
+  // Aliases of this catalog its holders may grant and revoke (GrantPermission).
+  repeated string delegates = 3;
 }
 
 message PublishCatalogResponse {}
@@ -200,7 +206,7 @@ message RefreshClientTokenRequest {
 
 // A relying party's token pair. Expiries are unix SECONDS. Deliberately carries no
 // profile: the client reads that from `UserDirectory.GetMe` with the access token, and
-// GetMe is also what it re-checks `scopes` against on every request.
+// GetMe is also what it re-checks `permissions` against on every request.
 message ClientTokenResponse {
   string access_token = 1;
   int64 access_expires_at = 2;
