@@ -21,6 +21,7 @@ axum.workspace = true
 axum-extra.workspace = true
 base64.workspace = true
 color-eyre.workspace = true
+concierge_iam.workspace = true
 domain.workspace = true
 dotenvy.workspace = true
 ev = { workspace = true, features = ["analytics", "error_monitoring", "otel", "settings", "settings_drift"] }

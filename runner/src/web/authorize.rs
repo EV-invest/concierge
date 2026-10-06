@@ -114,14 +114,14 @@ pub async fn authorize(State(st): State<WebState>, jar: CookieJar, headers: Head
 	let Ok(user) = Uuid::parse_str(&fresh.user.user_id).map(UserId::from_raw) else {
 		return (jar, back.error("access_denied")).into_response();
 	};
-	let token_version = match relying_parties.admit(user, &client).await {
+	let token_version = match relying_parties.admit(user).await {
 		Ok(Admission::Admitted { token_version }) => token_version,
 		Ok(Admission::Denied) => {
-			tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: authorize denied by the access policy");
+			tracing::info!(client_id = %client.client_id, user_id = %user, "relying party: authorize denied, the account is not active");
 			return (jar, back.error("access_denied")).into_response();
 		}
 		Err(err) => {
-			tracing::error!(%err, "relying party: policy unreadable at authorize");
+			tracing::error!(%err, "relying party: account unreadable at authorize");
 			return (jar, back.error("temporarily_unavailable")).into_response();
 		}
 	};

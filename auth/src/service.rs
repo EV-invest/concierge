@@ -12,14 +12,15 @@
 use std::sync::Arc;
 
 use evconcierge_contracts::concierge::v1::{
-	ClientTokenResponse, ExchangeCodeRequest, ExchangeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse,
-	RefreshClientTokenRequest, RefreshRequest, RevokeSessionRequest, RevokeSessionResponse, Session, TokenResponse, UserSummary, auth_service_server::AuthService as AuthServiceRpc,
+	ClientTokenResponse, ExchangeCodeRequest, ExchangeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, PublishCatalogRequest,
+	PublishCatalogResponse, RefreshClientTokenRequest, RefreshRequest, RevokeSessionRequest, RevokeSessionResponse, Session, TokenResponse, UserSummary,
+	auth_service_server::AuthService as AuthServiceRpc,
 };
 use tonic::{Request, Response, Status};
 
 use crate::{
 	AuthError,
-	clients::{ClientGrant, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation},
+	clients::{CatalogPublication, ClientGrant, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation},
 	config::AuthConfig,
 	google::GoogleOauth,
 	management::{IssuedRefresh, RefreshInspect, RefreshStore, SessionBounds},
@@ -380,6 +381,22 @@ impl AuthServiceRpc for AuthService {
 			.await
 			.inspect_err(crate::telemetry::report_client_grant)?;
 		Ok(Response::new(self.client_token_response(grant)?))
+	}
+
+	async fn publish_catalog(&self, request: Request<PublishCatalogRequest>) -> Result<Response<PublishCatalogResponse>, Status> {
+		let grants = self.client_grants.as_ref().ok_or(AuthError::NotConfigured)?;
+		let req = request.into_inner();
+		grants
+			.publish_catalog(CatalogPublication {
+				client_id: req.client_id,
+				client_secret: req.client_secret,
+				version: req.version,
+				permissions: req.permissions,
+				aliases: req.aliases,
+			})
+			.await
+			.inspect_err(crate::telemetry::report_client_grant)?;
+		Ok(Response::new(PublishCatalogResponse {}))
 	}
 
 	async fn jwks(&self, _request: Request<JwksRequest>) -> Result<Response<JwksResponse>, Status> {

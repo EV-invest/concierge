@@ -157,7 +157,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
   banking's mirror). Two ENTRY POINTS reach it, and they differ in what they
   are allowed to decide and over whom. `users.set_kyc_level` is unconditional in
-  DIRECTION and belongs to the human path (`Permission::KycManage`), because a human is
+  DIRECTION and belongs to the human path (`Kyc::Manage`), because a human is
   precisely who may move a level DOWN. It is NOT unconditional in TARGET: nobody sets
   their own level, the same rule `HoldUser` carries below, and for the same reason —
   `KycManage` is held by `Admin` as well as `Owner`, and tier 1 is the floor for
@@ -183,7 +183,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   public, HMAC over the raw body, 300s replay window) lands in that same aggregate
   call, so banking never learns a vendor exists. A provider may only RAISE a level and
   never past `PROVIDER_MAX_TIER`; every tier above it and every downgrade are human
-  decisions under `Permission::KycManage` — somebody else's, when the account is the
+  decisions under `Kyc::Manage` — somebody else's, when the account is the
   operator's own. The identity a callback acts on comes from the
   stored `kyc_cases` row, NEVER from the request body; the body's echoed `vendor_data` is
   a CROSS-CHECK against that row and is decided inside the recording transaction, because
@@ -445,7 +445,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   dispatcher's sweep. Moving that wholesale to a quorum by mail would trade a ~30s brake
   for one that takes hours, and a broadcast made in those hours is irreversible; so
   `DisableUser` is retired (it refuses, naming both replacements) and splits into
-  `HoldUser` — one operator, `Permission::UserSuspend`, `users.suspended_by =
+  `HoldUser` — one operator, `Users::Suspend`, `users.suspended_by =
   'admin_hold'` with `hold_expires_at = now + HOLD_TTL_SECS` (24h) — and
   `GovernanceService.OpenUserSuspension`, the owners' proposal, which writes
   `suspended_by = 'governance'` and carries no deadline. One actor may stop money
@@ -478,46 +478,60 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   single act deliberately — containing a rogue operator must never be the slower path.
   The refusal is decided INSIDE the write transaction from the row held `FOR UPDATE`,
   the same TOCTOU argument as the `owner` refusal beside it.
-- **Scoped grants are access to ONE resource, and never money.** `scoped_grants`
-  (`domain::scopes`, `infrastructure::scoped_grants`) holds a user's `operator`/`admin`
-  role over `allocation:<service_id>` — a vertical's panel. There is no `viewer`: a
-  read-only holder would be an ordinary user (global `investor`), who gets no access to
-  the service, so `viewer` is refused as an unknown role (`INVALID_ARGUMENT`); 0024
-  deleted the rows 0023 allowed. Rights over an allocation's MONEY are banking's own
-  grants, so scopes never cross the bridge. A global `admin`/`owner`
-  (`Permission::ScopeManage`) grants anything; a scope's `admin` grants `operator`
-  inside that scope and never touches an `admin` grant in either direction — one who
-  could mint scope admins could hand the scope away for good. A
-  scope admin also names a grant's target only by EMAIL, never by user id: ids of staff
-  are visible to them (`granted_by`), and granting a bare id then reading the roster
-  would make them a lookup service for anyone's address. Revoking takes either form —
-  the answer depends only on a grant in their own scope, which they can list — and the
-  roster they see carries email and grant only: no `legal_name`, no `preferred_name`.
-  An email held by several accounts names nobody, and a disabled or held account is not
-  granted access. A global admin/owner hears which (`NOT_FOUND` for no account,
-  `FAILED_PRECONDITION` with the reason otherwise); a scope admin hears ONE
+- **Every check asks for a permission; seats are governed, tenants' grants are not.** A
+  permission is `<namespace>:<resource…>:<action>` (`concierge_iam`), an alias a named set
+  of them. What a SEAT means is code (`domain::authz`, `SEAT_*` over `concierge:*`, `iam:*`,
+  `bank:*`) and who holds one is still only governance's to say; nothing compares seats by
+  rank. A TENANT (`tenants`, migration 0026) owns one namespace, and its relying party
+  publishes the catalog over it (`AuthService.PublishCatalog`, client secret, everything
+  inside the namespace, at most 1024 permissions and 128 aliases of at most 128 characters —
+  every `GetMe` loads it). `version` is the unix seconds of the client's build COMMIT, never
+  older than the stored one and never more than a day ahead of this plane's clock: a version
+  nothing can supersede would leave the tenant unable even to narrow a compromised alias.
+  Every catalog ever published is kept (`catalogs`, one row per version, `published_by`),
+  so which one was in force when is a query. `GrantPermission` stores a target inside a
+  tenant namespace — alias, permission or `*` pattern — as named, so a republished alias
+  reaches every holder and a target the catalog dropped stays as an orphaned row granting
+  nothing. Nothing grants anything in `iam`/`concierge`/`bank`/`seat`, so no grant can reach a
+  seat's permissions, and NOBODY grants to their own account (`grants_not_to_self`, the rule
+  `HoldUser` and `SetKycLevel` carry) — a grant made to oneself would outlive the seat that
+  made it. Seats holding `iam:tenants:grant` grant any target; a tenant decides whether such a
+  seat also HOLDS every permission of its namespace without a row
+  (`tenants.granting_seats_hold_all`: `sa` says yes, keeping "the global admin is the panel's
+  admin"; a tenant with PII to protect says no and its admins are granted like anyone). The
+  write re-decides from the actor's row under `FOR UPDATE` and audits
+  `permission_granted`/`permission_revoked` in the same transaction. `GetMe.permissions` is
+  CONCRETE (no alias, no wildcard): to a relying party its own tenant's namespace only, to a
+  session the seat plus every tenant.
+- **A tenant may let an alias delegate, and a delegate is a narrow, blind granter.** A
+  catalog's `delegations` names, per alias, the aliases its holders may grant and revoke
+  (`sa:admin` → `sa:operator`), and an alias that is delegated may delegate nothing itself:
+  a holder can never mint a peer, nor someone who could. Delegated grants are access to one
+  tenant's surface and never money — rights over an allocation's MONEY are banking's own.
+  A delegate names the subject only by EMAIL, never by user id: ids are visible to them
+  (`granted_by`), and granting a bare id then reading the roster would make them a lookup
+  service for anyone's address. Revoking takes either form — the answer depends only on a
+  grant they can list — and the roster they see (`ListGrants`) carries email and grant
+  only: no `legal_name`, no `preferred_name`. An email held by several accounts names
+  nobody, and a disabled or held account is not granted. A seat hears which (`NOT_FOUND`
+  for no account, `FAILED_PRECONDITION` with the reason otherwise); a delegate hears ONE
   `FAILED_PRECONDITION("this address cannot be granted access")` for all three, and a
   revoke answers one `NOT_FOUND` for everything — otherwise a grant is an oracle for
   whether an address has an account and in what standing (banking#447). The adapter
-  collapses them (`ScopeGrantOutcome::Ungrantable`, cause kept for the log only), and a
-  scope admin's `admin` request is refused on the role before the address is looked up,
-  so PERMISSION_DENIED is not a second door. Anyone short of global authority also has a
-  per-actor budget of `SCOPE_WRITE_RATE_LIMIT` (20) grant+revoke calls per
-  `SCOPE_WRITE_RATE_WINDOW_SECS` (hour), refusals included, else `RESOURCE_EXHAUSTED`;
-  global admins/owners are not counted — they can read every account through
-  `ListUsers` anyway. The limiter is the in-process `notification::RateLimiter`, so the
-  budget is per replica and resets on restart. The write re-decides
-  everything inside its transaction: the `users` rows of target and actor are locked
-  `FOR UPDATE` in one statement ordered by id (no deadlock between two actors), the
-  actor's role and status are RE-READ from that row — the RPC gate's copy only feeds a
-  lock-free precheck that can refuse early — emergency access travels as an explicit
-  flag because no row records it, and the actor's own grant is held `FOR SHARE`. A
-  caller with no authority is denied before learning whether the target exists. One
-  active row per (user, scope) at the column; a role change revokes the old row and
-  inserts a new one, and each change writes `scope_granted`/`scope_revoked` to
-  `admin_action` in the same transaction; a refusal is logged at `warn!` (ids and
-  scope, and for an ungrantable address its category — never the address).
-  `GetMe.scopes` is the caller's active grants only — a global role is not folded in.
+  collapses them (`GrantOutcome::Ungrantable`, cause kept for the log only), and a target
+  outside the delegation is refused before the address is looked up, so PERMISSION_DENIED
+  is not a second door. A delegate has a per-actor budget of `GRANT_WRITE_RATE_LIMIT` (20)
+  grant+revoke calls per `GRANT_WRITE_RATE_WINDOW_SECS` (hour), refusals included, else
+  `RESOURCE_EXHAUSTED`; granting seats are not counted — they can read every account
+  through `ListUsers` anyway. The limiter is the in-process `notification::RateLimiter`,
+  so the budget is per replica and resets on restart. The write re-decides everything
+  inside its transaction: the `users` rows of subject and actor are locked `FOR UPDATE` in
+  one statement ordered by id (no deadlock between two actors), the actor's seat and status
+  are RE-READ from that row — the RPC gate's copy only feeds a lock-free precheck that can
+  refuse early — emergency access travels as an explicit flag because no row records it,
+  and the delegate's own grants are held `FOR SHARE`. A caller with no authority is denied
+  before learning whether the subject exists; a refusal is logged at `warn!` (ids and
+  target, and for an ungrantable address its category — never the address).
 - **This plane is the identity provider of first-party clients on OTHER origins, and a
   client's token opens exactly one RPC.** A relying party (`relying_party`, registry
   `rp_clients` from `0025`; the Service-Arb panel `sa` is seeded) runs authorization code +
@@ -531,11 +545,11 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   learns a client exists. A code is 256 random bits stored as a digest, lives
   `CODE_TTL_SECS` (60), is bound to client, redirect_uri, PKCE challenge, user and
   `token_version`, and is BURNED on its first presentation, matching or not; a second
-  presentation marks it replayed and revokes every session it opened. The client's
-  `access_policy` (`public` | `scope:<scope>`, `domain::clients`) is re-read at authorize,
-  at the exchange and on EVERY refresh; `scope:` admits an active grant on the scope (any
-  scope role) or a global `admin`/`owner` (emergency access counting as the role it
-  grants), and a refusal on refresh revokes the session. Client refresh families live in
+  presentation marks it replayed and revokes every session it opened. Every client signs
+  in any ACTIVE account — part of a client's surface is open to everyone, and what a user
+  may do there is `GetMe.permissions`, which the client gates on. The account is re-read at
+  authorize, at the exchange and on EVERY refresh, and a refusal on refresh revokes the
+  session. Every client is a tenant (`rp_clients.tenant_id`). Client refresh families live in
   Postgres (`rp_sessions`), not Redis, because a replayed code has to find what it bought.
   The access token is `typ=access`, `aud=<client audience>` (the CHECK keeps any
   `concierge*`/`banking*` audience out of the registry), at most 15 min, and its `jti` is
@@ -544,7 +558,7 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   after the plane's verifier has refused it — and that path re-checks the session is live,
   so revocation is immediate there. The layer marks such a caller (`RestrictedCaller`) and
   `GetMe` answers it from an ALLOWLIST — id, email (+verified), status, preferred name,
-  role (+break-glass flag), scopes — never legal name, phone, birth date, nationality, tax
+  role (+break-glass flag), its tenant's permissions — never legal name, phone, birth date, nationality, tax
   residence, address or KYC level. An outage of that second verifier stays UNAVAILABLE.
   The plane's own verifier never learns a client
   audience: widening it would open every RPC. Secrets are env, not migration:

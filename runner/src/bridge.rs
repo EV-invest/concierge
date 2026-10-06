@@ -86,6 +86,7 @@ impl OutboxRow {
 			token_version: self.token_version as u64,
 			// Absent (pre-role rows) → empty; the banking puller reads empty as 'investor'.
 			role: self.role.unwrap_or_default(),
+			permissions: Vec::new(),
 		}
 	}
 }

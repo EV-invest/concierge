@@ -1399,7 +1399,7 @@ async fn a_body_without_an_event_id_is_handled_and_still_idempotent() {
 /// The vendor path must not undo a human decision it raced with.
 ///
 /// The old handler read the level on one connection and wrote it on another. Between the
-/// two, an operator under `Permission::KycManage` can commit anything — including a grant
+/// two, an operator under `Kyc::Manage` can commit anything — including a grant
 /// ABOVE what a vendor may ever give. The webhook then wrote its own stale conclusion on
 /// top, and a tier 3 the consilium had just granted came back as tier 2, decided by a
 /// vendor that is not allowed past 2 in the first place. Nothing logs an error: from the

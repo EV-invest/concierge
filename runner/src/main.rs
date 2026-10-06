@@ -165,13 +165,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 	// client's secret comes from `RP_CLIENT_SECRET_<ID>` and is written to the registry as
 	// a digest here, so a rotation is an env change and a restart. Dev-only loopback
 	// redirect targets come from `RP_DEV_REDIRECT_URIS`, refused in production.
-	let scoped_grants: Arc<dyn concierge::ports::ScopedGrantRepository> = Arc::new(infrastructure::scoped_grants::PgScopedGrants::new(pool.clone()));
+	let grants: Arc<dyn concierge::ports::GrantRepository> = Arc::new(infrastructure::grants::PgGrants::new(pool.clone()));
 	let dev_redirects = relying_party::parse_dev_redirects(&std::env::var("RP_DEV_REDIRECT_URIS").unwrap_or_default(), config.app_env == "production")?;
 	let relying_parties = Arc::new(RelyingParties::new(
 		Arc::new(infrastructure::relying_parties::PgRelyingParties::new(pool.clone())),
 		users.clone(),
-		scoped_grants.clone(),
-		break_glass.clone(),
+		grants.clone(),
 		dev_redirects,
 	));
 	let client_audiences = relying_parties
@@ -308,9 +307,9 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		std::time::Duration::from_secs(config.governance_mail_rate_window_secs),
 		config.governance_mail_rate_limit,
 	));
-	let scope_write_limiter = Arc::new(notification::RateLimiter::new(
-		std::time::Duration::from_secs(config.scope_write_rate_window_secs),
-		config.scope_write_rate_limit,
+	let grant_write_limiter = Arc::new(notification::RateLimiter::new(
+		std::time::Duration::from_secs(config.grant_write_rate_window_secs),
+		config.grant_write_rate_limit,
 	));
 
 	// The site-level auth HTTP surface: the conductor rewrites the shared origin's
@@ -436,7 +435,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 				governance_repo,
 				governance_revisions,
 			))))
-			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), scoped_grants, break_glass.clone()).with_scope_write_limiter(scope_write_limiter))))
+			.add_service(auth.layer(UserDirectoryServer::new(directory::Directory::new(users.clone(), grants, break_glass.clone()).with_grant_write_limiter(grant_write_limiter))))
 			.add_service(auth.layer(PlatformServiceServer::new(platform::Platform::new(users.clone(), break_glass, platform_repo))))
 			.add_service(auth.layer(NotificationServiceServer::new(notification::Notifications::new(notification_repo, users, subscribe_limiter))))
 			.add_service(auth.layer(LogServiceServer::new(log::Logs::new())))

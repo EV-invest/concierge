@@ -2,7 +2,7 @@
 //! self-extinguishing emergency access that keeps a brand-new fund reachable.
 //!
 //! Resolves the caller's persisted [`Role`] from the verified access-token `sub` and
-//! checks it against the RBAC matrix ([`grants`]).
+//! asks whether that seat holds the permission ([`Role::may`]).
 //!
 //! # Break-glass, and why it switches itself off
 //!
@@ -55,8 +55,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use concierge_iam::Permission;
 use domain::{
-	authz::{Permission, Role, grants},
+	authz::Role,
 	error::DomainError,
 	users::{UserId, UserStatus},
 };
@@ -228,18 +229,14 @@ impl Elevation<'_> {
 
 /// Authorize `request` for `permission`, or return a gRPC `PermissionDenied`/
 /// `Unauthenticated`.
-pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, break_glass: &BreakGlass, request: &Request<T>, permission: Permission) -> Result<(), Status> {
+pub async fn require_permission<T>(users: &dyn UserDirectoryRepository, break_glass: &BreakGlass, request: &Request<T>, permission: impl Permission) -> Result<(), Status> {
 	let role = caller_role(users, break_glass, request).await?.role;
-	if grants(role, permission) {
-		Ok(())
-	} else {
-		Err(Status::permission_denied("insufficient role"))
-	}
+	if role.may(permission) { Ok(()) } else { Err(Status::permission_denied("insufficient role")) }
 }
 
 /// The global role the plane acts on for the caller, after the live-record gate and with
 /// emergency access applied (and flagged) — for a surface whose rule is not a single
-/// [`Permission`] (a scope's own admin acts without one). Refuses exactly as
+/// permission (a delegate acts without one). Refuses exactly as
 /// [`require_permission`] does for a caller it cannot resolve.
 pub async fn caller_role<T>(users: &dyn UserDirectoryRepository, break_glass: &BreakGlass, request: &Request<T>) -> Result<EffectiveRole, Status> {
 	let caller = caller_gate(users, request).await?;

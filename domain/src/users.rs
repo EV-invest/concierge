@@ -130,7 +130,7 @@ pub const HOLD_COOLDOWN_SECS: i64 = 7 * 24 * 60 * 60;
 /// WHY a disabled account is disabled — and therefore who is allowed to undo it.
 ///
 /// The split exists because the two are not the same decision. A hold is one operator's
-/// reflex under `Permission::UserSuspend`, deliberately cheap to reach and deliberately
+/// reflex under `Users::Suspend`, deliberately cheap to reach and deliberately
 /// self-cancelling. A governance suspension is the owners' ratified verdict, and a
 /// single admin must not be able to overturn it from the console — which is exactly what
 /// would happen if reinstatement stayed unqualified.

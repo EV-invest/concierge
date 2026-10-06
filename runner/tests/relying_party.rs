@@ -2,7 +2,7 @@
 //! through the real axum router, `ExchangeCode`/`RefreshClientToken` through the real
 //! `AuthService`, and the minted token through the real gRPC auth layer.
 //!
-//! Every test registers its OWN client (unique id, audience and scope) rather than
+//! Every test registers its OWN client (unique id, audience and tenant) rather than
 //! touching the seeded `sa`, so runs neither collide nor depend on the registry's state.
 //!
 //! The authorize tests that need a signed-in browser need Redis as well: the session
@@ -23,8 +23,7 @@ use concierge::{
 	authz::BreakGlass,
 	directory::Directory,
 	infrastructure::{
-		db, governance::PgGovernance, kyc::cases::PgKycCases, notifications::PgNotifications, platform::PgPlatform, relying_parties::PgRelyingParties, scoped_grants::PgScopedGrants,
-		users::PgUsers,
+		db, governance::PgGovernance, grants::PgGrants, kyc::cases::PgKycCases, notifications::PgNotifications, platform::PgPlatform, relying_parties::PgRelyingParties, users::PgUsers,
 	},
 	platform::Platform,
 	ports::{ClientRecord, RelyingPartyRepository, UserDirectoryRepository},
@@ -91,7 +90,7 @@ fn random(n: usize) -> String {
 struct TestClient {
 	id: String,
 	audience: String,
-	scope: String,
+	namespace: String,
 	redirect_uri: String,
 	secret: String,
 }
@@ -112,30 +111,40 @@ async fn setup() -> Option<Fx> {
 
 	let users = Arc::new(PgUsers::new(pool.clone()));
 	let repo = Arc::new(PgRelyingParties::new(pool.clone()));
-	let rp = Arc::new(RelyingParties::new(
-		repo.clone(),
-		users.clone(),
-		Arc::new(PgScopedGrants::new(pool.clone())),
-		Arc::new(BreakGlass::new(Vec::new())),
-		Default::default(),
-	));
+	let rp = Arc::new(RelyingParties::new(repo.clone(), users.clone(), Arc::new(PgGrants::new(pool.clone())), Default::default()));
 
 	let tag = Uuid::new_v4().simple().to_string()[..12].to_string();
 	let client = TestClient {
 		id: format!("t_{tag}"),
 		audience: format!("aud_{tag}"),
-		scope: format!("allocation:rp_{tag}"),
+		namespace: format!("n_{tag}"),
 		redirect_uri: format!("https://rp-{tag}.test/auth/callback"),
 		secret: random(32),
 	};
-	sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, access_policy, created_at) VALUES ($1, $2, $3, $4, 0)")
+	sqlx::query("INSERT INTO tenants (id, namespace, granting_seats_hold_all, created_at) VALUES ($1, $1, TRUE, 0)")
+		.bind(&client.namespace)
+		.execute(&pool)
+		.await
+		.expect("register the client's tenant");
+	sqlx::query("INSERT INTO rp_clients (client_id, audience, redirect_uris, created_at, tenant_id) VALUES ($1, $2, $3, 0, $4)")
 		.bind(&client.id)
 		.bind(&client.audience)
 		.bind(vec![client.redirect_uri.clone()])
-		.bind(format!("scope:{}", client.scope))
+		.bind(&client.namespace)
 		.execute(&pool)
 		.await
 		.expect("register the test client");
+	sqlx::query("INSERT INTO catalogs (tenant_id, version, catalog, published_at) VALUES ($1, 1, $2, 0)")
+		.bind(&client.namespace)
+		.bind(serde_json::json!({
+			"version": 1,
+			"permissions": [format!("{}:work:leads:read", client.namespace)],
+			"aliases": { format!("{}:operator", client.namespace): [format!("{}:work:leads:read", client.namespace)] },
+			"delegations": {},
+		}))
+		.execute(&pool)
+		.await
+		.expect("publish the tenant's catalog");
 	repo.set_secret_hash(&client.id, Some(sha256(&client.secret).as_slice()), 1).await.expect("set the client secret");
 
 	let (provisioner, _rx) = provisioner_channel();
@@ -165,31 +174,25 @@ impl Fx {
 		self.users.provision(subject, Email::parse("rp@example.com").unwrap(), true).await.expect("provision").id()
 	}
 
-	async fn grant_scope(&self, user: UserId) {
-		sqlx::query("INSERT INTO scoped_grants (user_id, scope, role, granted_by, granted_at) VALUES ($1, $2, 'operator', $1, 0)")
+	/// The tenant's `operator` alias, granted by someone else.
+	async fn grant_operator(&self, user: UserId) {
+		let granter = self.user().await;
+		sqlx::query("INSERT INTO grants (user_id, namespace, target, granted_by, granted_at) VALUES ($1, $2, $2 || ':operator', $3, 0)")
 			.bind(user.raw())
-			.bind(&self.client.scope)
+			.bind(&self.client.namespace)
+			.bind(granter.raw())
 			.execute(&self.pool)
 			.await
-			.expect("grant scope");
+			.expect("grant the operator alias");
 	}
 
-	async fn revoke_scope(&self, user: UserId) {
-		sqlx::query("UPDATE scoped_grants SET revoked_at = 1, revoked_by = user_id WHERE user_id = $1 AND scope = $2 AND revoked_at IS NULL")
+	async fn set_status(&self, user: UserId, status: &str) {
+		sqlx::query("UPDATE users SET status = $2 WHERE id = $1")
 			.bind(user.raw())
-			.bind(&self.client.scope)
+			.bind(status)
 			.execute(&self.pool)
 			.await
-			.expect("revoke scope");
-	}
-
-	async fn set_role(&self, user: UserId, role: &str) {
-		sqlx::query("UPDATE users SET role = $2 WHERE id = $1")
-			.bind(user.raw())
-			.bind(role)
-			.execute(&self.pool)
-			.await
-			.expect("set role");
+			.expect("set status");
 	}
 
 	async fn bump_token_version(&self, user: UserId) {
@@ -204,12 +207,12 @@ impl Fx {
 		self.rp.resolve(&self.client.id, &self.client.redirect_uri).await.unwrap().expect("the test client resolves")
 	}
 
-	/// A code for `user`, issued the way `/auth/authorize` issues one (policy included),
+	/// A code for `user`, issued the way `/auth/authorize` issues one (admission included),
 	/// plus the PKCE verifier it is bound to.
 	async fn code_for(&self, user: UserId) -> (String, String) {
 		let client = self.record().await;
-		let Admission::Admitted { token_version } = self.rp.admit(user, &client).await.unwrap() else {
-			panic!("the user must pass the policy to be issued a code");
+		let Admission::Admitted { token_version } = self.rp.admit(user).await.unwrap() else {
+			panic!("the user must be admitted to be issued a code");
 		};
 		let verifier = random(48);
 		let code = self
@@ -263,9 +266,8 @@ impl Fx {
 		.map(|r| r.into_inner())
 	}
 
-	async fn signed_in_operator(&self) -> (UserId, ClientTokenResponse) {
+	async fn signed_in(&self) -> (UserId, ClientTokenResponse) {
 		let user = self.user().await;
-		self.grant_scope(user).await;
 		let (code, verifier) = self.code_for(user).await;
 		(user, self.exchange(&code, &verifier).await.expect("a fresh code redeems"))
 	}
@@ -298,7 +300,7 @@ fn claims_of(token: &str) -> Value {
 #[tokio::test]
 async fn a_code_redeems_once_for_a_client_audience_access_token() {
 	let fx = fixture!();
-	let (user, tokens) = fx.signed_in_operator().await;
+	let (user, tokens) = fx.signed_in().await;
 
 	let claims = claims_of(&tokens.access_token);
 	assert_eq!(claims["aud"], fx.client.audience.as_str());
@@ -318,7 +320,6 @@ async fn a_code_redeems_once_for_a_client_audience_access_token() {
 async fn a_wrong_pkce_verifier_is_refused_and_burns_the_code() {
 	let fx = fixture!();
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let (code, verifier) = fx.code_for(user).await;
 
 	let status = fx.exchange(&code, &random(48)).await.expect_err("a verifier that does not hash to the challenge");
@@ -332,7 +333,6 @@ async fn a_wrong_pkce_verifier_is_refused_and_burns_the_code() {
 async fn a_replayed_code_is_refused_and_revokes_what_it_bought() {
 	let fx = fixture!();
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let (code, verifier) = fx.code_for(user).await;
 	let first = fx.exchange(&code, &verifier).await.expect("first redemption");
 	assert!(fx.session_live(&first).await);
@@ -350,7 +350,6 @@ async fn a_replayed_code_is_refused_and_revokes_what_it_bought() {
 async fn an_expired_code_is_refused() {
 	let fx = fixture!();
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let (code, verifier) = fx.code_for(user).await;
 	sqlx::query("UPDATE rp_codes SET expires_at = issued_at - 1 WHERE code_hash = $1")
 		.bind(sha256(&code))
@@ -366,7 +365,6 @@ async fn an_expired_code_is_refused() {
 async fn a_wrong_client_secret_is_refused_without_burning_the_code() {
 	let fx = fixture!();
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let (code, verifier) = fx.code_for(user).await;
 
 	let status = fx.exchange_as(&random(32), &code, &verifier).await.expect_err("wrong secret");
@@ -379,7 +377,6 @@ async fn a_wrong_client_secret_is_refused_without_burning_the_code() {
 async fn a_client_without_a_secret_obtains_nothing() {
 	let fx = fixture!();
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let (code, verifier) = fx.code_for(user).await;
 	fx.repo.set_secret_hash(&fx.client.id, None, 2).await.unwrap();
 
@@ -388,47 +385,28 @@ async fn a_client_without_a_secret_obtains_nothing() {
 }
 
 #[tokio::test]
-async fn a_scope_revoked_between_authorize_and_exchange_denies_the_exchange() {
+async fn a_suspension_between_authorize_and_exchange_denies_the_exchange() {
 	let fx = fixture!();
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let (code, verifier) = fx.code_for(user).await;
-	fx.revoke_scope(user).await;
+	fx.set_status(user, "disabled").await;
 
-	let status = fx.exchange(&code, &verifier).await.expect_err("the policy is re-read at the exchange");
+	let status = fx.exchange(&code, &verifier).await.expect_err("the account is re-read at the exchange");
 	assert_eq!(status.code(), Code::PermissionDenied);
 }
 
-// ─── Policy ──────────────────────────────────────────────────────────────────────
+// ─── Admission ───────────────────────────────────────────────────────────────────
 
+/// What a user may do inside a client is its tenant's permissions, which GetMe hands it;
+/// signing in only asks whether the account is usable. A user holding nothing still gets
+/// in — some of a client's surface is open to everyone.
 #[tokio::test]
-async fn the_policy_admits_scope_holders_and_global_admins_only() {
+async fn any_active_account_is_admitted_and_a_suspended_one_is_not() {
 	let fx = fixture!();
-	let client = fx.record().await;
-
 	let nobody = fx.user().await;
-	assert!(matches!(fx.rp.admit(nobody, &client).await.unwrap(), Admission::Denied));
-
-	let operator = fx.user().await;
-	fx.grant_scope(operator).await;
-	assert!(matches!(fx.rp.admit(operator, &client).await.unwrap(), Admission::Admitted { .. }));
-
-	let admin = fx.user().await;
-	fx.set_role(admin, "admin").await;
-	assert!(matches!(fx.rp.admit(admin, &client).await.unwrap(), Admission::Admitted { .. }));
-
-	// A global operator runs the console, not every vertical's panel.
-	let console_operator = fx.user().await;
-	fx.set_role(console_operator, "operator").await;
-	assert!(matches!(fx.rp.admit(console_operator, &client).await.unwrap(), Admission::Denied));
-
-	// A suspended scope holder is out whatever they hold.
-	sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
-		.bind(operator.raw())
-		.execute(&fx.pool)
-		.await
-		.unwrap();
-	assert!(matches!(fx.rp.admit(operator, &client).await.unwrap(), Admission::Denied));
+	assert!(matches!(fx.rp.admit(nobody).await.unwrap(), Admission::Admitted { .. }));
+	fx.set_status(nobody, "disabled").await;
+	assert!(matches!(fx.rp.admit(nobody).await.unwrap(), Admission::Denied));
 }
 
 // ─── RefreshClientToken ──────────────────────────────────────────────────────────
@@ -436,7 +414,7 @@ async fn the_policy_admits_scope_holders_and_global_admins_only() {
 #[tokio::test]
 async fn refresh_rotates_and_a_reused_token_revokes_the_session() {
 	let fx = fixture!();
-	let (_, first) = fx.signed_in_operator().await;
+	let (_, first) = fx.signed_in().await;
 
 	let second = fx.refresh(&first.refresh_token).await.expect("rotation");
 	assert_ne!(second.refresh_token, first.refresh_token);
@@ -449,25 +427,25 @@ async fn refresh_rotates_and_a_reused_token_revokes_the_session() {
 }
 
 #[tokio::test]
-async fn refresh_after_the_scope_is_revoked_is_denied_and_ends_the_session() {
+async fn refresh_after_a_suspension_is_denied_and_ends_the_session() {
 	let fx = fixture!();
-	let (user, tokens) = fx.signed_in_operator().await;
-	fx.revoke_scope(user).await;
+	let (user, tokens) = fx.signed_in().await;
+	fx.set_status(user, "disabled").await;
 
-	let status = fx.refresh(&tokens.refresh_token).await.expect_err("the policy is re-checked on every refresh");
+	let status = fx.refresh(&tokens.refresh_token).await.expect_err("the account is re-checked on every refresh");
 	assert_eq!(status.code(), Code::PermissionDenied);
 	assert_eq!(fx.revoked_reason(fx.session_of(&tokens).await).await.as_deref(), Some("access_denied"));
 	assert!(!fx.session_live(&tokens).await, "the outstanding access token dies with the session");
 
-	// Granting it back does not resurrect a session that was ended.
-	fx.grant_scope(user).await;
+	// Reinstating the account does not resurrect a session that was ended.
+	fx.set_status(user, "active").await;
 	fx.refresh(&tokens.refresh_token).await.expect_err("revoked for good");
 }
 
 #[tokio::test]
 async fn refresh_after_revoke_all_is_refused() {
 	let fx = fixture!();
-	let (user, tokens) = fx.signed_in_operator().await;
+	let (user, tokens) = fx.signed_in().await;
 	fx.bump_token_version(user).await;
 
 	let status = fx.refresh(&tokens.refresh_token).await.expect_err("token_version moved past the session");
@@ -478,7 +456,7 @@ async fn refresh_after_revoke_all_is_refused() {
 #[tokio::test]
 async fn a_refresh_token_is_bound_to_its_client() {
 	let fx = fixture!();
-	let (_, tokens) = fx.signed_in_operator().await;
+	let (_, tokens) = fx.signed_in().await;
 	let other = fixture!();
 
 	let status = AuthRpc::refresh_client_token(
@@ -520,7 +498,7 @@ async fn boot(fx: &Fx) -> Channel {
 
 	let users: Arc<dyn UserDirectoryRepository> = fx.users.clone();
 	let break_glass = Arc::new(BreakGlass::new(Vec::new()));
-	let directory = Directory::new(users.clone(), Arc::new(PgScopedGrants::new(fx.pool.clone())), break_glass.clone());
+	let directory = Directory::new(users.clone(), Arc::new(PgGrants::new(fx.pool.clone())), break_glass.clone());
 	let platform = Platform::new(users, break_glass, Arc::new(PgPlatform::new(fx.pool.clone())));
 	let issuance = fx.auth.clone();
 	tokio::spawn(async move {
@@ -550,7 +528,7 @@ fn bearer<T>(message: T, token: &str) -> Request<T> {
 #[tokio::test]
 async fn a_client_token_opens_get_me_and_no_other_rpc() {
 	let fx = fixture!();
-	let (user, tokens) = fx.signed_in_operator().await;
+	let (user, tokens) = fx.signed_in().await;
 	let channel = boot(&fx).await;
 	let mut directory = UserDirectoryClient::new(channel.clone());
 
@@ -560,7 +538,14 @@ async fn a_client_token_opens_get_me_and_no_other_rpc() {
 		.expect("GetMe admits the client's token")
 		.into_inner();
 	assert_eq!(me.user_id, user.to_string());
-	assert!(me.scopes.iter().any(|grant| grant.scope == fx.client.scope), "GetMe hands the client the live scopes");
+	assert!(me.permissions.is_empty(), "a user granted nothing holds nothing");
+	fx.grant_operator(user).await;
+	let me = directory.get_me(bearer(GetMeRequest {}, &tokens.access_token)).await.expect("GetMe").into_inner();
+	assert_eq!(
+		me.permissions,
+		[format!("{}:work:leads:read", fx.client.namespace)],
+		"GetMe hands the client the live permissions"
+	);
 
 	// Another method of the SAME service.
 	let status = directory
@@ -580,12 +565,12 @@ async fn a_client_token_opens_get_me_and_no_other_rpc() {
 #[tokio::test]
 async fn a_revoked_session_ends_its_access_token_at_get_me() {
 	let fx = fixture!();
-	let (user, tokens) = fx.signed_in_operator().await;
+	let (user, tokens) = fx.signed_in().await;
 	let channel = boot(&fx).await;
 	let mut directory = UserDirectoryClient::new(channel);
 	directory.get_me(bearer(GetMeRequest {}, &tokens.access_token)).await.expect("live");
 
-	fx.revoke_scope(user).await;
+	fx.set_status(user, "disabled").await;
 	fx.refresh(&tokens.refresh_token).await.expect_err("ends the session");
 
 	let status = directory
@@ -760,44 +745,34 @@ async fn a_bad_pkce_challenge_goes_back_to_the_client_as_invalid_request() {
 }
 
 #[tokio::test]
-async fn authorize_issues_a_code_only_to_users_the_policy_admits() {
+async fn authorize_issues_a_code_only_to_an_active_account() {
 	let fx = fixture!();
 	let router = router(&fx).await;
 
-	let outsider = fx.user().await;
-	let Some(cookie) = session_cookie(&fx, outsider).await else {
+	let suspended = fx.user().await;
+	let Some(cookie) = session_cookie(&fx, suspended).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
 	};
 	let verifier = random(48);
 	let uri = authorize_uri(&fx.client.id, &fx.client.redirect_uri, &s256_challenge(&verifier));
+	fx.set_status(suspended, "disabled").await;
 
-	// No scope: the client is told, with its state, and no code exists.
+	// Suspended: no code exists.
 	let answer = get(&router, &uri, Some(&cookie)).await;
 	assert_eq!(answer.status, StatusCode::FOUND);
-	let back = params(answer.location.as_deref().unwrap());
-	assert_eq!(back.get("error").map(String::as_str), Some("access_denied"));
-	assert_eq!(back["state"], "st-123");
-	assert!(!back.contains_key("code"));
+	assert!(!params(answer.location.as_deref().unwrap()).contains_key("code"));
 
-	// A scope operator gets a code that redeems.
-	let operator = fx.user().await;
-	fx.grant_scope(operator).await;
-	let cookie = session_cookie(&fx, operator).await.unwrap();
+	// Anyone else gets a code that redeems, holding nothing in the tenant.
+	let user = fx.user().await;
+	let cookie = session_cookie(&fx, user).await.unwrap();
 	let answer = get(&router, &uri, Some(&cookie)).await;
 	let location = answer.location.unwrap();
 	assert!(location.starts_with(&format!("{}?", fx.client.redirect_uri)), "{location}");
 	let back = params(&location);
 	assert_eq!(back["state"], "st-123");
 	let tokens = fx.exchange(&back["code"], &verifier).await.expect("the issued code redeems with its verifier");
-	assert_eq!(tokens.user_id, operator.to_string());
-
-	// A global admin without any grant gets one too.
-	let admin = fx.user().await;
-	fx.set_role(admin, "admin").await;
-	let cookie = session_cookie(&fx, admin).await.unwrap();
-	let back = params(&get(&router, &uri, Some(&cookie)).await.location.unwrap());
-	assert!(back.contains_key("code"), "a global admin passes a scope policy: {back:?}");
+	assert_eq!(tokens.user_id, user.to_string());
 }
 
 // ─── Security follow-ups (PR #100 review) ────────────────────────────────────────
@@ -805,7 +780,7 @@ async fn authorize_issues_a_code_only_to_users_the_policy_admits() {
 #[tokio::test]
 async fn get_me_on_a_client_token_carries_no_identity_document_fields() {
 	let fx = fixture!();
-	let (user, tokens) = fx.signed_in_operator().await;
+	let (user, tokens) = fx.signed_in().await;
 	sqlx::query(
 		"UPDATE users SET legal_name = 'Jane Q Public', preferred_name = 'Jane', phone = '+15550100', date_of_birth = '1990-01-01', nationality = 'DE', tax_residence = 'DE', residential_address = '1 Main St', kyc_level = 1 WHERE id = $1",
 	)
@@ -819,7 +794,6 @@ async fn get_me_on_a_client_token_carries_no_identity_document_fields() {
 	assert_eq!(me.user_id, user.to_string());
 	assert_eq!(me.preferred_name, "Jane");
 	assert_eq!(me.email, "rp@example.com");
-	assert!(!me.scopes.is_empty());
 	for (field, value) in [
 		("legal_name", &me.legal_name),
 		("phone", &me.phone),
@@ -836,7 +810,7 @@ async fn get_me_on_a_client_token_carries_no_identity_document_fields() {
 #[tokio::test]
 async fn a_wrong_refresh_secret_for_a_real_session_revokes_it() {
 	let fx = fixture!();
-	let (_, tokens) = fx.signed_in_operator().await;
+	let (_, tokens) = fx.signed_in().await;
 	let session = fx.session_of(&tokens).await;
 
 	// The session id is right and the client proved itself; only the secret is wrong. That
@@ -851,7 +825,6 @@ async fn a_wrong_refresh_secret_for_a_real_session_revokes_it() {
 async fn a_session_is_not_opened_off_a_code_whose_replay_is_still_committing() {
 	let fx = fixture!();
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let (code, _) = fx.code_for(user).await;
 	let code_hash = sha256(&code);
 
@@ -946,7 +919,6 @@ async fn a_cabinet_session_revoked_upstream_does_not_authorize() {
 	let fx = fixture!();
 	let router = router(&fx).await;
 	let operator = fx.user().await;
-	fx.grant_scope(operator).await;
 	let Some((cookie, refresh_token)) = signed_in_browser(&fx, operator).await else {
 		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
 		return;
@@ -990,7 +962,6 @@ async fn signing_out_of_the_cabinet_signs_out_of_the_client() {
 	let fx = fixture!();
 	let router = router(&fx).await;
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let Some((cabinet, client)) = signed_into_client(&fx, &router, user).await else {
 		eprintln!("skipped: REDIS_URL unset");
 		return;
@@ -1010,7 +981,6 @@ async fn revoking_a_cabinet_session_by_id_ends_its_client_sessions_and_only_the_
 	let fx = fixture!();
 	let router = router(&fx).await;
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let Some((cabinet, client)) = signed_into_client(&fx, &router, user).await else {
 		eprintln!("skipped: REDIS_URL unset");
 		return;
@@ -1037,7 +1007,6 @@ async fn revoke_all_ends_every_client_session_and_outstanding_code() {
 	let fx = fixture!();
 	let router = router(&fx).await;
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let Some((cabinet, client)) = signed_into_client(&fx, &router, user).await else {
 		eprintln!("skipped: REDIS_URL unset");
 		return;
@@ -1055,7 +1024,6 @@ async fn a_replica_without_the_secret_variable_keeps_the_stored_secret() {
 	let fx = fixture!();
 	fx.rp.sync_registry(|_| None).await.expect("sync with no secrets in env");
 	let user = fx.user().await;
-	fx.grant_scope(user).await;
 	let (code, verifier) = fx.code_for(user).await;
 	fx.exchange(&code, &verifier).await.expect("the client still authenticates with the secret another replica set");
 }

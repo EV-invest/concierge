@@ -118,11 +118,11 @@ ev::settings! {
 		/// fits with room to spare, and the durable ceiling stays the daily send budget.
 		governance_mail_rate_limit: u32 = "30",
 		governance_mail_rate_window_secs: u64 = "3600",
-		/// GrantScope + RevokeScope calls one scope admin may make per window, refusals
-		/// included — the ceiling on probing addresses through their scope. Global
-		/// admins/owners are not counted. Mirrors `directory::SCOPE_WRITE_RATE_LIMIT`.
-		scope_write_rate_limit: u32 = "20",
-		scope_write_rate_window_secs: u64 = "3600",
+		/// GrantPermission + RevokePermission calls one delegate may make per window,
+		/// refusals included — the ceiling on probing addresses through their delegation.
+		/// Granting seats are not counted. Mirrors `directory::GRANT_WRITE_RATE_LIMIT`.
+		grant_write_rate_limit: u32 = "20",
+		grant_write_rate_window_secs: u64 = "3600",
 		/// Base URL of the owner-removal approval page; the emailed token is appended as
 		/// the final path segment, so a message carries `<this>/<token>`.
 		///

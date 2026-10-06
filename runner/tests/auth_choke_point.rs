@@ -15,8 +15,8 @@ use std::{net::TcpListener, time::Duration};
 
 use evconcierge_auth::{Verifier, grpc_auth_layer};
 use evconcierge_contracts::concierge::v1::{
-	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, GrantScopeRequest, GrantScopeResponse, HoldUserRequest, HoldUserResponse,
-	ListScopedGrantsRequest, ListScopedGrantsResponse, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse, RevokeScopeRequest, RevokeScopeResponse,
+	CheckRequest, CheckResponse, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, GrantPermissionRequest, GrantPermissionResponse, HoldUserRequest, HoldUserResponse,
+	ListGrantsRequest, ListGrantsResponse, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse, RevokePermissionRequest, RevokePermissionResponse,
 	RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
 	health_service_client::HealthServiceClient,
 	health_service_server::{HealthService, HealthServiceServer},
@@ -84,16 +84,16 @@ impl UserDirectory for Directory {
 		Err(Status::unimplemented("UserDirectory.SetRole is not implemented"))
 	}
 
-	async fn grant_scope(&self, _request: Request<GrantScopeRequest>) -> Result<Response<GrantScopeResponse>, Status> {
-		Err(Status::unimplemented("UserDirectory.GrantScope is not implemented"))
+	async fn grant_permission(&self, _request: Request<GrantPermissionRequest>) -> Result<Response<GrantPermissionResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.GrantPermission is not implemented"))
 	}
 
-	async fn revoke_scope(&self, _request: Request<RevokeScopeRequest>) -> Result<Response<RevokeScopeResponse>, Status> {
-		Err(Status::unimplemented("UserDirectory.RevokeScope is not implemented"))
+	async fn revoke_permission(&self, _request: Request<RevokePermissionRequest>) -> Result<Response<RevokePermissionResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.RevokePermission is not implemented"))
 	}
 
-	async fn list_scoped_grants(&self, _request: Request<ListScopedGrantsRequest>) -> Result<Response<ListScopedGrantsResponse>, Status> {
-		Err(Status::unimplemented("UserDirectory.ListScopedGrants is not implemented"))
+	async fn list_grants(&self, _request: Request<ListGrantsRequest>) -> Result<Response<ListGrantsResponse>, Status> {
+		Err(Status::unimplemented("UserDirectory.ListGrants is not implemented"))
 	}
 }
 

@@ -12,7 +12,7 @@
 //! a rotation succeeds only against the secret it was checked against.
 
 use async_trait::async_trait;
-use domain::{clients::AccessPolicy, error::DomainError, users::UserId};
+use domain::{error::DomainError, users::UserId};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -41,9 +41,9 @@ struct ClientRow {
 	client_id: String,
 	audience: String,
 	redirect_uris: Vec<String>,
-	access_policy: String,
 	secret_hash: Option<Vec<u8>>,
 	disabled_at: Option<i64>,
+	namespace: String,
 }
 
 impl TryFrom<ClientRow> for ClientRecord {
@@ -51,12 +51,12 @@ impl TryFrom<ClientRow> for ClientRecord {
 
 	fn try_from(row: ClientRow) -> Result<Self, DomainError> {
 		Ok(Self {
-			access_policy: AccessPolicy::parse(&row.access_policy)?,
 			client_id: row.client_id,
 			audience: row.audience,
 			redirect_uris: row.redirect_uris,
 			secret_hash: row.secret_hash,
 			disabled: row.disabled_at.is_some(),
+			namespace: row.namespace,
 		})
 	}
 }
@@ -87,23 +87,29 @@ struct SessionDbRow {
 #[async_trait]
 impl RelyingPartyRepository for PgRelyingParties {
 	async fn client(&self, client_id: &str) -> Result<Option<ClientRecord>, DomainError> {
-		sqlx::query_as::<_, ClientRow>("SELECT client_id, audience, redirect_uris, access_policy, secret_hash, disabled_at FROM rp_clients WHERE client_id = $1")
-			.bind(client_id)
-			.fetch_optional(&self.pool)
-			.await
-			.map_err(repo_err)?
-			.map(ClientRecord::try_from)
-			.transpose()
+		sqlx::query_as::<_, ClientRow>(
+			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace \
+			 FROM rp_clients c JOIN tenants t ON t.id = c.tenant_id WHERE c.client_id = $1",
+		)
+		.bind(client_id)
+		.fetch_optional(&self.pool)
+		.await
+		.map_err(repo_err)?
+		.map(ClientRecord::try_from)
+		.transpose()
 	}
 
 	async fn clients(&self) -> Result<Vec<ClientRecord>, DomainError> {
-		sqlx::query_as::<_, ClientRow>("SELECT client_id, audience, redirect_uris, access_policy, secret_hash, disabled_at FROM rp_clients ORDER BY client_id")
-			.fetch_all(&self.pool)
-			.await
-			.map_err(repo_err)?
-			.into_iter()
-			.map(ClientRecord::try_from)
-			.collect()
+		sqlx::query_as::<_, ClientRow>(
+			"SELECT c.client_id, c.audience, c.redirect_uris, c.secret_hash, c.disabled_at, t.namespace \
+			 FROM rp_clients c JOIN tenants t ON t.id = c.tenant_id ORDER BY c.client_id",
+		)
+		.fetch_all(&self.pool)
+		.await
+		.map_err(repo_err)?
+		.into_iter()
+		.map(ClientRecord::try_from)
+		.collect()
 	}
 
 	async fn set_secret_hash(&self, client_id: &str, secret_hash: Option<&[u8]>, now: i64) -> Result<bool, DomainError> {

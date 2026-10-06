@@ -14,11 +14,10 @@
 //!   This is the only place the auth crate's primitive DTOs become domain value objects,
 //!   so `domain` never depends on `evconcierge_auth` and vice-versa.
 //!
-//! Scoped grants (`GrantScope`/`RevokeScope`/`ListScopedGrants`, and `GetMe.scopes`) are
-//! the one surface here not gated by a single [`Permission`]: a scope's own admin acts
-//! on part of one scope without holding any global role. The matrix is
-//! [`domain::scopes::ScopeAuthority`], and the adapter applies it inside the write
-//! transaction.
+//! Grants (`GrantPermission`/`RevokePermission`/`ListGrants`) are the one surface here
+//! not gated by a single seat permission: the holder of an alias the tenant lets delegate
+//! acts on part of one namespace without holding any seat. The adapter decides who may,
+//! inside the write transaction.
 //!
 //! Every role this module RETURNS — provisioner summaries (the issued session's
 //! `UserSummary`), `GetMe`/`GetUser`, `ListUsers` — is the caller's/target's role as
@@ -42,21 +41,21 @@
 //! we don't control, so the large-err lint does not apply in this module.
 #![allow(clippy::result_large_err)]
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use domain::{
-	authz::{Permission, Role},
+	authz::{Iam, Kyc, Role, Roles, Users},
 	error::DomainError,
 	governance::MAX_REASON_CHARS,
-	scopes::{Scope, ScopeAuthority, ScopeRole},
+	iam::{self, Target},
 	users::{AuthSubject, Email, MAX_KYC_LEVEL, ProfileFields, Suspension, User, UserId, UserStatus},
 };
-use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser};
+use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser, claims_of};
 use evconcierge_contracts::concierge::v1::{
-	AdminUserSummary, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, GrantScopeRequest, GrantScopeResponse, HoldUserRequest, HoldUserResponse,
-	ListScopedGrantsRequest, ListScopedGrantsResponse, ListUsersRequest, ListUsersResponse, ReinstateUserRequest, ReinstateUserResponse, RevokeScopeRequest, RevokeScopeResponse,
-	RevokeTokensRequest, RevokeTokensResponse, ScopeHolder, ScopedGrant, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
-	grant_scope_request, revoke_scope_request, user_directory_server::UserDirectory,
+	AdminUserSummary, DisableUserRequest, DisableUserResponse, GetMeRequest, GetUserRequest, GrantHolder, GrantPermissionRequest, GrantPermissionResponse, HoldUserRequest, HoldUserResponse,
+	ListGrantsRequest, ListGrantsResponse, ListUsersRequest, ListUsersResponse, PermissionGrant, ReinstateUserRequest, ReinstateUserResponse, RevokePermissionRequest,
+	RevokePermissionResponse, RevokeTokensRequest, RevokeTokensResponse, SetKycLevelRequest, SetKycLevelResponse, SetRoleRequest, SetRoleResponse, UpdateProfileRequest, UserProfile,
+	grant_permission_request, revoke_permission_request, user_directory_server::UserDirectory,
 };
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
@@ -65,24 +64,21 @@ use uuid::Uuid;
 use crate::{
 	authz::{BreakGlass, EffectiveRole, Elevation},
 	governance::audit_of,
-	infrastructure::{
-		scoped_grants::ScopedGrantRecord,
-		users::{AdminAction, AdminUserRow, Reinstatement},
-	},
+	infrastructure::users::{AdminAction, AdminUserRow, Reinstatement},
 	notification::{RateLimiter, now_secs},
-	ports::{RoleChange, ScopeActor, ScopeGrantOutcome, ScopeRevokeOutcome, ScopeTarget, ScopedGrantRepository, UngrantableAddress, UserDirectoryRepository},
+	ports::{GrantActor, GrantAuthority, GrantOutcome, GrantRecord, GrantRepository, GrantSubject, RevokeOutcome, RoleChange, UngrantableAddress, UserDirectoryRepository},
 	support::domain_to_status,
 };
 
-/// Scope writes (`GrantScope` + `RevokeScope`, one budget) a caller without global
-/// authority may make per [`SCOPE_WRITE_RATE_WINDOW`]. The defaults of
-/// `SCOPE_WRITE_RATE_LIMIT`/`SCOPE_WRITE_RATE_WINDOW_SECS`; `main` wires the configured
-/// values through [`Directory::with_scope_write_limiter`].
-pub const SCOPE_WRITE_RATE_LIMIT: u32 = 20;
-pub const SCOPE_WRITE_RATE_WINDOW: Duration = Duration::from_secs(60 * 60);
+/// Grant writes (`GrantPermission` + `RevokePermission`, one budget) a delegate may make
+/// per [`GRANT_WRITE_RATE_WINDOW`]. The defaults of
+/// `GRANT_WRITE_RATE_LIMIT`/`GRANT_WRITE_RATE_WINDOW_SECS`; `main` wires the configured
+/// values through [`Directory::with_grant_write_limiter`].
+pub const GRANT_WRITE_RATE_LIMIT: u32 = 20;
+pub const GRANT_WRITE_RATE_WINDOW: Duration = Duration::from_secs(60 * 60);
 
-/// The one answer a scope admin gets for an address that cannot be granted, whatever
-/// the reason (see [`ScopeGrantOutcome::Ungrantable`]).
+/// The one answer a delegate gets for an address that cannot be granted, whatever the
+/// reason (see [`GrantOutcome::Ungrantable`]).
 const UNGRANTABLE_ADDRESS: &str = "this address cannot be granted access";
 
 /// The user directory/profile service, backed by the [`UserDirectoryRepository`]
@@ -90,53 +86,50 @@ const UNGRANTABLE_ADDRESS: &str = "this address cannot be granted access";
 #[derive(Clone)]
 pub struct Directory {
 	users: Arc<dyn UserDirectoryRepository>,
-	scopes: Arc<dyn ScopedGrantRepository>,
+	grants: Arc<dyn GrantRepository>,
 	break_glass: Arc<BreakGlass>,
-	/// Per-actor budget for scope writes by anyone short of global authority. Every
-	/// attempt spends it, refusals included: the probing it bounds is made of refusals.
-	scope_writes: Arc<RateLimiter>,
+	/// Per-actor budget for grant writes by anyone short of a granting seat. Every attempt
+	/// spends it, refusals included: the probing it bounds is made of refusals.
+	grant_writes: Arc<RateLimiter>,
 }
 
 impl Directory {
-	pub fn new(users: Arc<dyn UserDirectoryRepository>, scopes: Arc<dyn ScopedGrantRepository>, break_glass: Arc<BreakGlass>) -> Self {
+	pub fn new(users: Arc<dyn UserDirectoryRepository>, grants: Arc<dyn GrantRepository>, break_glass: Arc<BreakGlass>) -> Self {
 		Self {
 			users,
-			scopes,
+			grants,
 			break_glass,
-			scope_writes: Arc::new(RateLimiter::new(SCOPE_WRITE_RATE_WINDOW, SCOPE_WRITE_RATE_LIMIT)),
+			grant_writes: Arc::new(RateLimiter::new(GRANT_WRITE_RATE_WINDOW, GRANT_WRITE_RATE_LIMIT)),
 		}
 	}
 
-	/// Replace the scope-write budget (the configured one, in `main`).
-	pub fn with_scope_write_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
-		self.scope_writes = limiter;
+	/// Replace the grant-write budget (the configured one, in `main`).
+	pub fn with_grant_write_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+		self.grant_writes = limiter;
 		self
 	}
 
-	/// Spend one unit of a scope writer's budget, or refuse. A global admin/owner is not
-	/// counted: they can already read every account through `ListUsers`, so a ceiling
-	/// on them would bound no oracle and only get in the way of bulk onboarding. The
-	/// gate's role decides who is global — the write re-checks authority, but a stale
-	/// "global" there costs at most an unmetered refusal.
-	fn charge_scope_write(&self, actor: &ScopeActor, verb: &'static str) -> Result<(), Status> {
-		if ScopeAuthority::resolve(actor.role, None) == ScopeAuthority::Global {
+	/// Spend one unit of a delegate's budget, or refuse. A granting seat is not counted:
+	/// it can already read every account through `ListUsers`, so a ceiling on it would
+	/// bound no oracle and only get in the way of bulk onboarding. The gate's role decides
+	/// — the write re-checks authority, but a stale seat there costs at most an unmetered
+	/// refusal.
+	fn charge_grant_write(&self, actor: &GrantActor, verb: &'static str) -> Result<(), Status> {
+		if actor.role.may(Iam::Grant) || self.grant_writes.check(&actor.id.to_string()) {
 			return Ok(());
 		}
-		if self.scope_writes.check(&actor.id.to_string()) {
-			return Ok(());
-		}
-		tracing::warn!(actor = %actor.id, verb, "scope write rate limit exceeded");
-		Err(Status::resource_exhausted("too many scoped grant changes; try again later"))
+		tracing::warn!(actor = %actor.id, verb, "grant write rate limit exceeded");
+		Err(Status::resource_exhausted("too many grant changes; try again later"))
 	}
 
-	/// The caller as a scope actor: their id and the global role the RBAC gate resolves
-	/// for them. Deliberately NOT a permission check — a scope's own admin holds no
-	/// global permission, so whether they may act is the repository's call, made from
-	/// their grant inside the transaction.
-	async fn scope_actor<T>(&self, request: &Request<T>) -> Result<ScopeActor, Status> {
+	/// The caller as a grant actor: their id and the seat the RBAC gate resolves for them.
+	/// Deliberately NOT a permission check — a delegate holds no seat permission, so
+	/// whether they may act is the repository's call, made from their grants inside the
+	/// transaction.
+	async fn grant_actor<T>(&self, request: &Request<T>) -> Result<GrantActor, Status> {
 		let resolved = crate::authz::caller_role(self.users.as_ref(), &self.break_glass, request).await?;
 		let id = self.acting_operator(request).await?;
-		Ok(ScopeActor {
+		Ok(GrantActor {
 			id,
 			role: resolved.role,
 			elevated: resolved.break_glass,
@@ -160,6 +153,32 @@ impl Directory {
 	/// grants AND says where it came from.
 	async fn effective_role_of(&self, user: &User) -> EffectiveRole {
 		self.elevation().await.role_of(user.role(), &user.id().to_string())
+	}
+
+	/// What `user` may do, concrete. A relying party (`audience`) reads its own tenant's
+	/// namespace and nothing else; a first-party session reads the seat and every tenant.
+	async fn permissions_of(&self, user: UserId, seat: Role, audience: Option<&str>) -> Result<Vec<String>, DomainError> {
+		let mut held: BTreeSet<String> = BTreeSet::new();
+		let tenants = match audience {
+			Some(audience) => {
+				let namespace = self
+					.grants
+					.audience_namespace(audience)
+					.await?
+					.ok_or_else(|| DomainError::Repository(format!("relying party `{audience}` has no tenant")))?;
+				self.grants.catalog(&namespace).await?.into_iter().collect()
+			}
+			None => {
+				held.extend(seat.permissions().iter().map(|p| (*p).to_owned()));
+				self.grants.catalogs().await?
+			}
+		};
+		let targets = self.grants.targets_of(user).await?;
+		for tenant in &tenants {
+			let ours: Vec<Target> = targets.iter().filter(|t| t.namespace() == tenant.namespace).cloned().collect();
+			held.extend(iam::resolve(seat, tenant.granting_seats_hold_all, &ours, &tenant.catalog).into_iter().map(str::to_owned));
+		}
+		Ok(held.into_iter().collect())
 	}
 
 	/// The break-glass rule frozen for this request. Taken once and applied to every row
@@ -215,8 +234,8 @@ fn hold_refusal(err: DomainError) -> Status {
 	}
 }
 
-/// Gate an RPC on a required [`Permission`] via the shared [`crate::authz`] matrix.
-async fn require_permission<T>(directory: &Directory, request: &Request<T>, permission: Permission) -> Result<(), Status> {
+/// Gate an RPC on a seat permission via the shared [`crate::authz`] gate.
+async fn require_permission<T>(directory: &Directory, request: &Request<T>, permission: impl concierge_iam::Permission) -> Result<(), Status> {
 	crate::authz::require_permission(directory.users.as_ref(), &directory.break_glass, request, permission).await
 }
 
@@ -245,50 +264,46 @@ fn require_reason(raw: &str) -> Result<String, Status> {
 	Ok(reason.to_owned())
 }
 
-fn parse_scope(raw: &str) -> Result<Scope, Status> {
-	Scope::parse(raw).map_err(domain_to_status)
-}
-
-/// A request's `oneof target`, parsed. Both request types carry the same pair.
-fn parse_scope_target(user_id: Option<&str>, email: Option<&str>) -> Result<ScopeTarget, Status> {
+/// A request's `oneof subject`, parsed. Both request types carry the same pair.
+fn parse_subject(user_id: Option<&str>, email: Option<&str>) -> Result<GrantSubject, Status> {
 	match (user_id, email) {
-		(Some(raw), _) => parse_target_id(raw).map(ScopeTarget::Id),
-		(None, Some(raw)) => Email::parse(raw).map(ScopeTarget::Email).map_err(domain_to_status),
-		(None, None) => Err(Status::invalid_argument("target is required: user_id or email")),
+		(Some(raw), _) => parse_target_id(raw).map(GrantSubject::Id),
+		(None, Some(raw)) => Email::parse(raw).map(GrantSubject::Email).map_err(domain_to_status),
+		(None, None) => Err(Status::invalid_argument("subject is required: user_id or email")),
 	}
 }
 
-/// A refused scope write, logged: an operator probing the edge of their scope is the
-/// signal worth keeping. Ids and the scope only — never the address they typed.
-fn scope_refused(actor: &ScopeActor, verb: &'static str, scope: &Scope, requested: Option<ScopeRole>) -> Status {
-	tracing::warn!(actor = %actor.id, verb, scope = %scope, requested = requested.map(ScopeRole::as_str), "scoped grant refused");
-	scope_denied()
+/// A refused grant write, logged: someone probing the edge of their delegation is the
+/// signal worth keeping. Ids and the target — never the address they typed.
+fn grant_denied(actor: &GrantActor, verb: &'static str, target: &str) -> Status {
+	tracing::warn!(actor = %actor.id, verb, target, "grant refused");
+	Status::permission_denied("grants are made by a seat holding iam:tenants:grant, or by an alias's holder for exactly the aliases it delegates, naming the user by email")
 }
 
-/// A scope admin's grant to an address that cannot be granted, logged with the reason
-/// they are not told. Ids, scope and the category — never the address.
-fn scope_ungrantable(actor: &ScopeActor, scope: &Scope, why: UngrantableAddress) -> Status {
-	tracing::warn!(actor = %actor.id, scope = %scope, outcome = why.as_str(), "scoped grant to an ungrantable address");
+/// A delegate's grant to an address that cannot be granted, logged with the reason they
+/// are not told. Ids, target and the category — never the address.
+fn ungrantable(actor: &GrantActor, target: &str, why: UngrantableAddress) -> Status {
+	tracing::warn!(actor = %actor.id, target, outcome = why.as_str(), "grant to an ungrantable address");
 	Status::failed_precondition(UNGRANTABLE_ADDRESS)
-}
-
-/// The one refusal every scope write shares. Worded as the rule, so a scope admin who
-/// reached for an admin grant learns why without a second request.
-fn scope_denied() -> Status {
-	Status::permission_denied("scoped grants are managed by a global admin or owner, or by the scope's own admin for operator grants only")
 }
 
 #[tonic::async_trait]
 impl UserDirectory for Directory {
 	async fn get_me(&self, request: Request<GetMeRequest>) -> Result<Response<UserProfile>, Status> {
 		// Read before `active_caller_id` borrows the request: whether a relying party (a
-		// backend on another origin) is asking, rather than the user's own session.
-		let relying_party = request.extensions().get::<evconcierge_auth::RestrictedCaller>().is_some();
+		// backend on another origin) is asking, rather than the user's own session, and
+		// which one.
+		let relying_party = request
+			.extensions()
+			.get::<evconcierge_auth::RestrictedCaller>()
+			.map(|_| claims_of(&request).map(|claims| claims.aud.clone()).ok_or_else(|| Status::unauthenticated("missing claims")))
+			.transpose()?;
 		let id = self.active_caller_id(&request).await?;
 		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
-		let mut profile = user_to_proto(&user, self.effective_role_of(&user).await);
-		profile.scopes = self.scopes.active_for_user(id).await.map_err(domain_to_status)?.into_iter().map(grant_to_proto).collect();
-		Ok(Response::new(if relying_party { for_relying_party(profile) } else { profile }))
+		let resolved = self.effective_role_of(&user).await;
+		let mut profile = user_to_proto(&user, resolved);
+		profile.permissions = self.permissions_of(id, resolved.role, relying_party.as_deref()).await.map_err(domain_to_status)?;
+		Ok(Response::new(if relying_party.is_some() { for_relying_party(profile) } else { profile }))
 	}
 
 	async fn update_profile(&self, request: Request<UpdateProfileRequest>) -> Result<Response<UserProfile>, Status> {
@@ -314,7 +329,7 @@ impl UserDirectory for Directory {
 	}
 
 	async fn revoke_tokens(&self, request: Request<RevokeTokensRequest>) -> Result<Response<RevokeTokensResponse>, Status> {
-		require_permission(self, &request, Permission::UserRevoke).await?;
+		require_permission(self, &request, Users::Revoke).await?;
 		let actor = self.acting_operator(&request).await?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
@@ -338,7 +353,7 @@ impl UserDirectory for Directory {
 	async fn disable_user(&self, request: Request<DisableUserRequest>) -> Result<Response<DisableUserResponse>, Status> {
 		// Still gated, so the refusal never becomes a way for an unauthorized caller to
 		// probe which user ids exist.
-		require_permission(self, &request, Permission::UserSuspend).await?;
+		require_permission(self, &request, Users::Suspend).await?;
 		Err(Status::failed_precondition(
 			"DisableUser is retired because it meant two different things: use UserDirectory.HoldUser to freeze \
 			 this account now (it lapses in 24h unless ratified), or GovernanceService.OpenUserSuspension to \
@@ -355,7 +370,7 @@ impl UserDirectory for Directory {
 	/// [`domain::users::HOLD_TTL_SECS`] unless the owners ratify it, so one actor can stop
 	/// money temporarily and never permanently.
 	async fn hold_user(&self, request: Request<HoldUserRequest>) -> Result<Response<HoldUserResponse>, Status> {
-		require_permission(self, &request, Permission::UserSuspend).await?;
+		require_permission(self, &request, Users::Suspend).await?;
 		let caller = crate::authz::caller_gate(self.users.as_ref(), &request).await?;
 		let actor = caller.id.ok_or_else(|| Status::unauthenticated("subject is not a user id"))?;
 		// The actor's role is NOT taken from `caller` here: the repository reads the
@@ -389,7 +404,7 @@ impl UserDirectory for Directory {
 	/// taken inside the write transaction, not here, for the same TOCTOU reason
 	/// [`Self::set_role`] takes its own there.
 	async fn reinstate_user(&self, request: Request<ReinstateUserRequest>) -> Result<Response<ReinstateUserResponse>, Status> {
-		require_permission(self, &request, Permission::UserSuspend).await?;
+		require_permission(self, &request, Users::Suspend).await?;
 		let actor = self.acting_operator(&request).await?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
@@ -437,7 +452,7 @@ impl UserDirectory for Directory {
 	/// `main.rs` supports, and one in which both KYC routes answer 503 — that person has
 	/// no path to any level on their own account. Seating a second holder is the way out.
 	async fn set_kyc_level(&self, request: Request<SetKycLevelRequest>) -> Result<Response<SetKycLevelResponse>, Status> {
-		require_permission(self, &request, Permission::KycManage).await?;
+		require_permission(self, &request, Kyc::Manage).await?;
 		let actor = self.acting_operator(&request).await?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
@@ -466,7 +481,7 @@ impl UserDirectory for Directory {
 	}
 
 	async fn list_users(&self, request: Request<ListUsersRequest>) -> Result<Response<ListUsersResponse>, Status> {
-		require_permission(self, &request, Permission::UserRead).await?;
+		require_permission(self, &request, Users::Read).await?;
 		let req = request.into_inner();
 		let limit = if req.limit == 0 { 50 } else { (req.limit as i64).clamp(1, 200) };
 		// Truncate rather than reject: the free-text query is a filter, not stored data.
@@ -503,7 +518,7 @@ impl UserDirectory for Directory {
 	}
 
 	async fn get_user(&self, request: Request<GetUserRequest>) -> Result<Response<UserProfile>, Status> {
-		require_permission(self, &request, Permission::UserRead).await?;
+		require_permission(self, &request, Users::Read).await?;
 		let id = parse_target_id(&request.get_ref().user_id)?;
 		let user = self.users.find_by_id(id).await.map_err(domain_to_status)?.ok_or_else(|| Status::not_found("user"))?;
 		Ok(Response::new(user_to_proto(&user, self.effective_role_of(&user).await)))
@@ -535,7 +550,7 @@ impl UserDirectory for Directory {
 	/// consilium had just granted — no floor, no audit, and this module's "exactly two
 	/// writers of `owner`" invariant briefly false.
 	async fn set_role(&self, request: Request<SetRoleRequest>) -> Result<Response<SetRoleResponse>, Status> {
-		require_permission(self, &request, Permission::RoleGrant).await?;
+		require_permission(self, &request, Roles::Grant).await?;
 		let actor = self.acting_operator(&request).await?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
@@ -559,83 +574,103 @@ impl UserDirectory for Directory {
 		}
 	}
 
-	async fn grant_scope(&self, request: Request<GrantScopeRequest>) -> Result<Response<GrantScopeResponse>, Status> {
-		let actor = self.scope_actor(&request).await?;
-		self.charge_scope_write(&actor, "grant")?;
+	async fn grant_permission(&self, request: Request<GrantPermissionRequest>) -> Result<Response<GrantPermissionResponse>, Status> {
+		let actor = self.grant_actor(&request).await?;
+		self.charge_grant_write(&actor, "grant")?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
-		let target = match &req.target {
-			Some(grant_scope_request::Target::UserId(raw)) => parse_scope_target(Some(raw), None),
-			Some(grant_scope_request::Target::Email(raw)) => parse_scope_target(None, Some(raw)),
-			None => parse_scope_target(None, None),
+		let subject = match &req.subject {
+			Some(grant_permission_request::Subject::UserId(raw)) => parse_subject(Some(raw), None),
+			Some(grant_permission_request::Subject::Email(raw)) => parse_subject(None, Some(raw)),
+			None => parse_subject(None, None),
 		}?;
-		let scope = parse_scope(&req.scope)?;
-		let role = ScopeRole::parse(&req.role).map_err(domain_to_status)?;
-		let action = AdminAction::by(actor.id, "scope_granted", &audit).with_reason(&req.reason);
-		match self.scopes.grant(&target, &scope, role, &actor, &action, now_secs()).await.map_err(domain_to_status)? {
-			ScopeGrantOutcome::Granted(grant) => Ok(Response::new(GrantScopeResponse { grant: Some(grant_to_proto(grant)) })),
-			ScopeGrantOutcome::Denied => Err(scope_refused(&actor, "grant", &scope, Some(role))),
+		let target = parse_grant_target(&req.target)?;
+		let action = AdminAction::by(actor.id, "permission_granted", &audit).with_reason(&req.reason);
+		match self.grants.grant(&subject, &target, &actor, &action, now_secs()).await.map_err(domain_to_status)? {
+			GrantOutcome::Granted(grant) => Ok(Response::new(GrantPermissionResponse {
+				grant: Some(permission_grant_to_proto(grant, false)),
+			})),
+			GrantOutcome::Denied => Err(grant_denied(&actor, "grant", target.as_str())),
+			// The rule `HoldUser` and `SetKycLevel` carry: nobody acts on their own account.
+			GrantOutcome::ToSelf => Err(Status::permission_denied("nobody grants to their own account")),
+			GrantOutcome::UnknownTenant => Err(Status::invalid_argument(format!("no tenant owns the `{}` namespace", target.namespace()))),
+			GrantOutcome::UndefinedTarget => Err(Status::invalid_argument(format!("the tenant's catalog defines nothing `{}` names", target.as_str()))),
 			// FAILED_PRECONDITION, as for a hold: a state that can change (reinstate the
 			// account), not a statement about the caller's authority.
-			ScopeGrantOutcome::TargetDisabled => Err(Status::failed_precondition("the account is disabled; reinstate it before granting it access")),
-			ScopeGrantOutcome::AmbiguousEmail => Err(Status::failed_precondition("this email belongs to more than one account; a global admin can grant by user_id")),
-			ScopeGrantOutcome::Ungrantable(why) => Err(scope_ungrantable(&actor, &scope, why)),
+			GrantOutcome::TargetDisabled => Err(Status::failed_precondition("the account is disabled; reinstate it before granting it access")),
+			GrantOutcome::AmbiguousEmail => Err(Status::failed_precondition("this email belongs to more than one account; grant by user_id")),
+			GrantOutcome::Ungrantable(why) => Err(ungrantable(&actor, target.as_str(), why)),
 		}
 	}
 
-	async fn revoke_scope(&self, request: Request<RevokeScopeRequest>) -> Result<Response<RevokeScopeResponse>, Status> {
-		let actor = self.scope_actor(&request).await?;
-		self.charge_scope_write(&actor, "revoke")?;
+	async fn revoke_permission(&self, request: Request<RevokePermissionRequest>) -> Result<Response<RevokePermissionResponse>, Status> {
+		let actor = self.grant_actor(&request).await?;
+		self.charge_grant_write(&actor, "revoke")?;
 		let audit = audit_of(&request);
 		let req = request.into_inner();
-		let target = match &req.target {
-			Some(revoke_scope_request::Target::UserId(raw)) => parse_scope_target(Some(raw), None),
-			Some(revoke_scope_request::Target::Email(raw)) => parse_scope_target(None, Some(raw)),
-			None => parse_scope_target(None, None),
+		let subject = match &req.subject {
+			Some(revoke_permission_request::Subject::UserId(raw)) => parse_subject(Some(raw), None),
+			Some(revoke_permission_request::Subject::Email(raw)) => parse_subject(None, Some(raw)),
+			None => parse_subject(None, None),
 		}?;
-		let scope = parse_scope(&req.scope)?;
-		let action = AdminAction::by(actor.id, "scope_revoked", &audit).with_reason(&req.reason);
-		match self.scopes.revoke(&target, &scope, &actor, &action, now_secs()).await.map_err(domain_to_status)? {
-			ScopeRevokeOutcome::Revoked => Ok(Response::new(RevokeScopeResponse {})),
-			ScopeRevokeOutcome::NotHeld => Err(Status::not_found("the user holds no active grant on this scope")),
-			ScopeRevokeOutcome::Denied => Err(scope_refused(&actor, "revoke", &scope, None)),
+		let target = parse_grant_target(&req.target)?;
+		let action = AdminAction::by(actor.id, "permission_revoked", &audit).with_reason(&req.reason);
+		match self.grants.revoke(&subject, &target, &actor, &action, now_secs()).await.map_err(domain_to_status)? {
+			RevokeOutcome::Revoked => Ok(Response::new(RevokePermissionResponse {})),
+			RevokeOutcome::NotHeld => Err(Status::not_found("the user holds no active grant of this target")),
+			RevokeOutcome::Denied => Err(grant_denied(&actor, "revoke", target.as_str())),
 		}
 	}
 
-	async fn list_scoped_grants(&self, request: Request<ListScopedGrantsRequest>) -> Result<Response<ListScopedGrantsResponse>, Status> {
-		let actor = self.scope_actor(&request).await?;
-		let scope = parse_scope(&request.get_ref().scope)?;
-		let authority = self.scopes.authority(&actor, &scope).await.map_err(domain_to_status)?;
-		if !authority.may_list() {
-			return Err(Status::permission_denied("a scope's grants are listed to a global admin or owner, or to the scope's own admin"));
-		}
-		// Names are staff's to see. A scope admin gets addresses and grants: anything that
-		// says who an address belongs to would turn a grant-then-list into an identity
-		// lookup (banking#447).
-		let names = authority.sees_legal_names();
-		let holders = self.scopes.holders(&scope).await.map_err(domain_to_status)?;
-		Ok(Response::new(ListScopedGrantsResponse {
-			holders: holders
-				.into_iter()
-				.map(|holder| ScopeHolder {
-					grant: Some(grant_to_proto(holder.grant)),
+	async fn list_grants(&self, request: Request<ListGrantsRequest>) -> Result<Response<ListGrantsResponse>, Status> {
+		let actor = self.grant_actor(&request).await?;
+		let namespace = request.into_inner().namespace;
+		// Names are a seat's to see. A delegate gets addresses and grants: anything that says
+		// who an address belongs to would turn a grant-then-list into an identity lookup
+		// (banking#447).
+		let names = match self.grants.authority(&actor, &namespace).await.map_err(domain_to_status)? {
+			GrantAuthority::Seat => true,
+			GrantAuthority::Delegate => false,
+			GrantAuthority::None => return Err(grant_denied(&actor, "list", &namespace)),
+		};
+		let holders = self
+			.grants
+			.holders(&namespace)
+			.await
+			.map_err(domain_to_status)?
+			.ok_or_else(|| Status::not_found("no tenant owns this namespace"))?;
+		let catalog = self.grants.catalog(&namespace).await.map_err(domain_to_status)?;
+		let holders = holders
+			.into_iter()
+			.map(|holder| {
+				let target = parse_grant_target(&holder.grant.target)?;
+				let orphaned = catalog.as_ref().is_none_or(|tenant| target.grants(&tenant.catalog).is_empty());
+				Ok(GrantHolder {
+					grant: Some(permission_grant_to_proto(holder.grant, orphaned)),
 					email: holder.email.unwrap_or_default(),
 					legal_name: holder.legal_name.filter(|_| names).unwrap_or_default(),
 					preferred_name: holder.preferred_name.filter(|_| names).unwrap_or_default(),
 				})
-				.collect(),
-		}))
+			})
+			.collect::<Result<_, Status>>()?;
+		Ok(Response::new(ListGrantsResponse { holders }))
 	}
 }
 
-fn grant_to_proto(grant: ScopedGrantRecord) -> ScopedGrant {
-	ScopedGrant {
+fn permission_grant_to_proto(grant: GrantRecord, orphaned: bool) -> PermissionGrant {
+	PermissionGrant {
+		id: grant.id,
 		user_id: grant.user_id.to_string(),
-		scope: grant.scope.to_string(),
-		role: grant.role.as_str().to_owned(),
+		target: grant.target,
 		granted_by: grant.granted_by.to_string(),
 		granted_at: grant.granted_at,
+		reason: grant.reason.unwrap_or_default(),
+		orphaned,
 	}
+}
+
+fn parse_grant_target(raw: &str) -> Result<Target, Status> {
+	Target::parse(raw).map_err(domain_to_status)
 }
 
 fn user_to_proto(user: &User, resolved: EffectiveRole) -> UserProfile {
@@ -660,7 +695,7 @@ fn user_to_proto(user: &User, resolved: EffectiveRole) -> UserProfile {
 		role_is_break_glass: resolved.break_glass,
 		suspended_by: user.suspension().map(Suspension::as_str).unwrap_or_default().to_owned(),
 		hold_expires_at: user.suspension().and_then(Suspension::hold_expires_at).unwrap_or_default(),
-		scopes: Vec::new(),
+		permissions: Vec::new(),
 	}
 }
 
@@ -676,7 +711,7 @@ fn for_relying_party(profile: UserProfile) -> UserProfile {
 		preferred_name: profile.preferred_name,
 		role: profile.role,
 		role_is_break_glass: profile.role_is_break_glass,
-		scopes: profile.scopes,
+		permissions: profile.permissions,
 		..UserProfile::default()
 	}
 }

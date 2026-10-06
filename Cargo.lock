@@ -663,6 +663,7 @@ dependencies = [
  "axum-extra",
  "base64 0.22.1",
  "color-eyre",
+ "concierge_iam",
  "domain",
  "dotenvy",
  "ev_lib",
@@ -1558,6 +1559,7 @@ dependencies = [
 name = "domain"
 version = "0.1.0"
 dependencies = [
+ "concierge_iam",
  "ev_lib",
  "getrandom 0.4.3",
  "serde",
