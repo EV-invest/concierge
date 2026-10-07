@@ -186,8 +186,12 @@ impl WebSessions {
 		Ok(self.store.load(id).await?.map(|s| s.refresh_token))
 	}
 
-	/// Drop the session, returning its refresh token for upstream revocation.
+	/// Drop the session, returning its refresh token for upstream revocation. Waits
+	/// out an in-flight [`Self::fresh`]: otherwise its save re-creates the session
+	/// after this delete, and the token returned here is the one that refresh just
+	/// rotated away from.
 	pub async fn forget(&self, id: &str) -> color_eyre::Result<Option<String>> {
+		let _flight = self.locks.acquire(id.to_string()).await;
 		self.store.remove(id).await
 	}
 }
