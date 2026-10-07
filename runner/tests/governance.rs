@@ -1042,7 +1042,7 @@ const BANKING_EVM: &str = "0x52908400098527886E0F7030069857D2E4169EE7";
 
 /// The phishing payload of #96: a holder of the bridge token used to be able to put a
 /// host, an address or a phone number into the subject line and the From/To rows of a
-/// genuine consent or approval mail. Every field refuses it, and nothing is queued.
+/// genuine consent, approval or outcome mail. Every field refuses it, and nothing is queued.
 #[tokio::test]
 async fn payment_mails_refuse_a_host_an_address_or_a_number_to_call() {
 	let Some(fx) = setup().await else {
@@ -1071,6 +1071,17 @@ async fn payment_mails_refuse_a_host_an_address_or_a_number_to_call() {
 		edit(request.payment_approval.as_mut().unwrap());
 		request
 	};
+	// The outcome mails carry the same tuple, built by banking from the same helpers (#106).
+	let outcome_with = |kind: GovernanceMailKind, edit: &dyn Fn(&mut PayoutOutcomeMail)| {
+		let mut request = payment_outcome(owner, kind);
+		edit(request.payout_outcome.as_mut().unwrap());
+		request
+	};
+	let consent_outcome_with = |edit: &dyn Fn(&mut PaymentOutcomeMail)| {
+		let mut request = consent_outcome(investor, investor, "TOKEN_BURNED");
+		edit(request.payment_outcome.as_mut().unwrap());
+		request
+	};
 	for lure in lures {
 		for (request, field) in [
 			(consent_with(&|m| m.amount = lure.into()), "consent amount"),
@@ -1079,6 +1090,13 @@ async fn payment_mails_refuse_a_host_an_address_or_a_number_to_call() {
 			(approval_with(&|m| m.amount = lure.into()), "approval amount"),
 			(approval_with(&|m| m.source = lure.into()), "approval source"),
 			(approval_with(&|m| m.destination = lure.into()), "approval destination"),
+			(outcome_with(GovernanceMailKind::PayoutOutcome, &|m| m.amount = lure.into()), "outcome amount"),
+			(outcome_with(GovernanceMailKind::PayoutOutcome, &|m| m.source = lure.into()), "outcome source"),
+			(outcome_with(GovernanceMailKind::PayoutOutcome, &|m| m.destination = lure.into()), "outcome destination"),
+			(outcome_with(GovernanceMailKind::ApprovalTokenBurned, &|m| m.amount = lure.into()), "burn notice amount"),
+			(outcome_with(GovernanceMailKind::ApprovalTokenBurned, &|m| m.destination = lure.into()), "burn notice destination"),
+			(consent_outcome_with(&|m| m.source = lure.into()), "consent outcome source"),
+			(consent_outcome_with(&|m| m.destination = lure.into()), "consent outcome destination"),
 		] {
 			let key = request.dedupe_key.clone();
 			let err = fx.relay().send_governance_mail(relayed(request)).await.unwrap_err();
@@ -1155,6 +1173,22 @@ async fn payment_mails_accept_every_shape_banking_sends() {
 			fx.relay().send_governance_mail(relayed(request)).await.is_ok(),
 			"approval {source:?} -> {destination:?} of {amount:?}"
 		);
+		// banking's `outcome_of` builds the verdict's tuple from the same helpers (#106).
+		for kind in [GovernanceMailKind::PayoutOutcome, GovernanceMailKind::ApprovalTokenBurned] {
+			let mut request = payment_outcome(owner, kind);
+			let mail = request.payout_outcome.as_mut().unwrap();
+			(mail.source, mail.destination, mail.amount) = (source.clone(), destination.clone(), amount.clone());
+			assert!(
+				fx.relay().send_governance_mail(relayed(request)).await.is_ok(),
+				"{kind:?} {source:?} -> {destination:?} of {amount:?}"
+			);
+		}
+	}
+	// A consent's ending names the ends as the consent did.
+	for end in &ends {
+		let mut request = consent_outcome(investor, investor, "TOKEN_BURNED");
+		request.payment_outcome.as_mut().unwrap().destination = end.clone();
+		assert!(fx.relay().send_governance_mail(relayed(request)).await.is_ok(), "consent outcome to {end:?}");
 	}
 }
 
@@ -1202,11 +1236,11 @@ fn payment_outcome(addressee: UserId, kind: GovernanceMailKind) -> SendGovernanc
 			outcome: "EXECUTED".into(),
 			network: String::new(),
 			address: String::new(),
-			amount: "25 000.00 USDT".into(),
+			amount: "25000".into(),
 			detail: "Settled as one ledger transfer.".into(),
 			tier: "service".into(),
-			source: "Piggybank — fund treasury".into(),
-			destination: "Quy Nhon Fund — pooled funds".into(),
+			source: "the fund allocation".into(),
+			destination: "the quy-nhon product (Quy Nhon Fund)".into(),
 			reason: "Seed the pooled balance for Q3".into(),
 			fund: String::new(),
 			current: None,
@@ -1438,7 +1472,7 @@ async fn a_payment_outcome_rides_the_outcome_payload() {
 		);
 		let payload = fx.payload(&key).await;
 		assert_eq!(payload["tier"], "service");
-		assert_eq!(payload["destination"], "Quy Nhon Fund — pooled funds");
+		assert_eq!(payload["destination"], "the quy-nhon product (Quy Nhon Fund)");
 		assert_eq!(payload["network"], "", "the rail pair stays empty, which is how the renderer tells the two apart");
 	}
 
@@ -2236,8 +2270,8 @@ fn consent_outcome(addressee: UserId, subject: UserId, outcome: &str) -> SendGov
 			outcome: outcome.into(),
 			reason: reason.into(),
 			tier: "external".into(),
-			source: "Quy Nhon Fund — distributions".into(),
-			destination: "Your bank account ••4417".into(),
+			source: format!("investor {BANKING_INVESTOR}"),
+			destination: format!("{BANKING_EVM} on polygon"),
 			amount: "1 200.00 USDT".into(),
 			payment_id: "7d7a1f0e-3f0b-4c1e-9a55-2b6f1e0c9d42".into(),
 		}),
@@ -2423,7 +2457,7 @@ async fn a_payment_outcome_leaves_an_inbox_trace_for_the_subject_only() {
 	assert_eq!((topic.as_str(), kind.as_str()), ("account:money-movement", "payment_outcome"));
 	assert_eq!(title, "Your payment consent link was locked");
 	assert!(body.contains("1 200.00 USDT"), "the entry says which payment: {body}");
-	for foreign in ["WRONG_CODES", "Quy Nhon Fund — distributions", "Your bank account ••4417"] {
+	for foreign in ["WRONG_CODES", BANKING_INVESTOR, BANKING_EVM] {
 		assert!(!body.contains(foreign), "the money plane's text is not shown where it cannot be attributed: {foreign}");
 	}
 	assert_eq!(fx.inbox_keys(investor).await, vec![format!("governance:{key}")]);
