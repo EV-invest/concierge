@@ -135,6 +135,79 @@ async fn fresh_falls_back_to_the_stored_summary_when_the_directory_is_down() {
 	sessions.forget(&id).await.unwrap();
 }
 
+/// Issuance stand-in whose refresh is slow and rotates the token, to hold `fresh`
+/// in flight while the reader signs out.
+struct SlowRefresh;
+
+impl PrincipalSource for SlowRefresh {
+	async fn principal(&self, _user_id: &str) -> Result<UserSummary, AuthError> {
+		unreachable!("a refresh response already carries the live user")
+	}
+}
+
+#[tonic::async_trait]
+impl AuthRpc for SlowRefresh {
+	async fn refresh(&self, _: Request<RefreshRequest>) -> Result<Response<TokenResponse>, Status> {
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+		let mut t = tokens("web-sess-signout-race-user");
+		t.refresh_token = "family.rotated".into();
+		Ok(Response::new(t))
+	}
+
+	async fn exchange(&self, _: Request<ExchangeRequest>) -> Result<Response<TokenResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn logout(&self, _: Request<LogoutRequest>) -> Result<Response<LogoutResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn list_sessions(&self, _: Request<ListSessionsRequest>) -> Result<Response<ListSessionsResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn revoke_session(&self, _: Request<RevokeSessionRequest>) -> Result<Response<RevokeSessionResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn exchange_code(&self, _: Request<ExchangeCodeRequest>) -> Result<Response<ClientTokenResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn refresh_client_token(&self, _: Request<RefreshClientTokenRequest>) -> Result<Response<ClientTokenResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn publish_catalog(&self, _: Request<PublishCatalogRequest>) -> Result<Response<PublishCatalogResponse>, Status> {
+		unreachable!()
+	}
+
+	async fn jwks(&self, _: Request<JwksRequest>) -> Result<Response<JwksResponse>, Status> {
+		unreachable!()
+	}
+}
+
+// Signing out while a refresh is in flight must neither resurrect the session nor
+// revoke upstream with the token that refresh just rotated away from.
+#[tokio::test]
+async fn forget_waits_for_an_inflight_refresh_and_ends_the_session() {
+	let sessions = WebSessions::from_env().await.unwrap();
+	let mut expiring = tokens("web-sess-signout-race-user");
+	expiring.access_expires_at = 0;
+	let (id, ..) = sessions.put(expiring).await.unwrap().expect("token pair carries a user");
+
+	let refreshing = sessions.fresh(&id, &SlowRefresh);
+	let signing_out = async {
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		sessions.forget(&id).await.unwrap()
+	};
+	let (fresh, forgotten) = tokio::join!(refreshing, signing_out);
+
+	assert!(fresh.unwrap().is_some(), "the refresh was already in flight and completes");
+	assert_eq!(forgotten.as_deref(), Some("family.rotated"), "upstream must be told the CURRENT token");
+	assert!(sessions.fresh(&id, &SlowRefresh).await.unwrap().is_none(), "the session must be dead after sign-out");
+}
+
 #[tokio::test]
 async fn sessions_survive_a_restart() {
 	if std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty()).is_none() {
