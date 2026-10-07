@@ -1357,10 +1357,10 @@ impl MailRelayService for MailRelay {
 			// A burned approval token is an outcome the owners are told about, and the
 			// outcome payload already carries everything that mail needs to say. The
 			// payout fields keep `bounded` (a live contract); the payment tuple added
-			// later is held to `line` like every other payment field, the fee terms
-			// added after that to the fee approval's rules, and the mark to the amount's,
-			// so the money plane learns one rule per field across every kind that
-			// carries it.
+			// later is held to the payment approval's shapes — banking builds both from
+			// the same helpers (#106) — the fee terms added after that to the fee
+			// approval's rules, and the mark to the amount's, so the money plane learns
+			// one rule per field across every kind that carries it.
 			Ok(GovernanceMailKind::PayoutOutcome) | Ok(GovernanceMailKind::ApprovalTokenBurned) => {
 				let mail = req.payout_outcome.ok_or_else(|| Status::invalid_argument("payout_outcome is required for this kind"))?;
 				let outcome = bounded(&mail.outcome, 64, "outcome")?;
@@ -1399,13 +1399,15 @@ impl MailRelayService for MailRelay {
 					// Subject-line fields, under the payout approval's rule.
 					"network": no_link(&bounded(&mail.network, 64, "network")?, "network")?,
 					"address": bounded(&mail.address, 128, "address")?,
-					"amount": no_link(&bounded(&mail.amount, 64, "amount")?, "amount")?,
+					// A payment's amount takes the payment approval's shape; a payout's keeps
+					// its live contract.
+					"amount": if names_a_payment { payment_amount(&mail.amount)? } else { no_link(&bounded(&mail.amount, 64, "amount")?, "amount")? },
 					"detail": bounded(&mail.detail, 500, "detail")?,
 					// Empty for a payout; the burn notice over a payment or over fee terms
 					// carries no reason.
 					"tier": if mail.tier.is_empty() { String::new() } else { payment_tier(&mail.tier)? },
-					"source": line(&mail.source, 160, "source")?,
-					"destination": line(&mail.destination, 160, "destination")?,
+					"source": if names_a_payment { payment_end(&mail.source, "source")? } else { String::new() },
+					"destination": if names_a_payment { payment_end(&mail.destination, "destination")? } else { String::new() },
 					"reason": line(&mail.reason, 500, "reason")?,
 					// Empty and null for a payout and for a payment. `fund` is what the mail is
 					// about, so it must say something and, as in the fee approval, must not be
@@ -1537,7 +1539,7 @@ impl MailRelayService for MailRelay {
 			// A payment that died waiting for its subject's consent. Nothing here is a secret
 			// and no money-plane text reaches a sentence: the ending and its reason are closed
 			// words this plane phrases, the amount must read as money, and the two ends of the
-			// transfer are values in a box, refused if they carry a link.
+			// transfer are the platform's own labels, as in the consent it ends (#106).
 			Ok(GovernanceMailKind::PaymentOutcome) => {
 				let mail = req.payment_outcome.ok_or_else(|| Status::invalid_argument("payment_outcome is required for this kind"))?;
 				let subject = parse_user_id(&mail.subject_user_id, "subject_user_id")?;
@@ -1572,8 +1574,8 @@ impl MailRelayService for MailRelay {
 					"outcome": mail.outcome,
 					"reason": mail.reason,
 					"tier": payment_tier(&mail.tier)?,
-					"source": no_url(&line(&mail.source, 160, "source")?, "source")?,
-					"destination": no_url(&line(&mail.destination, 160, "destination")?, "destination")?,
+					"source": payment_end(&mail.source, "source")?,
+					"destination": payment_end(&mail.destination, "destination")?,
 					"amount": amount,
 					"payment_id": payment_id.to_string(),
 				});
