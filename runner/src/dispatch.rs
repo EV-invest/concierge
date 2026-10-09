@@ -251,8 +251,29 @@ pub(crate) fn governance_mail(kind: &str, payload: &serde_json::Value, cabinet_u
 /// Render one claimed job. `None` when the row references data that has since gone,
 /// which is treated as a permanent failure rather than retried forever.
 fn render(job: &crate::infrastructure::notifications::DeliveryJob, cfg: &DispatcherConfig) -> Option<OutgoingEmail> {
+	if job.kind == "email_code" {
+		let payload = job.payload.as_ref()?;
+		let sign_in = match text_field(payload, "purpose").as_str() {
+			"login" => true,
+			"verify" => false,
+			_ => return None,
+		};
+		let code = text_field(payload, "code");
+		if code.is_empty() {
+			return None;
+		}
+		let rendered = templates::email_code(sign_in, &code, int_field(payload, "expires_at"));
+		return Some(OutgoingEmail {
+			to: job.recipient.clone(),
+			subject: rendered.subject,
+			html: rendered.html,
+			text: rendered.text,
+			unsubscribe_url: String::new(),
+		});
+	}
+
 	let origin = cfg.public_origin.trim_end_matches('/');
-	let unsubscribe_url = format!("{origin}/notifications/unsubscribe?token={}", job.unsubscribe_token);
+	let unsubscribe_url = format!("{origin}/notifications/unsubscribe?token={}", job.unsubscribe_token.as_deref()?);
 
 	// Governance mail carries NO unsubscribe target, so the transport sets no
 	// List-Unsubscribe header: a security mail a recipient can switch off is not one.
@@ -355,14 +376,18 @@ pub async fn drain_once(repo: &dyn NotificationDispatchRepository, transport: &d
 }
 
 /// The dispatcher loop. Spawned by the composition root; runs until the process ends.
-pub async fn run_dispatcher(repo: Arc<dyn NotificationDispatchRepository>, transport: Arc<dyn EmailTransport>, cfg: DispatcherConfig) {
+/// `wake` cuts a sleep short: a sign-in code is waited on by somebody at a keyboard.
+pub async fn run_dispatcher(repo: Arc<dyn NotificationDispatchRepository>, transport: Arc<dyn EmailTransport>, cfg: DispatcherConfig, wake: Arc<tokio::sync::Notify>) {
 	tracing::info!(interval_secs = cfg.interval.as_secs(), daily_budget = cfg.daily_budget, "notification dispatcher started");
 	loop {
 		// A full batch means there is probably more behind it — keep going rather than
 		// sleeping a whole interval per 25 messages when a backlog is draining.
 		let claimed = drain_once(repo.as_ref(), transport.as_ref(), &cfg).await;
 		if claimed < BATCH as usize {
-			tokio::time::sleep(cfg.interval).await;
+			tokio::select! {
+				_ = tokio::time::sleep(cfg.interval) => {}
+				_ = wake.notified() => {}
+			}
 		}
 	}
 }

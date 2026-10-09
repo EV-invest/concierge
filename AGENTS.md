@@ -87,7 +87,7 @@ retired in favour of `HoldUser` plus `GovernanceService.OpenUserSuspension`.
 | Bring-up · `nix run` apps (`concierge` — applies DB migrations on boot, `db`) · migrations applied on boot, authored with sqlx-cli · dev shell | [`flake.nix`](./flake.nix) |
 | Workspace, crate graph | [`Cargo.toml`](./Cargo.toml) |
 | `runner` — the modular monolith: ONE binary (composition root) mounting the internal modules **auth**, **directory**, **bridge** (cross-plane producer), **governance** (the consilia: owner admission/removal, the user proposals over suspension/reinstatement/`admin`, + the money plane's mail relay), **platform** (platform/cabinet config: maintenance mode · announcement banner · feature flags), **notification**, **log**. `directory` + `bridge` + `governance` + `platform` + `notification` are live; `log` is a DEFERRED stub | [`runner/`](./runner) |
-| `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Google OAuth code+PKCE · Redis-backed refresh rotation with reuse detection · `Exchange`/`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port) provisioning users to the directory over an in-process `Provisioner` channel, **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
+| `evconcierge_auth` — the real `AuthService` issuance surface (Ed25519 signer · JWKS · Redis-backed refresh rotation with reuse detection · `Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party `ExchangeCode`/`RefreshClientToken` over the runner's `ClientGrants` port, plus `open_session` for the web surface's sign-ins) reading accounts from the directory over an in-process `Provisioner` channel, the closed `oauth::OAuthProvider` set (Google, GitHub — code + PKCE), **plus** the stateless token-verification flow imported by downstream service repos by git. No-op-until-configured: with no signing key it runs inert | [`auth/`](./auth) |
 | gRPC contracts — `proto/concierge/v1/` (source of truth) → Rust stubs via `tonic-build`. `evconcierge_auth` depends on `contracts`; not vice-versa | [`contracts/`](./contracts) |
 | Shared identity types · DDD building blocks (`ev::architecture`) | [`domain/src/`](./domain/src) |
 | `concierge_iam` (+ `_derive`) — permission scopes: `#[derive(Permission)]` enums, `alias!`, the concrete `PermissionSet` a service asks `may` of, `Pattern` containment, the `Catalog` a tenant publishes. I/O-free, wasm-safe, published to crates.io so consumers need no protoc | [`iam/`](./iam) |
@@ -153,6 +153,48 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   banner, feature flags) behind the shared RBAC gate (`authz`). `notification` and
   `log` stay DEFERRED stubs (`tonic::Status::unimplemented`); their application
   layers are placeholders to grow into. Health returns `"ok"`.
+- **Every sign-in method lands in ONE rule, and a proven mailbox is the link.** The web
+  surface signs in by Google or GitHub (`/auth/login?provider=`, `/callback/auth/{provider}`),
+  by an emailed code (`/auth/code/{request,verify}`) or by a password
+  (`/auth/password/{signup,signin}`); there is no sign-in RPC (`Exchange` is gone). Every
+  method but the password produces a `ProvenIdentity` and `UserDirectoryRepository::resolve`
+  turns it into an account under advisory locks on the subject and the mailbox: a linked
+  provider subject (`user_identities`) opens its account; else a PROVEN mailbox opens the
+  account it is verified on; else it TAKES OVER the account that registered it unverified
+  with a password — sessions revoked, password dropped, audited `taken_over_by_mailbox` —
+  because that registration may be a squat waiting for the owner (pre-hijack); else a new
+  account, verified iff the mailbox was proven. A provider address never moves onto a
+  mailbox another account proved. This is why `users_verified_email_idx` makes a VERIFIED
+  address unique (0029 reversed 0001's "email is NOT unique" for verified rows only;
+  unverified duplicates stay legal). `users.auth_subject` is now the account's opaque,
+  immutable cross-plane subject — a Google `sub` on accounts made before 0029, the account
+  id on later ones — and is never parsed; banking keys on it unchanged. The previous binary
+  provisions by `auth_subject`, so 0029's `users_mirror_google_subject` trigger mirrors its
+  inserts into `user_identities` and refuses one whose sub this binary already linked; it is
+  dropped once no older binary runs. The credential POSTs carry no session to double-submit
+  against, so they check `Origin` against `PUBLIC_ORIGIN` (login CSRF), and the ones that
+  cost a mail or test a password check a Cloudflare Turnstile token server-side
+  (`TURNSTILE_SECRET`, required in every environment — development runs Cloudflare's
+  always-pass test secret, and there is no arm that skips the check). Codes are six digits,
+  SHA-256 bound to their row at rest, ten minutes, attempts counted before the
+  constant-time compare and burned on the fifth wrong guess, superseded by a newer one,
+  and capped at five sends per address per 15 minutes counted IN THE TABLE (replicas
+  share it); the plaintext rides only the `email_code` delivery's payload. Asking for a code
+  answers alike for every address: whether an account exists is decided once the code
+  proves the mailbox. A password (argon2id) signs up an UNVERIFIED account that works at
+  once ("verify my email now" mails a code; `/auth/email/verify/{request,confirm}` later);
+  sign-up refuses an address that backs a password or is verified somewhere, which tells
+  the caller an account exists and is accepted. Sign-in answers one `invalid_credentials`
+  for a wrong password and a missing account alike (a decoy hash keeps the timing equal);
+  ten failures lock the PASSWORD for 15 minutes and never the code path, so nobody locks an
+  owner out of their account by guessing at it. Setting a password spends a verification
+  code, so a stolen session cannot plant a credential that outlives its revocation; "forgot
+  password" is a code sign-in. An account handle is an email OR a username, through one
+  resolver (`infrastructure::users::account_named`): an email names the accounts it is
+  verified on or backs a password of, and only when it names none is the handle read as a
+  username — a chosen username matches `[a-z0-9_.-]{3,32}` and never contains `@`, a
+  default one is the local part, else the whole address, else none. Nothing ever requires
+  the username.
 - **KYC has exactly one writer**: the `User` aggregate's `set_kyc_level` and the
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
   banking's mirror). Two ENTRY POINTS reach it, and they differ in what they
@@ -171,7 +213,10 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   downgrade of it need a second seated holder. It is NOT unconditional in RANGE: the aggregate refuses anything above
   `domain::users::MAX_KYC_LEVEL` (3), and the `users_kyc_level_range` CHECK refuses it
   again at the column — the range belongs to the record, not to the one handler that
-  happened to check it. `user_outbox.kyc_level` carries the same CHECK, `NOT VALID` on
+  happened to check it. A level above 0 needs a VERIFIED email the same way — the aggregate
+  refuses (`FAILED_PRECONDITION`) and `users_kyc_needs_verified_email` refuses it again —
+  because a tier is granted to a person and an unproven address hands it to whoever holds
+  the mailbox. `user_outbox.kyc_level` carries the same CHECK, `NOT VALID` on
   purpose: it is the copy banking mirrors, so future appends are bounded while the log
   keeps reporting what it reported. `users.raise_kyc_level_to` is the vendor path: it is MONOTONIC, and the
   "is this actually a raise?" comparison is taken inside the write transaction from
@@ -432,7 +477,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   (`support::authenticate_service`), the Didit webhook HMAC (`infrastructure::kyc::didit`),
   the consilium self-decision code (`infrastructure::governance`), the refresh-token secret
   (`evconcierge_auth::management`), a relying party's client secret and refresh secret
-  (`relying_party`, both compared as fixed-width digests) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
+  (`relying_party`, both compared as fixed-width digests), an emailed sign-in or verification
+  code (`infrastructure::credentials`) and the `x-ev-csrf` token (`web::routes::verify_csrf`).
   Whether any one of them is a practical timing oracle is not the test — a plane that
   states this discipline and then has one check quietly doing `!=` (#52) is a plane whose
   next reader takes the exception for the rule. The CSRF check is also the STRICTER of the
@@ -495,7 +541,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   nothing. Nothing grants anything in `iam`/`concierge`/`bank`/`seat`, so no grant can reach a
   seat's permissions, and NOBODY grants to their own account (`grants_not_to_self`, the rule
   `HoldUser` and `SetKycLevel` carry) — a grant made to oneself would outlive the seat that
-  made it. Seats holding `iam:tenants:grant` grant any target; a tenant decides whether such a
+  made it. Every seat is an account first and holds its own record (`concierge:self:*`,
+  `bank:self:*`, one per cabinet section), so "needs an account" is a permission and not a
+  special case: a GUEST is a principal too — `SEAT_GUEST`, never persisted and not a `Role`
+  (that word crosses the bridge) — and holds what that alias lists. `/auth/session` answers
+  `permissions` for both, the guest's when nobody is signed in. A guest carries no token: it
+  owns nothing server-side, and a zone backend keeps refusing it 401 exactly as before, which
+  is what keeps a guest from ever being handed a money token. Seats holding `iam:tenants:grant` grant any target; a tenant decides whether such a
   seat also HOLDS every permission of its namespace without a row
   (`tenants.granting_seats_hold_all`: `sa` says yes, keeping "the global admin is the panel's
   admin"; a tenant with PII to protect says no and its admins are granted like anyone). The
@@ -522,12 +574,12 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   (`sa:admin` → `sa:operator`), and an alias that is delegated may delegate nothing itself:
   a holder can never mint a peer, nor someone who could. Delegated grants are access to one
   tenant's surface and never money — rights over an allocation's MONEY are banking's own.
-  A delegate names the subject only by EMAIL, never by user id: ids are visible to them
-  (`granted_by`), and granting a bare id then reading the roster would make them a lookup
-  service for anyone's address. Revoking takes either form — the answer depends only on a
-  grant they can list — and the roster they see (`ListGrants`) carries email and grant
-  only: no `legal_name`, no `preferred_name`. An email held by several accounts names
-  nobody, and a disabled or held account is not granted. A seat hears which (`NOT_FOUND`
+  A delegate names the subject only by ACCOUNT HANDLE (an email or a username, resolved by
+  `account_named`), never by user id: ids are visible to them (`granted_by`), and granting a
+  bare id then reading the roster would make them a lookup service for anyone's address.
+  Revoking takes either form — the answer depends only on a grant they can list — and the
+  roster they see (`ListGrants`) carries email, username and grant only: no `legal_name`,
+  no `preferred_name`. A handle naming several accounts names nobody, and a disabled or held account is not granted. A seat hears which (`NOT_FOUND`
   for no account, `FAILED_PRECONDITION` with the reason otherwise); a delegate hears ONE
   `FAILED_PRECONDITION("this address cannot be granted access")` for all three, and a
   revoke answers one `NOT_FOUND` for everything — otherwise a grant is an oracle for

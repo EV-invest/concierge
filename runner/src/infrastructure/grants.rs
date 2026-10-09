@@ -29,7 +29,7 @@ use domain::{
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::users::{AdminAction, record_action};
+use super::users::{AdminAction, Named, account_named, record_action};
 use crate::ports::{
 	GrantActor, GrantAuthority, GrantHolderRecord, GrantOutcome, GrantRecord, GrantRepository, GrantSubject, PublishOutcome, RevokeOutcome, TenantCatalog, UngrantableAddress,
 };
@@ -62,6 +62,7 @@ struct HolderRow {
 	#[sqlx(flatten)]
 	grant: GrantRow,
 	email: Option<String>,
+	username: Option<String>,
 	legal_name: Option<String>,
 	preferred_name: Option<String>,
 }
@@ -160,40 +161,10 @@ fn acting_role(actor: &GrantActor, standing: Option<Standing>) -> Option<Role> {
 	Some(if actor.elevated { Role::Owner } else { standing.role })
 }
 
-/// The id a subject names, if any account holds it. An email may belong to several
-/// accounts (`users.email` is deliberately not unique), and picking one of them would
-/// grant access to whichever sorted first.
-enum Resolved {
-	One(UserId),
-	None,
-	Ambiguous,
-}
-
-impl Resolved {
-	fn id(&self) -> Option<UserId> {
-		match self {
-			Self::One(id) => Some(*id),
-			Self::None | Self::Ambiguous => None,
-		}
-	}
-}
-
-async fn resolve_subject(conn: &mut PgConnection, subject: &GrantSubject) -> Result<Resolved, DomainError> {
+async fn resolve_subject(conn: &mut PgConnection, subject: &GrantSubject) -> Result<Named, DomainError> {
 	match subject {
-		GrantSubject::Id(id) => Ok(Resolved::One(*id)),
-		GrantSubject::Email(email) => {
-			// Stored normalized by `Email::parse`, so an equality is the case-insensitive match.
-			let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1 LIMIT 2")
-				.bind(email.as_str())
-				.fetch_all(&mut *conn)
-				.await
-				.map_err(repo_err)?;
-			Ok(match ids.as_slice() {
-				[] => Resolved::None,
-				[id] => Resolved::One(UserId::from_raw(*id)),
-				_ => Resolved::Ambiguous,
-			})
-		}
+		GrantSubject::Id(id) => Ok(Named::One(*id)),
+		GrantSubject::Account(handle) => account_named(conn, handle).await,
 	}
 }
 
@@ -301,9 +272,9 @@ impl GrantRepository for PgGrants {
 		let told_why = authority == GrantAuthority::Seat;
 		let subject_standing = resolved.id().and_then(|id| standing_in(&locked, id));
 		let (user_id, standing) = match (resolved, subject_standing) {
-			(Resolved::Ambiguous, _) if told_why => return Ok(GrantOutcome::AmbiguousEmail),
-			(Resolved::Ambiguous, _) => return Ok(GrantOutcome::Ungrantable(UngrantableAddress::SharedByAccounts)),
-			(Resolved::One(id), Some(standing)) => (id, standing),
+			(Named::Several, _) if told_why => return Ok(GrantOutcome::AmbiguousAccount),
+			(Named::Several, _) => return Ok(GrantOutcome::Ungrantable(UngrantableAddress::SharedByAccounts)),
+			(Named::One(id), Some(standing)) => (id, standing),
 			_ if told_why =>
 				return Err(DomainError::NotFound {
 					entity: "user",
@@ -399,7 +370,7 @@ impl GrantRepository for PgGrants {
 			return Ok(None);
 		}
 		let rows = sqlx::query_as::<_, HolderRow>(
-			"SELECT g.id, g.user_id, g.target, g.granted_by, g.granted_at, g.reason, u.email, u.legal_name, u.preferred_name \
+			"SELECT g.id, g.user_id, g.target, g.granted_by, g.granted_at, g.reason, u.email, u.username, u.legal_name, u.preferred_name \
 			 FROM grants g JOIN users u ON u.id = g.user_id \
 			 WHERE g.namespace = $1 AND g.revoked_at IS NULL \
 			 ORDER BY g.granted_at, g.id",
@@ -413,6 +384,7 @@ impl GrantRepository for PgGrants {
 				.map(|row| GrantHolderRecord {
 					grant: row.grant.into(),
 					email: row.email,
+					username: row.username,
 					legal_name: row.legal_name,
 					preferred_name: row.preferred_name,
 				})

@@ -44,8 +44,10 @@ pub struct AuthConfig {
 	pub service_ttl_secs: u64,
 	/// Signing/verification key material. `None` ⇒ auth disabled (dev/CI).
 	pub signing: Option<SigningConfig>,
-	/// Google OAuth2 client credentials. `None` ⇒ the `Exchange` route is disabled.
-	pub google: Option<GoogleConfig>,
+	/// `GOOGLE_CLIENT_ID`/`_SECRET`. `None` ⇒ no Google sign-in.
+	pub google: Option<OAuthClientConfig>,
+	/// `GITHUB_CLIENT_ID`/`_SECRET`. `None` ⇒ no GitHub sign-in.
+	pub github: Option<OAuthClientConfig>,
 }
 impl AuthConfig {
 	pub fn from_env() -> Result<Self> {
@@ -57,13 +59,8 @@ impl AuthConfig {
 			}),
 			_ => None,
 		};
-		let google = match (
-			env::var("GOOGLE_CLIENT_ID").ok().filter(|s| !s.is_empty()),
-			env::var("GOOGLE_CLIENT_SECRET").ok().filter(|s| !s.is_empty()),
-		) {
-			(Some(client_id), Some(client_secret)) => Some(GoogleConfig { client_id, client_secret }),
-			_ => None,
-		};
+		let google = OAuthClientConfig::from_env("GOOGLE")?;
+		let github = OAuthClientConfig::from_env("GITHUB")?;
 		let config = Self {
 			issuer: env::var("AUTH_ISSUER").unwrap_or_else(|_| "https://auth.concierge.ev".to_string()),
 			client_audience: env::var("AUTH_CLIENT_AUDIENCE").unwrap_or_else(|_| "concierge".to_string()),
@@ -75,6 +72,7 @@ impl AuthConfig {
 			service_ttl_secs: parse_secs("AUTH_SERVICE_TTL_SECS", 300)?,
 			signing,
 			google,
+			github,
 		};
 		config.assert_plane()?;
 		Ok(config)
@@ -107,12 +105,23 @@ pub struct SigningConfig {
 	/// `kid` and any retired-but-still-valid keys (make-before-break rotation).
 	pub jwks_json: String,
 }
-/// Google OAuth2 confidential-client credentials. `Debug` is hand-written to redact
-/// the client secret (same footgun as [`SigningConfig`]).
+/// An OAuth2 confidential client's credentials. `Debug` is hand-written to redact the
+/// client secret (same footgun as [`SigningConfig`]).
 #[derive(Clone)]
-pub struct GoogleConfig {
+pub struct OAuthClientConfig {
 	pub client_id: String,
 	pub client_secret: String,
+}
+impl OAuthClientConfig {
+	/// `<PREFIX>_CLIENT_ID` + `<PREFIX>_CLIENT_SECRET`: both or neither.
+	fn from_env(prefix: &str) -> Result<Option<Self>> {
+		let read = |suffix: &str| env::var(format!("{prefix}_{suffix}")).ok().filter(|s| !s.is_empty());
+		match (read("CLIENT_ID"), read("CLIENT_SECRET")) {
+			(Some(client_id), Some(client_secret)) => Ok(Some(Self { client_id, client_secret })),
+			(None, None) => Ok(None),
+			_ => color_eyre::eyre::bail!("{prefix}_CLIENT_ID and {prefix}_CLIENT_SECRET are set together or not at all"),
+		}
+	}
 }
 /// Configuration a **downstream service** uses to build a [`Verifier`](crate::verifier::Verifier).
 #[derive(Clone, Debug)]
@@ -171,9 +180,12 @@ impl std::fmt::Debug for SigningConfig {
 	}
 }
 
-impl std::fmt::Debug for GoogleConfig {
+impl std::fmt::Debug for OAuthClientConfig {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("GoogleConfig").field("client_id", &self.client_id).field("client_secret", &"<redacted>").finish()
+		f.debug_struct("OAuthClientConfig")
+			.field("client_id", &self.client_id)
+			.field("client_secret", &"<redacted>")
+			.finish()
 	}
 }
 
@@ -208,8 +220,8 @@ mod tests {
 	}
 
 	#[test]
-	fn google_config_debug_redacts_client_secret() {
-		let cfg = GoogleConfig {
+	fn oauth_client_config_debug_redacts_client_secret() {
+		let cfg = OAuthClientConfig {
 			client_id: "client-1".to_string(),
 			client_secret: "SUPERSECRETOAUTH".to_string(),
 		};
@@ -231,6 +243,7 @@ mod tests {
 			service_ttl_secs: 300,
 			signing: None,
 			google: None,
+			github: None,
 		}
 	}
 

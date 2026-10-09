@@ -27,7 +27,7 @@ use concierge::{
 	web,
 };
 use ev::error_monitoring::{self, Config as SentryConfig};
-use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
+use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, oauth::OAuthProvider, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
 	CheckRequest, CheckResponse,
 	auth_service_server::AuthServiceServer,
@@ -177,6 +177,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.sync_registry(|var| std::env::var(var).ok())
 		.await
 		.context("failed to load the relying-party registry")?;
+	let providers: Vec<OAuthProvider> = auth_config
+		.google
+		.iter()
+		.map(OAuthProvider::google)
+		.chain(auth_config.github.iter().map(OAuthProvider::github))
+		.collect();
 	let auth_service = AuthService::try_new(auth_config, provisioner)
 		.await
 		.context("failed to build the auth service")?
@@ -278,6 +284,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		}
 	};
 
+	let mail_wake = Arc::new(tokio::sync::Notify::new());
 	tokio::spawn(concierge::dispatch::run_dispatcher(
 		dispatch_repo,
 		transport,
@@ -288,6 +295,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			daily_budget: config.notification_daily_email_budget,
 			interval: std::time::Duration::from_secs(config.notification_dispatch_interval_secs),
 		},
+		mail_wake.clone(),
 	));
 
 	// The hold sweep. Unlike consilium expiry — which is lazy, so nothing has to be
@@ -348,6 +356,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		auth_service.clone(),
 		config.public_origin.clone(),
 		config.app_env == "production",
+		web::SignInDeps {
+			providers,
+			turnstile: web::Turnstile::new(config.turnstile_secret.clone(), web::SITEVERIFY.to_string()),
+			credentials: Arc::new(infrastructure::credentials::PgCredentials::new(pool.clone())),
+			mail_wake,
+		},
 		web::KycDeps {
 			users: users.clone(),
 			cases: kyc_cases,

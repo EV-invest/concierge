@@ -29,6 +29,8 @@ dotenvy = "0.15.7"
 ev = { version = "0.24.2", package = "ev_lib", default-features = false, features = ["architecture", "types"] }
 evconcierge_auth = { path = "auth" }
 evconcierge_contracts = { path = "contracts" }
+# argon2id for the passwords this plane checks itself.
+argon2 = { version = "0.5", features = ["std"] }
 form_urlencoded = "1"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 heck = "0.5"

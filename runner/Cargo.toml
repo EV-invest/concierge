@@ -16,6 +16,7 @@ name = "concierge"
 path = "src/main.rs"
 
 [dependencies]
+argon2.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 axum-extra.workspace = true

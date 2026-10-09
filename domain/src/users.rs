@@ -42,9 +42,9 @@ pub type UserId = Id<UserTag>;
 pub struct UserTag;
 
 /// A user email. Parse-don't-validate: lowercased and trimmed on construction, so
-/// equality and the storage form are normalized. Deliberately **not** a unique key —
-/// a person may change the email behind a stable [`AuthSubject`]. Serializes
-/// transparently as the bare string.
+/// equality and the storage form are normalized. Unique only among VERIFIED addresses
+/// (`users_verified_email_idx`): a proven mailbox is what links sign-in methods to one
+/// account. Serializes transparently as the bare string.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct Email(String);
@@ -70,9 +70,59 @@ impl Email {
 	}
 }
 
+impl Email {
+	/// The part before the `@`.
+	pub fn local_part(&self) -> &str {
+		self.0.split('@').next().expect("parse requires an '@'")
+	}
+}
+
 impl core::fmt::Display for Email {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.write_str(&self.0)
+	}
+}
+
+/// An account handle beside the email, interchangeable with it wherever an account is
+/// named. Stored lowercase and unique. A handle the user CHOOSES matches
+/// `[a-z0-9_.-]{3,32}`, so it never contains `@`; only the defaults derived from the email
+/// ([`Self::defaults_for`]) can, and those are the account's own address.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct Username(String);
+
+impl Username {
+	pub const MAX_CHARS: usize = 32;
+	pub const MIN_CHARS: usize = 3;
+
+	/// A handle typed by the user.
+	pub fn parse(raw: &str) -> Result<Self, DomainError> {
+		let normalized = raw.trim().to_lowercase();
+		let len = normalized.chars().count();
+		if !(Self::MIN_CHARS..=Self::MAX_CHARS).contains(&len) || !normalized.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-')) {
+			return Err(DomainError::Validation(format!(
+				"username must be {}-{} characters of a-z, 0-9, '_', '.' or '-'",
+				Self::MIN_CHARS,
+				Self::MAX_CHARS
+			)));
+		}
+		Ok(Self(normalized))
+	}
+
+	/// What an account gets without asking, in order of preference: the local part, then
+	/// the whole address. The first one nobody holds wins; when both are held the account
+	/// has no handle rather than an invented one.
+	pub fn defaults_for(email: &Email) -> [Self; 2] {
+		[Self(email.local_part().to_owned()), Self(email.as_str().to_owned())]
+	}
+
+	/// A stored value, already normalized by whichever constructor wrote it.
+	pub fn from_stored(raw: String) -> Self {
+		Self(raw)
+	}
+
+	pub fn as_str(&self) -> &str {
+		&self.0
 	}
 }
 
@@ -233,6 +283,7 @@ pub struct User {
 	auth_subject: AuthSubject,
 	email: Email,
 	email_verified: bool,
+	username: Option<Username>,
 	status: UserStatus,
 	/// Why the account is disabled, when it is. `None` on an active user — and also on a
 	/// row disabled before this field existed, which therefore reads as the unqualified
@@ -256,12 +307,13 @@ pub struct User {
 impl User {
 	/// Provision a brand-new user at first sign-in. The application layer mints the
 	/// [`UserId`] (host-only), keeping this pure.
-	pub fn provision(id: UserId, auth_subject: AuthSubject, email: Email, email_verified: bool) -> Self {
+	pub fn provision(id: UserId, auth_subject: AuthSubject, email: Email, email_verified: bool, username: Option<Username>) -> Self {
 		let mut user = Self {
 			id,
 			auth_subject,
 			email,
 			email_verified,
+			username,
 			status: UserStatus::Active,
 			suspension: None,
 			hold_ended_at: None,
@@ -284,6 +336,7 @@ impl User {
 		auth_subject: AuthSubject,
 		email: Email,
 		email_verified: bool,
+		username: Option<Username>,
 		status: UserStatus,
 		suspension: Option<Suspension>,
 		hold_ended_at: Option<i64>,
@@ -298,6 +351,7 @@ impl User {
 			auth_subject,
 			email,
 			email_verified,
+			username,
 			status,
 			suspension,
 			hold_ended_at,
@@ -328,6 +382,32 @@ impl User {
 		// An email change carries no distinct bridge Kind; banking re-reads the email
 		// snapshot on the next lifecycle event, so this mutation bumps row_version
 		// without emitting an outbox row.
+		self.row_version += 1;
+	}
+
+	/// The holder of the mailbox has proven it with a code. Bumps `row_version` and
+	/// emits nothing, like [`Self::change_email`].
+	pub fn verify_email(&mut self) {
+		if self.email_verified {
+			return;
+		}
+		self.email_verified = true;
+		self.row_version += 1;
+	}
+
+	/// The mailbox was proven by somebody else than whoever registered this account
+	/// unverified: every session ends and the address is the prover's. The caller drops the
+	/// password that came with the squatted registration.
+	pub fn take_over(&mut self) {
+		self.verify_email();
+		self.revoke_tokens();
+	}
+
+	pub fn set_username(&mut self, username: Username) {
+		if self.username.as_ref() == Some(&username) {
+			return;
+		}
+		self.username = Some(username);
 		self.row_version += 1;
 	}
 
@@ -482,9 +562,15 @@ impl User {
 	/// Rejects anything above [`MAX_KYC_LEVEL`]. This is the ONE writer of the level, so
 	/// bounding it here bounds every path that reaches it — the operator RPC, the vendor
 	/// webhook, and whatever writer is added next — instead of trusting each to re-check.
+	/// For the same reason it refuses any level above 0 on an unverified email: a tier is
+	/// granted to a person, and an address nobody proved hands it to whoever holds the
+	/// mailbox (`users_kyc_needs_verified_email` refuses it again at the column).
 	pub fn set_kyc_level(&mut self, level: u32) -> Result<(), DomainError> {
 		if level > MAX_KYC_LEVEL {
 			return Err(DomainError::Validation(format!("kyc_level must be between 0 and {MAX_KYC_LEVEL}")));
+		}
+		if level > 0 && !self.email_verified {
+			return Err(DomainError::Precondition("a KYC level above 0 needs a verified email".into()));
 		}
 		if self.kyc_level == level {
 			return Ok(());
@@ -524,6 +610,10 @@ impl User {
 
 	pub fn email_verified(&self) -> bool {
 		self.email_verified
+	}
+
+	pub fn username(&self) -> Option<&Username> {
+		self.username.as_ref()
 	}
 
 	pub fn status(&self) -> UserStatus {
@@ -790,7 +880,26 @@ mod tests {
 	use super::*;
 
 	fn fixture() -> User {
-		User::provision(UserId::new(), AuthSubject::parse("g-123").unwrap(), Email::parse("Ada@Example.com").unwrap(), true)
+		User::provision(UserId::new(), AuthSubject::parse("g-123").unwrap(), Email::parse("Ada@Example.com").unwrap(), true, None)
+	}
+
+	#[test]
+	fn an_unverified_email_holds_no_kyc_level() {
+		let mut user = User::provision(UserId::new(), AuthSubject::parse("g-1").unwrap(), Email::parse("a@b.c").unwrap(), false, None);
+		assert!(matches!(user.set_kyc_level(1), Err(DomainError::Precondition(_))));
+		user.set_kyc_level(0).expect("level 0 needs nothing");
+		user.verify_email();
+		user.set_kyc_level(1).expect("verified");
+	}
+
+	#[test]
+	fn a_chosen_username_never_looks_like_an_email() {
+		assert_eq!(Username::parse(" Bob_1.x-Y ").unwrap().as_str(), "bob_1.x-y");
+		for bad in ["ab", "bob@x.com", "bob smith", &"a".repeat(33), "ünï"] {
+			assert!(Username::parse(bad).is_err(), "{bad}");
+		}
+		let [local, full] = Username::defaults_for(&Email::parse("Bob+tag@X.com").unwrap());
+		assert_eq!((local.as_str(), full.as_str()), ("bob+tag", "bob+tag@x.com"));
 	}
 
 	#[test]

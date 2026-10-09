@@ -84,28 +84,30 @@ service UserDirectory {
   //
   // Who may: a seat holding `iam:tenants:grant` — any target. The holder of an alias the
   // catalog lets delegate (`delegations`) — exactly the aliases it delegates, naming the
-  // user by `email` only (a `user_id` is PERMISSION_DENIED: ids are visible in the
-  // roster, and granting one would reveal its owner's address). Anyone else, or a target
-  // outside the delegation: PERMISSION_DENIED, before the user is looked up.
+  // user by `account` (an email or a username) only (a `user_id` is PERMISSION_DENIED:
+  // ids are visible in the roster, and granting one would reveal its owner's address).
+  // Anyone else, or a target outside the delegation: PERMISSION_DENIED, before the user
+  // is looked up. An email names the accounts it is verified on or backs a password of;
+  // only when it names none is the handle read as a username.
   //
-  // To a seat: an unknown user or address is NOT_FOUND; an address held by several
+  // To a seat: an unknown user or handle is NOT_FOUND; a handle naming several
   // accounts, or a disabled/held account, is FAILED_PRECONDITION with the reason. To a
   // delegate all three are the SAME FAILED_PRECONDITION ("this address cannot be granted
-  // access"), so a grant never tells them whether, or how, an address is known. A
+  // access"), so a grant never tells them whether, or how, a handle is known. A
   // delegate gets a budget of GrantPermission + RevokePermission calls per hour
   // (refusals included); past it, RESOURCE_EXHAUSTED.
   rpc GrantPermission(GrantPermissionRequest) returns (GrantPermissionResponse);
 
   // Take a grant away. Same authority as GrantPermission, either addressing form for a
   // delegate too: the answer depends only on a grant they can already list. NOT_FOUND when
-  // the user holds no active grant of that target — including an address nobody, or
-  // several accounts, hold. Shares GrantPermission's budget.
+  // the user holds no active grant of that target — including a handle naming nobody, or
+  // several accounts. Shares GrantPermission's budget.
   rpc RevokePermission(RevokePermissionRequest) returns (RevokePermissionResponse);
 
   // The active grants inside one tenant namespace, with each holder's identity. A seat
   // holding `iam:tenants:grant`, or a delegate of that namespace — who gets `legal_name`
-  // AND `preferred_name` empty: the team sees each other's email and grant, and nothing
-  // that says who an address belongs to.
+  // AND `preferred_name` empty: the team sees each other's email, username and grant, and
+  // nothing that says who an address belongs to.
   rpc ListGrants(ListGrantsRequest) returns (ListGrantsResponse);
 }
 
@@ -155,6 +157,9 @@ message UserProfile {
   // relying party, its tenant's namespace and nothing else; to a first-party session, the
   // seat's permissions plus every tenant's. A relying party gates on this alone.
   repeated string permissions = 22;
+  // A handle beside the email, interchangeable with it wherever an account is named.
+  // Empty when the account has none.
+  string username = 23;
 }
 
 // The caller's editable profile, full-replace. Same 10 fields as the editable part of
@@ -242,6 +247,8 @@ message AdminUserSummary {
   string suspended_by = 9;
   // Unix SECONDS an "admin_hold" lapses. 0 when nothing lapses.
   int64 hold_expires_at = 10;
+  // See UserProfile.username. ListUsers' query matches it as it matches the email.
+  string username = 11;
 }
 
 message ListUsersRequest {
@@ -298,7 +305,8 @@ message PermissionGrant {
 message GrantPermissionRequest {
   oneof subject {
     string user_id = 1;
-    string email = 2;
+    // An email or a username: one handle, resolved the way a password sign-in resolves it.
+    string account = 2;
   }
   string target = 3;
   // Recorded on the grant and the audit row.
@@ -312,7 +320,8 @@ message GrantPermissionResponse {
 message RevokePermissionRequest {
   oneof subject {
     string user_id = 1;
-    string email = 2;
+    // An email or a username, as in GrantPermissionRequest.
+    string account = 2;
   }
   string target = 3;
   // Recorded on the audit row.
@@ -331,6 +340,8 @@ message GrantHolder {
   string email = 2;
   string legal_name = 3;
   string preferred_name = 4;
+  // The holder's handle; empty when they have none. A delegate sees it as it sees the email.
+  string username = 5;
 }
 
 message ListGrantsResponse {

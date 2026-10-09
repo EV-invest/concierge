@@ -21,7 +21,9 @@ mod kyc;
 mod oauth;
 mod routes;
 mod session;
+mod sign_in;
 mod single_flight;
+mod turnstile;
 
 // The one session-store name tests exercise the persistence invariant through.
 use std::sync::Arc;
@@ -32,16 +34,18 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use domain::users::UserId;
-use evconcierge_auth::AuthService;
+use evconcierge_auth::{AuthService, oauth::OAuthProvider};
 /// Re-exported so the integration suite asserts against the cap the route actually
 /// enforces. A test that hard-coded the number would keep passing after someone raised
 /// it, and the number is what stands between one account and the vendor balance.
 pub use kyc::START_MAX_PER_WINDOW;
 pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
+use tokio::sync::Notify;
+pub use turnstile::{SITEVERIFY, Turnstile};
 
 use crate::{
-	ports::{GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
+	ports::{CredentialRepository, GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
 	relying_party::RelyingParties,
 	web::{oauth::OAuthTxStore, single_flight::KeyedLocks},
 };
@@ -101,14 +105,24 @@ pub struct WebState {
 impl WebState {
 	/// `relying_parties` is `None` where no client flow is mounted; `/auth/authorize` then
 	/// answers 503 with a page, never a redirect.
-	pub async fn try_new(auth: AuthService, public_origin: String, secure_cookies: bool, kyc: KycDeps, relying_parties: Option<Arc<RelyingParties>>) -> color_eyre::Result<Self> {
+	pub async fn try_new(
+		auth: AuthService,
+		public_origin: String,
+		secure_cookies: bool,
+		sign_in: SignInDeps,
+		kyc: KycDeps,
+		relying_parties: Option<Arc<RelyingParties>>,
+	) -> color_eyre::Result<Self> {
 		Ok(Self {
 			inner: Arc::new(Inner {
 				auth,
 				oauth: OAuthTxStore::new(),
 				sessions: WebSessions::from_env().await?,
 				cookies: CookieNames::new(secure_cookies),
-				google_client_id: std::env::var("GOOGLE_CLIENT_ID").ok().filter(|v| !v.is_empty()),
+				providers: sign_in.providers,
+				turnstile: sign_in.turnstile,
+				credentials: sign_in.credentials,
+				mail_wake: sign_in.mail_wake,
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
@@ -122,6 +136,16 @@ impl WebState {
 			}),
 		})
 	}
+}
+
+/// What the sign-in routes need beyond the session machinery.
+pub struct SignInDeps {
+	/// The OAuth providers offered, each answering at `/callback/auth/<name>`.
+	pub providers: Vec<OAuthProvider>,
+	pub turnstile: Turnstile,
+	pub credentials: Arc<dyn CredentialRepository>,
+	/// The mail dispatcher's wake-up: a queued code leaves now rather than on the next tick.
+	pub mail_wake: Arc<Notify>,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -152,10 +176,19 @@ pub fn router(state: WebState) -> Router {
 		// k8s liveness/readiness probe target — the only unauthenticated route.
 		.route("/health", get(|| async { "ok" }))
 		.route("/auth/login", get(routes::login))
-		.route("/callback/auth/google", get(routes::callback))
+		.route("/callback/auth/{provider}", get(routes::callback))
 		.route("/auth/session", get(routes::session))
 		.route("/auth/logout", post(routes::logout))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
+		.route("/auth/code/request", post(sign_in::request_code))
+		.route("/auth/code/verify", post(sign_in::verify_code))
+		.route("/auth/email/verify/request", post(sign_in::request_verification))
+		.route("/auth/email/verify/confirm", post(sign_in::confirm_verification))
+		.route("/auth/password/signup", post(sign_in::sign_up))
+		.route("/auth/password/signin", post(sign_in::sign_in))
+		.route("/auth/password/set", post(sign_in::set_password))
+		.route("/auth/username", post(sign_in::set_username))
+		.route("/auth/methods", get(sign_in::methods))
 		// The relying-party code flow's front door. It needs no CSRF token: it changes
 		// nothing a cross-site request could exploit — it only ever redirects to an
 		// address registered for the client, carrying a code that is useless without the
@@ -192,10 +225,13 @@ struct Inner {
 	oauth: OAuthTxStore,
 	sessions: WebSessions,
 	cookies: CookieNames,
-	/// Public OAuth client id; `None` ⇒ login answers 503 (mirrors the inert plane).
-	google_client_id: Option<String>,
+	/// An absent provider's login answers 503 (mirrors the inert plane).
+	providers: Vec<OAuthProvider>,
+	turnstile: Turnstile,
+	credentials: Arc<dyn CredentialRepository>,
+	mail_wake: Arc<Notify>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
-	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/google`.
+	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,
 	/// The identity control plane — the KYC webhook applies its verdict through the same
 	/// port the operator console's `SetKycLevel` does.
