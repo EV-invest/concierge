@@ -177,7 +177,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.sync_registry(|var| std::env::var(var).ok())
 		.await
 		.context("failed to load the relying-party registry")?;
-	let providers: Vec<OAuthProvider> = auth_config.google.iter().map(OAuthProvider::google).collect();
+	let providers: Vec<OAuthProvider> = auth_config
+		.google
+		.iter()
+		.map(OAuthProvider::google)
+		.chain(auth_config.github.iter().map(OAuthProvider::github))
+		.collect();
 	let auth_service = AuthService::try_new(auth_config, provisioner)
 		.await
 		.context("failed to build the auth service")?

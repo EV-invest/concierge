@@ -43,6 +43,7 @@ pub mod verifier;
 
 // Issuance internals — host-only (used by `service` via `crate::`), not part of the
 // verify-side surface downstream service repos import, so kept private.
+mod github;
 mod google;
 mod management;
 pub mod oauth;
