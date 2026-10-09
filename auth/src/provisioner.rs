@@ -1,14 +1,9 @@
-//! In-process user-provisioning channel (auth → directory).
+//! In-process account channel (auth → directory).
 //!
-//! Mirrors the banking plane's `auth → core` provisioning seam. The auth module
-//! owns the signing keys (the only minter); the directory module owns Postgres (the
-//! only writer). When a Google sign-in is verified, auth asks the directory to
-//! upsert (or look up) the user behind that identity over an in-process channel —
-//! a task-boundary channel inside the one concierge runner process, never the wire.
-//!
-//! A1b (this slice) defines the channel and CALLS it from `Exchange`; A1c implements
-//! the receiver against the users repository. Until then the channel handle can be
-//! injected unconfigured, so issuance compiles and runs ahead of the directory.
+//! The auth module owns the signing keys (the only minter); the directory module owns
+//! Postgres (the only writer). Before minting, auth reads the account's live state over
+//! this task-boundary channel inside the one runner process, never the wire. Which
+//! account a sign-in opens is decided before auth is asked (`UserDirectoryRepository::resolve`).
 //!
 //! DTOs are primitive (`String`-shaped) on purpose, so this crate stays free of a
 //! `domain` dependency; the directory parses them into typed ids/value objects.
@@ -20,10 +15,7 @@ use crate::AuthError;
 /// What the auth module asks the directory to do.
 #[derive(Debug)]
 pub enum ProvisionCommand {
-	/// First/again sign-in: upsert the user by their immutable auth subject and
-	/// return the current summary. Idempotent.
-	Provision { auth_subject: String, email: String, email_verified: bool },
-	/// Refresh-time check: fetch the current summary by concierge user id (to enforce
+	/// Session-opening and refresh-time check: fetch the current summary by concierge user id (to enforce
 	/// `token_version`/`status` without minting a stale token).
 	Lookup { user_id: String },
 	/// "Revoke all": bump the user's authoritative `token_version` in the control
@@ -72,16 +64,6 @@ impl Provisioner {
 		// that is `Unavailable`, never `NotConfigured`.
 		self.tx.send(ProvisionRequest { command, respond_to }).await.map_err(|_| AuthError::Unavailable)?;
 		response.await.map_err(|_| AuthError::Unavailable)?
-	}
-
-	/// Upsert the user behind a verified identity and return the current summary.
-	pub async fn provision(&self, auth_subject: String, email: String, email_verified: bool) -> Result<ProvisionedUser, AuthError> {
-		self.send(ProvisionCommand::Provision {
-			auth_subject,
-			email,
-			email_verified,
-		})
-		.await
 	}
 
 	/// Fetch the current summary for a known concierge user id.

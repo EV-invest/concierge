@@ -7,14 +7,15 @@
 //! `domain` stays wasm-safe for service frontends.
 
 use serde::{Deserialize, Serialize};
+use strum::{EnumString, IntoStaticStr};
 
-use crate::error::DomainError;
+use crate::{error::DomainError, users::Email};
 
-/// The immutable external identity asserted by the identity provider (Google's
-/// `sub` claim). It is the stable natural key both planes provision a
-/// [`User`](crate::users::User) against: never reused, never changing for a person,
-/// and distinct from the plane's own canonical [`UserId`](crate::users::UserId)
-/// (which is what the first-party JWT carries as its `sub`).
+/// The account's opaque, immutable cross-plane subject: the key both planes correlate a
+/// [`User`](crate::users::User) on, never reused and never changing. Accounts provisioned
+/// before sign-in methods were split out carry their Google `sub`; later ones their own
+/// [`UserId`](crate::users::UserId). Which provider subjects open an account is
+/// [`ProvenIdentity`]'s business, not this one's.
 ///
 /// Serializes transparently as the bare string so the wire/storage shape is just the
 /// subject value.
@@ -42,6 +43,32 @@ impl core::fmt::Display for AuthSubject {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.write_str(&self.0)
 	}
+}
+
+/// An identity provider whose subject can open an account.
+#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+pub enum Provider {
+	Google,
+	Github,
+}
+
+impl Provider {
+	pub fn as_str(self) -> &'static str {
+		self.into()
+	}
+}
+
+/// What a sign-in proved about the person at the keyboard. Every method that is not a
+/// password lands here, and one rule turns it into an account (the directory's `resolve`).
+#[derive(Clone, Debug)]
+pub struct ProvenIdentity {
+	/// The provider subject, for an OAuth sign-in; `None` for an emailed code.
+	pub provider: Option<(Provider, String)>,
+	pub email: Email,
+	/// Whether the mailbox itself was proven — by our own code, or by a provider that
+	/// says it verified the address. Only a proven mailbox links to an existing account.
+	pub email_proven: bool,
 }
 
 #[cfg(test)]

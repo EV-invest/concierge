@@ -1,6 +1,6 @@
-//! The browser-facing half of the Google OAuth handshake (PKCE/state/nonce),
-//! ported from the cabinet BFF — the confidential code→token exchange stays in
-//! `evconcierge_auth::service` (called in-process by the callback route).
+//! The browser-facing half of an OAuth handshake (PKCE/state/nonce): the transaction
+//! between the redirect out and the callback. The provider's own half — its URLs and the
+//! code→identity exchange — is `evconcierge_auth::oauth::OAuthProvider`.
 
 use std::collections::HashMap;
 
@@ -9,8 +9,6 @@ use tokio::sync::Mutex;
 
 use crate::web::{now_secs, random_token};
 
-const AUTHORIZE_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const SCOPE: &str = "openid email profile";
 /// The OAuth handshake (PKCE/state/nonce) lives at most this long between authorize and callback.
 pub const OAUTH_TX_TTL: i64 = 600;
 /// Hard cap on in-flight OAuth txns. The unauthenticated login route feeds this map,
@@ -44,23 +42,6 @@ impl Challenge {
 	}
 }
 
-/// Build the Google authorize URL to redirect the browser to.
-pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str, nonce: &str, code_challenge: &str) -> String {
-	let query = form_urlencoded::Serializer::new(String::new())
-		.append_pair("client_id", client_id)
-		.append_pair("redirect_uri", redirect_uri)
-		.append_pair("response_type", "code")
-		.append_pair("scope", SCOPE)
-		.append_pair("state", state)
-		.append_pair("nonce", nonce)
-		.append_pair("code_challenge", code_challenge)
-		.append_pair("code_challenge_method", "S256")
-		.append_pair("access_type", "online")
-		.append_pair("prompt", "select_account")
-		.finish();
-	format!("{AUTHORIZE_ENDPOINT}?{query}")
-}
-
 /// Keep a post-login redirect target same-origin to defeat open-redirects.
 pub fn safe_return_to(raw: Option<&str>) -> String {
 	let Some(raw) = raw else { return "/".to_string() };
@@ -78,6 +59,8 @@ pub fn safe_return_to(raw: Option<&str>) -> String {
 /// One in-flight OAuth login transaction, bound to the `ev_oauth_tx` cookie.
 #[derive(Clone)]
 pub struct OAuthTx {
+	/// The provider the browser was sent to; its callback must be the one answering.
+	pub provider: &'static str,
 	pub state: String,
 	pub nonce: String,
 	pub code_verifier: String,
@@ -99,10 +82,11 @@ impl OAuthTxStore {
 	/// Store a transaction, returning its id (the `ev_oauth_tx` cookie value). Evicts on
 	/// write: abandoned logins never replay their cookie, so `take` never frees them — drop
 	/// every expired entry here, and if the cap is still hit, drop the oldest.
-	pub async fn put(&self, state: String, nonce: String, code_verifier: String, return_to: String) -> String {
+	pub async fn put(&self, provider: &'static str, state: String, nonce: String, code_verifier: String, return_to: String) -> String {
 		let id = random_token(32);
 		let now = now_secs();
 		let tx = OAuthTx {
+			provider,
 			state,
 			nonce,
 			code_verifier,

@@ -13,6 +13,10 @@ pub enum DomainError {
 	/// `invalid_argument`.
 	#[error("forbidden: {0}")]
 	Forbidden(String),
+	/// The record is not in a state that allows the action yet. Maps to gRPC
+	/// `failed_precondition`: unlike `Forbidden`, the same caller succeeds once it changes.
+	#[error("precondition failed: {0}")]
+	Precondition(String),
 	/// Unexpected failure from a driven adapter. Carries a description for logging
 	/// only — it is never surfaced verbatim to clients.
 	#[error("repository error: {0}")]

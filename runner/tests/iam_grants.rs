@@ -20,11 +20,7 @@ use concierge::{
 	ports::{GrantActor, GrantOutcome, GrantRepository, GrantSubject, RelyingPartyRepository, RevokeOutcome, UserDirectoryRepository},
 	relying_party::RelyingParties,
 };
-use domain::{
-	authz::Role,
-	iam::Target,
-	users::{AuthSubject, Email, UserId},
-};
+use domain::{authz::Role, iam::Target, users::UserId};
 use evconcierge_auth::{CatalogPublication, Claims, ClientGrantError, ClientGrants, RestrictedCaller, TokenType};
 use evconcierge_contracts::concierge::v1::{
 	CatalogAlias, GetMeRequest, GrantPermissionRequest, ListGrantsRequest, RevokePermissionRequest, grant_permission_request, revoke_permission_request, user_directory_server::UserDirectory,
@@ -151,9 +147,8 @@ impl Fixture {
 
 	async fn user(&self, tag: &str) -> UserId {
 		let unique = Uuid::new_v4();
-		let subject = AuthSubject::parse(&format!("iam-{tag}-{unique}")).unwrap();
-		let email = Email::parse(&format!("{tag}-{}@iam.example.com", &unique.simple().to_string()[..12])).unwrap();
-		self.users.provision(subject, email, true).await.unwrap().id()
+		let email = format!("{tag}-{}@iam.example.com", &unique.simple().to_string()[..12]);
+		self.users.resolve(common::google_as(&format!("iam-{tag}-{unique}"), &email, true), 0).await.unwrap().id()
 	}
 
 	async fn seated(&self, tag: &str, role: Role) -> UserId {
@@ -245,12 +240,15 @@ impl Fixture {
 			.unwrap()
 	}
 
-	/// Two accounts on one address, returned as that address.
+	/// Two accounts on one address, returned as that address. One verified mailbox names
+	/// one account, so the second holds it unverified.
 	async fn shared_email(&self) -> String {
 		let email = format!("shared-{}@iam.example.com", Uuid::new_v4().simple());
-		for _ in 0..2 {
-			let subject = AuthSubject::parse(&format!("iam-shared-{}", Uuid::new_v4())).unwrap();
-			self.users.provision(subject, Email::parse(&email).unwrap(), true).await.unwrap();
+		for verified in [true, false] {
+			self.users
+				.resolve(common::google_as(&format!("iam-shared-{}", Uuid::new_v4()), &email, verified), 0)
+				.await
+				.unwrap();
 		}
 		email
 	}

@@ -5,12 +5,13 @@
 //!
 //! # For the concierge runner
 //!
-//! - [`AuthService`] is the user/session issuance surface (`Exchange`/`Refresh`/
-//!   `Logout`/`ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party
+//! - [`AuthService`] is the user/session issuance surface (`Refresh`/`Logout`/
+//!   `ListSessions`/`RevokeSession`/`Jwks`, plus the relying-party
 //!   `ExchangeCode`/`RefreshClientToken` over the [`ClientGrants`] port). The runner mounts it as a
-//!   tonic server. It owns the signing keys / JWKS / Google client / refresh store
-//!   and provisions users in process over the [`Provisioner`] channel (auth →
-//!   directory). Built [`AuthService::try_new`] with a signing key configured it
+//!   tonic server, and its web surface opens sessions through
+//!   [`AuthService::open_session`] once a sign-in named an account. It owns the signing
+//!   keys / JWKS / refresh store and reads accounts in process over the [`Provisioner`]
+//!   channel (auth → directory). The sign-in providers are [`oauth::OAuthProvider`]. Built [`AuthService::try_new`] with a signing key configured it
 //!   mints real tokens; with none it runs inert ([`AuthError::NotConfigured`]).
 //!
 //! # For a downstream service (a separate repo)
@@ -44,11 +45,12 @@ pub mod verifier;
 // verify-side surface downstream service repos import, so kept private.
 mod google;
 mod management;
+pub mod oauth;
 mod signer;
 
 pub use claims::{Claims, TokenType};
 pub use clients::{BoxFuture, CatalogPublication, ClientGrant, ClientGrantError, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation};
-pub use config::{AuthConfig, GoogleConfig, SigningConfig, VerifierConfig};
+pub use config::{AuthConfig, OAuthClientConfig, SigningConfig, VerifierConfig};
 pub use interceptor::{AuthLayer, Authenticate, RestrictedCaller, claims_of, grpc_auth_layer};
 pub use jwks::{JwksCache, VerifyPolicy, verify_token};
 pub use provisioner::{ProvisionCommand, ProvisionRequest, ProvisionedUser, Provisioner, provisioner_channel};

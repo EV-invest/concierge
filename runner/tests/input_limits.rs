@@ -23,7 +23,7 @@ use concierge::{
 };
 use domain::{
 	authz::Role,
-	users::{AuthSubject, Email, MAX_KYC_LEVEL, UserId},
+	users::{MAX_KYC_LEVEL, UserId},
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
@@ -92,8 +92,7 @@ fn request_with<T>(sub: &str, inner: T) -> Request<T> {
 /// rule of the module: `revoke_tokens`, `reinstate_user` and `get_user` compare nothing,
 /// and `update_profile`/`list_users` below are self-service and must stay that way.
 async fn subject_of(users: &Arc<dyn UserDirectoryRepository>, tag: &str) -> String {
-	let subject = AuthSubject::parse(&format!("{tag}-{}", Uuid::new_v4())).unwrap();
-	users.provision(subject, Email::parse("limits-target@example.com").unwrap(), true).await.unwrap().id().to_string()
+	users.resolve(common::google(tag, true), 0).await.unwrap().id().to_string()
 }
 
 /// A PERSISTED admin, so one principal exercises both the self-service and the admin
@@ -102,8 +101,7 @@ async fn subject_of(users: &Arc<dyn UserDirectoryRepository>, tag: &str) -> Stri
 /// consilium suite — one leftover owner there would silently turn every assertion here
 /// into a `PermissionDenied`. `Admin` grants everything these handlers ask for.
 async fn admin(users: &Arc<dyn UserDirectoryRepository>) -> (String, Arc<BreakGlass>) {
-	let subject = AuthSubject::parse(&format!("limits-{}", Uuid::new_v4())).unwrap();
-	let user = users.provision(subject, Email::parse("limits@example.com").unwrap(), true).await.unwrap();
+	let user = users.resolve(common::google("limits", true), 0).await.unwrap();
 	users.set_role(user.id(), Role::Admin).await.unwrap();
 	(user.id().to_string(), Arc::new(BreakGlass::new(Vec::new())))
 }
@@ -259,8 +257,7 @@ async fn a_self_targeted_kyc_write_is_refused_beneath_the_handler() {
 	let Some((users, _, _)) = setup().await else {
 		return;
 	};
-	let subject = AuthSubject::parse(&format!("kyc-self-{}", Uuid::new_v4())).unwrap();
-	let user = users.provision(subject, Email::parse("kyc-self@example.com").unwrap(), true).await.unwrap();
+	let user = users.resolve(common::google("kyc-self", true), 0).await.unwrap();
 	let other = subject_of(&users, "kyc-writer").await.parse::<Uuid>().map(UserId::from_raw).unwrap();
 
 	let err = users
@@ -283,8 +280,7 @@ async fn kyc_level_is_bounded_beneath_the_handler() {
 	let Some((users, _, _)) = setup().await else {
 		return;
 	};
-	let subject = AuthSubject::parse(&format!("kyc-bound-{}", Uuid::new_v4())).unwrap();
-	let user = users.provision(subject, Email::parse("kyc-bound@example.com").unwrap(), true).await.unwrap();
+	let user = users.resolve(common::google("kyc-bound", true), 0).await.unwrap();
 
 	for level in [MAX_KYC_LEVEL + 1, 999, u32::MAX] {
 		let err = users.set_kyc_level(user.id(), level, &AdminAction::system("kyc_level_set"), 0).await.unwrap_err();
@@ -308,8 +304,7 @@ async fn kyc_level_out_of_range_is_refused_by_the_store() {
 	db::migrate(&pool).await.expect("apply migrations");
 	let users: Arc<dyn UserDirectoryRepository> = Arc::new(PgUsers::new(pool.clone()));
 
-	let subject = AuthSubject::parse(&format!("kyc-store-{}", Uuid::new_v4())).unwrap();
-	let user = users.provision(subject, Email::parse("kyc-store@example.com").unwrap(), true).await.unwrap();
+	let user = users.resolve(common::google("kyc-store", true), 0).await.unwrap();
 
 	// A negative value matters as much as 999: the column is signed, the domain reads it
 	// as `u32`, and -1 would rehydrate as 4294967295 — the largest tier imaginable.

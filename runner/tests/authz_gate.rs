@@ -33,7 +33,7 @@ use concierge::{
 };
 use domain::{
 	authz::{Role, Roles, Users},
-	users::{AuthSubject, Email, UserId},
+	users::UserId,
 };
 use evconcierge_auth::{Claims, TokenType, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{GetMeRequest, GetUserRequest, HoldUserRequest, ListUsersRequest, user_directory_server::UserDirectory};
@@ -97,9 +97,7 @@ impl Fixture {
 	}
 
 	async fn provision(&self, tag: &str) -> UserId {
-		let subject = AuthSubject::parse(&format!("authz-{tag}-{}", Uuid::new_v4())).unwrap();
-		let email = Email::parse(&format!("{tag}-{}@example.com", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, email, true).await.unwrap().id()
+		self.users.resolve(common::google(tag, true), 0).await.unwrap().id()
 	}
 }
 
@@ -301,28 +299,24 @@ async fn provisioner_summaries_carry_the_role_and_name_its_source() {
 		return;
 	};
 	let users = fx.port();
-	// Pre-provision so the concierge id is known, then allowlist it and drive the same
-	// channel the auth task uses for Exchange (Provision) and Refresh (Lookup).
-	let subject = AuthSubject::parse(&format!("authz-prov-{}", Uuid::new_v4())).unwrap();
-	let user = users.provision(subject.clone(), Email::parse("bootop@example.com").unwrap(), true).await.unwrap();
+	// Provision so the concierge id is known, then allowlist it and drive the channel the
+	// auth task reads accounts through when it opens a session and on every refresh.
+	let user = users.resolve(common::google("bootop", true), 0).await.unwrap();
 	let allowlist = Arc::new(BreakGlass::new(vec![user.id().to_string()]));
 	let (provisioner, rx) = provisioner_channel();
 	tokio::spawn(directory::run_provisioner(rx, users.clone(), allowlist));
 
-	let provisioned = provisioner.provision(subject.as_str().to_owned(), "bootop@example.com".into(), true).await.unwrap();
-	assert_eq!(provisioned.role, "owner", "an Exchange summary carries the elevated role");
-	assert!(provisioned.role_is_break_glass, "and says the authority is the environment's, not the register's");
 	let looked_up = provisioner.lookup(user.id().to_string()).await.unwrap();
-	assert_eq!(looked_up.role, "owner", "a Refresh summary agrees");
-	assert!(looked_up.role_is_break_glass);
+	assert_eq!(looked_up.role, "owner", "a session summary carries the elevated role");
+	assert!(looked_up.role_is_break_glass, "and says the authority is the environment's, not the register's");
 
 	// Elevation is surface-only: the persisted role is never written by it.
 	let persisted = users.find_by_id(user.id()).await.unwrap().expect("user exists");
 	assert_eq!(persisted.role(), Role::Investor, "users.role is untouched by elevation");
 
 	// Non-allowlisted control: a summary keeps the persisted role and claims nothing.
-	let stranger_subject = AuthSubject::parse(&format!("authz-str-{}", Uuid::new_v4())).unwrap();
-	let stranger = provisioner.provision(stranger_subject.as_str().to_owned(), "stranger@example.com".into(), true).await.unwrap();
+	let stranger = users.resolve(common::google("stranger", true), 0).await.unwrap();
+	let stranger = provisioner.lookup(stranger.id().to_string()).await.unwrap();
 	assert_eq!(stranger.role, "investor");
 	assert!(!stranger.role_is_break_glass);
 

@@ -17,10 +17,7 @@ use concierge::{
 	},
 	ports::UserDirectoryRepository,
 };
-use domain::{
-	authz::Role,
-	users::{AuthSubject, Email, UserStatus},
-};
+use domain::{authz::Role, users::UserStatus};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -37,10 +34,6 @@ async fn setup() -> Option<(PgUsers, PgPool)> {
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	Some((PgUsers::new(pool.clone()), pool))
-}
-
-fn unique_subject() -> AuthSubject {
-	AuthSubject::parse(&format!("itest-{}", Uuid::new_v4())).unwrap()
 }
 
 #[derive(sqlx::FromRow)]
@@ -69,13 +62,13 @@ async fn provision_creates_user_and_emits_created() {
 		eprintln!("DATABASE_URL unset — skipping real-DB test");
 		return;
 	};
-	let subject = unique_subject();
-	let user = repo.provision(subject.clone(), Email::parse("itest@example.com").unwrap(), true).await.unwrap();
+	let address = format!("itest-{}@example.com", Uuid::new_v4().simple());
+	let user = repo.resolve(common::google_as(&format!("itest-{}", Uuid::new_v4()), &address, true), 0).await.unwrap();
 
 	// GetMe reads exactly this row back.
 	let loaded = repo.find_by_id(user.id()).await.unwrap().expect("user exists");
 	assert_eq!(loaded.id(), user.id());
-	assert_eq!(loaded.email().as_str(), "itest@example.com");
+	assert_eq!(loaded.email().as_str(), address);
 	assert_eq!(loaded.token_version(), 0);
 	assert!(loaded.is_active());
 
@@ -84,8 +77,8 @@ async fn provision_creates_user_and_emits_created() {
 	let created = &rows[0];
 	assert_eq!(created.kind, "CREATED");
 	assert_eq!(created.sequence, 1, "sequence = row_version after provision");
-	assert_eq!(created.auth_subject, subject.as_str());
-	assert_eq!(created.email.as_deref(), Some("itest@example.com"));
+	assert_eq!(created.auth_subject, user.id().to_string(), "a new account's subject is its own id");
+	assert_eq!(created.email.as_deref(), Some(address.as_str()));
 	assert!(created.email_verified);
 	assert_eq!(created.token_version, 0);
 }
@@ -95,12 +88,13 @@ async fn reprovision_is_idempotent_and_emits_no_new_event() {
 	let Some((repo, pool)) = setup().await else {
 		return;
 	};
-	let subject = unique_subject();
-	let first = repo.provision(subject.clone(), Email::parse("before@example.com").unwrap(), true).await.unwrap();
-	let again = repo.provision(subject.clone(), Email::parse("After@Example.com").unwrap(), true).await.unwrap();
+	let subject = format!("itest-{}", Uuid::new_v4());
+	let tag = Uuid::new_v4().simple();
+	let first = repo.resolve(common::google_as(&subject, &format!("before-{tag}@example.com"), true), 0).await.unwrap();
+	let again = repo.resolve(common::google_as(&subject, &format!("After-{tag}@Example.com"), true), 0).await.unwrap();
 
 	assert_eq!(first.id(), again.id(), "one subject maps to one user");
-	assert_eq!(again.email().as_str(), "after@example.com", "email is updated and normalized");
+	assert_eq!(again.email().as_str(), format!("after-{tag}@example.com"), "email is updated and normalized");
 	let rows = outbox_for(&pool, first.id().raw()).await;
 	assert_eq!(rows.len(), 1, "an email-only re-sign-in emits no new outbox row");
 }
@@ -110,7 +104,7 @@ async fn revoke_bumps_version_and_emits_sessions_revoked() {
 	let Some((repo, pool)) = setup().await else {
 		return;
 	};
-	let user = repo.provision(unique_subject(), Email::parse("rev@example.com").unwrap(), true).await.unwrap();
+	let user = repo.resolve(common::google("rev", true), 0).await.unwrap();
 	let revoked = repo.revoke_tokens(user.id(), &AdminAction::system("tokens_revoked"), 0).await.unwrap();
 	assert_eq!(revoked.token_version(), 1);
 
@@ -129,7 +123,7 @@ async fn disable_then_enable_emits_suspended_then_reinstated() {
 	let Some((repo, pool)) = setup().await else {
 		return;
 	};
-	let user = repo.provision(unique_subject(), Email::parse("dis@example.com").unwrap(), true).await.unwrap();
+	let user = repo.resolve(common::google("dis", true), 0).await.unwrap();
 
 	let disabled = repo.disable_user(user.id()).await.unwrap();
 	assert_eq!(disabled.status(), UserStatus::Disabled);
@@ -149,7 +143,7 @@ async fn kyc_change_emits_kyc_changed_with_level() {
 	let Some((repo, pool)) = setup().await else {
 		return;
 	};
-	let user = repo.provision(unique_subject(), Email::parse("kyc@example.com").unwrap(), true).await.unwrap();
+	let user = repo.resolve(common::google("kyc", true), 0).await.unwrap();
 	repo.set_kyc_level(user.id(), 2, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
 
 	let row = outbox_for(&pool, user.id().raw()).await.pop().expect("a row");
@@ -162,7 +156,7 @@ async fn role_change_emits_role_changed_carrying_the_new_role() {
 	let Some((repo, pool)) = setup().await else {
 		return;
 	};
-	let user = repo.provision(unique_subject(), Email::parse("role@example.com").unwrap(), true).await.unwrap();
+	let user = repo.resolve(common::google("role", true), 0).await.unwrap();
 
 	// A default-role user is Investor; the CREATED snapshot carries it.
 	let created = &outbox_for(&pool, user.id().raw()).await[0];
@@ -211,8 +205,8 @@ async fn both_kyc_writers_land_in_one_audit_log_with_the_delta() {
 	let Some((repo, pool)) = setup().await else {
 		return;
 	};
-	let operator = repo.provision(unique_subject(), Email::parse("kyc-operator@example.com").unwrap(), true).await.unwrap();
-	let user = repo.provision(unique_subject(), Email::parse("kyc-subject@example.com").unwrap(), true).await.unwrap();
+	let operator = repo.resolve(common::google("kyc-operator", true), 0).await.unwrap();
+	let user = repo.resolve(common::google("kyc-subject", true), 0).await.unwrap();
 
 	// The VENDOR half, which used to write nothing here.
 	let vendor_case = Uuid::new_v4();
@@ -260,7 +254,7 @@ async fn a_vendor_approval_that_changes_nothing_writes_no_audit_row() {
 	let Some((repo, pool)) = setup().await else {
 		return;
 	};
-	let user = repo.provision(unique_subject(), Email::parse("kyc-noop@example.com").unwrap(), true).await.unwrap();
+	let user = repo.resolve(common::google("kyc-noop", true), 0).await.unwrap();
 	let audit = AdminAction::system("kyc_level_set").with_detail(serde_json::json!({ "source": "didit", "case_id": Uuid::new_v4().to_string() }));
 
 	repo.raise_kyc_level_to(user.id(), 1, &audit, 1_700_000_000).await.unwrap();

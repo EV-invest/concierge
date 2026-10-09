@@ -30,7 +30,7 @@ use concierge::{
 	relying_party::{Admission, ClientTokenAuthenticator, RelyingParties, Requester, s256_challenge},
 	web::{self, KycDeps},
 };
-use domain::users::{AuthSubject, Email, UserId};
+use domain::users::UserId;
 use evconcierge_auth::{AuthConfig, AuthService, SigningConfig, TokenType, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
 	ClientTokenResponse, ExchangeCodeRequest, GetMeRequest, GetPlatformConfigRequest, RefreshClientTokenRequest, TokenResponse, UpdateProfileRequest, UserSummary,
@@ -73,6 +73,7 @@ fn auth_config() -> AuthConfig {
 			jwks_json: format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","x":"{TEST_JWK_X}","kid":"test-kid","alg":"EdDSA","use":"sig"}}]}}"#),
 		}),
 		google: None,
+		github: None,
 	}
 }
 
@@ -170,8 +171,7 @@ macro_rules! fixture {
 
 impl Fx {
 	async fn user(&self) -> UserId {
-		let subject = AuthSubject::parse(&format!("rp-itest-{}", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, Email::parse("rp@example.com").unwrap(), true).await.expect("provision").id()
+		self.users.resolve(common::google("rp", true), 0).await.expect("provision").id()
 	}
 
 	/// The tenant's `operator` alias, granted by someone else.
@@ -589,6 +589,7 @@ async fn router(fx: &Fx) -> Router {
 		fx.auth.clone(),
 		"https://evinvest.test".to_string(),
 		false,
+		web::SignInDeps { providers: Vec::new() },
 		KycDeps {
 			users: fx.users.clone(),
 			cases: Arc::new(PgKycCases::new(fx.pool.clone())),
@@ -822,7 +823,7 @@ async fn get_me_on_a_client_token_carries_no_identity_document_fields() {
 	let me = directory.get_me(bearer(GetMeRequest {}, &tokens.access_token)).await.expect("GetMe").into_inner();
 	assert_eq!(me.user_id, user.to_string());
 	assert_eq!(me.preferred_name, "Jane");
-	assert_eq!(me.email, "rp@example.com");
+	assert_eq!(me.email, fx.users.find_by_id(user).await.unwrap().expect("user exists").email().as_str());
 	for (field, value) in [
 		("legal_name", &me.legal_name),
 		("phone", &me.phone),

@@ -24,7 +24,7 @@ use concierge::{
 };
 use domain::{
 	authz::{Role, SEAT_GENERATION},
-	users::{AuthSubject, Email, UserId},
+	users::UserId,
 };
 use evconcierge_contracts::concierge::v1::{PullUserLifecycleRequest, user_events_server::UserEvents, user_lifecycle_event::Kind};
 use sqlx::PgPool;
@@ -38,10 +38,6 @@ async fn setup() -> Option<(PgUsers, PgPool)> {
 	let pool = db::connect_sized(&url, 5).await.expect("connect to Postgres");
 	db::migrate(&pool).await.expect("apply migrations");
 	Some((PgUsers::new(pool.clone()), pool))
-}
-
-fn unique_subject() -> AuthSubject {
-	AuthSubject::parse(&format!("itest-{}", Uuid::new_v4())).unwrap()
 }
 
 fn authed<T>(body: T) -> Request<T> {
@@ -68,8 +64,8 @@ async fn pull_returns_ordered_events_and_advances_cursor() {
 		.expect("read the outbox head");
 
 	// Seed a known sequence of mutations across two users → multiple outbox rows.
-	let a = repo.provision(unique_subject(), Email::parse("a@example.com").unwrap(), true).await.unwrap();
-	let b = repo.provision(unique_subject(), Email::parse("b@example.com").unwrap(), true).await.unwrap();
+	let a = repo.resolve(common::google("a", true), 0).await.unwrap();
+	let b = repo.resolve(common::google("b", true), 0).await.unwrap();
 	repo.set_kyc_level(a.id(), 2, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
 	repo.revoke_tokens(b.id(), &AdminAction::system("tokens_revoked"), 0).await.unwrap();
 
@@ -111,7 +107,7 @@ async fn cursor_pagination_does_not_re_serve() {
 	};
 	let bridge = Bridge::new(pool.clone(), Some(TOKEN.to_string()));
 
-	let user = repo.provision(unique_subject(), Email::parse("page@example.com").unwrap(), true).await.unwrap();
+	let user = repo.resolve(common::google("page", true), 0).await.unwrap();
 	repo.set_kyc_level(user.id(), 1, &AdminAction::system("kyc_level_set"), 0).await.unwrap();
 
 	// First page of 1 starting at the row just before this user's CREATED. Even with
@@ -234,7 +230,7 @@ async fn outbox_append_serializes_position_with_commit_order() {
 		return;
 	};
 	let repo = Arc::new(repo);
-	let user = repo.provision(unique_subject(), Email::parse("lock@example.com").unwrap(), true).await.unwrap();
+	let user = repo.resolve(common::google("lock", true), 0).await.unwrap();
 
 	// Hold the outbox advisory lock in an open transaction — mimicking another writer
 	// mid-append. This is the mechanism that forces `position` (BIGSERIAL) assignment order
@@ -289,7 +285,7 @@ async fn pulled(pool: &PgPool, user: UserId) -> Vec<(Kind, Option<Vec<String>>)>
 
 async fn operator(pool: &PgPool) -> UserId {
 	let repo = PgUsers::new(pool.clone());
-	let user = repo.provision(unique_subject(), Email::parse("seat@example.com").unwrap(), true).await.unwrap();
+	let user = repo.resolve(common::google("seat", true), 0).await.unwrap();
 	repo.set_role(user.id(), Role::Operator).await.unwrap();
 	user.id()
 }

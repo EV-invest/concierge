@@ -15,9 +15,10 @@ use async_trait::async_trait;
 use color_eyre::eyre::ensure;
 use domain::{
 	architecture::{EmitsEvents, Reader, Repository},
+	auth::{ProvenIdentity, Provider},
 	authz::{Role, SEAT_GENERATION},
 	error::DomainError,
-	users::{AuthSubject, Email, ProfileFields, Suspension, User, UserEvent, UserId, UserStatus},
+	users::{AuthSubject, Email, ProfileFields, Suspension, User, UserEvent, UserId, UserStatus, Username},
 };
 use sqlx::{PgConnection, PgPool, Row};
 use strum::VariantArray;
@@ -30,7 +31,7 @@ use crate::ports::{KycLevelChange, RoleChange, UserDirectoryRepository};
 /// than a runtime `format!` — keep this list in sync with [`UserRow`].
 macro_rules! user_columns {
 	() => {
-		"id, auth_subject, email, email_verified, status, suspended_by, hold_expires_at, hold_ended_at, token_version, kyc_level, role, \
+		"id, auth_subject, email, email_verified, username, status, suspended_by, hold_expires_at, hold_ended_at, token_version, kyc_level, role, \
 		legal_name, preferred_name, phone, date_of_birth, nationality, tax_residence, \
 		residential_address, language, base_currency, timezone, row_version"
 	};
@@ -210,6 +211,7 @@ struct UserRow {
 	auth_subject: String,
 	email: Option<String>,
 	email_verified: bool,
+	username: Option<String>,
 	status: String,
 	suspended_by: Option<String>,
 	hold_expires_at: Option<i64>,
@@ -238,6 +240,7 @@ impl UserRow {
 			AuthSubject::parse(&self.auth_subject)?,
 			Email::parse(&email)?,
 			self.email_verified,
+			self.username.map(Username::from_stored),
 			UserStatus::parse(&self.status)?,
 			// A disabled row with no `suspended_by` predates the column and is meant to
 			// read as `None` — see the migration: those accounts keep the one-act,
@@ -279,63 +282,52 @@ impl UserDirectoryRepository for PgUsers {
 		row.map(UserRow::into_domain).transpose()
 	}
 
-	/// Upsert the user behind a verified identity. First sign-in inserts (emitting
-	/// `Created`); a repeat sign-in applies the IdP's current email. Idempotent under a
-	/// concurrent first-login race via `ON CONFLICT DO NOTHING` + re-read.
-	async fn provision(&self, subject: AuthSubject, email: Email, email_verified: bool) -> Result<User, DomainError> {
+	async fn resolve(&self, identity: ProvenIdentity, now: i64) -> Result<User, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		// Subject before email, everywhere: two sign-ins racing for one subject or one
+		// mailbox must not both decide "nobody has it yet".
+		if let Some((provider, subject)) = &identity.provider {
+			lock(&mut tx, &format!("identity:{}:{subject}", provider.as_str())).await?;
+		}
+		lock_email(&mut tx, &identity.email).await?;
 
-		let existing = sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE auth_subject = $1 FOR UPDATE"))
-			.bind(subject.as_str())
-			.fetch_optional(&mut *tx)
-			.await
-			.map_err(repo_err)?;
-
-		let mut user = match existing {
-			Some(row) => {
-				let mut user = row.into_domain()?;
-				user.change_email(email, email_verified);
-				update_row(&mut tx, &user).await?;
-				user
-			}
-			None => {
-				let candidate = User::provision(UserId::new(), subject.clone(), email.clone(), email_verified);
-				let inserted = sqlx::query_scalar::<_, Uuid>(
-					"INSERT INTO users (id, auth_subject, email, email_verified, status, token_version, kyc_level, role, row_version) \
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (auth_subject) DO NOTHING RETURNING id",
-				)
-				.bind(candidate.id().raw())
-				.bind(candidate.auth_subject().as_str())
-				.bind(candidate.email().as_str())
-				.bind(candidate.email_verified())
-				.bind(candidate.status().as_str())
-				.bind(candidate.token_version() as i64)
-				.bind(candidate.kyc_level() as i32)
-				.bind(candidate.role().as_str())
-				.bind(candidate.row_version() as i64)
+		if let Some((provider, subject)) = &identity.provider {
+			let linked: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM user_identities WHERE provider = $1 AND subject = $2")
+				.bind(provider.as_str())
+				.bind(subject)
 				.fetch_optional(&mut *tx)
 				.await
 				.map_err(repo_err)?;
-
-				match inserted {
-					Some(_) => candidate,
-					None => {
-						// Lost the first-login race: re-read the row the other transaction
-						// created and take the email-update path. Idempotent.
-						let row = sqlx::query_as::<_, UserRow>(concat!("SELECT ", user_columns!(), " FROM users WHERE auth_subject = $1 FOR UPDATE"))
-							.bind(subject.as_str())
-							.fetch_one(&mut *tx)
-							.await
-							.map_err(repo_err)?;
-						let mut user = row.into_domain()?;
-						user.change_email(email, email_verified);
-						update_row(&mut tx, &user).await?;
-						user
-					}
+			if let Some(id) = linked {
+				let mut user = load_for_update(&mut tx, UserId::from_raw(id)).await?;
+				// A provider's address moving onto one another account already proved
+				// stays theirs; this account keeps the address it had.
+				if !(identity.email_proven && identity.email != *user.email() && verified_holder(&mut tx, &identity.email).await?.is_some()) {
+					user.change_email(identity.email, identity.email_proven);
+					update_row(&mut tx, &user).await?;
 				}
+				tx.commit().await.map_err(repo_err)?;
+				return Ok(user);
+			}
+		}
+
+		let mut user = match linkable(&mut tx, &identity, now).await? {
+			Some(user) => user,
+			None => {
+				let id = UserId::new();
+				let user = User::provision(
+					id,
+					AuthSubject::parse(&id.to_string())?,
+					identity.email.clone(),
+					identity.email_proven,
+					free_username(&mut tx, &identity.email).await?,
+				);
+				insert_user(&mut tx, user).await?
 			}
 		};
-
+		if let Some((provider, subject)) = &identity.provider {
+			link(&mut tx, *provider, subject, user.id(), now).await?;
+		}
 		drain_outbox(&mut tx, &mut user).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(user)
@@ -679,6 +671,115 @@ impl UserDirectoryRepository for PgUsers {
 	}
 }
 
+/// A transaction-scoped advisory lock on `key`.
+pub(crate) async fn lock(conn: &mut PgConnection, key: &str) -> Result<(), DomainError> {
+	sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+		.bind(key)
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	Ok(())
+}
+
+/// Serializes every write that decides who holds `email`: sign-in resolution, sign-up and
+/// verification.
+pub(crate) async fn lock_email(conn: &mut PgConnection, email: &Email) -> Result<(), DomainError> {
+	lock(conn, &format!("email:{email}")).await
+}
+
+/// The one account `email` is verified on, if any (`users_verified_email_idx`).
+pub(crate) async fn verified_holder(conn: &mut PgConnection, email: &Email) -> Result<Option<UserId>, DomainError> {
+	sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE lower(email) = $1 AND email_verified")
+		.bind(email.as_str())
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)
+		.map(|id| id.map(UserId::from_raw))
+}
+
+/// The existing account a proven mailbox opens: the one it is verified on, else the one
+/// that registered it unverified with a password — taken over, since whoever proves the
+/// mailbox is its owner and the registration may have been a squat (pre-hijack).
+async fn linkable(conn: &mut PgConnection, identity: &ProvenIdentity, now: i64) -> Result<Option<User>, DomainError> {
+	if !identity.email_proven {
+		return Ok(None);
+	}
+	if let Some(id) = verified_holder(conn, &identity.email).await? {
+		return load_for_update(conn, id).await.map(Some);
+	}
+	let squatted: Vec<Uuid> = sqlx::query_scalar(
+		"SELECT u.id FROM users u JOIN password_credentials p ON p.user_id = u.id \
+		 WHERE lower(u.email) = $1 AND NOT u.email_verified ORDER BY u.id",
+	)
+	.bind(identity.email.as_str())
+	.fetch_all(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+	let id = match squatted.as_slice() {
+		[] => return Ok(None),
+		[id] => UserId::from_raw(*id),
+		// Sign-up refuses an address that already backs a password, under the same lock.
+		_ => return Err(DomainError::Repository(format!("{} unverified password accounts share one address", squatted.len()))),
+	};
+	let mut user = load_for_update(conn, id).await?;
+	user.take_over();
+	sqlx::query("DELETE FROM password_credentials WHERE user_id = $1")
+		.bind(id.raw())
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	update_row(conn, &user).await?;
+	let source = identity.provider.as_ref().map_or("email_code", |(provider, _)| provider.as_str());
+	record_action(conn, id, &AdminAction::system("taken_over_by_mailbox").with_detail(serde_json::json!({ "source": source })), now).await?;
+	Ok(Some(user))
+}
+
+/// The first default handle for `email` nobody holds.
+pub(crate) async fn free_username(conn: &mut PgConnection, email: &Email) -> Result<Option<Username>, DomainError> {
+	let candidates = Username::defaults_for(email);
+	let held: Vec<String> = sqlx::query_scalar("SELECT username FROM users WHERE username = ANY($1)")
+		.bind(candidates.iter().map(Username::as_str).collect::<Vec<_>>())
+		.fetch_all(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	Ok(candidates.into_iter().find(|candidate| !held.iter().any(|h| h == candidate.as_str())))
+}
+
+/// Insert a freshly provisioned account. Its `CREATED` is still pending for the caller's
+/// drain.
+pub(crate) async fn insert_user(conn: &mut PgConnection, user: User) -> Result<User, DomainError> {
+	sqlx::query(
+		"INSERT INTO users (id, auth_subject, email, email_verified, username, status, token_version, kyc_level, role, row_version) \
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+	)
+	.bind(user.id().raw())
+	.bind(user.auth_subject().as_str())
+	.bind(user.email().as_str())
+	.bind(user.email_verified())
+	.bind(user.username().map(Username::as_str))
+	.bind(user.status().as_str())
+	.bind(user.token_version() as i64)
+	.bind(user.kyc_level() as i32)
+	.bind(user.role().as_str())
+	.bind(user.row_version() as i64)
+	.execute(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+	Ok(user)
+}
+
+async fn link(conn: &mut PgConnection, provider: Provider, subject: &str, user: UserId, now: i64) -> Result<(), DomainError> {
+	sqlx::query("INSERT INTO user_identities (provider, subject, user_id, linked_at) VALUES ($1, $2, $3, $4)")
+		.bind(provider.as_str())
+		.bind(subject)
+		.bind(user.raw())
+		.bind(now)
+		.execute(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	Ok(())
+}
+
 /// Read one user `FOR UPDATE` on an open transaction. Shared with the governance
 /// adapter, which must take a seat and append the resulting `ROLE_CHANGED` in the same
 /// transaction as the consilium's verdict — one identity writer, not two.
@@ -699,7 +800,7 @@ pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(
 		legal_name = $7, preferred_name = $8, phone = $9, date_of_birth = $10, nationality = $11, \
 		tax_residence = $12, residential_address = $13, language = $14, base_currency = $15, \
 		timezone = $16, role = $17, row_version = $18, suspended_by = $19, hold_expires_at = $20, hold_ended_at = $21, \
-		updated_at = now() WHERE id = $1",
+		username = $22, updated_at = now() WHERE id = $1",
 	)
 	.bind(user.id().raw())
 	.bind(user.email().as_str())
@@ -725,6 +826,7 @@ pub(crate) async fn update_row(conn: &mut PgConnection, user: &User) -> Result<(
 	// the sentinel keeps the round trip stable and keeps the sweep's index useful.
 	.bind(user.suspension().and_then(Suspension::hold_expires_at).filter(|expires| *expires != i64::MAX))
 	.bind(user.hold_ended_at())
+	.bind(user.username().map(Username::as_str))
 	.execute(&mut *conn)
 	.await
 	.map_err(repo_err)?;

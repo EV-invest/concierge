@@ -1,6 +1,8 @@
-//! Google OAuth2 confidential-client flow (the only outbound HTTP this plane makes).
+//! Google OAuth2 confidential-client flow — the [`OAuthProvider::Google`] arm.
 //!
-//! The auth service exchanges the browser's authorization code (with its PKCE
+//! [`OAuthProvider::Google`]: crate::oauth::OAuthProvider::Google
+//!
+//! The web surface exchanges the browser's authorization code (with its PKCE
 //! verifier) for Google's tokens, verifies the returned `id_token` against
 //! Google's JWKS, checks the `nonce`, and extracts the stable `sub` + verified
 //! email. Google's token is then **discarded** — it is never forwarded inward; the
@@ -16,8 +18,9 @@ use std::{
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::Deserialize;
 
-use crate::{AuthError, config::GoogleConfig};
+use crate::{AuthError, config::OAuthClientConfig, oauth::OAuthIdentity};
 
+const AUTHORIZE_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const CERTS_ENDPOINT: &str = "https://www.googleapis.com/oauth2/v3/certs";
 const ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.google.com"];
@@ -27,14 +30,6 @@ const ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.google.com"
 /// plane verifier's [`MIN_REFRESH_INTERVAL`](crate::verifier)). A refresh also waits
 /// out the `Cache-Control: max-age` the last response advertised.
 const MIN_CERTS_REFRESH: Duration = Duration::from_secs(30);
-
-/// The verified identity extracted from a Google `id_token`.
-#[derive(Clone, Debug)]
-pub struct GoogleIdentity {
-	pub subject: String,
-	pub email: String,
-	pub email_verified: bool,
-}
 
 /// A configured Google OAuth2 client.
 pub struct GoogleOauth {
@@ -46,7 +41,7 @@ pub struct GoogleOauth {
 	certs: Mutex<CertCache>,
 }
 impl GoogleOauth {
-	pub fn new(config: &GoogleConfig) -> Self {
+	pub fn new(config: &OAuthClientConfig) -> Self {
 		Self {
 			client_id: config.client_id.clone(),
 			client_secret: config.client_secret.clone(),
@@ -57,9 +52,25 @@ impl GoogleOauth {
 		}
 	}
 
+	pub fn authorize_url(&self, redirect_uri: &str, state: &str, nonce: &str, code_challenge: &str) -> String {
+		let query = form_urlencoded::Serializer::new(String::new())
+			.append_pair("client_id", &self.client_id)
+			.append_pair("redirect_uri", redirect_uri)
+			.append_pair("response_type", "code")
+			.append_pair("scope", "openid email profile")
+			.append_pair("state", state)
+			.append_pair("nonce", nonce)
+			.append_pair("code_challenge", code_challenge)
+			.append_pair("code_challenge_method", "S256")
+			.append_pair("access_type", "online")
+			.append_pair("prompt", "select_account")
+			.finish();
+		format!("{AUTHORIZE_ENDPOINT}?{query}")
+	}
+
 	/// Exchange an authorization code for Google's tokens and return the verified
-	/// identity. `nonce` must equal the one the BFF placed in the authorize request.
-	pub async fn exchange_code(&self, auth_code: &str, code_verifier: &str, redirect_uri: &str, nonce: &str) -> Result<GoogleIdentity, AuthError> {
+	/// identity. `nonce` must equal the one placed in the authorize request.
+	pub async fn exchange_code(&self, auth_code: &str, code_verifier: &str, redirect_uri: &str, nonce: &str) -> Result<OAuthIdentity, AuthError> {
 		let response = self
 			.http
 			.post(&self.token_endpoint)
@@ -98,7 +109,7 @@ impl GoogleOauth {
 		self.verify_id_token(&id_token, nonce).await
 	}
 
-	async fn verify_id_token(&self, id_token: &str, nonce: &str) -> Result<GoogleIdentity, AuthError> {
+	async fn verify_id_token(&self, id_token: &str, nonce: &str) -> Result<OAuthIdentity, AuthError> {
 		let header = decode_header(id_token).map_err(|_| AuthError::Provider("malformed google id_token header".into()))?;
 		if header.alg != Algorithm::RS256 {
 			return Err(AuthError::Provider("unexpected google id_token algorithm".into()));
@@ -126,7 +137,7 @@ impl GoogleOauth {
 		}
 		let email = claims.email.ok_or_else(|| AuthError::Provider("google id_token had no email".into()))?;
 
-		Ok(GoogleIdentity {
+		Ok(OAuthIdentity {
 			subject: claims.sub,
 			email,
 			email_verified: claims.email_verified.unwrap_or(false),

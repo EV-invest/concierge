@@ -89,3 +89,23 @@ impl Scratch {
 			.expect("drop the scratch database");
 	}
 }
+
+/// A Google sign-in as `UserDirectoryRepository::resolve` receives it, with a fresh
+/// subject and a fresh address: one verified mailbox opens one account, so two fixtures
+/// sharing an address would silently be one person. `tag` keeps the address readable.
+pub fn google(tag: &str, verified: bool) -> domain::auth::ProvenIdentity {
+	google_as(
+		&format!("{tag}-{}", uuid::Uuid::new_v4()),
+		&format!("{tag}-{}@example.com", uuid::Uuid::new_v4().simple()),
+		verified,
+	)
+}
+
+/// A Google sign-in by a named subject and address — for the tests about what those do.
+pub fn google_as(subject: &str, email: &str, verified: bool) -> domain::auth::ProvenIdentity {
+	domain::auth::ProvenIdentity {
+		provider: Some((domain::auth::Provider::Google, subject.to_owned())),
+		email: domain::users::Email::parse(email).expect("a test address parses"),
+		email_proven: verified,
+	}
+}

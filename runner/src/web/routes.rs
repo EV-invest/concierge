@@ -4,25 +4,31 @@
 
 use axum::{
 	Json,
-	extract::{Query, State},
+	extract::{Path, Query, State},
 	http::{HeaderMap, StatusCode},
 	response::Redirect,
 };
 use axum_extra::extract::cookie::CookieJar;
+use domain::{
+	auth::{ProvenIdentity, Provider},
+	users::{Email, UserId},
+};
+use evconcierge_auth::oauth::OAuthProvider;
 use evconcierge_contracts::concierge::v1::{self as cc, auth_service_server::AuthService as AuthRpc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 
 use crate::web::{
-	WebState,
-	oauth::{Challenge, OAUTH_TX_TTL, authorize_url, safe_return_to},
+	WebState, now_secs,
+	oauth::{Challenge, OAUTH_TX_TTL, safe_return_to},
 };
 
 #[derive(Deserialize)]
 pub struct LoginQuery {
 	#[serde(rename = "returnTo")]
 	return_to: Option<String>,
+	provider: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -59,24 +65,25 @@ impl SessionInfo {
 	}
 }
 
-/// `GET /auth/login?returnTo=` — mint PKCE/state/nonce, stash the transaction
-/// server-side, and redirect the browser to Google's consent screen.
+/// `GET /auth/login?provider=&returnTo=` — mint PKCE/state/nonce, stash the
+/// transaction server-side, and redirect the browser to the provider's consent screen.
 pub async fn login(State(st): State<WebState>, jar: CookieJar, Query(q): Query<LoginQuery>) -> Result<(CookieJar, Redirect), (StatusCode, &'static str)> {
 	let st = &st.inner;
-	let Some(client_id) = st.google_client_id.clone() else {
-		return Err((StatusCode::SERVICE_UNAVAILABLE, "auth not configured"));
-	};
+	// A link that names no provider predates the choice, and meant Google.
+	let provider = st
+		.provider(q.provider.as_deref().unwrap_or("google"))
+		.ok_or((StatusCode::SERVICE_UNAVAILABLE, "sign-in method not configured"))?;
 	let return_to = safe_return_to(q.return_to.as_deref());
 	let ch = Challenge::new();
-	let tx_id = st.oauth.put(ch.state.clone(), ch.nonce.clone(), ch.code_verifier.clone(), return_to).await;
-	let url = authorize_url(&client_id, &st.redirect_uri(), &ch.state, &ch.nonce, &ch.code_challenge);
+	let tx_id = st.oauth.put(provider.name(), ch.state.clone(), ch.nonce.clone(), ch.code_verifier.clone(), return_to).await;
+	let url = provider.authorize_url(&st.redirect_uri(provider.name()), &ch.state, &ch.nonce, &ch.code_challenge);
 	let jar = jar.add(st.cookies.server_cookie(st.cookies.oauth_tx.clone(), tx_id, OAUTH_TX_TTL));
 	Ok((jar, Redirect::to(&url)))
 }
-/// `GET /callback/auth/google` — validate the state against the stored transaction,
-/// exchange the code for this plane's tokens (in-process), open a session, and
+/// `GET /callback/auth/{provider}` — validate the state against the stored transaction,
+/// redeem the code with the provider, resolve the account it opens, open a session, and
 /// redirect back to where the user came from.
-pub async fn callback(State(st): State<WebState>, jar: CookieJar, headers: HeaderMap, Query(q): Query<CallbackQuery>) -> (CookieJar, Redirect) {
+pub async fn callback(State(st): State<WebState>, Path(name): Path<String>, jar: CookieJar, headers: HeaderMap, Query(q): Query<CallbackQuery>) -> (CookieJar, Redirect) {
 	let st = &st.inner;
 	// The transaction is keyed by the HttpOnly tx cookie, so only the browser that
 	// started the flow holds it; `state` must then match the stored tx.
@@ -91,55 +98,81 @@ pub async fn callback(State(st): State<WebState>, jar: CookieJar, headers: Heade
 	let (Some(code), Some(state_param), Some(tx)) = (q.code, q.state, tx) else {
 		return fail(st, jar, &return_to, "invalid");
 	};
+	let Some(provider) = st.provider(&name).filter(|p| p.name() == tx.provider) else {
+		return fail(st, jar, &return_to, "invalid");
+	};
 	if tx.state != state_param {
 		return fail(st, jar, &return_to, "invalid");
 	}
 
-	let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-	let ip = client_ip(&headers);
-	let req = cc::ExchangeRequest {
-		auth_code: code,
-		code_verifier: tx.code_verifier,
-		redirect_uri: st.redirect_uri(),
-		nonce: tx.nonce,
-		user_agent,
-		ip,
-	};
-	match AuthRpc::exchange(&st.auth, tonic::Request::new(req)).await {
-		Ok(response) => {
-			// Signed in again, perhaps as another account: the browser's previous session ends here.
-			if let Some(previous) = jar.get(&st.cookies.session).map(|c| c.value().to_string())
-				&& let Err(e) = close(st, &previous).await
-			{
-				tracing::error!(error = ?e, "auth callback: previous session not closed");
-				return fail(st, jar, &return_to, "session");
-			}
-			let tokens = response.into_inner();
-			let access_token = tokens.access_token.clone();
-			let (id, csrf, max_age) = match st.sessions.put(tokens).await {
-				Ok(Some(opened)) => opened,
-				Ok(None) => return fail(st, jar, &return_to, "exchange"),
-				Err(e) => {
-					tracing::error!(error = ?e, "auth callback: session store put failed");
-					return fail(st, jar, &return_to, "session");
-				}
-			};
-			let jar = jar
-				.add(st.cookies.server_cookie(st.cookies.session.clone(), id, max_age))
-				.add(st.cookies.readable_cookie(st.cookies.csrf.clone(), csrf, max_age))
-				// The zone-shared credential: every same-origin request carries it, and a
-				// zone backend verifies it locally against this plane's JWKS. The JWT
-				// inside expires on its own short TTL; `/auth/session` re-sets it.
-				.add(st.cookies.server_cookie(st.cookies.access.clone(), access_token, max_age));
-			let jar = clear_tx(st, jar);
-			(jar, Redirect::to(&safe_return_to(Some(&tx.return_to))))
-		}
+	let identity = match provider.exchange_code(&code, &tx.code_verifier, &st.redirect_uri(provider.name()), &tx.nonce).await {
+		Ok(identity) => identity,
 		Err(e) => {
-			// Surface the upstream status server-side; the user only sees `?auth_error=`.
-			tracing::error!(code = ?e.code(), detail = %e.message(), "auth callback token exchange failed");
-			fail(st, jar, &return_to, "exchange")
+			// The callback is outside the reporting interceptor: an incident is reported here or never.
+			evconcierge_auth::telemetry::report_unexpected(&e);
+			tracing::warn!(provider = provider.name(), error = %e, "auth callback: provider exchange failed");
+			return fail(st, jar, &return_to, "exchange");
 		}
+	};
+	let Ok(email) = Email::parse(&identity.email) else {
+		tracing::warn!(provider = provider.name(), "auth callback: provider answered an unusable email");
+		return fail(st, jar, &return_to, "exchange");
+	};
+	let provider_kind: Provider = provider.name().parse().expect("every OAuthProvider name is a domain Provider");
+	let proven = ProvenIdentity {
+		provider: Some((provider_kind, identity.subject)),
+		email,
+		email_proven: identity.email_verified,
+	};
+	let user = match st.users.resolve(proven, now_secs()).await {
+		Ok(user) => user,
+		Err(e) => {
+			tracing::error!(error = %e, "auth callback: account resolution failed");
+			return fail(st, jar, &return_to, "session");
+		}
+	};
+	match open_session(st, jar, &headers, user.id()).await {
+		Ok(jar) => (clear_tx(st, jar), Redirect::to(&safe_return_to(Some(&tx.return_to)))),
+		Err((jar, reason)) => fail(st, jar, &return_to, reason),
 	}
+}
+
+/// Sign the browser in as `user`: close whatever session it held, open a new one, and
+/// set the session, CSRF and zone-shared access cookies. The one place every sign-in
+/// method ends. Errs with the jar untouched and a machine-readable reason.
+pub(super) async fn open_session(st: &super::Inner, jar: CookieJar, headers: &HeaderMap, user: UserId) -> Result<CookieJar, (CookieJar, &'static str)> {
+	let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+	let tokens = match st.auth.open_session(&user.to_string(), user_agent, client_ip(headers)).await {
+		Ok(tokens) => tokens,
+		Err(e) if e.code() == tonic::Code::PermissionDenied => return Err((jar, "disabled")),
+		Err(e) => {
+			tracing::error!(code = ?e.code(), detail = %e.message(), "sign-in: session issuance failed");
+			return Err((jar, "session"));
+		}
+	};
+	// Signed in again, perhaps as another account: the browser's previous session ends here.
+	if let Some(previous) = jar.get(&st.cookies.session).map(|c| c.value().to_string())
+		&& let Err(e) = close(st, &previous).await
+	{
+		tracing::error!(error = ?e, "sign-in: previous session not closed");
+		return Err((jar, "session"));
+	}
+	let access_token = tokens.access_token.clone();
+	let (id, csrf, max_age) = match st.sessions.put(tokens).await {
+		Ok(Some(opened)) => opened,
+		Ok(None) => return Err((jar, "session")),
+		Err(e) => {
+			tracing::error!(error = ?e, "sign-in: session store put failed");
+			return Err((jar, "session"));
+		}
+	};
+	Ok(jar
+		.add(st.cookies.server_cookie(st.cookies.session.clone(), id, max_age))
+		.add(st.cookies.readable_cookie(st.cookies.csrf.clone(), csrf, max_age))
+		// The zone-shared credential: every same-origin request carries it, and a zone
+		// backend verifies it locally against this plane's JWKS. The JWT inside expires
+		// on its own short TTL; `/auth/session` re-sets it.
+		.add(st.cookies.server_cookie(st.cookies.access.clone(), access_token, max_age)))
 }
 /// `GET /auth/session` — who-am-I for the browser, refreshing the access token (and
 /// its zone-shared cookie) transparently. Never returns a token in the body.
@@ -259,9 +292,13 @@ struct SessionEntry {
 }
 
 impl super::Inner {
-	/// The one redirect URI registered with Google: the callback on the user-facing origin.
-	fn redirect_uri(&self) -> String {
-		format!("{}/api/callback/auth/google", self.public_origin)
+	/// The one redirect URI registered with a provider: its callback on the user-facing origin.
+	fn redirect_uri(&self, provider: &str) -> String {
+		format!("{}/api/callback/auth/{provider}", self.public_origin)
+	}
+
+	fn provider(&self, name: &str) -> Option<&OAuthProvider> {
+		self.providers.iter().find(|p| p.name() == name)
 	}
 }
 

@@ -48,7 +48,7 @@ use domain::{
 	error::DomainError,
 	governance::MAX_REASON_CHARS,
 	iam::{self, Target},
-	users::{AuthSubject, Email, MAX_KYC_LEVEL, ProfileFields, Suspension, User, UserId, UserStatus},
+	users::{Email, MAX_KYC_LEVEL, ProfileFields, Suspension, User, UserId, UserStatus},
 };
 use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser, claims_of};
 use evconcierge_contracts::concierge::v1::{
@@ -735,15 +735,6 @@ fn summary_to_proto(row: AdminUserRow, role: String, role_is_break_glass: bool) 
 
 async fn handle(users: &dyn UserDirectoryRepository, command: ProvisionCommand, break_glass: &BreakGlass) -> Result<ProvisionedUser, AuthError> {
 	let user = match command {
-		ProvisionCommand::Provision {
-			auth_subject,
-			email,
-			email_verified,
-		} => {
-			let subject = AuthSubject::parse(&auth_subject).map_err(invalid_identity)?;
-			let email = Email::parse(&email).map_err(invalid_identity)?;
-			users.provision(subject, email, email_verified).await.map_err(to_auth)?
-		}
 		ProvisionCommand::Lookup { user_id } => {
 			let id = parse_id(&user_id)?;
 			users.find_by_id(id).await.map_err(to_auth)?.ok_or_else(|| AuthError::Directory("unknown user".into()))?
@@ -778,10 +769,6 @@ fn summary(user: &User, resolved: EffectiveRole) -> ProvisionedUser {
 
 fn parse_id(raw: &str) -> Result<UserId, AuthError> {
 	Uuid::parse_str(raw).map(UserId::from_raw).map_err(|_| AuthError::Directory("invalid user id".into()))
-}
-
-fn invalid_identity(_: DomainError) -> AuthError {
-	AuthError::Provider("invalid identity from provider".into())
 }
 
 fn to_auth(err: DomainError) -> AuthError {

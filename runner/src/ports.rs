@@ -26,11 +26,12 @@
 use async_trait::async_trait;
 use domain::{
 	architecture::{Reader, Repository},
+	auth::ProvenIdentity,
 	authz::Role,
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	iam::{Catalog, Target},
-	users::{AuthSubject, Email, ProfileFields, User, UserId},
+	users::{Email, ProfileFields, User, UserId},
 };
 use uuid::Uuid;
 
@@ -400,9 +401,18 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	/// Find a user by canonical id.
 	async fn find_by_id(&self, id: UserId) -> Result<Option<User>, DomainError>;
 
-	/// Upsert by the immutable [`AuthSubject`] at sign-in: create (emitting `CREATED`)
-	/// or refresh the email. Idempotent for concurrent first-logins.
-	async fn provision(&self, subject: AuthSubject, email: Email, email_verified: bool) -> Result<User, DomainError>;
+	/// The account a sign-in opens — the ONE linking rule every non-password method lands
+	/// in, decided under advisory locks on the subject and the mailbox:
+	///
+	/// 1. a linked provider subject opens its account (the email follows the provider's,
+	///    never downgrading a verified one, never onto an address another account proved);
+	/// 2. a proven mailbox opens the account it is verified on;
+	/// 3. a proven mailbox takes over the account that registered it UNVERIFIED with a
+	///    password: sessions revoked, password dropped, address verified;
+	/// 4. otherwise a new account (`CREATED`), verified iff the mailbox was proven.
+	///
+	/// A provider subject is linked to whichever account 2-4 picked.
+	async fn resolve(&self, identity: ProvenIdentity, now: i64) -> Result<User, DomainError>;
 
 	/// Full-replace the caller's editable profile fields.
 	async fn update_profile(&self, id: UserId, fields: ProfileFields) -> Result<User, DomainError>;

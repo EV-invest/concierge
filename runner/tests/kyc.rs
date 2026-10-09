@@ -11,6 +11,8 @@
 //! session; callback verification is the same code the live adapter runs, so a test that
 //! passes here is a test of what ships.
 
+mod common;
+
 use std::sync::{
 	Arc,
 	atomic::{AtomicUsize, Ordering},
@@ -40,10 +42,7 @@ use concierge::{
 	},
 	web::{self, KycDeps, START_MAX_PER_WINDOW},
 };
-use domain::{
-	error::DomainError,
-	users::{AuthSubject, Email, UserId},
-};
+use domain::{error::DomainError, users::UserId};
 use evconcierge_auth::AuthService;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -257,6 +256,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 		AuthService::unconfigured(),
 		"https://evinvest.test".to_string(),
 		false,
+		web::SignInDeps { providers: Vec::new() },
 		KycDeps {
 			users: users.clone(),
 			cases: cases.clone(),
@@ -283,8 +283,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 impl Harness {
 	/// A brand-new user, so runs neither collide nor need a clean database.
 	async fn user(&self) -> UserId {
-		let subject = AuthSubject::parse(&format!("kyc-itest-{}", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, Email::parse("kyc@example.com").unwrap(), true).await.expect("provision").id()
+		self.users.resolve(common::google("kyc", true), 0).await.expect("provision").id()
 	}
 
 	/// Open a case the way `/kyc/start` does, without going through the session cookie.
@@ -413,8 +412,12 @@ impl Harness {
 	/// alert is addressed to.
 	async fn owner(&self) -> (UserId, String) {
 		let email = format!("owner-{}@example.com", Uuid::new_v4());
-		let subject = AuthSubject::parse(&format!("kyc-owner-{}", Uuid::new_v4())).unwrap();
-		let id = self.users.provision(subject, Email::parse(&email).unwrap(), true).await.expect("provision").id();
+		let id = self
+			.users
+			.resolve(common::google_as(&format!("kyc-owner-{}", Uuid::new_v4()), &email, true), 0)
+			.await
+			.expect("provision")
+			.id();
 		self.reseat(id).await;
 		(id, email)
 	}

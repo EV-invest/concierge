@@ -1,10 +1,10 @@
 //! The auth service — the user/session issuance surface, mounted by the runner.
 //!
-//! Owns the signing keys, JWKS, Google client, and refresh store; serves the
-//! issuance gRPC routes (`Exchange`/`Refresh`/`Logout`/`ListSessions`/
-//! `RevokeSession`/`Jwks`). It provisions users in-process over the [`Provisioner`]
-//! channel (auth → directory); the runner builds the channel, hands auth the
-//! [`Provisioner`] half, and gives the receiver to the directory module (A1c).
+//! Owns the signing keys, JWKS and refresh store; serves the issuance gRPC routes
+//! (`Refresh`/`Logout`/`ListSessions`/`RevokeSession`/`Jwks`) and opens the sessions the
+//! web surface's sign-ins decide ([`AuthService::open_session`]). It reads accounts
+//! in-process over the [`Provisioner`] channel (auth → directory); the runner builds the
+//! channel, hands auth the [`Provisioner`] half, and gives the receiver to the directory.
 //!
 //! Unconfigured (no `AUTH_SIGNING_KEY_PEM`) it runs inert: issuance answers
 //! [`AuthError::NotConfigured`], so the plane still boots locally with no signing key.
@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use evconcierge_contracts::concierge::v1::{
-	ClientTokenResponse, ExchangeCodeRequest, ExchangeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, PublishCatalogRequest,
+	ClientTokenResponse, ExchangeCodeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, PublishCatalogRequest,
 	PublishCatalogResponse, RefreshClientTokenRequest, RefreshRequest, RevokeSessionRequest, RevokeSessionResponse, Session, TokenResponse, UserSummary,
 	auth_service_server::AuthService as AuthServiceRpc,
 };
@@ -22,7 +22,6 @@ use crate::{
 	AuthError,
 	clients::{CatalogPublication, ClientGrant, ClientGrants, ClientRefresh, CodeRedemption, UpstreamRevocation},
 	config::AuthConfig,
-	google::GoogleOauth,
 	management::{IssuedRefresh, RefreshInspect, RefreshStore, SessionBounds},
 	provisioner::{ProvisionedUser, Provisioner},
 	signer::{Signer, load_jwks},
@@ -52,12 +51,10 @@ impl AuthService {
 			}
 			None => (None, Vec::new()),
 		};
-		let google = config.google.as_ref().map(GoogleOauth::new);
 		Ok(Self {
 			client_grants: None,
 			engine: Arc::new(AuthEngine {
 				signer,
-				google,
 				refresh: RefreshStore::from_env().await?,
 				provisioner,
 				jwks,
@@ -82,7 +79,6 @@ impl AuthService {
 			client_grants: None,
 			engine: Arc::new(AuthEngine {
 				signer: None,
-				google: None,
 				refresh: RefreshStore::in_process(),
 				provisioner,
 				jwks: Vec::new(),
@@ -130,7 +126,24 @@ impl AuthService {
 		}
 	}
 
-	/// Open a refresh family without a Google exchange, for integration suites that need
+	/// Open a session for an account a sign-in resolved: re-read it live, refuse a disabled
+	/// one, mint the access token and open a refresh family carrying the device metadata.
+	///
+	/// Served on the public, un-wrapped web surface — outside the reporting interceptor —
+	/// so operational failures are reported here or never.
+	pub async fn open_session(&self, user_id: &str, user_agent: String, ip: String) -> Result<TokenResponse, Status> {
+		let engine = &self.engine;
+		let signer = engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
+		let summary = engine.provisioner.lookup(user_id.to_owned()).await.inspect_err(crate::telemetry::report_unexpected)?;
+		if summary.is_disabled() {
+			return Err(Status::permission_denied("user is disabled"));
+		}
+		let (access_token, access_exp) = signer.mint_access(&summary.user_id, summary.token_version)?;
+		let refresh = engine.refresh.issue(&summary.user_id, summary.token_version, engine.session_bounds, user_agent, ip).await?;
+		Ok(token_response(access_token, access_exp, refresh, &summary))
+	}
+
+	/// Open a refresh family without a sign-in, for integration suites that need
 	/// a real `evinvest.ltd` session to exist. Returns the refresh token.
 	#[cfg(feature = "test-support")]
 	pub async fn open_family_for_tests(&self, user_id: &str, token_version: u64) -> Result<String, AuthError> {
@@ -172,7 +185,6 @@ impl AuthService {
 
 struct AuthEngine {
 	signer: Option<Signer>,
-	google: Option<GoogleOauth>,
 	refresh: RefreshStore,
 	provisioner: Provisioner,
 	jwks: Vec<evconcierge_contracts::concierge::v1::Jwk>,
@@ -204,39 +216,6 @@ fn user_summary(summary: &ProvisionedUser) -> UserSummary {
 
 #[tonic::async_trait]
 impl AuthServiceRpc for AuthService {
-	async fn exchange(&self, request: Request<ExchangeRequest>) -> Result<Response<TokenResponse>, Status> {
-		let engine = &self.engine;
-		let signer = engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
-		let google = engine.google.as_ref().ok_or(AuthError::NotConfigured)?;
-		let req = request.into_inner();
-
-		// `exchange` is served on the public, un-wrapped server — outside the reporting
-		// interceptor — so operational failures must be reported here or never.
-		let identity = google
-			.exchange_code(&req.auth_code, &req.code_verifier, &req.redirect_uri, &req.nonce)
-			.await
-			.inspect_err(crate::telemetry::report_unexpected)?;
-		// Policy: an unverified Google email may sign in (the account is keyed by the
-		// stable `sub`, and `email_verified` is persisted and surfaced end-to-end so
-		// nothing is silently trusted); the directory never downgrades an already-verified
-		// stored email to an unverified one.
-		let summary = engine
-			.provisioner
-			.provision(identity.subject, identity.email, identity.email_verified)
-			.await
-			.inspect_err(crate::telemetry::report_unexpected)?;
-		if summary.is_disabled() {
-			return Err(Status::permission_denied("user is disabled"));
-		}
-
-		let (access_token, access_exp) = signer.mint_access(&summary.user_id, summary.token_version)?;
-		let refresh = engine
-			.refresh
-			.issue(&summary.user_id, summary.token_version, engine.session_bounds, req.user_agent, req.ip)
-			.await?;
-		Ok(Response::new(token_response(access_token, access_exp, refresh, &summary)))
-	}
-
 	async fn refresh(&self, request: Request<RefreshRequest>) -> Result<Response<TokenResponse>, Status> {
 		let engine = &self.engine;
 		let signer = engine.signer.as_ref().ok_or(AuthError::NotConfigured)?;
@@ -434,6 +413,7 @@ mod tests {
 				jwks_json: format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","x":"{TEST_JWK_X}","kid":"test-kid","alg":"EdDSA","use":"sig"}}]}}"#),
 			}),
 			google: None,
+			github: None,
 		}
 	}
 
@@ -504,22 +484,11 @@ mod tests {
 		assert!(verify_token(&token, &cache, &service_policy).is_err());
 	}
 
-	// An unconfigured service must not mint: Exchange short-circuits at NotConfigured
-	// (mapped to UNAVAILABLE) rather than touching the dropped provisioner channel.
+	// An unconfigured service must not mint: a session opens nowhere, and the dropped
+	// provisioner channel is never reached.
 	#[tokio::test]
-	async fn unconfigured_exchange_is_not_configured() {
-		let service = AuthService::unconfigured();
-		let status = service
-			.exchange(Request::new(ExchangeRequest {
-				auth_code: "x".into(),
-				code_verifier: "y".into(),
-				redirect_uri: "z".into(),
-				nonce: "n".into(),
-				user_agent: String::new(),
-				ip: String::new(),
-			}))
-			.await
-			.unwrap_err();
+	async fn an_unconfigured_service_opens_no_session() {
+		let status = AuthService::unconfigured().open_session("x", String::new(), String::new()).await.unwrap_err();
 		assert_eq!(status.code(), tonic::Code::Unavailable);
 	}
 

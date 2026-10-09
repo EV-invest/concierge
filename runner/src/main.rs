@@ -27,7 +27,7 @@ use concierge::{
 	web,
 };
 use ev::error_monitoring::{self, Config as SentryConfig};
-use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, provisioner_channel};
+use evconcierge_auth::{AuthConfig, AuthService, Verifier, VerifierConfig, grpc_auth_layer, oauth::OAuthProvider, provisioner_channel};
 use evconcierge_contracts::concierge::v1::{
 	CheckRequest, CheckResponse,
 	auth_service_server::AuthServiceServer,
@@ -177,6 +177,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		.sync_registry(|var| std::env::var(var).ok())
 		.await
 		.context("failed to load the relying-party registry")?;
+	let providers: Vec<OAuthProvider> = auth_config.google.iter().map(OAuthProvider::google).collect();
 	let auth_service = AuthService::try_new(auth_config, provisioner)
 		.await
 		.context("failed to build the auth service")?
@@ -348,6 +349,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		auth_service.clone(),
 		config.public_origin.clone(),
 		config.app_env == "production",
+		web::SignInDeps { providers },
 		web::KycDeps {
 			users: users.clone(),
 			cases: kyc_cases,

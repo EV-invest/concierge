@@ -32,7 +32,7 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use domain::users::UserId;
-use evconcierge_auth::AuthService;
+use evconcierge_auth::{AuthService, oauth::OAuthProvider};
 /// Re-exported so the integration suite asserts against the cap the route actually
 /// enforces. A test that hard-coded the number would keep passing after someone raised
 /// it, and the number is what stands between one account and the vendor balance.
@@ -101,14 +101,21 @@ pub struct WebState {
 impl WebState {
 	/// `relying_parties` is `None` where no client flow is mounted; `/auth/authorize` then
 	/// answers 503 with a page, never a redirect.
-	pub async fn try_new(auth: AuthService, public_origin: String, secure_cookies: bool, kyc: KycDeps, relying_parties: Option<Arc<RelyingParties>>) -> color_eyre::Result<Self> {
+	pub async fn try_new(
+		auth: AuthService,
+		public_origin: String,
+		secure_cookies: bool,
+		sign_in: SignInDeps,
+		kyc: KycDeps,
+		relying_parties: Option<Arc<RelyingParties>>,
+	) -> color_eyre::Result<Self> {
 		Ok(Self {
 			inner: Arc::new(Inner {
 				auth,
 				oauth: OAuthTxStore::new(),
 				sessions: WebSessions::from_env().await?,
 				cookies: CookieNames::new(secure_cookies),
-				google_client_id: std::env::var("GOOGLE_CLIENT_ID").ok().filter(|v| !v.is_empty()),
+				providers: sign_in.providers,
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
@@ -122,6 +129,12 @@ impl WebState {
 			}),
 		})
 	}
+}
+
+/// What the sign-in routes need beyond the session machinery.
+pub struct SignInDeps {
+	/// The OAuth providers offered, each answering at `/callback/auth/<name>`.
+	pub providers: Vec<OAuthProvider>,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -152,7 +165,7 @@ pub fn router(state: WebState) -> Router {
 		// k8s liveness/readiness probe target — the only unauthenticated route.
 		.route("/health", get(|| async { "ok" }))
 		.route("/auth/login", get(routes::login))
-		.route("/callback/auth/google", get(routes::callback))
+		.route("/callback/auth/{provider}", get(routes::callback))
 		.route("/auth/session", get(routes::session))
 		.route("/auth/logout", post(routes::logout))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
@@ -192,10 +205,10 @@ struct Inner {
 	oauth: OAuthTxStore,
 	sessions: WebSessions,
 	cookies: CookieNames,
-	/// Public OAuth client id; `None` ⇒ login answers 503 (mirrors the inert plane).
-	google_client_id: Option<String>,
+	/// An absent provider's login answers 503 (mirrors the inert plane).
+	providers: Vec<OAuthProvider>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
-	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/google`.
+	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,
 	/// The identity control plane — the KYC webhook applies its verdict through the same
 	/// port the operator console's `SetKycLevel` does.
