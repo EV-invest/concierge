@@ -1106,6 +1106,25 @@ async fn a_second_start_reuses_the_live_case_and_never_calls_the_vendor() {
 	assert_eq!(h.case_count(user).await, 1, "one attempt, one row — a second would read as an abandoned try");
 }
 
+/// A level above 0 needs a verified email, so starting a verification that could only
+/// end in one is refused before the vendor is paid for it.
+#[tokio::test]
+async fn an_unverified_email_starts_no_verification() {
+	let counter = Arc::new(AtomicUsize::new(0));
+	let Some(h) = setup_with(Some(Arc::new(CountingKyc::new(counter.clone())))).await else {
+		return;
+	};
+	let user = h.users.resolve(common::google("kyc-unverified", false), 0).await.expect("provision").id();
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let (status, body) = h.start(&cookie, Some(&csrf), "{}").await;
+	assert_eq!((status, body), (StatusCode::FORBIDDEN, json!({ "error": "email_unverified" })));
+	assert_eq!(counter.load(Ordering::SeqCst), 0, "nothing was bought");
+	assert_eq!(h.case_count(user).await, 0);
+}
+
 /// Two starts from one user at the SAME time — the race #56 describes.
 ///
 /// The gate is a read, so this cannot be shown with two sequential calls: the second

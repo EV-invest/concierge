@@ -72,6 +72,8 @@ const UNAUTHENTICATED: &str = "unauthenticated";
 const CSRF: &str = "csrf";
 const THROTTLED: &str = "throttled";
 const INTERNAL: &str = "internal";
+/// A tier is granted to a person, and an unproven address is not one yet.
+const EMAIL_UNVERIFIED: &str = "email_unverified";
 
 /// What every answer from `GET /kyc/status` carries, hit or refusal.
 ///
@@ -202,6 +204,19 @@ pub async fn start(State(st): State<WebState>, jar: CookieJar, headers: HeaderMa
 	// Same rotation as on `/kyc/status`, and the same obligation: this read may have
 	// renewed the pair, so the browser leaves with the token the store now holds.
 	let jar = caller.refreshed(st, jar);
+
+	// Before the gate and the billed vendor call: the level a verdict would grant is
+	// refused at the aggregate anyway (`User::set_kyc_level`), and a session bought for
+	// it would be paid for nothing.
+	match st.users.find_by_id(user_id).await {
+		Ok(Some(user)) if user.email_verified() => {}
+		Ok(Some(_)) => return Err(StartError::Refused(StatusCode::FORBIDDEN, EMAIL_UNVERIFIED)),
+		Ok(None) => return Err(StartError::Refused(StatusCode::UNAUTHORIZED, UNAUTHENTICATED)),
+		Err(e) => {
+			tracing::error!(error = %e, "kyc: could not read the account starting verification");
+			return Err(StartError::Refused(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL));
+		}
+	}
 
 	// One start per user at a time, from the gate read to the row write. The gate below
 	// is a READ: two requests arriving together would both see "no live case", both
