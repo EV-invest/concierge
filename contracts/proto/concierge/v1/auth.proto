@@ -143,6 +143,9 @@ message UserSummary {
   // register's: it disappears the moment the fund has its first persisted owner, and it
   // seats nobody. A client MUST render it as a warning, never as ownership.
   bool role_is_break_glass = 6;
+  bool email_verified = 7;
+  // Empty when the account has no handle.
+  string username = 8;
 }
 
 message ExchangeCodeRequest {

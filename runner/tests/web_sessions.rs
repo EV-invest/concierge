@@ -25,6 +25,8 @@ fn summary(user_id: &str, role: &str) -> UserSummary {
 		token_version: 1,
 		role: role.into(),
 		role_is_break_glass: false,
+		email_verified: true,
+		username: String::new(),
 	}
 }
 

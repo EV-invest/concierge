@@ -113,6 +113,7 @@ impl Reader for PgUsers {
 pub struct AdminUserRow {
 	pub id: Uuid,
 	pub email: Option<String>,
+	pub username: Option<String>,
 	pub status: String,
 	pub kyc_level: i32,
 	pub role: String,
@@ -331,6 +332,18 @@ impl UserDirectoryRepository for PgUsers {
 		drain_outbox(&mut tx, &mut user).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(user)
+	}
+
+	async fn set_username(&self, id: UserId, username: Username) -> Result<User, DomainError> {
+		self.mutate(id, |user| {
+			user.set_username(username);
+			Ok(())
+		})
+		.await
+		.map_err(|err| match err {
+			DomainError::Repository(msg) if msg.contains("users_username_idx") => DomainError::Conflict("username is taken".into()),
+			other => other,
+		})
 	}
 
 	async fn update_profile(&self, id: UserId, fields: ProfileFields) -> Result<User, DomainError> {
@@ -637,10 +650,10 @@ impl UserDirectoryRepository for PgUsers {
 	/// static statement (sqlx 0.9 needs a `&'static str`).
 	async fn list(&self, query: &str, role: &str, status: &str, limit: i64, offset: i64) -> Result<(Vec<AdminUserRow>, i64), DomainError> {
 		let rows = sqlx::query_as::<_, AdminUserRow>(
-			"SELECT id, email, status, kyc_level, role, token_version, suspended_by, hold_expires_at, \
+			"SELECT id, email, username, status, kyc_level, role, token_version, suspended_by, hold_expires_at, \
 			 EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at \
 			 FROM users \
-			 WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR id::text ILIKE '%' || $1 || '%') \
+			 WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR username ILIKE '%' || $1 || '%' OR id::text ILIKE '%' || $1 || '%') \
 			   AND ($2 = '' OR role = $2) \
 			   AND ($3 = '' OR status = $3) \
 			 ORDER BY created_at DESC LIMIT $4 OFFSET $5",
@@ -656,7 +669,7 @@ impl UserDirectoryRepository for PgUsers {
 
 		let total: i64 = sqlx::query_scalar(
 			"SELECT COUNT(*) FROM users \
-			 WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR id::text ILIKE '%' || $1 || '%') \
+			 WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR username ILIKE '%' || $1 || '%' OR id::text ILIKE '%' || $1 || '%') \
 			   AND ($2 = '' OR role = $2) \
 			   AND ($3 = '' OR status = $3)",
 		)
@@ -732,6 +745,52 @@ async fn linkable(conn: &mut PgConnection, identity: &ProvenIdentity, now: i64) 
 	let source = identity.provider.as_ref().map_or("email_code", |(provider, _)| provider.as_str());
 	record_action(conn, id, &AdminAction::system("taken_over_by_mailbox").with_detail(serde_json::json!({ "source": source })), now).await?;
 	Ok(Some(user))
+}
+
+/// Whom an account handle — an email or a username — names.
+pub enum Named {
+	One(UserId),
+	Nobody,
+	/// Several accounts answer to it; it names none of them.
+	Several,
+}
+
+impl Named {
+	pub fn id(&self) -> Option<UserId> {
+		match self {
+			Self::One(id) => Some(*id),
+			Self::Nobody | Self::Several => None,
+		}
+	}
+}
+
+/// THE resolver for every surface that names an account by handle (password sign-in,
+/// grants). An email names the accounts it is verified on or backs a password of —
+/// what a stranger merely typed into a provider names nobody. Only when no account
+/// answers to it as an email is it read as a username, so a username spelled like
+/// somebody's address never captures their sign-in.
+pub(crate) async fn account_named(conn: &mut PgConnection, handle: &str) -> Result<Named, DomainError> {
+	if let Ok(email) = Email::parse(handle) {
+		let ids: Vec<Uuid> = sqlx::query_scalar(
+			"SELECT u.id FROM users u WHERE lower(u.email) = $1 \
+			 AND (u.email_verified OR EXISTS (SELECT 1 FROM password_credentials p WHERE p.user_id = u.id)) LIMIT 2",
+		)
+		.bind(email.as_str())
+		.fetch_all(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+		match ids.as_slice() {
+			[] => {}
+			[id] => return Ok(Named::One(UserId::from_raw(*id))),
+			_ => return Ok(Named::Several),
+		}
+	}
+	let id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+		.bind(handle.trim().to_lowercase())
+		.fetch_optional(&mut *conn)
+		.await
+		.map_err(repo_err)?;
+	Ok(id.map_or(Named::Nobody, |id| Named::One(UserId::from_raw(id))))
 }
 
 /// The first default handle for `email` nobody holds.

@@ -329,3 +329,189 @@ async fn the_code_leaves_in_a_mail_and_not_in_the_table() {
 		.unwrap();
 	assert!(stored.is_none(), "the plaintext is struck once the mail is out");
 }
+
+impl Fx {
+	async fn sign_up(&self, email: &str, password: &str, verify: bool, browser: &mut Browser) -> Answer {
+		self.post(
+			"/auth/password/signup",
+			json!({ "email": email, "password": password, "verify": verify, "turnstileToken": "human" }),
+			browser,
+		)
+		.await
+	}
+
+	async fn password_sign_in(&self, identifier: &str, password: &str, browser: &mut Browser) -> Answer {
+		self.post(
+			"/auth/password/signin",
+			json!({ "identifier": identifier, "password": password, "turnstileToken": "human" }),
+			browser,
+		)
+		.await
+	}
+
+	/// Mail the signed-in account a verification code and read it back.
+	async fn verification_code(&self, browser: &mut Browser) -> String {
+		let answer = self.post("/auth/email/verify/request", json!({}), browser).await;
+		assert_eq!(answer.body, json!({ "ok": true }));
+		let email = self.session(browser).await["user"]["email"].as_str().unwrap().to_owned();
+		self.mailed_code(&email).await
+	}
+
+	async fn methods(&self, browser: &Browser) -> Value {
+		let request = Request::get("/auth/methods").header(header::COOKIE, browser.header()).body(Body::empty()).unwrap();
+		let response = self.router.clone().oneshot(request).await.unwrap();
+		serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
+	}
+}
+
+const PASSWORD: &str = "correct horse battery";
+
+#[tokio::test]
+async fn a_password_account_works_unverified_and_verifies_later() {
+	let fx = fixture!();
+	let email = address("later");
+	let mut browser = Browser::default();
+	let answer = fx.sign_up(&email, PASSWORD, false, &mut browser).await;
+	assert_eq!((answer.status, answer.body), (StatusCode::OK, json!({ "ok": true, "verification": "skipped" })));
+	assert_eq!(fx.session(&browser).await["user"]["emailVerified"], false, "signed in, unverified");
+
+	let code = fx.verification_code(&mut browser).await;
+	let confirmed = fx.post("/auth/email/verify/confirm", json!({ "code": code }), &mut browser).await;
+	assert_eq!(confirmed.body, json!({ "ok": true }));
+	assert_eq!(fx.session(&browser).await["user"]["emailVerified"], true);
+	assert_eq!(fx.methods(&browser).await["password"], true, "verifying later keeps the password");
+}
+
+#[tokio::test]
+async fn ticking_verify_mails_a_code_at_sign_up() {
+	let fx = fixture!();
+	let email = address("now");
+	let answer = fx.sign_up(&email, PASSWORD, true, &mut Browser::default()).await;
+	assert_eq!(answer.body, json!({ "ok": true, "verification": "sent" }));
+	assert_eq!(fx.queued_codes(&email).await, 1);
+}
+
+#[tokio::test]
+async fn an_address_somebody_proved_or_backs_a_password_is_not_signed_up_again() {
+	let fx = fixture!();
+	let proved = address("proved");
+	fx.sign_in_with_code(&proved, &mut Browser::default()).await;
+	let answer = fx.sign_up(&proved, PASSWORD, false, &mut Browser::default()).await;
+	assert_eq!((answer.status, answer.body), (StatusCode::CONFLICT, json!({ "error": "email_taken" })));
+
+	let registered = address("registered");
+	fx.sign_up(&registered, PASSWORD, false, &mut Browser::default()).await;
+	let again = fx.sign_up(&registered, "another password", false, &mut Browser::default()).await;
+	assert_eq!(again.body, json!({ "error": "email_taken" }));
+}
+
+#[tokio::test]
+async fn a_short_password_is_refused() {
+	let fx = fixture!();
+	let answer = fx.sign_up(&address("short"), "1234567", false, &mut Browser::default()).await;
+	assert_eq!((answer.status, answer.body), (StatusCode::BAD_REQUEST, json!({ "error": "weak_password" })));
+}
+
+#[tokio::test]
+async fn a_password_signs_in_by_email_or_username_and_says_nothing_else() {
+	let fx = fixture!();
+	let local = format!("pw{}", Uuid::new_v4().simple());
+	let email = format!("{local}@example.com");
+	fx.sign_up(&email, PASSWORD, false, &mut Browser::default()).await;
+
+	for identifier in [email.as_str(), local.as_str(), &email.to_uppercase()] {
+		let mut browser = Browser::default();
+		let answer = fx.password_sign_in(identifier, PASSWORD, &mut browser).await;
+		assert_eq!(answer.status, StatusCode::OK, "{identifier}");
+		assert_eq!(fx.session(&browser).await["user"]["email"], email);
+	}
+	let invalid = json!({ "error": "invalid_credentials" });
+	assert_eq!(fx.password_sign_in(&email, "not the password", &mut Browser::default()).await.body, invalid);
+	assert_eq!(
+		fx.password_sign_in(&address("nobody"), PASSWORD, &mut Browser::default()).await.body,
+		invalid,
+		"no account reads as a wrong password"
+	);
+}
+
+/// A username spelled like an address never captures that address's sign-in: the handle
+/// is read as an email first.
+#[tokio::test]
+async fn an_address_is_an_email_before_it_is_a_username() {
+	let fx = fixture!();
+	let local = format!("shadow{}", Uuid::new_v4().simple());
+	let email = format!("{local}@example.com");
+	fx.sign_up(&email, PASSWORD, false, &mut Browser::default()).await;
+	let twin = fx.users.resolve(common::google_as(&format!("twin-{}", Uuid::new_v4()), &email, false), 0).await.unwrap();
+	assert_eq!(
+		twin.username().map(|u| u.as_str()),
+		Some(email.as_str()),
+		"the local part was taken, so the twin's handle is the address"
+	);
+
+	let mut browser = Browser::default();
+	assert_eq!(fx.password_sign_in(&email, PASSWORD, &mut browser).await.status, StatusCode::OK);
+	assert_ne!(fx.session(&browser).await["user"]["userId"], twin.id().to_string());
+}
+
+#[tokio::test]
+async fn a_locked_password_still_lets_a_code_in() {
+	let fx = fixture!();
+	let email = address("locked");
+	fx.sign_up(&email, PASSWORD, false, &mut Browser::default()).await;
+	for _ in 0..concierge::ports::PASSWORD_MAX_FAILURES {
+		fx.password_sign_in(&email, "wrong guess", &mut Browser::default()).await;
+	}
+	let locked = fx.password_sign_in(&email, PASSWORD, &mut Browser::default()).await;
+	assert_eq!((locked.status, locked.body), (StatusCode::TOO_MANY_REQUESTS, json!({ "error": "password_locked" })));
+
+	let mut browser = Browser::default();
+	assert_eq!(fx.sign_in_with_code(&email, &mut browser).await.status, StatusCode::OK, "the mailbox still opens it");
+}
+
+#[tokio::test]
+async fn setting_a_password_takes_a_mailed_code() {
+	let fx = fixture!();
+	let email = address("setpw");
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&email, &mut browser).await;
+	assert_eq!(fx.methods(&browser).await["password"], false);
+
+	let refused = fx.post("/auth/password/set", json!({ "password": PASSWORD, "code": "000000" }), &mut browser).await;
+	assert_eq!(refused.body, json!({ "error": "invalid_code" }), "a session alone plants no password");
+
+	let code = fx.verification_code(&mut browser).await;
+	let set = fx.post("/auth/password/set", json!({ "password": PASSWORD, "code": code }), &mut browser).await;
+	assert_eq!(set.body, json!({ "ok": true }));
+	assert_eq!(fx.password_sign_in(&email, PASSWORD, &mut Browser::default()).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_username_is_chosen_within_its_alphabet_and_held_by_one_account() {
+	let fx = fixture!();
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&address("handle"), &mut browser).await;
+	let wanted = format!("h{}", &Uuid::new_v4().simple().to_string()[..12]);
+
+	let set = fx.post("/auth/username", json!({ "username": wanted.to_uppercase() }), &mut browser).await;
+	assert_eq!(set.body, json!({ "ok": true, "username": wanted }));
+	let with_at = fx.post("/auth/username", json!({ "username": "me@example.com" }), &mut browser).await;
+	assert_eq!(with_at.body, json!({ "error": "invalid_username" }), "a chosen handle never looks like an address");
+
+	let mut other = Browser::default();
+	fx.sign_in_with_code(&address("rival"), &mut other).await;
+	let taken = fx.post("/auth/username", json!({ "username": wanted }), &mut other).await;
+	assert_eq!((taken.status, taken.body), (StatusCode::CONFLICT, json!({ "error": "username_taken" })));
+}
+
+#[tokio::test]
+async fn the_admin_search_finds_a_username() {
+	let fx = fixture!();
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&address("searched"), &mut browser).await;
+	let wanted = format!("s{}", &Uuid::new_v4().simple().to_string()[..12]);
+	fx.post("/auth/username", json!({ "username": wanted }), &mut browser).await;
+	let (rows, total) = fx.users.list(&wanted[..10], "", "", 10, 0).await.unwrap();
+	assert_eq!(total, 1);
+	assert_eq!(rows[0].username.as_deref(), Some(wanted.as_str()));
+}

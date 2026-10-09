@@ -7,15 +7,18 @@
 use async_trait::async_trait;
 use domain::{
 	error::DomainError,
-	users::{Email, User, UserId},
+	users::{AuthSubject, Email, User, UserId},
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use super::users::{load_for_update, lock_email, update_row, verified_holder};
-use crate::ports::{CODE_MAX_ATTEMPTS, CODE_SEND_WINDOW_SECS, CODE_SENDS_PER_WINDOW, CODE_TTL_SECS, CodeIssue, CodePurpose, CodeRefusal, CredentialRepository, VerifyRefusal};
+use super::users::{Named, account_named, drain_outbox, free_username, insert_user, load_for_update, lock_email, update_row, verified_holder};
+use crate::ports::{
+	CODE_MAX_ATTEMPTS, CODE_SEND_WINDOW_SECS, CODE_SENDS_PER_WINDOW, CODE_TTL_SECS, CodeIssue, CodePurpose, CodeRefusal, CredentialRepository, PASSWORD_LOCK_SECS, PASSWORD_MAX_FAILURES,
+	SignInMethods, SignUp, StoredPassword, VerifyRefusal,
+};
 
 pub struct PgCredentials {
 	pool: PgPool,
@@ -179,28 +182,120 @@ impl CredentialRepository for PgCredentials {
 
 	async fn verify_email(&self, user: UserId, code: &str, now: i64) -> Result<Result<User, VerifyRefusal>, DomainError> {
 		let mut tx = self.pool.begin().await.map_err(repo_err)?;
-		let email = email_of(&mut tx, user).await?;
-		lock_email(&mut tx, &email).await?;
-		let outcome = match redeem(&mut tx, &email, "verify", Some(user), code, now).await? {
-			Err(refusal) => Err(VerifyRefusal::Code(refusal)),
-			Ok(()) => match verified_holder(&mut tx, &email).await? {
-				Some(holder) if holder != user => Err(VerifyRefusal::Taken),
-				_ => {
-					let mut account = load_for_update(&mut tx, user).await?;
-					// Moved between the read and the lock: the code proved the old address.
-					if *account.email() != email {
-						Err(VerifyRefusal::Code(CodeRefusal::Missing))
-					} else {
-						account.verify_email();
-						update_row(&mut tx, &account).await?;
-						Ok(account)
-					}
-				}
-			},
-		};
+		let outcome = verify_with_code(&mut tx, user, code, now).await?;
 		tx.commit().await.map_err(repo_err)?;
 		Ok(outcome)
 	}
+
+	async fn sign_up(&self, email: &Email, phc: String, now: i64) -> Result<SignUp, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		lock_email(&mut tx, email).await?;
+		let backs_password: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users u JOIN password_credentials p ON p.user_id = u.id WHERE lower(u.email) = $1)")
+			.bind(email.as_str())
+			.fetch_one(&mut *tx)
+			.await
+			.map_err(repo_err)?;
+		if backs_password || verified_holder(&mut tx, email).await?.is_some() {
+			return Ok(SignUp::Taken);
+		}
+		let id = UserId::new();
+		let user = User::provision(id, AuthSubject::parse(&id.to_string())?, email.clone(), false, free_username(&mut tx, email).await?);
+		let mut user = insert_user(&mut tx, user).await?;
+		write_password(&mut tx, id, &phc, now).await?;
+		drain_outbox(&mut tx, &mut user).await?;
+		tx.commit().await.map_err(repo_err)?;
+		Ok(SignUp::Created(user))
+	}
+
+	async fn password_named(&self, handle: &str) -> Result<Option<StoredPassword>, DomainError> {
+		let mut conn = self.pool.acquire().await.map_err(repo_err)?;
+		let Named::One(user) = account_named(&mut conn, handle).await? else {
+			return Ok(None);
+		};
+		let row: Option<(String, Option<i64>)> = sqlx::query_as("SELECT phc, locked_until FROM password_credentials WHERE user_id = $1")
+			.bind(user.raw())
+			.fetch_optional(&mut *conn)
+			.await
+			.map_err(repo_err)?;
+		Ok(row.map(|(phc, locked_until)| StoredPassword { user, phc, locked_until }))
+	}
+
+	async fn record_password_attempt(&self, user: UserId, succeeded: bool, now: i64) -> Result<(), DomainError> {
+		let query = match succeeded {
+			true => sqlx::query("UPDATE password_credentials SET failed_attempts = 0, locked_until = NULL WHERE user_id = $1").bind(user.raw()),
+			false => sqlx::query(
+				"UPDATE password_credentials SET \
+				 locked_until = CASE WHEN failed_attempts + 1 >= $2 THEN $3 + $4 ELSE locked_until END, \
+				 failed_attempts = CASE WHEN failed_attempts + 1 >= $2 THEN 0 ELSE failed_attempts + 1 END \
+				 WHERE user_id = $1",
+			)
+			.bind(user.raw())
+			.bind(PASSWORD_MAX_FAILURES)
+			.bind(now)
+			.bind(PASSWORD_LOCK_SECS),
+		};
+		query.execute(&self.pool).await.map_err(repo_err)?;
+		Ok(())
+	}
+
+	async fn methods(&self, user: UserId) -> Result<SignInMethods, DomainError> {
+		let password: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM password_credentials WHERE user_id = $1)")
+			.bind(user.raw())
+			.fetch_one(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		let providers = sqlx::query_scalar("SELECT provider FROM user_identities WHERE user_id = $1 ORDER BY provider")
+			.bind(user.raw())
+			.fetch_all(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		Ok(SignInMethods { password, providers })
+	}
+
+	async fn set_password(&self, user: UserId, code: &str, phc: String, now: i64) -> Result<Result<(), VerifyRefusal>, DomainError> {
+		let mut tx = self.pool.begin().await.map_err(repo_err)?;
+		let outcome = verify_with_code(&mut tx, user, code, now).await?;
+		if outcome.is_ok() {
+			write_password(&mut tx, user, &phc, now).await?;
+		}
+		tx.commit().await.map_err(repo_err)?;
+		Ok(outcome.map(|_| ()))
+	}
+}
+
+/// Spend a verification code and mark the account's address verified. The caller commits
+/// whatever the outcome: a wrong guess must stay counted.
+async fn verify_with_code(conn: &mut PgConnection, user: UserId, code: &str, now: i64) -> Result<Result<User, VerifyRefusal>, DomainError> {
+	let email = email_of(conn, user).await?;
+	lock_email(conn, &email).await?;
+	if let Err(refusal) = redeem(conn, &email, "verify", Some(user), code, now).await? {
+		return Ok(Err(VerifyRefusal::Code(refusal)));
+	}
+	if verified_holder(conn, &email).await?.is_some_and(|holder| holder != user) {
+		return Ok(Err(VerifyRefusal::Taken));
+	}
+	let mut account = load_for_update(conn, user).await?;
+	// Moved between the read and the lock: the code proved the old address.
+	if *account.email() != email {
+		return Ok(Err(VerifyRefusal::Code(CodeRefusal::Missing)));
+	}
+	account.verify_email();
+	update_row(conn, &account).await?;
+	Ok(Ok(account))
+}
+
+async fn write_password(conn: &mut PgConnection, user: UserId, phc: &str, now: i64) -> Result<(), DomainError> {
+	sqlx::query(
+		"INSERT INTO password_credentials (user_id, phc, updated_at) VALUES ($1, $2, $3) \
+		 ON CONFLICT (user_id) DO UPDATE SET phc = EXCLUDED.phc, failed_attempts = 0, locked_until = NULL, updated_at = EXCLUDED.updated_at",
+	)
+	.bind(user.raw())
+	.bind(phc)
+	.bind(now)
+	.execute(&mut *conn)
+	.await
+	.map_err(repo_err)?;
+	Ok(())
 }
 
 #[cfg(test)]

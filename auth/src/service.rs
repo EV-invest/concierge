@@ -211,6 +211,8 @@ fn user_summary(summary: &ProvisionedUser) -> UserSummary {
 		token_version: summary.token_version,
 		role: summary.role.clone(),
 		role_is_break_glass: summary.role_is_break_glass,
+		email_verified: summary.email_verified,
+		username: summary.username.clone(),
 	}
 }
 
@@ -445,6 +447,8 @@ mod tests {
 		ProvisionedUser {
 			user_id: user_id.into(),
 			email: "user@test".into(),
+			email_verified: true,
+			username: String::new(),
 			status: "active".into(),
 			token_version,
 			role: "investor".into(),

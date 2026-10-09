@@ -34,6 +34,9 @@ pub struct ProvisionRequest {
 pub struct ProvisionedUser {
 	pub user_id: String,
 	pub email: String,
+	pub email_verified: bool,
+	/// Empty when the account has no handle.
+	pub username: String,
 	pub status: String,
 	pub token_version: u64,
 	/// The user's platform access role (snake_case), so a freshly issued token pair

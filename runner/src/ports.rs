@@ -31,7 +31,7 @@ use domain::{
 	error::DomainError,
 	governance::{AdmissionId, AdmissionVote, ProposalVote, RemovalId, UserProposalId, UserProposalKind, Vote},
 	iam::{Catalog, Target},
-	users::{Email, ProfileFields, User, UserId},
+	users::{Email, ProfileFields, User, UserId, Username},
 };
 use uuid::Uuid;
 
@@ -74,11 +74,11 @@ pub struct GrantActor {
 	pub elevated: bool,
 }
 
-/// Whose grant: by id, or by the address a delegate already knows. A delegate may not
-/// grant by id.
+/// Whose grant: by id, or by a handle a delegate already knows — an email or a username,
+/// resolved by `infrastructure::users::account_named`. A delegate may not grant by id.
 pub enum GrantSubject {
 	Id(UserId),
-	Email(Email),
+	Account(String),
 }
 
 impl GrantSubject {
@@ -86,7 +86,7 @@ impl GrantSubject {
 	pub fn describe(&self) -> String {
 		match self {
 			Self::Id(id) => id.to_string(),
-			Self::Email(email) => email.as_str().to_owned(),
+			Self::Account(handle) => handle.clone(),
 		}
 	}
 }
@@ -117,8 +117,8 @@ pub enum GrantOutcome {
 	/// The account is disabled; a grant to it would wake up on reinstatement without
 	/// anyone having decided that. Said only to a seat.
 	TargetDisabled,
-	/// Said only to a seat.
-	AmbiguousEmail,
+	/// The handle names several accounts. Said only to a seat.
+	AmbiguousAccount,
 	/// A delegate's address cannot be granted, for a reason they are not told: telling
 	/// "nobody holds it" from "several accounts do" from "that account is disabled" would
 	/// let anyone with a delegating alias ask the plane about any address (banking#447).
@@ -186,6 +186,7 @@ pub struct GrantRecord {
 pub struct GrantHolderRecord {
 	pub grant: GrantRecord,
 	pub email: Option<String>,
+	pub username: Option<String>,
 	pub legal_name: Option<String>,
 	pub preferred_name: Option<String>,
 }
@@ -413,6 +414,9 @@ pub trait UserDirectoryRepository: Repository<Aggregate = User> + Reader<Aggrega
 	///
 	/// A provider subject is linked to whichever account 2-4 picked.
 	async fn resolve(&self, identity: ProvenIdentity, now: i64) -> Result<User, DomainError>;
+
+	/// The caller's chosen handle. [`DomainError::Conflict`] when somebody holds it.
+	async fn set_username(&self, id: UserId, username: Username) -> Result<User, DomainError>;
 
 	/// Full-replace the caller's editable profile fields.
 	async fn update_profile(&self, id: UserId, fields: ProfileFields) -> Result<User, DomainError>;
@@ -1310,6 +1314,33 @@ pub enum CodeRefusal {
 	Exhausted,
 }
 
+/// Failed password guesses before the password locks for [`PASSWORD_LOCK_SECS`]. The
+/// lock is on the password only: a code still signs the account in, so nobody can lock
+/// an owner out of their own account by guessing at it.
+pub const PASSWORD_MAX_FAILURES: i32 = 10;
+pub const PASSWORD_LOCK_SECS: i64 = 900;
+
+/// The password an account handle names, for checking.
+pub struct StoredPassword {
+	pub user: UserId,
+	/// PHC string, `$argon2id$…`.
+	pub phc: String,
+	pub locked_until: Option<i64>,
+}
+
+pub struct SignInMethods {
+	pub password: bool,
+	/// Linked providers, by `user_identities.provider`.
+	pub providers: Vec<String>,
+}
+
+pub enum SignUp {
+	Created(User),
+	/// The address backs a password already, or is verified on an account: that person
+	/// signs in, with a code if need be.
+	Taken,
+}
+
 #[derive(Debug)]
 pub enum VerifyRefusal {
 	Code(CodeRefusal),
@@ -1333,4 +1364,22 @@ pub trait CredentialRepository: Send + Sync {
 	/// Spend a verification code and mark the account's address verified, in one
 	/// transaction.
 	async fn verify_email(&self, user: UserId, code: &str, now: i64) -> Result<Result<User, VerifyRefusal>, DomainError>;
+
+	/// A new account behind an email and a password, its address unverified.
+	async fn sign_up(&self, email: &Email, phc: String, now: i64) -> Result<SignUp, DomainError>;
+
+	/// The password of the one account `handle` names (an email or a username), if it
+	/// has one.
+	async fn password_named(&self, handle: &str) -> Result<Option<StoredPassword>, DomainError>;
+
+	/// Count a guess: a failure moves toward the lock, a success clears the count.
+	async fn record_password_attempt(&self, user: UserId, succeeded: bool, now: i64) -> Result<(), DomainError>;
+
+	/// How the account can sign in, for its settings.
+	async fn methods(&self, user: UserId) -> Result<SignInMethods, DomainError>;
+
+	/// Set (or replace) the password, on the strength of a verification code — so a stolen
+	/// session alone cannot plant a password that outlives its revocation. Spending the
+	/// code verifies the address, as [`Self::verify_email`] does.
+	async fn set_password(&self, user: UserId, code: &str, phc: String, now: i64) -> Result<Result<(), VerifyRefusal>, DomainError>;
 }

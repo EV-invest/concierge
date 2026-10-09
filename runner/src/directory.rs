@@ -48,7 +48,7 @@ use domain::{
 	error::DomainError,
 	governance::MAX_REASON_CHARS,
 	iam::{self, Target},
-	users::{Email, MAX_KYC_LEVEL, ProfileFields, Suspension, User, UserId, UserStatus},
+	users::{MAX_KYC_LEVEL, ProfileFields, Suspension, User, UserId, UserStatus},
 };
 use evconcierge_auth::{AuthError, ProvisionCommand, ProvisionRequest, ProvisionedUser, claims_of};
 use evconcierge_contracts::concierge::v1::{
@@ -265,11 +265,11 @@ fn require_reason(raw: &str) -> Result<String, Status> {
 }
 
 /// A request's `oneof subject`, parsed. Both request types carry the same pair.
-fn parse_subject(user_id: Option<&str>, email: Option<&str>) -> Result<GrantSubject, Status> {
-	match (user_id, email) {
+fn parse_subject(user_id: Option<&str>, account: Option<&str>) -> Result<GrantSubject, Status> {
+	match (user_id, account) {
 		(Some(raw), _) => parse_target_id(raw).map(GrantSubject::Id),
-		(None, Some(raw)) => Email::parse(raw).map(GrantSubject::Email).map_err(domain_to_status),
-		(None, None) => Err(Status::invalid_argument("subject is required: user_id or email")),
+		(None, Some(raw)) if !raw.trim().is_empty() => Ok(GrantSubject::Account(raw.trim().to_owned())),
+		_ => Err(Status::invalid_argument("subject is required: user_id or account (an email or a username)")),
 	}
 }
 
@@ -277,7 +277,7 @@ fn parse_subject(user_id: Option<&str>, email: Option<&str>) -> Result<GrantSubj
 /// signal worth keeping. Ids and the target — never the address they typed.
 fn grant_denied(actor: &GrantActor, verb: &'static str, target: &str) -> Status {
 	tracing::warn!(actor = %actor.id, verb, target, "grant refused");
-	Status::permission_denied("grants are made by a seat holding iam:tenants:grant, or by an alias's holder for exactly the aliases it delegates, naming the user by email")
+	Status::permission_denied("grants are made by a seat holding iam:tenants:grant, or by an alias's holder for exactly the aliases it delegates, naming the user by email or username")
 }
 
 /// A delegate's grant to an address that cannot be granted, logged with the reason they
@@ -581,7 +581,7 @@ impl UserDirectory for Directory {
 		let req = request.into_inner();
 		let subject = match &req.subject {
 			Some(grant_permission_request::Subject::UserId(raw)) => parse_subject(Some(raw), None),
-			Some(grant_permission_request::Subject::Email(raw)) => parse_subject(None, Some(raw)),
+			Some(grant_permission_request::Subject::Account(raw)) => parse_subject(None, Some(raw)),
 			None => parse_subject(None, None),
 		}?;
 		let target = parse_grant_target(&req.target)?;
@@ -598,7 +598,7 @@ impl UserDirectory for Directory {
 			// FAILED_PRECONDITION, as for a hold: a state that can change (reinstate the
 			// account), not a statement about the caller's authority.
 			GrantOutcome::TargetDisabled => Err(Status::failed_precondition("the account is disabled; reinstate it before granting it access")),
-			GrantOutcome::AmbiguousEmail => Err(Status::failed_precondition("this email belongs to more than one account; grant by user_id")),
+			GrantOutcome::AmbiguousAccount => Err(Status::failed_precondition("this handle names more than one account; grant by user_id")),
 			GrantOutcome::Ungrantable(why) => Err(ungrantable(&actor, target.as_str(), why)),
 		}
 	}
@@ -610,7 +610,7 @@ impl UserDirectory for Directory {
 		let req = request.into_inner();
 		let subject = match &req.subject {
 			Some(revoke_permission_request::Subject::UserId(raw)) => parse_subject(Some(raw), None),
-			Some(revoke_permission_request::Subject::Email(raw)) => parse_subject(None, Some(raw)),
+			Some(revoke_permission_request::Subject::Account(raw)) => parse_subject(None, Some(raw)),
 			None => parse_subject(None, None),
 		}?;
 		let target = parse_grant_target(&req.target)?;
@@ -648,6 +648,7 @@ impl UserDirectory for Directory {
 				Ok(GrantHolder {
 					grant: Some(permission_grant_to_proto(holder.grant, orphaned)),
 					email: holder.email.unwrap_or_default(),
+					username: holder.username.unwrap_or_default(),
 					legal_name: holder.legal_name.filter(|_| names).unwrap_or_default(),
 					preferred_name: holder.preferred_name.filter(|_| names).unwrap_or_default(),
 				})
@@ -696,6 +697,7 @@ fn user_to_proto(user: &User, resolved: EffectiveRole) -> UserProfile {
 		suspended_by: user.suspension().map(Suspension::as_str).unwrap_or_default().to_owned(),
 		hold_expires_at: user.suspension().and_then(Suspension::hold_expires_at).unwrap_or_default(),
 		permissions: Vec::new(),
+		username: user.username().map(|u| u.as_str().to_owned()).unwrap_or_default(),
 	}
 }
 
@@ -722,6 +724,7 @@ fn summary_to_proto(row: AdminUserRow, role: String, role_is_break_glass: bool) 
 	AdminUserSummary {
 		user_id: row.id.to_string(),
 		email: row.email.unwrap_or_default(),
+		username: row.username.unwrap_or_default(),
 		status: row.status,
 		kyc_level: row.kyc_level as u32,
 		role,
@@ -760,6 +763,8 @@ fn summary(user: &User, resolved: EffectiveRole) -> ProvisionedUser {
 	ProvisionedUser {
 		user_id: user.id().to_string(),
 		email: user.email().as_str().to_owned(),
+		email_verified: user.email_verified(),
+		username: user.username().map(|u| u.as_str().to_owned()).unwrap_or_default(),
 		status: user.status().as_str().to_owned(),
 		token_version: user.token_version(),
 		role: resolved.role.as_str().to_owned(),

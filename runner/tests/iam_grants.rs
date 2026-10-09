@@ -47,7 +47,8 @@ struct Fixture {
 #[derive(Clone)]
 enum Who {
 	Id(UserId),
-	Email(String),
+	/// An email or a username.
+	Account(String),
 }
 
 const PERMISSIONS: [&str; 3] = ["work:leads:read", "work:leads:edit", "admin:sources:manage"];
@@ -173,7 +174,7 @@ impl Fixture {
 		let request = GrantPermissionRequest {
 			subject: Some(match who {
 				Who::Id(id) => grant_permission_request::Subject::UserId(id.to_string()),
-				Who::Email(email) => grant_permission_request::Subject::Email(email),
+				Who::Account(email) => grant_permission_request::Subject::Account(email),
 			}),
 			target: target.into(),
 			reason: "itest".into(),
@@ -185,7 +186,7 @@ impl Fixture {
 		let request = RevokePermissionRequest {
 			subject: Some(match who {
 				Who::Id(id) => revoke_permission_request::Subject::UserId(id.to_string()),
-				Who::Email(email) => revoke_permission_request::Subject::Email(email),
+				Who::Account(email) => revoke_permission_request::Subject::Account(email),
 			}),
 			target: target.into(),
 			reason: String::new(),
@@ -198,7 +199,7 @@ impl Fixture {
 	}
 
 	async fn grant_by_email(&self, actor: UserId, user: UserId, target: &str) -> Result<(), tonic::Status> {
-		self.grant_to(actor, Who::Email(self.email_of(user).await), target).await
+		self.grant_to(actor, Who::Account(self.email_of(user).await), target).await
 	}
 
 	async fn revoke(&self, actor: UserId, user: UserId, target: &str) -> Result<(), tonic::Status> {
@@ -240,17 +241,30 @@ impl Fixture {
 			.unwrap()
 	}
 
-	/// Two accounts on one address, returned as that address. One verified mailbox names
-	/// one account, so the second holds it unverified.
+	/// Two accounts an address names, returned as that address: the one it is verified on,
+	/// and one it backs a password of unverified — the only pair a handle can name.
 	async fn shared_email(&self) -> String {
 		let email = format!("shared-{}@iam.example.com", Uuid::new_v4().simple());
-		for verified in [true, false] {
-			self.users
-				.resolve(common::google_as(&format!("iam-shared-{}", Uuid::new_v4()), &email, verified), 0)
-				.await
-				.unwrap();
-		}
+		self.users.resolve(common::google_as(&format!("iam-shared-{}", Uuid::new_v4()), &email, true), 0).await.unwrap();
+		let second = self.users.resolve(common::google_as(&format!("iam-shared-{}", Uuid::new_v4()), &email, false), 0).await.unwrap();
+		sqlx::query("INSERT INTO password_credentials (user_id, phc, updated_at) VALUES ($1, '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA', 0)")
+			.bind(second.id().raw())
+			.execute(&self.pool)
+			.await
+			.unwrap();
 		email
+	}
+
+	async fn username_of(&self, user: UserId) -> String {
+		self.users
+			.find_by_id(user)
+			.await
+			.unwrap()
+			.unwrap()
+			.username()
+			.expect("a fixture account has a handle")
+			.as_str()
+			.to_owned()
 	}
 
 	async fn disabled_email(&self) -> String {
@@ -407,6 +421,13 @@ async fn a_delegate_grants_and_revokes_exactly_what_their_alias_delegates() {
 	fx.revoke(delegate, member, &fx.p("operator")).await.expect("revoking by id is fine: the roster hands ids back");
 	assert!(fx.active_grants(member).await.is_empty());
 
+	let handle = fx.username_of(member).await;
+	fx.grant_to(delegate, Who::Account(handle.clone()), &fx.p("operator"))
+		.await
+		.expect("a username names the account as its email does");
+	assert_eq!(fx.active_grants(member).await, [fx.p("operator")]);
+	fx.revoke_from(delegate, Who::Account(handle), &fx.p("operator")).await.unwrap();
+
 	// An operator holds nothing that delegates.
 	let operator = fx.user("operator").await;
 	fx.grant_by_email(delegate, operator, &fx.p("operator")).await.unwrap();
@@ -428,7 +449,7 @@ async fn a_delegate_cannot_tell_a_missing_address_from_a_shared_or_disabled_one(
 		("held", fx.held_email(seat).await),
 	];
 	for (what, email) in addresses {
-		let got = answer(fx.grant_to(delegate, Who::Email(email), &fx.p("operator")).await);
+		let got = answer(fx.grant_to(delegate, Who::Account(email), &fx.p("operator")).await);
 		assert_eq!(
 			got,
 			(Code::FailedPrecondition, "this address cannot be granted access".to_owned()),
@@ -440,8 +461,8 @@ async fn a_delegate_cannot_tell_a_missing_address_from_a_shared_or_disabled_one(
 	// otherwise PERMISSION_DENIED for a real account against the answer above for a missing
 	// one would be the same oracle by another door.
 	let real = fx.email_of(fx.user("real").await).await;
-	let for_real = answer(fx.grant_to(delegate, Who::Email(real), &fx.p("admin")).await);
-	let for_nobody = answer(fx.grant_to(delegate, Who::Email(unknown_email()), &fx.p("admin")).await);
+	let for_real = answer(fx.grant_to(delegate, Who::Account(real), &fx.p("admin")).await);
+	let for_nobody = answer(fx.grant_to(delegate, Who::Account(unknown_email()), &fx.p("admin")).await);
 	assert_eq!(for_real.0, Code::PermissionDenied);
 	assert_eq!(for_real, for_nobody);
 }
@@ -451,9 +472,9 @@ async fn a_delegate_cannot_tell_a_missing_address_from_a_shared_or_disabled_one(
 async fn a_seat_still_hears_why_an_address_cannot_be_granted() {
 	let Some(fx) = setup().await else { return };
 	let seat = fx.seated("seat", Role::Admin).await;
-	let unknown = answer(fx.grant_to(seat, Who::Email(unknown_email()), &fx.p("operator")).await);
-	let shared = answer(fx.grant_to(seat, Who::Email(fx.shared_email().await), &fx.p("operator")).await);
-	let disabled = answer(fx.grant_to(seat, Who::Email(fx.disabled_email().await), &fx.p("operator")).await);
+	let unknown = answer(fx.grant_to(seat, Who::Account(unknown_email()), &fx.p("operator")).await);
+	let shared = answer(fx.grant_to(seat, Who::Account(fx.shared_email().await), &fx.p("operator")).await);
+	let disabled = answer(fx.grant_to(seat, Who::Account(fx.disabled_email().await), &fx.p("operator")).await);
 	assert_eq!(unknown.0, Code::NotFound);
 	assert_eq!(shared.0, Code::FailedPrecondition);
 	assert!(shared.1.contains("more than one account"), "{}", shared.1);
@@ -473,7 +494,7 @@ async fn a_delegate_revoking_by_email_hears_one_not_found_for_everything() {
 		("disabled", fx.disabled_email().await),
 		("an account with no grant here", outsider),
 	] {
-		let got = answer(fx.revoke_from(delegate, Who::Email(email), &fx.p("operator")).await);
+		let got = answer(fx.revoke_from(delegate, Who::Account(email), &fx.p("operator")).await);
 		assert_eq!(got.0, Code::NotFound, "{what}");
 		answers.push(got);
 	}

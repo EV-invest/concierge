@@ -944,6 +944,8 @@ async fn signed_in_with(user_id: &str, access_ttl_secs: i64) -> Option<(String, 
 				token_version: 0,
 				role: "investor".into(),
 				role_is_break_glass: false,
+				email_verified: true,
+				username: String::new(),
 			}),
 		})
 		.await

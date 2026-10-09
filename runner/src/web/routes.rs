@@ -53,6 +53,8 @@ impl SessionInfo {
 			user: Some(SessionUser {
 				user_id: user.user_id,
 				email: user.email,
+				email_verified: user.email_verified,
+				username: Some(user.username).filter(|u| !u.is_empty()),
 				status: user.status,
 				role: user.role,
 				is_admin,
@@ -273,6 +275,8 @@ pub async fn revoke_session(State(st): State<WebState>, jar: CookieJar, headers:
 struct SessionUser {
 	user_id: String,
 	email: String,
+	email_verified: bool,
+	username: Option<String>,
 	status: String,
 	role: String,
 	is_admin: bool,

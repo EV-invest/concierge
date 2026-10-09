@@ -184,6 +184,11 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/code/verify", post(sign_in::verify_code))
 		.route("/auth/email/verify/request", post(sign_in::request_verification))
 		.route("/auth/email/verify/confirm", post(sign_in::confirm_verification))
+		.route("/auth/password/signup", post(sign_in::sign_up))
+		.route("/auth/password/signin", post(sign_in::sign_in))
+		.route("/auth/password/set", post(sign_in::set_password))
+		.route("/auth/username", post(sign_in::set_username))
+		.route("/auth/methods", get(sign_in::methods))
 		// The relying-party code flow's front door. It needs no CSRF token: it changes
 		// nothing a cross-site request could exploit — it only ever redirects to an
 		// address registered for the client, carrying a code that is useless without the

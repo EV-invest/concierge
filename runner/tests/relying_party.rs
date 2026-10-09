@@ -664,6 +664,8 @@ async fn signed_in_browser(fx: &Fx, user: UserId) -> Option<(String, String)> {
 				token_version: 0,
 				role: "investor".into(),
 				role_is_break_glass: false,
+				email_verified: true,
+				username: String::new(),
 			}),
 		})
 		.await
