@@ -589,7 +589,7 @@ async fn router(fx: &Fx) -> Router {
 		fx.auth.clone(),
 		"https://evinvest.test".to_string(),
 		false,
-		web::SignInDeps { providers: Vec::new() },
+		common::inert_sign_in(&fx.pool),
 		KycDeps {
 			users: fx.users.clone(),
 			cases: Arc::new(PgKycCases::new(fx.pool.clone())),

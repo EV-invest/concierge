@@ -90,7 +90,8 @@ pub struct DeliveryJob {
 	pub kind: String,
 	pub recipient: String,
 	pub attempts: i32,
-	pub unsubscribe_token: String,
+	/// `None` for a code mail, which is addressed to a mailbox rather than a subscriber.
+	pub unsubscribe_token: Option<String>,
 	pub confirm_token: Option<String>,
 	pub topic: Option<String>,
 	pub title: Option<String>,
@@ -506,7 +507,7 @@ impl NotificationDispatchRepository for PgNotifications {
 			"SELECT d.id, d.kind, d.recipient, d.attempts, s.unsubscribe_token, s.confirm_token, \
 			        n.topic, n.title, n.body, n.link, n.occurred_at, d.payload \
 			 FROM notification_deliveries d \
-			 JOIN notification_subscribers s ON s.id = d.subscriber_id \
+			 LEFT JOIN notification_subscribers s ON s.id = d.subscriber_id \
 			 LEFT JOIN notifications n ON n.id = d.notification_id \
 			 WHERE d.id = ANY($1) ORDER BY d.id ASC",
 		)

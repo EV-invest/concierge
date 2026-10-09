@@ -279,6 +279,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		}
 	};
 
+	let mail_wake = Arc::new(tokio::sync::Notify::new());
 	tokio::spawn(concierge::dispatch::run_dispatcher(
 		dispatch_repo,
 		transport,
@@ -289,6 +290,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			daily_budget: config.notification_daily_email_budget,
 			interval: std::time::Duration::from_secs(config.notification_dispatch_interval_secs),
 		},
+		mail_wake.clone(),
 	));
 
 	// The hold sweep. Unlike consilium expiry — which is lazy, so nothing has to be
@@ -349,7 +351,12 @@ async fn run(config: config::AppConfig) -> Result<()> {
 		auth_service.clone(),
 		config.public_origin.clone(),
 		config.app_env == "production",
-		web::SignInDeps { providers },
+		web::SignInDeps {
+			providers,
+			turnstile: web::Turnstile::new(config.turnstile_secret.clone(), web::SITEVERIFY.to_string()),
+			credentials: Arc::new(infrastructure::credentials::PgCredentials::new(pool.clone())),
+			mail_wake,
+		},
 		web::KycDeps {
 			users: users.clone(),
 			cases: kyc_cases,

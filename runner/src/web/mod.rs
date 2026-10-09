@@ -21,7 +21,9 @@ mod kyc;
 mod oauth;
 mod routes;
 mod session;
+mod sign_in;
 mod single_flight;
+mod turnstile;
 
 // The one session-store name tests exercise the persistence invariant through.
 use std::sync::Arc;
@@ -39,9 +41,11 @@ use evconcierge_auth::{AuthService, oauth::OAuthProvider};
 pub use kyc::START_MAX_PER_WINDOW;
 pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
+use tokio::sync::Notify;
+pub use turnstile::{SITEVERIFY, Turnstile};
 
 use crate::{
-	ports::{GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
+	ports::{CredentialRepository, GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
 	relying_party::RelyingParties,
 	web::{oauth::OAuthTxStore, single_flight::KeyedLocks},
 };
@@ -116,6 +120,9 @@ impl WebState {
 				sessions: WebSessions::from_env().await?,
 				cookies: CookieNames::new(secure_cookies),
 				providers: sign_in.providers,
+				turnstile: sign_in.turnstile,
+				credentials: sign_in.credentials,
+				mail_wake: sign_in.mail_wake,
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
@@ -135,6 +142,10 @@ impl WebState {
 pub struct SignInDeps {
 	/// The OAuth providers offered, each answering at `/callback/auth/<name>`.
 	pub providers: Vec<OAuthProvider>,
+	pub turnstile: Turnstile,
+	pub credentials: Arc<dyn CredentialRepository>,
+	/// The mail dispatcher's wake-up: a queued code leaves now rather than on the next tick.
+	pub mail_wake: Arc<Notify>,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -169,6 +180,10 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/session", get(routes::session))
 		.route("/auth/logout", post(routes::logout))
 		.route("/auth/sessions", get(routes::list_sessions).delete(routes::revoke_session))
+		.route("/auth/code/request", post(sign_in::request_code))
+		.route("/auth/code/verify", post(sign_in::verify_code))
+		.route("/auth/email/verify/request", post(sign_in::request_verification))
+		.route("/auth/email/verify/confirm", post(sign_in::confirm_verification))
 		// The relying-party code flow's front door. It needs no CSRF token: it changes
 		// nothing a cross-site request could exploit — it only ever redirects to an
 		// address registered for the client, carrying a code that is useless without the
@@ -207,6 +222,9 @@ struct Inner {
 	cookies: CookieNames,
 	/// An absent provider's login answers 503 (mirrors the inert plane).
 	providers: Vec<OAuthProvider>,
+	turnstile: Turnstile,
+	credentials: Arc<dyn CredentialRepository>,
+	mail_wake: Arc<Notify>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
 	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,

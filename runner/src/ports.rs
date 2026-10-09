@@ -1272,3 +1272,65 @@ pub trait OwnerGenesisRepository: Send + Sync {
 	/// test rather than only readable in a log.
 	async fn seed_owners(&self, subjects: &[GenesisSubject]) -> Result<GenesisOutcome, DomainError>;
 }
+
+/// How long an emailed code works.
+pub const CODE_TTL_SECS: i64 = 600;
+/// Wrong guesses a code survives before it burns (`email_codes_attempts`).
+pub const CODE_MAX_ATTEMPTS: i32 = 5;
+/// Codes one address may be sent per [`CODE_SEND_WINDOW_SECS`], counted in the table so
+/// the cap holds across replicas.
+pub const CODE_SENDS_PER_WINDOW: i64 = 5;
+pub const CODE_SEND_WINDOW_SECS: i64 = 900;
+
+/// What a code is for. A sign-in code proves a mailbox to whoever asks; a verification
+/// code proves the signed-in account's own address and is bound to that account.
+#[derive(Clone, Debug)]
+pub enum CodePurpose {
+	Login(Email),
+	Verify(UserId),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum CodeIssue {
+	/// Stored and queued for the mailer.
+	Sent,
+	/// The address was sent [`CODE_SENDS_PER_WINDOW`] codes in the window already.
+	Throttled,
+}
+
+/// Why a presented code did not prove the mailbox.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodeRefusal {
+	/// No live code was sent there, or it was already used.
+	Missing,
+	Expired,
+	/// Wrong, with guesses left.
+	Wrong,
+	/// Wrong, and that was the last guess: the code is burned.
+	Exhausted,
+}
+
+#[derive(Debug)]
+pub enum VerifyRefusal {
+	Code(CodeRefusal),
+	/// The address is verified on another account already.
+	Taken,
+}
+
+/// Emailed codes (and, beside them, passwords): the credentials this plane checks itself
+/// rather than trusting a provider for. Every method is one transaction, and a wrong guess
+/// is counted in it BEFORE the comparison, so an attempt that errors still counts.
+#[async_trait]
+pub trait CredentialRepository: Send + Sync {
+	/// Mint a code and queue the mail carrying it. The address a verification code goes
+	/// to is the account's current one, read here.
+	async fn issue_code(&self, purpose: CodePurpose, now: i64) -> Result<CodeIssue, DomainError>;
+
+	/// Spend a sign-in code. `Ok(Ok(()))` proves the mailbox; the account it opens is
+	/// [`UserDirectoryRepository::resolve`]'s to decide.
+	async fn redeem_login_code(&self, email: &Email, code: &str, now: i64) -> Result<Result<(), CodeRefusal>, DomainError>;
+
+	/// Spend a verification code and mark the account's address verified, in one
+	/// transaction.
+	async fn verify_email(&self, user: UserId, code: &str, now: i64) -> Result<Result<User, VerifyRefusal>, DomainError>;
+}

@@ -225,7 +225,10 @@ async fn delivery_queue_claims_leases_and_backs_off() {
 	let job = claimed.iter().find(|j| j.recipient == "queue@example.com").expect("our job is claimed");
 	assert_eq!(job.kind, "notification");
 	assert_eq!(job.title.as_deref(), Some("Queued"), "the join carries the notification body through for rendering");
-	assert!(!job.unsubscribe_token.is_empty(), "…and the subscriber's unsubscribe token, for the List-Unsubscribe header");
+	assert!(
+		job.unsubscribe_token.as_deref().is_some_and(|t| !t.is_empty()),
+		"…and the subscriber's unsubscribe token, for the List-Unsubscribe header"
+	);
 	assert_eq!(job.attempts, 1, "claiming counts an attempt, so a crash mid-send cannot retry forever");
 
 	// The lease hides it from a second dispatcher.

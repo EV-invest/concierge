@@ -77,7 +77,7 @@
         # surface (:55671) AND the bridge seams over TLS (:55672) in-process. The
         # contract's port/healthPath describe the web surface (http probes); gitops
         # patches the Service to expose the others.
-        # Secret env (signing key, JWKS, Google OAuth, bridge token) arrives via
+        # Secret env (signing key, JWKS, Google/GitHub OAuth, bridge token, Turnstile) arrives via
         # the automatic optional `kubernetes-concierge` envFrom — never baked in.
         # Topology literals are set directly as contract env vars (read by
         # ev::settings! from_env). deploy/config.nix is kept for reference only.
@@ -204,6 +204,8 @@
             # dev topology is owned here, deploy/config.nix kept for reference.
             export APP_ENV="''${APP_ENV:-development}"
             export PUBLIC_ORIGIN="''${PUBLIC_ORIGIN:-http://localhost:58843}"
+            # Cloudflare's always-pass test secret: the check still runs, against Cloudflare.
+            export TURNSTILE_SECRET="''${TURNSTILE_SECRET:-1x0000000000000000000000000000000AA}"
             export RUST_LOG="''${RUST_LOG:-info,concierge=debug,evconcierge_auth=debug}"
             exec cargo run -p concierge
           '';

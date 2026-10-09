@@ -40,7 +40,6 @@ use axum::{
 	response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::CookieJar;
-use domain::users::UserId;
 use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -50,7 +49,7 @@ use crate::{
 	ports::{CallbackHeaders, CaseDecision, KycCallbackError, KycCase, KycLevelChange, KycStatus, NewCase},
 	web::{
 		WebState, now_secs,
-		routes::{CsrfOutcome, csrf_outcome},
+		routes::{CsrfOutcome, SessionStoreDown, csrf_outcome, session_user},
 	},
 };
 
@@ -109,66 +108,10 @@ impl StartError {
 	}
 }
 
-/// The session locker could not be read. The ONE failure [`session_user`] has that is
-/// not "nobody is signed in" — kept as its own type so each route renders it in its own
-/// body shape without either of them having to guess what an absent session means.
-pub(super) struct SessionStoreDown;
-
 impl From<SessionStoreDown> for StartError {
 	fn from(_: SessionStoreDown) -> Self {
 		Self::Refused(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL)
 	}
-}
-
-/// The signed-in caller, plus the access token their browser must be left holding.
-///
-/// The token half is not incidental. Reading a session ROTATES it (see
-/// [`session_user`]), so a handler that takes the caller and drops the rest signs the
-/// browser out from under itself.
-pub(super) struct Caller {
-	id: UserId,
-	access_token: String,
-	remaining_secs: i64,
-}
-
-impl Caller {
-	/// Put the refreshed access token back in the browser, the way `/auth/session` does.
-	fn refreshed(self, st: &super::Inner, jar: CookieJar) -> CookieJar {
-		jar.add(st.cookies.server_cookie(st.cookies.access.clone(), self.access_token, self.remaining_secs))
-	}
-}
-
-/// The signed-in caller behind the session cookie, or `None` when there is no live
-/// session to read one from.
-///
-/// One reader for BOTH KYC routes. `/kyc/status` answers "is this person mid-flow?" and
-/// `/kyc/start` acts on it; a second copy of "take the cookie, refresh the session,
-/// parse the id" is a second place for those two to stop agreeing about who is asking.
-///
-/// This READ WRITES. `WebSessions::fresh` renews an access token inside
-/// `ACCESS_SKEW_SECS` of expiry: it calls `AuthRpc::refresh`, rotates the refresh token
-/// and saves the new pair, and past the refresh deadline it deletes the session
-/// outright. So the returned [`Caller`] carries the new access token, and every caller
-/// of this function owes the browser a `Set-Cookie` — otherwise the server holds the
-/// rotated pair and the browser holds a JWT that expires within the half-minute. On a
-/// polled route that is not a corner case; it is most polls that land in the window.
-async fn session_user(st: &super::Inner, jar: &CookieJar) -> Result<Option<Caller>, SessionStoreDown> {
-	let Some(session_id) = jar.get(&st.cookies.session).map(|c| c.value().to_string()) else {
-		return Ok(None);
-	};
-	let fresh = st.sessions.fresh(&session_id, &st.auth).await.map_err(|e| {
-		tracing::error!(error = ?e, "kyc: the web session store failed");
-		SessionStoreDown
-	})?;
-	// A cookie whose stored pair no longer carries a parsable user is the same answer as
-	// no cookie at all: there is nobody to act for.
-	Ok(fresh.and_then(|f| {
-		Uuid::parse_str(&f.user.user_id).map(UserId::from_raw).ok().map(|id| Caller {
-			id,
-			access_token: f.access_token,
-			remaining_secs: f.remaining_secs,
-		})
-	}))
 }
 
 impl IntoResponse for StartError {

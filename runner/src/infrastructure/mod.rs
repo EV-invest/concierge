@@ -16,8 +16,11 @@
 //!   decided and audited inside the transaction that writes them.
 //! - [`relying_parties`] — the registry of first-party clients on other origins, their
 //!   one-time authorization codes and their refresh families (all secrets as digests).
+//! - [`credentials`] — what this plane checks itself: emailed one-time codes and
+//!   passwords.
 //! - [`email`] — the SMTP transport seam and the rendered messages that cross it.
 
+pub mod credentials;
 pub mod db;
 pub mod email;
 pub mod governance;

@@ -256,7 +256,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 		AuthService::unconfigured(),
 		"https://evinvest.test".to_string(),
 		false,
-		web::SignInDeps { providers: Vec::new() },
+		common::inert_sign_in(&pool),
 		KycDeps {
 			users: users.clone(),
 			cases: cases.clone(),
