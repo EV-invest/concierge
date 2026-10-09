@@ -11,6 +11,7 @@ use axum::{
 use axum_extra::extract::cookie::CookieJar;
 use domain::{
 	auth::{ProvenIdentity, Provider},
+	authz::{Role, SEAT_GUEST},
 	users::{Email, UserId},
 };
 use evconcierge_auth::oauth::OAuthProvider;
@@ -44,11 +45,16 @@ pub struct SessionInfo {
 	authenticated: bool,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	user: Option<SessionUser>,
+	/// What the caller's seat holds, concrete — a guest's when nobody is signed in. What a
+	/// zone shows or walls off is decided from this; its backend still decides what runs.
+	permissions: &'static [&'static str],
 }
 impl SessionInfo {
 	fn authenticated(user: cc::UserSummary) -> Self {
 		let is_admin = !user.role.is_empty() && user.role != "investor";
+		let seat = Role::parse(&user.role).expect("the directory reports only Role strings");
 		Self {
+			permissions: seat.permissions(),
 			authenticated: true,
 			user: Some(SessionUser {
 				user_id: user.user_id,
@@ -64,7 +70,11 @@ impl SessionInfo {
 	}
 
 	fn anonymous() -> Self {
-		Self { authenticated: false, user: None }
+		Self {
+			authenticated: false,
+			user: None,
+			permissions: SEAT_GUEST.members,
+		}
 	}
 }
 

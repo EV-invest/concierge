@@ -133,7 +133,7 @@ async fn gate_enforces_role_status_and_revocation() {
 	let users = fx.users.as_ref();
 	let closed = BreakGlass::new(Vec::new());
 
-	// A freshly provisioned user is an Investor — holds nothing.
+	// A freshly provisioned user is an Investor — its own record and nothing of anyone else's.
 	let id = fx.provision("gate").await;
 	let sub = id.to_string();
 	let denied = require_permission(users, &closed, &request_as(access_claims(&sub, 0)), Users::Read).await.unwrap_err();

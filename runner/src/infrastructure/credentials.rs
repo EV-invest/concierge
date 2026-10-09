@@ -204,7 +204,7 @@ impl CredentialRepository for PgCredentials {
 		write_password(&mut tx, id, &phc, now).await?;
 		drain_outbox(&mut tx, &mut user).await?;
 		tx.commit().await.map_err(repo_err)?;
-		Ok(SignUp::Created(user))
+		Ok(SignUp::Created(Box::new(user)))
 	}
 
 	async fn password_named(&self, handle: &str) -> Result<Option<StoredPassword>, DomainError> {

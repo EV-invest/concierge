@@ -1335,7 +1335,7 @@ pub struct SignInMethods {
 }
 
 pub enum SignUp {
-	Created(User),
+	Created(Box<User>),
 	/// The address backs a password already, or is verified on an account: that person
 	/// signs in, with a code if need be.
 	Taken,

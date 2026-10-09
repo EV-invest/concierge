@@ -515,3 +515,19 @@ async fn the_admin_search_finds_a_username() {
 	assert_eq!(total, 1);
 	assert_eq!(rows[0].username.as_deref(), Some(wanted.as_str()));
 }
+
+/// A guest is a principal with a declared permission set, not an absence: the session
+/// answers it, and a sign-in replaces it with the seat's.
+#[tokio::test]
+async fn the_session_states_a_guests_permissions_and_then_the_seats() {
+	let fx = fixture!();
+	let guest = fx.session(&Browser::default()).await;
+	assert_eq!(guest, json!({ "authenticated": false, "permissions": domain::authz::SEAT_GUEST.members }));
+
+	let mut browser = Browser::default();
+	fx.sign_in_with_code(&address("seat"), &mut browser).await;
+	let session = fx.session(&browser).await;
+	let held: Vec<&str> = session["permissions"].as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
+	assert_eq!(held, domain::authz::Role::Investor.permissions());
+	assert!(held.contains(&"concierge:self:profile"), "an account holds its own record");
+}
