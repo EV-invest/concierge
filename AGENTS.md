@@ -194,7 +194,13 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   verified on or backs a password of, and only when it names none is the handle read as a
   username — a chosen username matches `[a-z0-9_.-]{3,32}` and never contains `@`, a
   default one is the local part, else the whole address, else none. Nothing ever requires
-  the username.
+  the username. A PASSKEY (WebAuthn, `web::passkey`, `passkey_credentials`) is registered by a
+  signed-in account and signs in without an account named first: it must be discoverable
+  (`residentKey: required`), its user handle is the account id, the relying party is
+  `PUBLIC_ORIGIN`'s host and that origin the only one accepted. A credential this plane
+  checks itself, like the password — not a provider subject and not a `user_identities`
+  row. Its ceremony state lives in process between the two requests, as the OAuth
+  transaction's does.
 - **KYC has exactly one writer**: the `User` aggregate's `set_kyc_level` and the
   `user_outbox` drain beside it in one transaction (→ `KYC_CHANGED` → outbox →
   banking's mirror). Two ENTRY POINTS reach it, and they differ in what they

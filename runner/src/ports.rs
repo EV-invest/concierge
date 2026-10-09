@@ -1332,6 +1332,17 @@ pub struct SignInMethods {
 	pub password: bool,
 	/// Linked providers, by `user_identities.provider`.
 	pub providers: Vec<String>,
+	pub passkeys: Vec<PasskeyRow>,
+}
+
+/// One registered passkey. `passkey` is the WebAuthn verifier's own serialization, opaque
+/// to persistence.
+pub struct PasskeyRow {
+	pub credential_id: String,
+	pub passkey: serde_json::Value,
+	pub name: String,
+	pub created_at: i64,
+	pub last_used_at: Option<i64>,
 }
 
 pub enum SignUp {
@@ -1377,6 +1388,18 @@ pub trait CredentialRepository: Send + Sync {
 
 	/// How the account can sign in, for its settings.
 	async fn methods(&self, user: UserId) -> Result<SignInMethods, DomainError>;
+
+	/// The account's passkeys.
+	async fn passkeys(&self, user: UserId) -> Result<Vec<PasskeyRow>, DomainError>;
+
+	/// Register a passkey. `false` when its credential id is registered already.
+	async fn add_passkey(&self, user: UserId, passkey: PasskeyRow) -> Result<bool, DomainError>;
+
+	/// Record a sign-in with a passkey: its updated counter and backup state, and when.
+	async fn passkey_used(&self, credential_id: &str, passkey: serde_json::Value, now: i64) -> Result<(), DomainError>;
+
+	/// `false` when the account holds no such passkey.
+	async fn remove_passkey(&self, user: UserId, credential_id: &str) -> Result<bool, DomainError>;
 
 	/// Set (or replace) the password, on the strength of a verification code — so a stolen
 	/// session alone cannot plant a password that outlives its revocation. Spending the

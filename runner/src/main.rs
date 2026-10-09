@@ -361,6 +361,7 @@ async fn run(config: config::AppConfig) -> Result<()> {
 			turnstile: web::Turnstile::new(config.turnstile_secret.clone(), web::SITEVERIFY.to_string()),
 			credentials: Arc::new(infrastructure::credentials::PgCredentials::new(pool.clone())),
 			mail_wake,
+			webauthn: Arc::new(relying_party_webauthn(&config.public_origin)?),
 		},
 		web::KycDeps {
 			users: users.clone(),
@@ -538,6 +539,16 @@ fn build_kyc_provider(config: &config::AppConfig) -> Result<Option<Arc<dyn conci
 /// account is one) can brute-force a hand-typed key offline and then recover the document
 /// number behind every stored row. That is precisely the PII `0010_kyc_cases.sql` promises
 /// this database does not hold, handed over by a weak secret rather than by the schema.
+/// The passkey verifier: the relying party is the public origin's host, and that origin is
+/// the only one an assertion may come from.
+fn relying_party_webauthn(public_origin: &str) -> Result<webauthn_rs::Webauthn> {
+	let origin = webauthn_rs::prelude::Url::parse(public_origin).context("PUBLIC_ORIGIN is not a URL")?;
+	let host = origin.host_str().ok_or_else(|| color_eyre::eyre::eyre!("PUBLIC_ORIGIN has no host"))?.to_owned();
+	webauthn_rs::WebauthnBuilder::new(&host, &origin)
+		.and_then(|builder| builder.rp_name("EV Investment").build())
+		.context("the passkey verifier refused PUBLIC_ORIGIN")
+}
+
 const MIN_IDENTITY_PEPPER_LEN: usize = 32;
 
 /// The configured identity pepper, or `None` — with the reason on the way out.
