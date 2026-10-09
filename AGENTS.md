@@ -434,7 +434,8 @@ Types: `feat` `fix` `perf` `refactor` `revert` `docs` `style` `test` `build` `ci
   probing for an ABSENT body (`403` with no code meant "stale token, reload"; `403` with
   one meant "failed"), which is a client reading tea leaves about which half of a refusal
   it is in (banking#193). One format now, one key, one closed vocabulary:
-  `unauthenticated` · `csrf` · `throttled` · `internal`, plus the pre-existing
+  `unauthenticated` · `csrf` · `throttled` · `internal` · `email_unverified` (403, checked
+  before the gate: a level above 0 needs a verified email), plus the pre-existing
   `kyc_unavailable`, which keeps its second `contact` field and is the only one that has
   one. `unauthenticated` has to stay REACHABLE: the CSRF check still runs before any
   session state is touched, but it answers "nobody is signed in" for an absent or lapsed
