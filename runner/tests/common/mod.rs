@@ -122,6 +122,7 @@ pub fn sign_in_with_turnstile(pool: &sqlx::PgPool, turnstile: &str) -> concierge
 		turnstile: concierge::web::Turnstile::new("test-secret".into(), turnstile.into()),
 		credentials: std::sync::Arc::new(concierge::infrastructure::credentials::PgCredentials::new(pool.clone())),
 		mail_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+		webauthn: std::sync::Arc::new(webauthn_for(WEBAUTHN_ORIGIN)),
 	}
 }
 
@@ -166,4 +167,14 @@ pub async fn stub_turnstile() -> String {
 	let addr = listener.local_addr().unwrap();
 	tokio::spawn(async move { axum::serve(listener, Router::new().route("/siteverify", post(verify))).await });
 	format!("http://{addr}/siteverify")
+}
+
+/// The origin every suite's web state is served from, as WebAuthn sees it.
+pub const WEBAUTHN_ORIGIN: &str = "https://evinvest.test";
+
+pub fn webauthn_for(origin: &str) -> webauthn_rs::Webauthn {
+	let url = webauthn_rs::prelude::Url::parse(origin).expect("a test origin parses");
+	webauthn_rs::WebauthnBuilder::new(url.host_str().expect("a test origin has a host"), &url)
+		.and_then(|b| b.build())
+		.expect("a test origin is a relying party")
 }

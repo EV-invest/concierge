@@ -19,6 +19,7 @@
 mod authorize;
 mod kyc;
 mod oauth;
+mod passkey;
 mod routes;
 mod session;
 mod sign_in;
@@ -43,11 +44,15 @@ pub use session::{PrincipalSource, WebSessions};
 use time::Duration;
 use tokio::sync::Notify;
 pub use turnstile::{SITEVERIFY, Turnstile};
+use webauthn_rs::{
+	Webauthn,
+	prelude::{DiscoverableAuthentication, PasskeyRegistration},
+};
 
 use crate::{
 	ports::{CredentialRepository, GovernanceRepository, KycCaseRepository, KycProvider, NotificationRepository, UserDirectoryRepository},
 	relying_party::RelyingParties,
-	web::{oauth::OAuthTxStore, single_flight::KeyedLocks},
+	web::{oauth::OAuthTxStore, passkey::Ceremonies, single_flight::KeyedLocks},
 };
 
 /// Cookie names + shared attributes. `__Host-` prefixed when secure (production);
@@ -123,6 +128,9 @@ impl WebState {
 				turnstile: sign_in.turnstile,
 				credentials: sign_in.credentials,
 				mail_wake: sign_in.mail_wake,
+				webauthn: sign_in.webauthn,
+				passkey_registrations: Ceremonies::default(),
+				passkey_sign_ins: Ceremonies::default(),
 				public_origin: public_origin.trim_end_matches('/').to_string(),
 				users: kyc.users,
 				kyc_cases: kyc.cases,
@@ -146,6 +154,8 @@ pub struct SignInDeps {
 	pub credentials: Arc<dyn CredentialRepository>,
 	/// The mail dispatcher's wake-up: a queued code leaves now rather than on the next tick.
 	pub mail_wake: Arc<Notify>,
+	/// The WebAuthn verifier, pinned to `PUBLIC_ORIGIN` and its host as the relying party.
+	pub webauthn: Arc<Webauthn>,
 }
 
 /// What the identity-verification routes need, gathered so the composition root hands
@@ -189,6 +199,11 @@ pub fn router(state: WebState) -> Router {
 		.route("/auth/password/set", post(sign_in::set_password))
 		.route("/auth/username", post(sign_in::set_username))
 		.route("/auth/methods", get(sign_in::methods))
+		.route("/auth/passkey/register/options", post(passkey::register_options))
+		.route("/auth/passkey/register/verify", post(passkey::register_verify))
+		.route("/auth/passkey/signin/options", post(passkey::signin_options))
+		.route("/auth/passkey/signin/verify", post(passkey::signin_verify))
+		.route("/auth/passkey/remove", post(passkey::remove))
 		// The relying-party code flow's front door. It needs no CSRF token: it changes
 		// nothing a cross-site request could exploit — it only ever redirects to an
 		// address registered for the client, carrying a code that is useless without the
@@ -230,6 +245,9 @@ struct Inner {
 	turnstile: Turnstile,
 	credentials: Arc<dyn CredentialRepository>,
 	mail_wake: Arc<Notify>,
+	webauthn: Arc<Webauthn>,
+	passkey_registrations: Ceremonies<(UserId, PasskeyRegistration)>,
+	passkey_sign_ins: Ceremonies<DiscoverableAuthentication>,
 	/// The user-facing origin the conductor serves (e.g. `https://evinvest.ltd`).
 	/// Builds the redirect_uri: `{public_origin}/api/callback/auth/<provider>`.
 	public_origin: String,

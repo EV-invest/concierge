@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::users::{Named, account_named, drain_outbox, free_username, insert_user, load_for_update, lock_email, update_row, verified_holder};
 use crate::ports::{
 	CODE_MAX_ATTEMPTS, CODE_SEND_WINDOW_SECS, CODE_SENDS_PER_WINDOW, CODE_TTL_SECS, CodeIssue, CodePurpose, CodeRefusal, CredentialRepository, PASSWORD_LOCK_SECS, PASSWORD_MAX_FAILURES,
-	SignInMethods, SignUp, StoredPassword, VerifyRefusal,
+	PasskeyRow, SignInMethods, SignUp, StoredPassword, VerifyRefusal,
 };
 
 pub struct PgCredentials {
@@ -249,7 +249,64 @@ impl CredentialRepository for PgCredentials {
 			.fetch_all(&self.pool)
 			.await
 			.map_err(repo_err)?;
-		Ok(SignInMethods { password, providers })
+		Ok(SignInMethods {
+			password,
+			providers,
+			passkeys: self.passkeys(user).await?,
+		})
+	}
+
+	async fn passkeys(&self, user: UserId) -> Result<Vec<PasskeyRow>, DomainError> {
+		let rows: Vec<(String, serde_json::Value, String, i64, Option<i64>)> =
+			sqlx::query_as("SELECT credential_id, passkey, name, created_at, last_used_at FROM passkey_credentials WHERE user_id = $1 ORDER BY created_at, credential_id")
+				.bind(user.raw())
+				.fetch_all(&self.pool)
+				.await
+				.map_err(repo_err)?;
+		Ok(rows
+			.into_iter()
+			.map(|(credential_id, passkey, name, created_at, last_used_at)| PasskeyRow {
+				credential_id,
+				passkey,
+				name,
+				created_at,
+				last_used_at,
+			})
+			.collect())
+	}
+
+	async fn add_passkey(&self, user: UserId, passkey: PasskeyRow) -> Result<bool, DomainError> {
+		let inserted = sqlx::query("INSERT INTO passkey_credentials (credential_id, user_id, passkey, name, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (credential_id) DO NOTHING")
+			.bind(&passkey.credential_id)
+			.bind(user.raw())
+			.bind(&passkey.passkey)
+			.bind(&passkey.name)
+			.bind(passkey.created_at)
+			.execute(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		Ok(inserted.rows_affected() == 1)
+	}
+
+	async fn passkey_used(&self, credential_id: &str, passkey: serde_json::Value, now: i64) -> Result<(), DomainError> {
+		sqlx::query("UPDATE passkey_credentials SET passkey = $2, last_used_at = $3 WHERE credential_id = $1")
+			.bind(credential_id)
+			.bind(passkey)
+			.bind(now)
+			.execute(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		Ok(())
+	}
+
+	async fn remove_passkey(&self, user: UserId, credential_id: &str) -> Result<bool, DomainError> {
+		let removed = sqlx::query("DELETE FROM passkey_credentials WHERE user_id = $1 AND credential_id = $2")
+			.bind(user.raw())
+			.bind(credential_id)
+			.execute(&self.pool)
+			.await
+			.map_err(repo_err)?;
+		Ok(removed.rows_affected() == 1)
 	}
 
 	async fn set_password(&self, user: UserId, code: &str, phc: String, now: i64) -> Result<Result<(), VerifyRefusal>, DomainError> {

@@ -531,3 +531,147 @@ async fn the_session_states_a_guests_permissions_and_then_the_seats() {
 	assert_eq!(held, domain::authz::Role::Investor.permissions());
 	assert!(held.contains(&"concierge:self:profile"), "an account holds its own record");
 }
+
+mod passkeys {
+	use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+	use webauthn_rs::prelude::{CreationChallengeResponse, PublicKeyCredential, RequestChallengeResponse, Url};
+
+	use super::*;
+
+	/// The soft authenticator keeps no resident keys and answers no discoverable request,
+	/// so the test plays that part of a platform authenticator: it is told which key to use
+	/// and stamps the user handle the key was registered under.
+	struct Device {
+		authenticator: WebauthnAuthenticator<SoftPasskey>,
+		credential_id: Option<String>,
+		user_handle: Option<Vec<u8>>,
+	}
+
+	impl Device {
+		fn new() -> Self {
+			Self {
+				authenticator: WebauthnAuthenticator::new(SoftPasskey::new(true)),
+				credential_id: None,
+				user_handle: None,
+			}
+		}
+
+		fn origin() -> Url {
+			Url::parse(ORIGIN).unwrap()
+		}
+
+		fn register(&mut self, mut options: Value) -> Value {
+			assert_eq!(options["publicKey"]["authenticatorSelection"]["residentKey"], "required", "a passkey must be discoverable");
+			options["publicKey"]["authenticatorSelection"]["requireResidentKey"] = json!(false);
+			let handle = options["publicKey"]["user"]["id"].as_str().unwrap().to_owned();
+			let ccr: CreationChallengeResponse = serde_json::from_value(options).unwrap();
+			let credential = self.authenticator.do_registration(Self::origin(), ccr).expect("the authenticator registers");
+			self.credential_id = Some(credential.id.clone());
+			self.user_handle = Some(base64_url(&handle));
+			serde_json::to_value(credential).unwrap()
+		}
+
+		fn assert(&mut self, mut options: Value) -> PublicKeyCredential {
+			assert_eq!(options["publicKey"]["allowCredentials"], json!([]), "a discoverable request names no credential");
+			options["publicKey"]["allowCredentials"] = json!([{ "type": "public-key", "id": self.credential_id.clone().unwrap() }]);
+			let rcr: RequestChallengeResponse = serde_json::from_value(options).unwrap();
+			let mut credential = self.authenticator.do_authentication(Self::origin(), rcr).expect("the authenticator asserts");
+			credential.response.user_handle = Some(self.user_handle.clone().unwrap().into());
+			credential
+		}
+	}
+
+	fn base64_url(raw: &str) -> Vec<u8> {
+		use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+		URL_SAFE_NO_PAD.decode(raw.trim_end_matches('=')).unwrap()
+	}
+
+	async fn registered(fx: &Fx, email: &str) -> (Device, Browser) {
+		let mut browser = Browser::default();
+		fx.sign_in_with_code(email, &mut browser).await;
+		let begun = fx.post("/auth/passkey/register/options", json!({}), &mut browser).await;
+		let mut device = Device::new();
+		let credential = device.register(begun.body["options"].clone());
+		let done = fx
+			.post(
+				"/auth/passkey/register/verify",
+				json!({ "ceremony": begun.body["ceremony"], "credential": credential, "name": "Test key" }),
+				&mut browser,
+			)
+			.await;
+		assert_eq!(done.body, json!({ "ok": true }));
+		(device, browser)
+	}
+
+	#[tokio::test]
+	async fn a_registered_passkey_signs_in_without_naming_the_account() {
+		let fx = fixture!();
+		let email = address("passkey");
+		let (mut device, owner) = registered(&fx, &email).await;
+		assert_eq!(fx.methods(&owner).await["passkeys"].as_array().unwrap().len(), 1);
+
+		let mut browser = Browser::default();
+		let begun = fx.post("/auth/passkey/signin/options", json!({}), &mut browser).await;
+		let assertion = device.assert(begun.body["options"].clone());
+		let done = fx
+			.post(
+				"/auth/passkey/signin/verify",
+				json!({ "ceremony": begun.body["ceremony"], "credential": assertion }),
+				&mut browser,
+			)
+			.await;
+		assert_eq!((done.status, done.body), (StatusCode::OK, json!({ "ok": true })));
+		assert_eq!(fx.session(&browser).await["user"]["email"], email);
+
+		let replay = fx
+			.post(
+				"/auth/passkey/signin/verify",
+				json!({ "ceremony": begun.body["ceremony"], "credential": assertion }),
+				&mut Browser::default(),
+			)
+			.await;
+		assert_eq!(replay.body, json!({ "error": "passkey_expired" }), "a ceremony answers once");
+	}
+
+	#[tokio::test]
+	async fn a_forged_assertion_signs_nobody_in() {
+		let fx = fixture!();
+		let (mut device, _) = registered(&fx, &address("forged")).await;
+		let mut browser = Browser::default();
+		let begun = fx.post("/auth/passkey/signin/options", json!({}), &mut browser).await;
+		let mut assertion = device.assert(begun.body["options"].clone());
+		let mut signature: Vec<u8> = assertion.response.signature.clone().into();
+		let last = signature.len() - 1;
+		signature[last] ^= 1;
+		assertion.response.signature = signature.into();
+		let done = fx
+			.post(
+				"/auth/passkey/signin/verify",
+				json!({ "ceremony": begun.body["ceremony"], "credential": assertion }),
+				&mut browser,
+			)
+			.await;
+		assert_eq!((done.status, done.body), (StatusCode::UNAUTHORIZED, json!({ "error": "passkey_rejected" })));
+		assert!(browser.get("ev_session").is_none());
+	}
+
+	#[tokio::test]
+	async fn a_removed_passkey_no_longer_signs_in() {
+		let fx = fixture!();
+		let (mut device, mut owner) = registered(&fx, &address("removed")).await;
+		let id = fx.methods(&owner).await["passkeys"][0]["id"].as_str().unwrap().to_owned();
+		assert_eq!(fx.post("/auth/passkey/remove", json!({ "credentialId": id }), &mut owner).await.body, json!({ "ok": true }));
+
+		let mut browser = Browser::default();
+		let begun = fx.post("/auth/passkey/signin/options", json!({}), &mut browser).await;
+		let assertion = device.assert(begun.body["options"].clone());
+		let done = fx
+			.post(
+				"/auth/passkey/signin/verify",
+				json!({ "ceremony": begun.body["ceremony"], "credential": assertion }),
+				&mut browser,
+			)
+			.await;
+		assert_eq!(done.body, json!({ "error": "passkey_rejected" }));
+	}
+}

@@ -36,6 +36,12 @@ use crate::{
 /// A refusal, as the dialog reads it.
 pub struct Refusal(StatusCode, &'static str);
 
+impl Refusal {
+	pub(super) fn new(status: StatusCode, code: &'static str) -> Self {
+		Self(status, code)
+	}
+}
+
 impl IntoResponse for Refusal {
 	fn into_response(self) -> Response {
 		(self.0, Json(json!({ "error": self.1 }))).into_response()
@@ -48,13 +54,13 @@ fn ok() -> Json<Value> {
 	Json(json!({ "ok": true }))
 }
 
-fn internal(context: &'static str, err: impl std::fmt::Display) -> Refusal {
+pub(super) fn internal(context: &'static str, err: impl std::fmt::Display) -> Refusal {
 	tracing::error!(error = %err, "{context}");
 	INTERNAL
 }
 
 /// Same-origin, and — when `turnstile` is given — a human.
-async fn guard(st: &super::Inner, headers: &HeaderMap, turnstile: Option<&str>) -> Result<(), Refusal> {
+pub(super) async fn guard(st: &super::Inner, headers: &HeaderMap, turnstile: Option<&str>) -> Result<(), Refusal> {
 	if headers.get("origin").and_then(|v| v.to_str().ok()) != Some(st.public_origin.as_str()) {
 		return Err(Refusal(StatusCode::FORBIDDEN, "origin"));
 	}
@@ -92,7 +98,7 @@ async fn sent(st: &super::Inner, issue: CodeIssue) -> Result<Json<Value>, Refusa
 }
 
 /// The caller behind a state-changing request with a session: CSRF first, as everywhere.
-async fn signed_in(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<Caller, Refusal> {
+pub(super) async fn signed_in(st: &super::Inner, jar: &CookieJar, headers: &HeaderMap) -> Result<Caller, Refusal> {
 	match csrf_outcome(st, jar, headers).await.map_err(|_| INTERNAL)? {
 		CsrfOutcome::Ok => {}
 		CsrfOutcome::NoSession => return Err(Refusal(StatusCode::UNAUTHORIZED, "unauthenticated")),
@@ -159,7 +165,7 @@ pub(super) async fn signed_in_as(st: &super::Inner, jar: CookieJar, headers: &He
 
 /// A signed-in route's answer. Reading the session may have rotated it, so the refreshed
 /// access cookie goes back with a refusal too.
-type Answered = Result<(CookieJar, Result<Json<Value>, Refusal>), Refusal>;
+pub(super) type Answered = Result<(CookieJar, Result<Json<Value>, Refusal>), Refusal>;
 
 /// `POST /auth/email/verify/request` — mail the signed-in account a code for its own
 /// address.
@@ -378,6 +384,7 @@ pub async fn methods(State(st): State<WebState>, jar: CookieJar) -> Answered {
 			"username": user.username().map(Username::as_str),
 			"password": methods.password,
 			"providers": methods.providers,
+			"passkeys": methods.passkeys.iter().map(|p| json!({ "id": p.credential_id, "name": p.name, "createdAt": p.created_at, "lastUsedAt": p.last_used_at })).collect::<Vec<_>>(),
 		}))),
 		(Ok(_), Ok(None)) => Err(Refusal(StatusCode::UNAUTHORIZED, "unauthenticated")),
 		(Err(e), _) | (_, Err(e)) => Err(internal("sign-in methods not read", e)),
