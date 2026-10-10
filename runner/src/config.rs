@@ -190,6 +190,10 @@ ev::settings! {
 		/// little too long, while a boot that refuses over an unset knob takes sign-in
 		/// down for the whole platform.
 		kyc_case_ttl_secs: i64 = "86400",
+		/// Cloudflare Turnstile secret for the credential endpoints. Required everywhere:
+		/// development uses Cloudflare's always-pass test secret, so no arm skips the check.
+		#[secret]
+		turnstile_secret: String,
 	}
 }
 
@@ -215,10 +219,14 @@ mod tests {
 				"SMTP_HOST",
 				"SMTP_USERNAME",
 				"SMTP_PASSWORD",
+				"TURNSTILE_SECRET",
 			]
 		);
 		// Locally, only what the process genuinely cannot start without.
-		assert_eq!(AppConfig::required_var_names("development"), vec!["DATABASE_URL", "BRIDGE_SERVICE_TOKEN", "PUBLIC_ORIGIN"]);
+		assert_eq!(
+			AppConfig::required_var_names("development"),
+			vec!["DATABASE_URL", "BRIDGE_SERVICE_TOKEN", "PUBLIC_ORIGIN", "TURNSTILE_SECRET"]
+		);
 	}
 
 	fn minimal_env(var: &str) -> Option<String> {
@@ -226,6 +234,7 @@ mod tests {
 			"DATABASE_URL" => Some("postgres://localhost/concierge"),
 			"BRIDGE_SERVICE_TOKEN" => Some("token"),
 			"PUBLIC_ORIGIN" => Some("https://evinvest.ltd"),
+			"TURNSTILE_SECRET" => Some("1x0000000000000000000000000000000AA"),
 			_ => None,
 		}
 		.map(str::to_string)

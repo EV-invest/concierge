@@ -35,7 +35,7 @@ use concierge::{
 use domain::{
 	authz::Role,
 	governance::{ProposalState, UserProposalId},
-	users::{AuthSubject, Email, HOLD_COOLDOWN_SECS, HOLD_TTL_SECS, Suspension, UserId, UserStatus},
+	users::{HOLD_COOLDOWN_SECS, HOLD_TTL_SECS, Suspension, UserId, UserStatus},
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
@@ -92,9 +92,7 @@ async fn setup() -> Option<Fixture> {
 
 impl Fixture {
 	async fn user(&self) -> UserId {
-		let subject = AuthSubject::parse(&format!("ug-itest-{}", Uuid::new_v4())).unwrap();
-		let email = Email::parse(&format!("ug-{}@example.com", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, email, true).await.expect("provision").id()
+		self.users.resolve(common::google("ug", true), 0).await.expect("provision").id()
 	}
 
 	/// Mint an owner straight through the repository: `SetRole` deliberately refuses to,

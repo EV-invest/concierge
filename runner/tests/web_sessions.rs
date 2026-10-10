@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use concierge::web::{PrincipalSource, WebSessions};
 use evconcierge_auth::{AuthError, AuthService};
 use evconcierge_contracts::concierge::v1::{
-	ClientTokenResponse, ExchangeCodeRequest, ExchangeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, PublishCatalogRequest,
+	ClientTokenResponse, ExchangeCodeRequest, JwksRequest, JwksResponse, ListSessionsRequest, ListSessionsResponse, LogoutRequest, LogoutResponse, PublishCatalogRequest,
 	PublishCatalogResponse, RefreshClientTokenRequest, RefreshRequest, RevokeSessionRequest, RevokeSessionResponse, TokenResponse, UserSummary, auth_service_server::AuthService as AuthRpc,
 };
 use tonic::{Request, Response, Status};
@@ -25,6 +25,8 @@ fn summary(user_id: &str, role: &str) -> UserSummary {
 		token_version: 1,
 		role: role.into(),
 		role_is_break_glass: false,
+		email_verified: true,
+		username: String::new(),
 	}
 }
 
@@ -66,10 +68,6 @@ impl PrincipalSource for Directory {
 
 #[tonic::async_trait]
 impl AuthRpc for Directory {
-	async fn exchange(&self, _: Request<ExchangeRequest>) -> Result<Response<TokenResponse>, Status> {
-		unreachable!("issuance is not part of a live principal read")
-	}
-
 	async fn refresh(&self, _: Request<RefreshRequest>) -> Result<Response<TokenResponse>, Status> {
 		unreachable!("issuance is not part of a live principal read")
 	}

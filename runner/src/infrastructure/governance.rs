@@ -859,22 +859,10 @@ impl OwnerGenesisRepository for PgGovernance {
 							None => resolution.missing_mailboxes.push(mailbox.clone()),
 						},
 						[only] => remember(&mut resolution.found, UserId::from_raw(*only)),
-						// `users.email` is deliberately NOT unique (a person may change it behind a
-						// stable auth subject, and a recreated account gets a new one), so two
-						// VERIFIED rows can still answer to one address — and a seat handed to the
-						// wrong person is one the owner floor will not let anyone take back. Refuse
-						// the whole roster rather than guess.
-						//
-						// Filtering to seatable rows BEFORE deciding this is what stops an
-						// impostor's unverified copy of a founder's address from deadlocking genesis
-						// permanently — which, leaving the registry empty, would hold emergency
-						// access open indefinitely.
-						many => {
-							return Ok(GenesisOutcome::Ambiguous {
-								mailbox: mailbox.clone(),
-								matches: many.len() as i64,
-							});
-						}
+						// Filtering to seatable rows first is what stops an impostor's unverified
+						// copy of a founder's address from deadlocking genesis permanently — which,
+						// leaving the registry empty, would hold emergency access open indefinitely.
+						_ => unreachable!("users_verified_email_idx: one verified account per address"),
 					}
 				}
 			}

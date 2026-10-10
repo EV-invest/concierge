@@ -75,8 +75,9 @@ message UserLifecycleEvent {
   // stale REINSTATED cannot un-freeze a user a later SUSPENDED already froze.
   uint64 sequence = 6;
 
-  // The shared correlation key both planes provision against: the provider
-  // (Google) `sub`. user_id above is concierge's OWN canonical id and means
+  // The account subject: opaque and immutable, the shared correlation key both
+  // planes provision against (older accounts carry a Google `sub`, newer ones their
+  // own id — never parse it). user_id above is concierge's OWN canonical id and means
   // nothing to banking, which keys its users on this subject — so this is what
   // the banking provisioner matches a CREATED event to a local UserId on.
   string auth_subject = 7;

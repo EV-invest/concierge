@@ -16,6 +16,8 @@ name = "concierge"
 path = "src/main.rs"
 
 [dependencies]
+argon2.workspace = true
+webauthn-rs.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 axum-extra.workspace = true
@@ -56,6 +58,8 @@ uuid.workspace = true
 [dev-dependencies]
 # Opens real refresh families, so the relying-party suite can sign a browser in and out.
 evconcierge_auth = { workspace = true, features = ["test-support"] }
+# A software authenticator, so the passkey suite drives real WebAuthn ceremonies.
+webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
 
 [lints]
 workspace = true

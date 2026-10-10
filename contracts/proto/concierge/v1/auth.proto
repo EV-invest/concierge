@@ -4,24 +4,17 @@ package concierge.v1;
 
 // AuthService — the concierge plane's token issuance and authorization surface.
 //
-// Issues first-party asymmetric JWTs (EdDSA/Ed25519) after Google OAuth2 sign-in,
-// rotates refresh tokens, and publishes verification keys. Services do NOT call
-// this per request to authorize: they verify access tokens locally against the
-// cached JWKS via the shared `evconcierge_auth` flow (no round trip, no
-// per-service token storage). They DO call `Jwks` periodically to refresh that
-// cache, since concierge speaks only gRPC (no HTTP `.well-known` endpoint).
+// Issues first-party asymmetric JWTs (EdDSA/Ed25519), rotates refresh tokens, and
+// publishes verification keys. Services do NOT call this per request to authorize:
+// they verify access tokens locally against the cached JWKS via the shared
+// `evconcierge_auth` flow (no round trip, no per-service token storage). They DO call
+// `Jwks` periodically to refresh that cache, since concierge speaks only gRPC (no HTTP
+// `.well-known` endpoint).
 //
-// The cabinet BFF is the OAuth confidential client. It runs the browser-facing
-// authorize redirect (PKCE + state + nonce) and then calls `Exchange`
-// server-to-server with the Google authorization code; the auth module performs
-// the confidential code→token exchange with Google, validates Google's id_token,
-// and discards it — Google's token is never forwarded inward.
+// Sign-in itself (Google, GitHub, emailed code, password) is the plane's own HTTP
+// surface (`/auth/*`, reached as `evinvest.ltd/api/auth/*`), which opens the session
+// in process; no RPC signs anybody in.
 service AuthService {
-  // Exchange a Google authorization code (with its PKCE verifier) for concierge's
-  // OWN tokens. Called by the cabinet BFF on the OAuth callback. Provisions the
-  // user on first sign-in in the directory module.
-  rpc Exchange(ExchangeRequest) returns (TokenResponse);
-
   // Rotate a refresh token: returns a fresh access+refresh pair and invalidates
   // the presented refresh token (rotation + reuse detection in the central store).
   rpc Refresh(RefreshRequest) returns (TokenResponse);
@@ -79,21 +72,6 @@ service AuthService {
   // Reserved for later auth slices, declared here to lock the namespace:
   //   rpc Introspect(IntrospectRequest) returns (IntrospectResponse);
   //   rpc MintServiceToken(MintServiceTokenRequest) returns (TokenResponse);
-}
-
-message ExchangeRequest {
-  // The Google authorization code from the OAuth redirect.
-  string auth_code = 1;
-  // The PKCE code verifier the BFF generated for this transaction (S256).
-  string code_verifier = 2;
-  // The exact redirect_uri used in the authorize request (Google requires a match).
-  string redirect_uri = 3;
-  // The nonce the BFF put in the authorize request; matched against Google's id_token.
-  string nonce = 4;
-  // Device metadata captured by the BFF at sign-in, stored on the refresh-token family
-  // for the "sessions & devices" surface. Best-effort, free-form.
-  string user_agent = 5;
-  string ip = 6;
 }
 
 message RefreshRequest {
@@ -165,6 +143,9 @@ message UserSummary {
   // register's: it disappears the moment the fund has its first persisted owner, and it
   // seats nobody. A client MUST render it as a warning, never as ownership.
   bool role_is_break_glass = 6;
+  bool email_verified = 7;
+  // Empty when the account has no handle.
+  string username = 8;
 }
 
 message ExchangeCodeRequest {

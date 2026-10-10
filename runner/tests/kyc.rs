@@ -11,6 +11,8 @@
 //! session; callback verification is the same code the live adapter runs, so a test that
 //! passes here is a test of what ships.
 
+mod common;
+
 use std::sync::{
 	Arc,
 	atomic::{AtomicUsize, Ordering},
@@ -40,10 +42,7 @@ use concierge::{
 	},
 	web::{self, KycDeps, START_MAX_PER_WINDOW},
 };
-use domain::{
-	error::DomainError,
-	users::{AuthSubject, Email, UserId},
-};
+use domain::{error::DomainError, users::UserId};
 use evconcierge_auth::AuthService;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -257,6 +256,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 		AuthService::unconfigured(),
 		"https://evinvest.test".to_string(),
 		false,
+		common::inert_sign_in(&pool),
 		KycDeps {
 			users: users.clone(),
 			cases: cases.clone(),
@@ -283,8 +283,7 @@ async fn setup_with(provider: Option<Arc<dyn KycProvider>>) -> Option<Harness> {
 impl Harness {
 	/// A brand-new user, so runs neither collide nor need a clean database.
 	async fn user(&self) -> UserId {
-		let subject = AuthSubject::parse(&format!("kyc-itest-{}", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, Email::parse("kyc@example.com").unwrap(), true).await.expect("provision").id()
+		self.users.resolve(common::google("kyc", true), 0).await.expect("provision").id()
 	}
 
 	/// Open a case the way `/kyc/start` does, without going through the session cookie.
@@ -413,8 +412,12 @@ impl Harness {
 	/// alert is addressed to.
 	async fn owner(&self) -> (UserId, String) {
 		let email = format!("owner-{}@example.com", Uuid::new_v4());
-		let subject = AuthSubject::parse(&format!("kyc-owner-{}", Uuid::new_v4())).unwrap();
-		let id = self.users.provision(subject, Email::parse(&email).unwrap(), true).await.expect("provision").id();
+		let id = self
+			.users
+			.resolve(common::google_as(&format!("kyc-owner-{}", Uuid::new_v4()), &email, true), 0)
+			.await
+			.expect("provision")
+			.id();
 		self.reseat(id).await;
 		(id, email)
 	}
@@ -941,6 +944,8 @@ async fn signed_in_with(user_id: &str, access_ttl_secs: i64) -> Option<(String, 
 				token_version: 0,
 				role: "investor".into(),
 				role_is_break_glass: false,
+				email_verified: true,
+				username: String::new(),
 			}),
 		})
 		.await
@@ -1099,6 +1104,25 @@ async fn a_second_start_reuses_the_live_case_and_never_calls_the_vendor() {
 	assert_eq!(second["case_id"], first["case_id"], "they are sent back to the attempt they already have");
 	assert_eq!(second["redirect_url"], first["redirect_url"]);
 	assert_eq!(h.case_count(user).await, 1, "one attempt, one row — a second would read as an abandoned try");
+}
+
+/// A level above 0 needs a verified email, so starting a verification that could only
+/// end in one is refused before the vendor is paid for it.
+#[tokio::test]
+async fn an_unverified_email_starts_no_verification() {
+	let counter = Arc::new(AtomicUsize::new(0));
+	let Some(h) = setup_with(Some(Arc::new(CountingKyc::new(counter.clone())))).await else {
+		return;
+	};
+	let user = h.users.resolve(common::google("kyc-unverified", false), 0).await.expect("provision").id();
+	let Some((cookie, csrf)) = signed_in(user).await else {
+		eprintln!("skipped: REDIS_URL unset — the router's session store would not see a session opened here");
+		return;
+	};
+	let (status, body) = h.start(&cookie, Some(&csrf), "{}").await;
+	assert_eq!((status, body), (StatusCode::FORBIDDEN, json!({ "error": "email_unverified" })));
+	assert_eq!(counter.load(Ordering::SeqCst), 0, "nothing was bought");
+	assert_eq!(h.case_count(user).await, 0);
 }
 
 /// Two starts from one user at the SAME time — the race #56 describes.

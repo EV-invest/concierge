@@ -7,6 +7,8 @@
 //! the shared RBAC gate, and a claims-less request never reaches the repository.
 //! Past the gate, the write path validates its input before it reaches the adapter.
 
+mod common;
+
 use std::sync::Arc;
 
 use concierge::{
@@ -15,10 +17,7 @@ use concierge::{
 	platform::Platform,
 	ports::{PlatformConfigRepository, UserDirectoryRepository},
 };
-use domain::{
-	authz::Role,
-	users::{AuthSubject, Email},
-};
+use domain::authz::Role;
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{GetPlatformConfigRequest, SetAnnouncementRequest, SetFeatureFlagRequest, SetMaintenanceModeRequest, platform_service_server::PlatformService};
 use tonic::{Code, Request};
@@ -57,8 +56,7 @@ async fn any_authenticated_principal_reads_config_but_cannot_write() {
 		return;
 	};
 	// A freshly provisioned user is an Investor — no console permission at all.
-	let subject = AuthSubject::parse(&format!("platform-{}", Uuid::new_v4())).unwrap();
-	let user = users.provision(subject, Email::parse("platform@example.com").unwrap(), true).await.unwrap();
+	let user = users.resolve(common::google("platform", true), 0).await.unwrap();
 	let sub = user.id().to_string();
 	let break_glass = Arc::new(BreakGlass::new(Vec::new()));
 	let platform = Platform::new(users, break_glass, config);
@@ -89,8 +87,7 @@ async fn operator_config_writes_validate_and_round_trip() {
 		eprintln!("DATABASE_URL unset — skipping real-DB test");
 		return;
 	};
-	let subject = AuthSubject::parse(&format!("platform-op-{}", Uuid::new_v4())).unwrap();
-	let user = users.provision(subject, Email::parse("platform-op@example.com").unwrap(), true).await.unwrap();
+	let user = users.resolve(common::google("platform-op", true), 0).await.unwrap();
 	let sub = user.id().to_string();
 	// A PERSISTED admin, so these assertions are about the validation past the gate and
 	// not about the gate itself. Deliberately NOT an `OWNER_SUBJECTS` caller: emergency

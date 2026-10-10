@@ -4,7 +4,7 @@
 //! This crate owns the signing key and nothing else about a client: the registry, the
 //! one-time codes, the refresh families and admission (which reads the user directory)
 //! are Postgres state in the runner. So the split is
-//! the one `Exchange` already has with the directory — the runner decides WHO gets a
+//! the one session opening already has with the directory — the runner decides WHO gets a
 //! token pair and holds the refresh half; this crate mints the access JWT for the
 //! decision it is handed.
 //!
