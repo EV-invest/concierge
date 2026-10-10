@@ -67,6 +67,16 @@ pub enum Roles {
 	Grant,
 }
 
+/// What an account may do with its own record — one per cabinet section, so "this needs
+/// an account" is a permission a guest lacks rather than a special case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+#[permission("concierge:self")]
+pub enum Own {
+	Profile,
+	Notifications,
+	Sessions,
+}
+
 /// Feature flags, maintenance, announcements, the client registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
 #[permission("concierge:platform")]
@@ -171,6 +181,15 @@ pub mod bank {
 		Suspend,
 	}
 
+	/// An account's own money: its wallet, its investments, its operations.
+	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
+	#[permission("bank:self")]
+	pub enum Own {
+		Wallet,
+		Invest,
+		Operations,
+	}
+
 	/// `rotate` supersedes a provably dead key; `migrate` retires a healthy one into the
 	/// enclave. Separate acts: holding one must not grant the other.
 	#[derive(Clone, Copy, Debug, Eq, PartialEq, Permission)]
@@ -184,11 +203,40 @@ pub mod bank {
 use bank::*;
 
 // What a seat means, as separation of duties: an operator views and never acts, an admin
-// does every act except granting seats, an owner does everything.
-alias!(SEAT_OPERATOR = "seat:operator", [Users::Read, Platform::Read, Treasury::Read, UserBalance::Read]);
+// does every act except granting seats, an owner does everything. Every seat is an account
+// first, so each holds what an investor does over its own record.
+//
+// A guest is nobody's seat — `Role` is the persisted, cross-plane word, and a guest has no
+// row — but it is a principal all the same, and this is all it holds.
+alias!(pub SEAT_GUEST = "seat:guest", []);
+alias!(
+	SEAT_INVESTOR = "seat:investor",
+	[Own::Profile, Own::Notifications, Own::Sessions, bank::Own::Wallet, bank::Own::Invest, bank::Own::Operations]
+);
+alias!(
+	SEAT_OPERATOR = "seat:operator",
+	[
+		Own::Profile,
+		Own::Notifications,
+		Own::Sessions,
+		bank::Own::Wallet,
+		bank::Own::Invest,
+		bank::Own::Operations,
+		Users::Read,
+		Platform::Read,
+		Treasury::Read,
+		UserBalance::Read,
+	]
+);
 alias!(
 	SEAT_ADMIN = "seat:admin",
 	[
+		Own::Profile,
+		Own::Notifications,
+		Own::Sessions,
+		bank::Own::Wallet,
+		bank::Own::Invest,
+		bank::Own::Operations,
 		Users::Read,
 		Users::Suspend,
 		Users::Revoke,
@@ -219,6 +267,12 @@ alias!(
 alias!(
 	SEAT_OWNER = "seat:owner",
 	[
+		Own::Profile,
+		Own::Notifications,
+		Own::Sessions,
+		bank::Own::Wallet,
+		bank::Own::Invest,
+		bank::Own::Operations,
 		Users::Read,
 		Users::Suspend,
 		Users::Revoke,
@@ -250,13 +304,13 @@ alias!(
 
 /// Orders what each seat's `bank:*` set means across binaries: a running older binary must
 /// not overwrite a newer meaning. Bump it whenever any [`Role::bank_permissions`] changes.
-pub const SEAT_GENERATION: u32 = 1;
+pub const SEAT_GENERATION: u32 = 2;
 
 impl Role {
 	/// The concrete permissions this seat holds: `concierge:*`, `iam:*` and `bank:*`.
 	pub fn permissions(self) -> &'static [&'static str] {
 		match self {
-			Self::Investor => &[],
+			Self::Investor => SEAT_INVESTOR.members,
 			Self::Operator => SEAT_OPERATOR.members,
 			Self::Admin => SEAT_ADMIN.members,
 			Self::Owner => SEAT_OWNER.members,
@@ -300,12 +354,14 @@ mod tests {
 	#[test]
 	fn default_role_is_investor() {
 		assert_eq!(Role::default(), Role::Investor);
-		assert!(Role::Investor.permissions().is_empty());
+		assert!(Role::Investor.may(Own::Profile) && Role::Investor.may(bank::Own::Wallet));
+		assert!(!Role::Investor.may(Users::Read));
 	}
 
 	#[test]
 	fn seat_bank_sets_are_pinned_to_their_generation() {
 		let seats: Vec<(&str, Vec<&str>)> = Role::VARIANTS.iter().map(|r| (r.as_str(), r.bank_permissions())).collect();
+		let own = vec!["bank:self:invest", "bank:self:operations", "bank:self:wallet"];
 		let staff = vec![
 			"bank:allocation:manage",
 			"bank:capital:manage",
@@ -317,6 +373,9 @@ mod tests {
 			"bank:payment:open",
 			"bank:redemption:fail",
 			"bank:redemption:settle",
+			"bank:self:invest",
+			"bank:self:operations",
+			"bank:self:wallet",
 			"bank:treasury:read",
 			"bank:user:revoke",
 			"bank:user:suspend",
@@ -327,16 +386,27 @@ mod tests {
 			"bank:withdrawal:settle",
 		];
 		let pinned = vec![
-			("investor", vec![]),
-			("operator", vec!["bank:treasury:read", "bank:user_balance:read"]),
+			("investor", own),
+			(
+				"operator",
+				vec!["bank:self:invest", "bank:self:operations", "bank:self:wallet", "bank:treasury:read", "bank:user_balance:read"],
+			),
 			("admin", staff.clone()),
 			("owner", staff),
 		];
 		assert_eq!(
 			(SEAT_GENERATION, seats),
-			(1, pinned),
+			(2, pinned),
 			"a seat's bank:* set changed: bump SEAT_GENERATION, then pin the new sets and generation here"
 		);
+	}
+
+	#[test]
+	fn a_guest_holds_nothing_an_account_does() {
+		assert!(SEAT_GUEST.members.is_empty());
+		for &role in Role::VARIANTS {
+			assert!(role.may(Own::Profile), "{role:?} is an account first");
+		}
 	}
 
 	#[test]

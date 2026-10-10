@@ -39,7 +39,7 @@ use domain::{
 	authz::Role,
 	error::DomainError,
 	governance::{AdmissionVote as DomainAdmissionVote, MAX_CODE_ATTEMPTS, ProposalState, REMOVAL_TTL_SECS, RemovalId, RemovalState, Vote},
-	users::{AuthSubject, Email, UserId},
+	users::UserId,
 };
 use evconcierge_auth::{Claims, TokenType};
 use evconcierge_contracts::concierge::v1::{
@@ -128,9 +128,7 @@ impl Fixture {
 	}
 
 	async fn provision(&self, email_verified: bool) -> UserId {
-		let subject = AuthSubject::parse(&format!("gov-itest-{}", Uuid::new_v4())).unwrap();
-		let email = Email::parse(&format!("gov-{}@example.com", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, email, email_verified).await.expect("provision").id()
+		self.users.resolve(common::google("gov", email_verified), 0).await.expect("provision").id()
 	}
 
 	/// The money plane's push seam over the same adapters, with a ceiling no test here

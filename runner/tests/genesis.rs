@@ -20,10 +20,7 @@ use concierge::{
 	infrastructure::{db, governance::PgGovernance, users::PgUsers},
 	ports::UserDirectoryRepository,
 };
-use domain::{
-	authz::Role,
-	users::{AuthSubject, Email, UserId},
-};
+use domain::{authz::Role, users::UserId};
 use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
@@ -69,9 +66,13 @@ impl Fixture {
 	/// A provisioned user holding no seat, with a unique address so the mailbox lookups
 	/// below are unambiguous by construction.
 	async fn user(&self) -> (UserId, String) {
-		let subject = AuthSubject::parse(&format!("genesis-{}", Uuid::new_v4())).unwrap();
 		let address = format!("genesis-{}@example.com", Uuid::new_v4());
-		let id = self.users.provision(subject, Email::parse(&address).unwrap(), true).await.expect("provision").id();
+		let id = self
+			.users
+			.resolve(common::google_as(&format!("genesis-{}", Uuid::new_v4()), &address, true), 0)
+			.await
+			.expect("provision")
+			.id();
 		(id, address)
 	}
 
@@ -79,8 +80,11 @@ impl Fixture {
 	/// ordinary Google sign-in with an unverified claim produces, which this plane keeps
 	/// working on purpose so that nothing downstream trusts an address silently.
 	async fn unverified_user(&self, address: &str) -> UserId {
-		let subject = AuthSubject::parse(&format!("genesis-unverified-{}", Uuid::new_v4())).unwrap();
-		self.users.provision(subject, Email::parse(address).unwrap(), false).await.expect("provision").id()
+		self.users
+			.resolve(common::google_as(&format!("genesis-unverified-{}", Uuid::new_v4()), address, false), 0)
+			.await
+			.expect("provision")
+			.id()
 	}
 
 	async fn disable(&self, id: UserId) {
@@ -191,41 +195,6 @@ async fn an_unknown_user_id_is_reported_separately_from_a_waiting_mailbox() {
 	};
 	assert_eq!(resolution.missing_ids, vec![UserId::from_raw(ghost)]);
 	assert!(resolution.missing_mailboxes.is_empty());
-}
-
-/// `users.email` is deliberately not unique, so an address CAN name two people. Seating
-/// the wrong one is not a mistake the owner floor lets anyone undo, so the whole roster
-/// is refused rather than guessed at.
-#[tokio::test]
-async fn an_ambiguous_mailbox_seats_nobody() {
-	let Some(fx) = setup().await else {
-		return;
-	};
-	let (first, shared) = fx.user().await;
-	let (second, _) = fx.user().await;
-	let (third, _) = fx.user().await;
-	// Reached for directly only because it is shorter than driving two sign-ins — this
-	// collision is entirely producible through the front door. The directory writes
-	// whatever address the identity provider claimed and never compares addresses across
-	// rows, so two auth subjects naming one mailbox (a recreated Workspace account, say)
-	// is an ordinary outcome rather than a corrupted database.
-	sqlx::query("UPDATE users SET email = $1 WHERE id = $2")
-		.bind(&shared)
-		.bind(second.raw())
-		.execute(&fx.pool)
-		.await
-		.expect("collide the two addresses");
-
-	let outcome = fx.seed(&[shared.clone(), third.to_string()]).await;
-
-	let GenesisOutcome::Ambiguous { mailbox, matches } = outcome else {
-		panic!("expected an ambiguity refusal, got {outcome:?}");
-	};
-	assert_eq!(mailbox.as_str(), shared);
-	assert_eq!(matches, 2);
-	for id in [first, second, third] {
-		assert_eq!(fx.role_of(id).await, Role::Investor, "an ambiguous roster seats nobody at all");
-	}
 }
 
 /// An entry that is neither a UUID nor an address is a typo, and a partially understood

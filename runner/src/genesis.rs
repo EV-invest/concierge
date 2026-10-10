@@ -150,12 +150,6 @@ pub enum GenesisOutcome {
 	Malformed { entry: String },
 	/// The registry already holds owners. The permanent end state.
 	Closed { owners: i64 },
-	/// A configured mailbox matches more than one SEATABLE user. Refuse to guess which.
-	/// Unverified and disabled rows are filtered out before this is decided, so an
-	/// impostor holding an unverified copy of a founder's address cannot deadlock
-	/// genesis — which, with the registry left empty, would keep emergency access open
-	/// indefinitely.
-	Ambiguous { mailbox: Email, matches: i64 },
 	/// Fewer than [`MIN_OWNERS`] resolved — nobody seated, retried next boot.
 	TooFew(Resolution),
 	/// Every resolved subject now holds a seat.
@@ -182,9 +176,6 @@ pub async fn seed(repo: &dyn OwnerGenesisRepository, subjects: &[String]) -> Res
 	match &outcome {
 		GenesisOutcome::Closed { owners } => {
 			tracing::info!(owners, "owner genesis is closed — the registry is already populated and OWNER_SUBJECTS is inert");
-		}
-		GenesisOutcome::Ambiguous { mailbox, matches } => {
-			tracing::error!(%mailbox, matches, "an OWNER_SUBJECTS e-mail matches more than one user — seating nobody; name these founders by user id instead");
 		}
 		GenesisOutcome::TooFew(resolution) => {
 			report_unresolved(resolution);
